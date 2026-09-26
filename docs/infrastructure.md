@@ -34,7 +34,9 @@ validation rejects allocations exceeding the declared host budgets and reserves;
 available capacity from Proxmox.
 
 The Arch worker defaults to 30 GiB and 12 vCPU on a host with 32 GiB and 12 logical CPUs/6 physical
-cores. This leaves a nominal 2 GiB outside the guest before QEMU overhead. All twelve logical CPUs
+cores. This leaves a nominal 2 GiB outside the guest before QEMU overhead. Ansible requires
+at least 1 GiB of measured host RAM beyond the guest allocation; firmware reservations mean
+Linux may report less than the nominal 32 GiB. All twelve logical CPUs
 are available to the guest and shared with the host scheduler; no logical CPUs are reserved solely
 for Arch. Twelve vCPU are logical execution contexts, not twelve physical cores. The root disk defaults to
 32 GiB and scratch to 512 GiB. Their configurable sum is capped at 700 GiB, leaving space for image

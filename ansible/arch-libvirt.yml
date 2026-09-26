@@ -7,10 +7,10 @@
     qcl_libvirt_users: []
     qcl_storage_directory: /var/lib/libvirt/qcl-negf
     qcl_cluster_bridge: ""
-    qcl_guest_memory_mib: 24576
-    qcl_host_memory_reserve_mib: 6144
-    qcl_guest_vcpus: 10
-    qcl_host_cpu_reserve: 2
+    qcl_guest_memory_mib: 30720
+    qcl_host_memory_reserve_mib: 1024
+    qcl_guest_vcpus: 12
+    qcl_host_cpu_reserve: 0
   tasks:
     - name: Confirm the intended existing Arch host and operator settings
       ansible.builtin.assert:
