@@ -14,7 +14,7 @@
     # Replace CPU counts and RealMemory using `slurmd -C` inside each VM;
     # leave an explicit operating-system reserve. Never use host physical cores
     # as guest logical CPU counts. Example below is a conservative Arch VM cap.
-    nodes = [ "arch-worker CPUs=10 RealMemory=22528 State=UNKNOWN" ];
+    nodes = [ "arch-worker CPUs=12 RealMemory=28672 State=UNKNOWN" ];
     partitions = [ "compute Nodes=arch-worker Default=YES MaxTime=7-00:00:00 State=UP" ];
   };
 }

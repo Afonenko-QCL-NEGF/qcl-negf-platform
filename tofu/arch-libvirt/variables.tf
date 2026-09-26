@@ -34,18 +34,18 @@ variable "scratch_gib" {
 }
 variable "memory_mib" {
   type    = number
-  default = 24576
+  default = 30720
   validation {
-    condition     = var.memory_mib >= 4096 && var.memory_mib <= 24576
-    error_message = "Keep at least 8 GiB of a nominal 32 GiB host outside the guest; maximum guest RAM is 24 GiB."
+    condition     = var.memory_mib >= 4096 && var.memory_mib <= 30720
+    error_message = "Maximum guest RAM is 30 GiB on the nominal 32 GiB host, leaving 2 GiB before hypervisor overhead."
   }
 }
 variable "vcpus" {
   type    = number
-  default = 10
+  default = 12
   validation {
-    condition     = var.vcpus >= 1 && var.vcpus <= 10
-    error_message = "Use at most 10 guest vCPUs on this 12-logical-CPU host."
+    condition     = var.vcpus >= 1 && var.vcpus <= 12
+    error_message = "Use at most 12 guest vCPUs on this 12-logical-CPU host."
   }
 }
 variable "mac" { type = string }

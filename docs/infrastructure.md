@@ -33,16 +33,17 @@ Replace these values with the machine's usable RAM and the needs of other guests
 validation rejects allocations exceeding the declared host budgets and reserves; it does not infer
 available capacity from Proxmox.
 
-The Arch worker defaults to 24 GiB and 10 vCPU on a host with 32 GiB and 12 logical CPUs/6 physical
-cores. This leaves a nominal 8 GiB and two logical CPUs outside the guest; QEMU also consumes host
-memory. Ten vCPU are logical execution contexts, not ten physical cores. The root disk defaults to
+The Arch worker defaults to 30 GiB and 12 vCPU on a host with 32 GiB and 12 logical CPUs/6 physical
+cores. This leaves a nominal 2 GiB outside the guest before QEMU overhead. All twelve logical CPUs
+are available to the guest and shared with the host scheduler; no logical CPUs are reserved solely
+for Arch. Twelve vCPU are logical execution contexts, not twelve physical cores. The root disk defaults to
 32 GiB and scratch to 512 GiB. Their configurable sum is capped at 700 GiB, leaving space for image
 files and host overhead within an 800 GB device. Check actual free space before creating sparse
 volumes: declared capacity is not reserved physical space.
 
 After boot, run `slurmd -C` inside each compute VM and copy the measured topology into the private
 site's `slurm.nodes`. Use a lower `RealMemory` than observed RAM to reserve the guest OS and
-services. `22528` MiB is a conservative example for the 24 GiB Arch guest, not a hardware
+services. `28672` MiB is a conservative example for the 30 GiB Arch guest, not a hardware
 measurement. Reserve one process per calculation and allocate its CPUs/RAM through AiiDA.
 BLAS/OpenMP defaults are one thread; Slurm cgroup v2 enforces the assigned CPU set and memory
 limits. Every compute node and submission host must retain the same immutable solver store path.

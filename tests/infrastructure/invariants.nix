@@ -10,7 +10,7 @@ let
   storage = mk [{ qclNegf.storage = { enable = true; clients = [ "control" "worker" ]; }; }];
   worker = mk [{ qclNegf.cluster = {
     worker = true; storageHost = "storage";
-    nodes = [ "worker CPUs=10 RealMemory=22528 State=UNKNOWN" ];
+    nodes = [ "worker CPUs=12 RealMemory=28672 State=UNKNOWN" ];
     partitions = [ "compute Nodes=worker Default=YES State=UP" ];
     scratchDevice = "/dev/disk/by-id/virtio-qcl-scratch";
   }; }];
