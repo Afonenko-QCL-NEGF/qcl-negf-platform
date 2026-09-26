@@ -1,0 +1,27 @@
+{
+  description = "Private QCL-NEGF laboratory site";
+  inputs.qcl.url = "git+https://github.com/AfonenkoA/qcl-negf.git?submodules=1";
+  # Run nix flake lock and review/commit flake.lock in the private site repository.
+  outputs = { self, qcl }: let
+    system = "x86_64-linux";
+    platform = qcl.inputs.platform;
+    nixpkgs = platform.inputs.nixpkgs;
+    site = import ./site.nix;
+    application = qcl.lib.mkApplication { inherit system; };
+    depot = builtins.fromJSON (builtins.readFile ./solver-depot.json);
+    preparedDepot = qcl.lib.mkPreparedDepot {
+      inherit system;
+      metadata = depot;
+    };
+    solver = qcl.lib.mkSolver { inherit system preparedDepot; };
+    hosts = import (platform.outPath + "/examples/private-site/hosts.nix") {
+      inherit nixpkgs platform site application solver;
+    };
+    images = platform.lib.mkImages { configurations = hosts; };
+  in {
+    nixosConfigurations = hosts;
+    packages.${system} = nixpkgs.lib.mapAttrs' (name: image:
+      nixpkgs.lib.nameValuePair "${name}-image" image
+    ) images // { inherit application solver; };
+  };
+}

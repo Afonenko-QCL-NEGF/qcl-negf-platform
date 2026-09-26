@@ -1,0 +1,29 @@
+{
+  "hosts": [
+    {
+      "name": "storage",
+      "flake": ".",
+      "target": "root@storage"
+    },
+    {
+      "name": "control",
+      "flake": ".",
+      "target": "root@control"
+    },
+    {
+      "name": "compute",
+      "flake": ".",
+      "target": "root@compute"
+    },
+    {
+      "name": "arch-worker",
+      "flake": ".",
+      "target": "root@arch-worker"
+    },
+    {
+      "name": "ci",
+      "flake": ".",
+      "target": "root@ci"
+    }
+  ]
+}

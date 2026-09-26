@@ -1,0 +1,16 @@
+{
+  "uri": "qemu+ssh://operator@arch-host/system",
+  "bridge": "br-cluster",
+  "pool_path": "/var/lib/libvirt/qcl-negf",
+  "root_gib": 32,
+  "scratch_gib": 512,
+  "memory_mib": 24576,
+  "vcpus": 10,
+  "mac": "52:54:00:00:00:0e",
+  "address": "192.0.2.14/24",
+  "gateway": "192.0.2.1",
+  "dns_servers": [
+    "192.0.2.1"
+  ],
+  "ssh_public_keys": []
+}

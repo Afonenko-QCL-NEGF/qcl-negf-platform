@@ -1,0 +1,59 @@
+{
+  "endpoint": "https://proxmox.example.org:8006/",
+  "node": "pve",
+  "image_datastore": "local",
+  "snippet_datastore": "local",
+  "root_datastore": "local-lvm",
+  "data_datastore": "local-lvm",
+  "cluster_bridge": "vmbr-cluster",
+  "ci_bridge": "vmbr-ci",
+  "dns_servers": [
+    "192.0.2.1"
+  ],
+  "ssh_public_keys": [],
+  "main_data_gib": 1024,
+  "controller_state_gib": 64,
+  "compute_scratch_gib": 256,
+  "host_memory_mib": 65536,
+  "host_reserve_mib": 8192,
+  "host_logical_cpus": 32,
+  "host_reserved_cpus": 2,
+  "vms": {
+    "storage": {
+      "vm_id": 9010,
+      "vcpus": 2,
+      "memory_mib": 4096,
+      "root_gib": 64,
+      "mac": "52:54:00:00:00:0a",
+      "address": "192.0.2.10/24",
+      "gateway": "192.0.2.1"
+    },
+    "control": {
+      "vm_id": 9011,
+      "vcpus": 4,
+      "memory_mib": 8192,
+      "root_gib": 64,
+      "mac": "52:54:00:00:00:0b",
+      "address": "192.0.2.11/24",
+      "gateway": "192.0.2.1"
+    },
+    "compute": {
+      "vm_id": 9012,
+      "vcpus": 20,
+      "memory_mib": 32768,
+      "root_gib": 64,
+      "mac": "52:54:00:00:00:0c",
+      "address": "192.0.2.12/24",
+      "gateway": "192.0.2.1"
+    },
+    "ci": {
+      "vm_id": 9013,
+      "vcpus": 4,
+      "memory_mib": 8192,
+      "root_gib": 64,
+      "mac": "52:54:00:00:00:0d",
+      "address": "198.51.100.13/24",
+      "gateway": "198.51.100.1"
+    }
+  }
+}

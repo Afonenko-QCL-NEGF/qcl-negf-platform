@@ -1,0 +1,69 @@
+---
+- name: Prepare the existing Arch host for a NixOS worker VM
+  hosts: arch_hypervisors
+  become: true
+  gather_facts: true
+  vars:
+    qcl_libvirt_users: []
+    qcl_storage_directory: /var/lib/libvirt/qcl-negf
+    qcl_cluster_bridge: ""
+    qcl_guest_memory_mib: 24576
+    qcl_host_memory_reserve_mib: 6144
+    qcl_guest_vcpus: 10
+    qcl_host_cpu_reserve: 2
+  tasks:
+    - name: Confirm the intended existing Arch host and operator settings
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['distribution'] == 'Archlinux'
+          - ansible_facts['architecture'] == 'x86_64'
+          - qcl_cluster_bridge | length > 0
+          - qcl_libvirt_users | length > 0
+          - (ansible_facts['memtotal_mb'] | int) >= (qcl_guest_memory_mib | int) + (qcl_host_memory_reserve_mib | int)
+          - (ansible_facts['processor_vcpus'] | int) >= (qcl_guest_vcpus | int) + (qcl_host_cpu_reserve | int)
+        fail_msg: Supply the existing LAN bridge, allowed libvirt operators and a guest budget fitting measured host capacity.
+    - name: Install virtualization tools from the configured Arch package database
+      ansible.builtin.package:
+        name: [libvirt, qemu-desktop, edk2-ovmf, dnsmasq, iproute2]
+        state: present
+    - name: Enable local libvirt management
+      ansible.builtin.systemd_service:
+        name: libvirtd.service
+        enabled: true
+        state: started
+    - name: Grant explicitly named operators local libvirt administration
+      ansible.builtin.user:
+        name: "{{ item }}"
+        groups: libvirt
+        append: true
+      loop: "{{ qcl_libvirt_users }}"
+    - name: Create the dedicated VM storage directory
+      ansible.builtin.file:
+        path: "{{ qcl_storage_directory }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+    - name: Inspect KVM availability
+      ansible.builtin.stat:
+        path: /dev/kvm
+      register: qcl_kvm
+    - name: Require hardware virtualization
+      ansible.builtin.assert:
+        that: qcl_kvm.stat.exists and qcl_kvm.stat.ischr
+        fail_msg: Enable VT-x/AMD-V in firmware and load the host KVM module before provisioning.
+    - name: Inspect the explicitly selected existing bridge
+      ansible.builtin.command:
+        argv: [ip, -json, -details, link, show, dev, "{{ qcl_cluster_bridge }}"]
+      register: qcl_bridge
+      changed_when: false
+      check_mode: false
+    - name: Verify the interface is a Linux bridge
+      ansible.builtin.assert:
+        that: (qcl_bridge.stdout | from_json)[0].linkinfo.info_kind == 'bridge'
+        fail_msg: Configure a LAN bridge using the host's existing network manager before applying OpenTofu.
+    - name: Report the physical host's measured capacity
+      ansible.builtin.debug:
+        msg:
+          - "Logical CPUs: {{ ansible_facts['processor_vcpus'] }}; RAM MiB: {{ ansible_facts['memtotal_mb'] }}"
+          - "Arch remains the host OS; no host partition, root filesystem or network configuration is replaced."

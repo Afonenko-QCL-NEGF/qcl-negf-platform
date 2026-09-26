@@ -1,0 +1,8 @@
+[arch_hypervisors]
+arch-host ansible_host=192.0.2.20
+
+[arch_hypervisors:vars]
+# Documentation address only. Put real host/user/key settings in a private inventory.
+ansible_user=operator
+qcl_cluster_bridge=br-cluster
+qcl_libvirt_users=["operator"]
