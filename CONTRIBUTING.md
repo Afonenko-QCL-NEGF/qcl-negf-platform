@@ -1,6 +1,6 @@
 # Contributing
 
-Develop this component through the [qcl-negf superproject](https://github.com/AfonenkoA/qcl-negf).
+Develop this component through the [qcl-negf superproject](https://github.com/Afonenko-QCL-NEGF/qcl-negf).
 Its Git tree selects every component revision, and its native package-manager locks select external
 dependencies. Commit a component change first, then update its gitlink in the root repository. Root
 CI tests the complete selected graph using Python 3.14.7 and the project's Julia environment.

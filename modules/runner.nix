@@ -22,7 +22,7 @@ in {
     systemd.slices.qcl-negf-ci.sliceConfig = { CPUQuota = cfg.cpuQuota; MemoryMax = cfg.memoryMax; TasksMax = 4096; };
     services.github-runners = lib.listToAttrs (map (repo: lib.nameValuePair repo {
       enable = true;
-      url = "https://github.com/AfonenkoA/${repo}";
+      url = "https://github.com/Afonenko-QCL-NEGF/${repo}";
       name = repo;
       tokenFile = "${cfg.tokenDirectory}/${repo}";
       tokenType = "access";

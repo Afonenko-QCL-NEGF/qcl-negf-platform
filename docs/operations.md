@@ -58,7 +58,7 @@ code. Use the parsed result status when accepting a calculation.
 ## Source, CI and delivery
 
 GitHub stores source, pull requests, workflow definitions and logs. The single runner is registered
-to `AfonenkoA/qcl-negf`, whose committed gitlinks select all eight components. The runner connects
+to `Afonenko-QCL-NEGF/qcl-negf`, whose committed gitlinks select all eight components. The runner connects
 outbound to GitHub; no inbound webhook service is needed. Component repositories do not have
 separate integration runners or source-revision manifests.
 
