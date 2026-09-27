@@ -1,7 +1,7 @@
 # QCL-NEGF platform
 
 NixOS modules, VM definitions and typed deployment commands for a scientific Slurm cluster. The
-[qcl-negf superproject](https://github.com/AfonenkoA/qcl-negf) selects eight component revisions
+[qcl-negf superproject](https://github.com/Afonenko-QCL-NEGF/qcl-negf) selects eight component revisions
 with Git submodules and runs integration CI on one self-hosted GitHub Actions runner. This
 repository owns infrastructure and deployment; AiiDA owns workflow provenance and Slurm assigns
 compute resources.
@@ -96,13 +96,13 @@ or set a root password. Provision SSH access in the site configuration. See
 
 ## Repository boundaries
 
-Numerical algorithms belong to [QCLNEGF.jl](https://github.com/AfonenkoA/QCLNEGF.jl); frozen-plan
+Numerical algorithms belong to [QCLNEGF.jl](https://github.com/Afonenko-QCL-NEGF/QCLNEGF.jl); frozen-plan
 execution and scratch staging belong to
-[QCLNEGFRunner.jl](https://github.com/AfonenkoA/QCLNEGFRunner.jl). Shared formats belong to
-[qcl-negf-contracts](https://github.com/AfonenkoA/qcl-negf-contracts), result tools to
-[qcl-negf-results](https://github.com/AfonenkoA/qcl-negf-results), workflows to
-[qcl-negf-aiida](https://github.com/AfonenkoA/qcl-negf-aiida), the API/UI to
-[qcl-negf-portal](https://github.com/AfonenkoA/qcl-negf-portal), and reference studies to
-[qcl-negf-research](https://github.com/AfonenkoA/qcl-negf-research).
+[QCLNEGFRunner.jl](https://github.com/Afonenko-QCL-NEGF/QCLNEGFRunner.jl). Shared formats belong to
+[qcl-negf-contracts](https://github.com/Afonenko-QCL-NEGF/qcl-negf-contracts), result tools to
+[qcl-negf-results](https://github.com/Afonenko-QCL-NEGF/qcl-negf-results), workflows to
+[qcl-negf-aiida](https://github.com/Afonenko-QCL-NEGF/qcl-negf-aiida), the API/UI to
+[qcl-negf-portal](https://github.com/Afonenko-QCL-NEGF/qcl-negf-portal), and reference studies to
+[qcl-negf-research](https://github.com/Afonenko-QCL-NEGF/qcl-negf-research).
 
 MIT license. See [CONTRIBUTING.md](CONTRIBUTING.md) for validation expectations.

@@ -1,6 +1,6 @@
 {
   description = "Private QCL-NEGF laboratory site";
-  inputs.qcl.url = "git+https://github.com/AfonenkoA/qcl-negf.git?submodules=1";
+  inputs.qcl.url = "git+https://github.com/Afonenko-QCL-NEGF/qcl-negf.git?submodules=1";
   # Run nix flake lock and review/commit flake.lock in the private site repository.
   outputs = { self, qcl }: let
     system = "x86_64-linux";
