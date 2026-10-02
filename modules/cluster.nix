@@ -25,7 +25,7 @@ in {
         { assertion = lib.hasPrefix "/" cfg.mungeKeyFile && !(lib.hasPrefix "/nix/store/" cfg.mungeKeyFile); message = "Munge secret must be a runtime absolute path outside the store."; }
       ];
       services.munge.password = cfg.mungeKeyFile;
-      systemd.services.munge = {
+      systemd.services.munged = {
         requires = config.qclNegf.runtimeSecretUnits;
         after = config.qclNegf.runtimeSecretUnits;
         unitConfig.RequiresMountsFor = cfg.mungeKeyFile;
@@ -92,7 +92,11 @@ in {
           install -d -o qcl-negf -g qcl-negf -m 0700 /scratch/qcl-negf
         '';
       };
-      systemd.services.slurmd.unitConfig.RequiresMountsFor = [ cfg.jobDirectory "/scratch" ];
+      systemd.services.slurmd = {
+        requires = [ "munged.service" ];
+        after = [ "munged.service" ];
+        unitConfig.RequiresMountsFor = [ cfg.jobDirectory "/scratch" ];
+      };
     })
   ];
 }

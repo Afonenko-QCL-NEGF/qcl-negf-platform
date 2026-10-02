@@ -84,8 +84,19 @@ The mount specifies ext4 explicitly so newly created filesystems do not depend
 on stale live-installer filesystem detection.
 
 ```sh
+nix flake lock /absolute/private-bootstrap
+nix eval --no-write-lock-file /absolute/private-bootstrap#nixosConfigurations.ci.config.system.build.toplevel.drvPath
 nixos-install --flake /absolute/private-bootstrap#ci --root /mnt --no-root-password
 ```
+
+Create and review `flake.lock` before evaluating/installing a path flake; an
+installer-generated lock can change that path's NAR hash between its source
+resolution and build. Commit the lock in the private site. When enforcing a
+finite install deadline with a transient systemd service, pass the installer's
+PATH explicitly (`--setenv=PATH=/run/current-system/sw/bin:/usr/bin:/bin`);
+systemd does not inherit the interactive shell's Nix tool paths. Set one build,
+four cores and the remaining authorized time on that service before invoking
+`nixos-install`.
 
 The SSH key in `site.nix` must be real before installation; this command leaves
 password login disabled. Existing `ops install` can run the same command from

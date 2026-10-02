@@ -39,7 +39,8 @@
     checks = forAll (system: let pkgs = nixpkgs.legacyPackages.${system}; in {
       infrastructure = let
         checked = import ./tests/infrastructure/invariants.nix { inherit nixpkgs; platform = self; };
-      in builtins.deepSeq checked (pkgs.runCommand "qcl-negf-infrastructure-check" {} "touch $out");
+        checkedMunge = import ./tests/infrastructure/munge.nix { inherit nixpkgs; platform = self; };
+      in builtins.deepSeq [ checked checkedMunge ] (pkgs.runCommand "qcl-negf-infrastructure-check" {} "touch $out");
       slurm-vm = import ./tests/slurm-vm.nix { inherit pkgs; module = self.nixosModules.default; };
       operations = pkgs.runCommand "qcl-negf-operations-check" { nativeBuildInputs = [ pkgs.deno pkgs.python314 ]; } ''
         cp -r ${./.} source

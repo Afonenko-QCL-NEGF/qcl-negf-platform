@@ -84,10 +84,10 @@ in {
     systemd.services.qcl-negf-aiida = {
       description = "AiiDA workflow daemon";
       wantedBy = [ "multi-user.target" ];
-      requires = [ "postgresql.service" "munge.service" ] ++ lib.optional config.qclNegf.cluster.controller "slurmctld.service" ++ bootstrapUnits ++ config.qclNegf.runtimeSecretUnits;
+      requires = [ "postgresql.service" "munged.service" ] ++ lib.optional config.qclNegf.cluster.controller "slurmctld.service" ++ bootstrapUnits ++ config.qclNegf.runtimeSecretUnits;
       partOf = bootstrapUnits;
       wants = [ "network-online.target" ];
-      after = [ "postgresql.service" "network-online.target" "munge.service" ] ++ lib.optional config.qclNegf.cluster.controller "slurmctld.service" ++ bootstrapUnits ++ config.qclNegf.runtimeSecretUnits;
+      after = [ "postgresql.service" "network-online.target" "munged.service" ] ++ lib.optional config.qclNegf.cluster.controller "slurmctld.service" ++ bootstrapUnits ++ config.qclNegf.runtimeSecretUnits;
       unitConfig.RequiresMountsFor = [ "/var/lib/qcl-negf" config.qclNegf.cluster.jobDirectory ];
       unitConfig.ConditionPathExists = "/var/lib/qcl-negf/aiida/config.json";
       environment = {
