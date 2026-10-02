@@ -1,5 +1,20 @@
 # Bootstrap without a scientific build cycle
 
+If the site's normal DNS selects an unreachable cache edge and public DNS ports
+are unavailable, `ansible/bootstrap-dns.yml` optionally supplies loopback DNS
+over HTTPS in the official minimal installer. Pin an official DNSCrypt release
+URL and SHA-256 from its release metadata and a reviewed public DoH stamp in
+the private site. The bootstrap downloads only that verified tool from GitHub;
+its temporary service has a six-hour limit and binds only `127.0.0.1:53`.
+The transient unit is declared under `/run/systemd/system`, since the live
+NixOS `/etc/systemd/system` is read-only; it disappears after reboot.
+HTTPS certificate checks and Nix cache signatures stay enabled. This resolver
+is installer-only: declare the corresponding standard NixOS
+`services.dnscrypt-proxy` configuration in the site before installation, with
+`networking.nameservers = lib.mkForce [ "127.0.0.1" ]`, explicit static resolver,
+no resolver-list sources and no DHCP DNS. Do not preserve a transient CDN
+address in `/etc/hosts` as a permanent network contract.
+
 The initial builder needs only the platform and its Nixpkgs lock. It does not
 import the root application, Julia solver or `solver-depot.json`. Copy
 `examples/bootstrap-site/flake.nix.template` to `flake.nix` and

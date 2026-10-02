@@ -1,0 +1,60 @@
+---
+# Optional HTTPS DNS for the official live installer, without Python dependency.
+- name: Provide checksum-pinned loopback DoH in the minimal installer
+  hosts: bootstrap
+  gather_facts: false
+  tasks:
+    - name: Require official immutable release and resolver configuration
+      ansible.builtin.assert:
+        that:
+          - qcl_dnscrypt_url is match('^https://github.com/DNSCrypt/dnscrypt-proxy/releases/download/[0-9.]+/dnscrypt-proxy-linux_x86_64-[0-9.]+[.]tar[.]gz$')
+          - qcl_dnscrypt_sha256 is match('^[0-9a-f]{64}$')
+          - qcl_doh_stamp is match('^sdns://[A-Za-z0-9_-]+$')
+    - name: Download and verify the official installer-only DNS tool
+      ansible.builtin.raw: |
+        set -eu
+        umask 077
+        mkdir -p /tmp/qcl-bootstrap-dns
+        cd /tmp/qcl-bootstrap-dns
+        curl --fail --location --max-time 120 --max-filesize 16777216 {{ qcl_dnscrypt_url | quote }} --output dnscrypt.tar.gz
+        printf '%s  dnscrypt.tar.gz\n' {{ qcl_dnscrypt_sha256 | quote }} | sha256sum --check -
+        tar --extract --gzip --file dnscrypt.tar.gz
+        test -x linux-x86_64/dnscrypt-proxy
+      when: not ansible_check_mode
+    - name: Declare the temporary loopback resolver and finite service
+      ansible.builtin.raw: |
+        set -eu
+        cat > /tmp/qcl-bootstrap-dns/resolver.toml <<'QCL_DNS_CONFIG'
+        listen_addresses = ['127.0.0.1:53']
+        server_names = ['site-doh']
+        ipv6_servers = false
+        dnscrypt_servers = false
+        doh_servers = true
+        ignore_system_dns = true
+        bootstrap_resolvers = []
+        http3 = false
+        netprobe_address = '8.8.8.8:443'
+        netprobe_timeout = 30
+        [static.site-doh]
+        stamp = '{{ qcl_doh_stamp }}'
+        QCL_DNS_CONFIG
+        mkdir -p /run/systemd/system
+        cat > /run/systemd/system/qcl-bootstrap-dns.service <<'QCL_DNS_SERVICE'
+        [Unit]
+        Description=Temporary verified QCL installer DNS over HTTPS
+        After=network-online.target
+        [Service]
+        Type=simple
+        ExecStart=/tmp/qcl-bootstrap-dns/linux-x86_64/dnscrypt-proxy -config /tmp/qcl-bootstrap-dns/resolver.toml
+        WorkingDirectory=/tmp/qcl-bootstrap-dns
+        MemoryMax=256M
+        CPUQuota=25%
+        RuntimeMaxSec=6h
+        NoNewPrivileges=yes
+        [Install]
+        WantedBy=multi-user.target
+        QCL_DNS_SERVICE
+        systemctl daemon-reload
+        systemctl restart qcl-bootstrap-dns.service
+        printf 'nameserver 127.0.0.1\n' | resolvconf -a qcl-bootstrap-dns
+      when: not ansible_check_mode
