@@ -9,6 +9,15 @@ variable "node" { type = string }
 variable "iso_datastore" { type = string }
 variable "root_datastore" { type = string }
 variable "ci_bridge" { type = string }
+variable "build_profile" {
+  type        = string
+  default     = "standard"
+  description = "Select after host admission; resource changes reboot the idle builder."
+  validation {
+    condition     = contains(["standard", "burst"], var.build_profile)
+    error_message = "Use the standard or burst build profile."
+  }
+}
 variable "installer_boot" {
   type        = bool
   default     = true

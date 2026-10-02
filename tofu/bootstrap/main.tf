@@ -1,5 +1,8 @@
 # Temporary installer/builder. Its configuration does not depend on the solver
 # or on a previously built application image. Keep its state in the private site.
+locals {
+  build_profile = jsondecode(file("${path.module}/../../ops/build-profiles.json"))[var.build_profile]
+}
 resource "proxmox_virtual_environment_file" "installer" {
   node_name    = var.node
   datastore_id = var.iso_datastore
@@ -17,26 +20,27 @@ resource "proxmox_virtual_environment_file" "installer" {
   }
 }
 resource "proxmox_virtual_environment_vm" "builder" {
-  node_name       = var.node
-  vm_id           = var.vm_id
-  name            = "qcl-bootstrap"
-  tags            = ["qcl-negf", "bootstrap"]
-  bios            = "seabios"
-  machine         = "q35"
-  on_boot         = false
-  started         = true
-  stop_on_destroy = true
-  boot_order      = var.installer_boot ? ["ide2", "virtio0"] : ["virtio0", "ide2"]
+  node_name           = var.node
+  vm_id               = var.vm_id
+  name                = "qcl-bootstrap"
+  tags                = ["qcl-negf", "bootstrap"]
+  bios                = "seabios"
+  machine             = "q35"
+  on_boot             = false
+  started             = true
+  stop_on_destroy     = true
+  reboot_after_update = true
+  boot_order          = var.installer_boot ? ["ide2", "virtio0"] : ["virtio0", "ide2"]
   agent {
     enabled = true
     wait_for_ip { disabled = true }
   }
   cpu {
-    cores = 4
+    cores = local.build_profile.vcpus
     type  = "host"
   }
   memory {
-    dedicated = 8192
+    dedicated = local.build_profile.memory_mib
     floating  = 0
   }
   disk {

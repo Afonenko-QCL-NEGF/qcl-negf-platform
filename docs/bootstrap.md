@@ -26,12 +26,17 @@ does not introduce a solver dependency.
 
 For a new temporary VM, `tofu/bootstrap/` imports checksum-pinned official
 NixOS installation media onto an existing Proxmox node. It provisions only a
-4-vCPU, 8-GiB builder with a replaceable root disk and the already prepared CI
+builder with a replaceable root disk and the already prepared CI
 bridge. Use [the host network policy](host-network.md) first. Copy its
 `site-base.json.example` into the private site, obtain the ISO and SHA-256 from
 the official NixOS release, then review `tofu init`, `tofu validate` and `tofu
 plan` from this separate provider directory. It needs no application image.
 The bootstrap provider state is separate from the four final VM roles.
+`build_profile` defaults to `standard` (4 vCPU, 8 GiB RAM). `burst` grants
+12 vCPU and 24 GiB RAM only after an idle-build and host-capacity admission,
+with compute stopped and its queue empty. CPU/RAM and Nix resource caps share
+the owning `ops/build-profiles.json`. Resizing explicitly permits the provider
+to reboot the idle builder; it never interrupts an active build.
 
 Initialize the local backend with an absolute state path inside the private
 site (`tofu init -backend-config=path=/private/site/state/bootstrap.tfstate`).
@@ -112,10 +117,11 @@ the official live ISO. Do not install onto scientific data/state disks.
 Select the root disk as the next boot device after installation and detach the
 ISO through the reviewed VM maintenance configuration.
 
-The example sets `nix.settings.max-jobs = 1` and `cores = 4`, independently of
-GitHub registration. Its runner, when enabled, also has a 4-CPU / 8-GiB systemd
-slice. The Nix daemon runs builds outside that runner slice, so the VM's resource
-ceiling is the total execution limit. Set matching site VM CPU/RAM ceilings,
+The example enables `qclNegf.builder` independently of GitHub registration.
+Its `profile` must match the reviewed VM profile. One Nix build runs at a time;
+the Nix daemon, administrative builds and runner jobs share `qcl-build.slice`,
+with CPU 400% / RAM 7G for standard or CPU 1200% / RAM 22G for burst, swap0.
+Administrative transient builds explicitly select this slice. Set matching site VM CPU/RAM ceilings,
 finite build wall time, output budget and attempt count before any full build.
 
 After boot, establish SSH, inspect the OS generation and available disk space,

@@ -1,0 +1,20 @@
+{
+  "standard": {
+    "vcpus": 4,
+    "memory_mib": 8192,
+    "cpu_quota": "400%",
+    "memory_max": "7G",
+    "memory_swap_max": 0,
+    "build_cores": 4,
+    "max_jobs": 1
+  },
+  "burst": {
+    "vcpus": 12,
+    "memory_mib": 24576,
+    "cpu_quota": "1200%",
+    "memory_max": "22G",
+    "memory_swap_max": 0,
+    "build_cores": 12,
+    "max_jobs": 1
+  }
+}
