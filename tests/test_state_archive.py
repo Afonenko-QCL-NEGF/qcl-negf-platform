@@ -2,11 +2,13 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 spec = importlib.util.spec_from_file_location(
     "state_archive", Path(__file__).parents[1] / "ops" / "state_archive.py"
@@ -16,6 +18,130 @@ spec.loader.exec_module(archive)
 
 
 class StateArchiveTests(unittest.TestCase):
+    def restore_case(self, root, aiida_bytes, slurm_bytes, database_bytes):
+        sources = {"aiida": root / "aiida", "slurm": root / "slurm"}
+        database = root / "postgresql"
+        staging = root / "staging"
+        for path in [*sources.values(), database, staging]:
+            path.mkdir()
+        (database / "pg_wal").mkdir()
+        output = staging / "controller.tar.gz"
+        output.write_bytes(b"fixture")
+        manifest = {
+            "database": "qcl-negf", "postgresql_version_num": "170006",
+            "postgresql_database_bytes": database_bytes,
+            "source_paths": {name: str(path) for name, path in sources.items()},
+            "files": {"aiida/object": {"bytes": aiida_bytes},
+                      "slurm/state": {"bytes": slurm_bytes},
+                      "postgresql.dump": {"bytes": 1024}},
+        }
+        sql = {
+            "SHOW server_version_num": "170006", "SHOW data_directory": str(database),
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema')": "0",
+            "SELECT count(*) FROM pg_tablespace WHERE spcname NOT IN ('pg_default','pg_global')": "0",
+        }
+        argv = ["restore", str(output), "--profile-directory", str(sources["aiida"]),
+                "--slurm-directory", str(sources["slurm"]), "--disk-budget-bytes", str(64 * 1024**3),
+                "--writers-paused"]
+        return sources, database, staging, manifest, sql, argv
+
+    def virtual_disks(self, root, source_devices, free_bytes):
+        # External filesystem boundaries are simulated; filesystem traversal,
+        # CLI checks and the admission decision remain real production code.
+        real_stat = Path.stat
+
+        def stat(path, *args, **kwargs):
+            value = real_stat(path, *args, **kwargs)
+            for location, device in source_devices.items():
+                if path == location or path.is_relative_to(location):
+                    fields = list(value)
+                    fields[2] = device
+                    return os.stat_result(fields)
+            return value
+
+        def disk_usage(path):
+            path = Path(path)
+            for location, size in free_bytes.items():
+                if path == location or path.is_relative_to(location):
+                    return SimpleNamespace(free=size)
+            return SimpleNamespace(free=free_bytes[root])
+
+        return stat, disk_usage
+
+    def test_restore_rejects_combined_aiida_and_slurm_on_one_filesystem_before_stop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sources, database, staging, manifest, sql, argv = self.restore_case(root, 1024**3, 1024**3, 1024)
+            stat, usage = self.virtual_disks(root, {sources["aiida"]: 101, sources["slurm"]: 101,
+                                                  database: 102, staging: 103},
+                                             {staging: 64 * 1024**3, database: 64 * 1024**3,
+                                              root: 3 * 1024**3 // 2})
+            with patch.object(archive.os, "geteuid", return_value=0), patch.object(Path, "stat", stat), \
+                    patch.object(archive.shutil, "disk_usage", usage), patch.object(archive, "verify", return_value=manifest), \
+                    patch.object(archive, "query", side_effect=lambda _args, statement: sql[statement]), \
+                    patch.object(archive, "stop_services", side_effect=AssertionError("Insufficient shared filesystem reached service stop")):
+                with self.assertRaisesRegex(ValueError, "space|budget"):
+                    archive.main(argv)
+
+    def test_restore_rejects_physical_database_reserve_before_stop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sources, database, staging, manifest, sql, argv = self.restore_case(root, 1024, 1024, 2 * 1024**3)
+            stat, usage = self.virtual_disks(root, {sources["aiida"]: 101, sources["slurm"]: 101,
+                                                  database: 102, staging: 103},
+                                             {database: 3 * 1024**3 // 2, root: 64 * 1024**3})
+            with patch.object(archive.os, "geteuid", return_value=0), patch.object(Path, "stat", stat), \
+                    patch.object(archive.shutil, "disk_usage", usage), patch.object(archive, "verify", return_value=manifest), \
+                    patch.object(archive, "query", side_effect=lambda _args, statement: sql[statement]), \
+                    patch.object(archive, "stop_services", side_effect=AssertionError("Insufficient PostgreSQL filesystem reached service stop")):
+                with self.assertRaisesRegex(ValueError, "space|budget"):
+                    archive.main(argv)
+
+    def test_restore_total_budget_includes_physical_database_and_staging(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sources, database, staging, manifest, sql, argv = self.restore_case(root, 1024, 1024, 2 * 1024**3)
+            argv[argv.index("--disk-budget-bytes") + 1] = str(3 * 1024**3)
+            stat, usage = self.virtual_disks(root, {sources["aiida"]: 101, sources["slurm"]: 101,
+                                                  database: 102, staging: 103}, {root: 64 * 1024**3})
+            with patch.object(archive.os, "geteuid", return_value=0), patch.object(Path, "stat", stat), \
+                    patch.object(archive.shutil, "disk_usage", usage), patch.object(archive, "verify", return_value=manifest), \
+                    patch.object(archive, "query", side_effect=lambda _args, statement: sql[statement]), \
+                    patch.object(archive, "stop_services", side_effect=AssertionError("Physical PostgreSQL bytes were omitted from total budget")):
+                with self.assertRaisesRegex(ValueError, "budget"):
+                    archive.main(argv)
+
+    def test_create_manifest_records_physical_database_size_for_restore(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sources, dump, output, _metadata = self.fixture(root)
+            database = root / "postgresql"
+            database.mkdir()
+            (database / "pg_wal").mkdir()
+            config = {"profiles": {"qcl-negf": {"storage": {"backend": "core.psql_dos", "config": {
+                "database_name": "qcl-negf", "database_hostname": "/run/postgresql",
+                "database_port": 5432, "database_username": "qcl-negf", "database_password": "",
+                "repository_uri": (sources["aiida"] / "repository").as_uri(),
+            }}}}}
+            (sources["aiida"] / "config.json").write_text(json.dumps(config))
+            sql = {"SELECT pg_database_size(current_database())": str(8 * 1024**2),
+                   "SHOW server_version_num": "170006", "SHOW data_directory": str(database),
+                   "SELECT count(*) FROM pg_tablespace WHERE spcname NOT IN ('pg_default','pg_global')": "0"}
+            stat, _usage = self.virtual_disks(root, {sources["aiida"]: 101, sources["slurm"]: 101,
+                                                    database: 101}, {root: 64 * 1024**3})
+
+            def pg_dump(command, **kwargs):
+                self.assertIn("pg_dump", command)
+                kwargs["stdout"].write(dump.read_bytes())
+
+            with patch.object(archive.os, "geteuid", return_value=0), patch.object(Path, "stat", stat), \
+                    patch.object(archive, "query", side_effect=lambda _args, statement: sql[statement]), \
+                    patch.object(archive, "stop_services", return_value=[]), patch.object(archive.subprocess, "run", pg_dump):
+                archive.main(["create", str(output), "--profile-directory", str(sources["aiida"]),
+                              "--slurm-directory", str(sources["slurm"]), "--source-revision", "a" * 40,
+                              "--disk-budget-bytes", str(256 * 1024**2), "--writers-paused"])
+            self.assertEqual(archive.verify(output).get("postgresql_database_bytes"), 8388608)
+
     def fixture(self, root):
         sources = {"aiida": root / "profile", "slurm": root / "slurm"}
         for source in sources.values():

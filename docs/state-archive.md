@@ -12,7 +12,8 @@ One local archive contains the complete AiiDA profile directory (including its
 disk-objectstore repository), a PostgreSQL custom dump and Slurm controller
 state. Every regular file appears in `manifest.json` with its SHA-256 and byte
 count. Tar preserves directories, including empty ones. The manifest records
-the deployed root revision, PostgreSQL version, source paths, runtime secret
+the deployed root revision, PostgreSQL version and measured physical database
+size (`postgresql_database_bytes`, from `pg_database_size`), source paths, runtime secret
 references and the NFS dataset reference. Secret references contain paths, not
 secret bytes. Preserve the actual Munge/API/SSH secrets through the site's
 separate secret-recovery procedure. AiiDA UUIDs are database identities and are
@@ -64,13 +65,32 @@ and an **empty** `qcl-negf` database owned by `qcl-negf`. Keep automatic bootstr
 API, daemon and Slurm startup disabled during this preparation; even a fresh
 controller may create state if those services start. Provide empty destination
 profile/Slurm directories and enough space for temporary extraction plus the
-restored files. Reprovision the referenced secrets separately. Verify the copied
+restored files and PostgreSQL. PostgreSQL `data_directory` must reside on a
+separate mounted data disk. External `pg_wal` and nondefault tablespaces require
+a separately reviewed restore procedure; this CLI refuses them during create
+and restore. Reprovision the referenced secrets separately. Verify the copied
 archive first, then run:
 
 ```sh
 qcl-negf-state-archive restore /absolute/external/controller-001.tar.gz \
   --disk-budget-bytes DECLARED_BYTES --writers-paused
 ```
+
+Before stopping any service or running `pg_restore`, admission sums allocations
+by filesystem device (`st_dev`): temporary extraction, profile/Slurm copies,
+and PostgreSQL may share one filesystem and must fit together. PostgreSQL
+reserves **twice the archived physical database size plus 1 GiB**. The physical
+size already includes stored indexes; the second copy and additional reserve
+allow transient index rebuild/WAL growth. Increase the additional reserve using
+`--postgresql-reserve-bytes BYTES` for a site's measured restore workload; values
+below 1 GiB are refused. Each filesystem also requires 64 MiB headroom, and
+file allocations include 4096 bytes overhead per file. The finite total budget
+includes all these allocations plus the retained input archive. Its already
+occupied bytes are not charged against current free space twice. An archive
+without a positive recorded physical database size is refused for restore.
+This reservation is an admission policy, not a universal upper bound on
+PostgreSQL growth or a filesystem quota; the bounded live restore rehearsal
+must establish the site's required reserve.
 
 Restore rejects a different PostgreSQL major, a different database name,
 nonempty destination database/directories, bad hashes, duplicate members,

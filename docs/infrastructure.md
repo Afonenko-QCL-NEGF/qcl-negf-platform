@@ -206,3 +206,12 @@ Primary interfaces are pinned to
 [dmacvicar/libvirt 0.9.9](https://github.com/dmacvicar/terraform-provider-libvirt/tree/v0.9.9/docs),
 and the platform's Nixpkgs lock. The libvirt configuration uses the current 0.9 attribute-based
 schema, including a separately uploaded cloud-init ISO; it does not use removed 0.8 block syntax.
+
+The main `tofu/proxmox` configuration declares a local backend. Initialize it
+with an absolute private state path, for example
+`tofu -chdir=tofu/proxmox init -backend-config=path=/private/site/state/proxmox.tfstate`.
+Keep that directory mode0700 and state/plan files mode0600; neither belongs in
+the public checkout. For an existing initialized working directory, review the
+state migration explicitly before using `init -migrate-state`; do not silently
+create a second empty state. Offline syntax/provider validation uses
+`init -backend=false` and does not establish the production backend.

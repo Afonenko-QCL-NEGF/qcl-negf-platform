@@ -12,6 +12,8 @@ import tempfile
 
 FORMAT = "qcl-negf-controller-state.v1"
 UNITS = ["qcl-negf-api.service", "qcl-negf-aiida.service", "slurmctld.service"]
+RESTORE_HEADROOM = 64 * 1024**2
+POSTGRESQL_EXTRA_RESERVE = 1024**3
 
 
 def digest(path):
@@ -122,6 +124,50 @@ def query(args, sql):
     return subprocess.check_output(pg(args, "psql") + ["--no-psqlrc", "--tuples-only", "--no-align", "--command", sql], text=True).strip()
 
 
+def postgresql_directory(args):
+    directory = Path(query(args, "SHOW data_directory"))
+    if (not directory.is_absolute() or not directory.is_dir() or directory.is_symlink()
+            or directory.stat().st_dev == Path("/").stat().st_dev):
+        raise ValueError("PostgreSQL data_directory must reside on a separate mounted data disk")
+    wal = directory / "pg_wal"
+    if (not wal.is_dir() or wal.is_symlink() or wal.stat().st_dev != directory.stat().st_dev
+            or query(args, "SELECT count(*) FROM pg_tablespace WHERE spcname NOT IN ('pg_default','pg_global')") != "0"):
+        raise ValueError("External PostgreSQL WAL or nondefault tablespaces require a separate restore procedure")
+    return directory
+
+
+def restore_admission(args, manifest, sources, database_directory):
+    database_bytes = manifest.get("postgresql_database_bytes")
+    if type(database_bytes) is not int or database_bytes <= 0:
+        raise ValueError("Archive lacks a positive physical PostgreSQL size; restore budget cannot be established")
+    sizes = {name: item["bytes"] for name, item in manifest["files"].items()}
+    if any(type(size) is not int or size < 0 for size in sizes.values()):
+        raise ValueError("Archive file sizes must be nonnegative integers")
+    allocations = [(args.archive.parent, sum(sizes.values()) + len(sizes) * 4096)]
+    for name, destination in sources.items():
+        files = [size for key, size in sizes.items() if key.startswith(name + "/")]
+        allocations.append((destination, sum(files) + len(files) * 4096))
+    # pg_database_size already includes indexes. Reserve a second physical
+    # copy plus explicit extra space for transient index/WAL growth.
+    allocations.append((database_directory, 2 * database_bytes + args.postgresql_reserve_bytes))
+    devices = {}
+    for path, size in allocations:
+        while not path.exists():
+            path = path.parent
+        device = path.stat().st_dev
+        free = shutil.disk_usage(path).free
+        allocation = devices.setdefault(device, {"bytes": 0, "free": free})
+        allocation["bytes"] += size
+        allocation["free"] = min(allocation["free"], free)
+    required = sum(value["bytes"] + RESTORE_HEADROOM for value in devices.values())
+    # The retained input archive consumes the overall budget already, but is
+    # not new allocation and must not be charged against free space twice.
+    if required + args.archive.stat().st_size > args.disk_budget_bytes:
+        raise ValueError("Restore exceeds the declared total disk budget")
+    if any(value["bytes"] + RESTORE_HEADROOM > value["free"] for value in devices.values()):
+        raise ValueError("Restore exceeds available space on a staging, state or PostgreSQL filesystem")
+
+
 def stop_services():
     active = [unit for unit in UNITS if subprocess.run(["systemctl", "is-active", "--quiet", unit]).returncode == 0]
     stopped = []
@@ -152,6 +198,7 @@ def main(argv=None):
     parser.add_argument("--database", default="qcl-negf")
     parser.add_argument("--source-revision")
     parser.add_argument("--disk-budget-bytes", type=int)
+    parser.add_argument("--postgresql-reserve-bytes", type=int, default=POSTGRESQL_EXTRA_RESERVE)
     parser.add_argument("--max-archives", type=int, default=1)
     parser.add_argument("--writers-paused", action="store_true")
     parser.add_argument("--secret-reference", action="append", default=[])
@@ -166,6 +213,8 @@ def main(argv=None):
         raise ValueError("Invalid database name")
     if not args.disk_budget_bytes or args.disk_budget_bytes <= 0 or args.max_archives <= 0:
         raise ValueError("Declare a finite positive disk budget and retention count")
+    if args.postgresql_reserve_bytes < POSTGRESQL_EXTRA_RESERVE:
+        raise ValueError("PostgreSQL restore requires at least 1 GiB additional reserve; increase it for the site's measured workload")
     sources = {"aiida": args.profile_directory, "slurm": args.slurm_directory}
     root_device = Path("/").stat().st_dev
     if any((path if path.exists() else path.parent).stat().st_dev == root_device for path in sources.values()):
@@ -184,6 +233,9 @@ def main(argv=None):
                 or not (args.profile_directory / "repository").is_dir()):
             raise ValueError("Profile storage must identify the archived database and included repository")
         database_bytes = int(query(args, "SELECT pg_database_size(current_database())"))
+        if database_bytes <= 0:
+            raise ValueError("PostgreSQL physical database size must be positive")
+        postgresql_directory(args)
         admission(args.archive, sources, database_bytes, args.disk_budget_bytes, args.max_archives)
         stopped = stop_services()
         try:
@@ -196,6 +248,7 @@ def main(argv=None):
                     subprocess.run(pg(args, "pg_dump") + ["--format=custom"], stdout=stream, check=True, timeout=1800)
                 pack(args.archive, sources, dump, {"source_revision": args.source_revision,
                      "postgresql_version_num": version, "database": args.database,
+                     "postgresql_database_bytes": database_bytes,
                      "source_paths": {name: str(path) for name, path in sources.items()},
                      "secret_references": args.secret_reference, "nfs_reference": args.nfs_reference},
                      args.disk_budget_bytes, args.max_archives)
@@ -213,13 +266,7 @@ def main(argv=None):
             raise ValueError("Restore requires an empty database; existing provenance is never overwritten")
         if any(path.exists() and (not path.is_dir() or any(path.iterdir())) for path in sources.values()):
             raise ValueError("Restore requires empty destination state directories")
-        required = 2 * sum(item["bytes"] for item in manifest["files"].values()) + args.archive.stat().st_size + 64 * 1024**2
-        if required > args.disk_budget_bytes or required > shutil.disk_usage(args.archive.parent).free:
-            raise ValueError("Restore exceeds the declared disk budget or available staging space")
-        for name, destination in sources.items():
-            source_bytes = sum(item["bytes"] for key, item in manifest["files"].items() if key.startswith(name + "/"))
-            if source_bytes + 64 * 1024**2 > shutil.disk_usage(destination.parent).free:
-                raise ValueError("Restored state exceeds available destination disk space")
+        restore_admission(args, manifest, sources, postgresql_directory(args))
         stop_services()
         with tempfile.TemporaryDirectory(prefix=".qcl-restore-", dir=args.archive.parent) as directory:
             with tarfile.open(args.archive, "r:gz") as handle:
