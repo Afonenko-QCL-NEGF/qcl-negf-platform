@@ -52,6 +52,12 @@ limits. Every compute node and submission host must retain the same immutable so
 
 ## Source to provisioned VM
 
+For a first installation without an existing builder, start with the
+[platform-only official-ISO bootstrap](bootstrap.md). It does not require any
+scientific artifacts. Prepare its isolated networks through the
+[private host policy](host-network.md), then build the reviewed scientific
+environment on that guest under the authorized finite build budget.
+
 1. Check out a reviewed root Git revision with all submodules. Run its tests and build the
    application/solver environment. Prepare the Julia depot using the root project's preparation
    command.
@@ -86,6 +92,11 @@ The helper builds `storage-image`, `control-image`, `compute-image`, `ci-image` 
 JSON plus an image manifest. It does not contact either hypervisor. Rebuilding updates the image
 paths and digests automatically. Generated provider inputs contain site information and remain
 private.
+
+For a site using only the primary Proxmox server, pass `-` in place of the Arch
+base JSON argument. It builds only the four Proxmox roles and does not evaluate
+or generate an Arch worker artifact/provider input. The default five-role mode
+remains available when that separate host is part of the site.
 
 The image imports `modules/image.nix`: BIOS GRUB on the VirtIO root disk, an automatically resized
 root filesystem, serial console, QEMU guest agent and cloud-init NoCloud networking/SSH seed

@@ -18,7 +18,7 @@ in {
     # Keep foreign ELF compatibility confined to the dedicated build VM.
     programs.nix-ld.enable = true;
     assertions = [
-      { assertion = !(config.qclNegf.cluster.controller || config.qclNegf.cluster.worker || config.qclNegf.application.enable); message = "CI must be on a dedicated VM, isolated from scientific credentials and workloads."; }
+      { assertion = !(config.qclNegf.cluster.controller || config.qclNegf.cluster.worker || config.qclNegf.cluster.submit || config.qclNegf.application.enable || config.qclNegf.storage.enable); message = "CI must be on a dedicated VM, isolated from scientific credentials, mounts and workloads."; }
       { assertion = lib.hasPrefix "/" cfg.tokenDirectory && !(lib.hasPrefix "/nix/store/" cfg.tokenDirectory); message = "Runner tokens require a runtime absolute directory outside the store."; }
     ];
     users.groups.qcl-negf-build = {};

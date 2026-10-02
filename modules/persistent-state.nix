@@ -31,7 +31,7 @@ in {
     };
     systemd.services.postgresql.unitConfig.RequiresMountsFor = "/var/lib/qcl-negf-state";
     systemd.services.slurmctld.unitConfig.RequiresMountsFor = "/var/lib/qcl-negf-state";
-    systemd.services.qcl-negf-aiida.unitConfig.RequiresMountsFor = "/var/lib/qcl-negf";
-    systemd.services.qcl-negf-api.unitConfig.RequiresMountsFor = "/var/lib/qcl-negf";
+    systemd.services.qcl-negf-aiida.unitConfig.RequiresMountsFor = [ "/var/lib/qcl-negf" ];
+    systemd.services.qcl-negf-api.unitConfig.RequiresMountsFor = [ "/var/lib/qcl-negf" ];
   };
 }

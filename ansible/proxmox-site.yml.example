@@ -10,6 +10,9 @@ qcl_ci_denied_cidrs: [203.0.113.0/24, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16]
 # Optional exact IPv4 DNS exceptions: only TCP/UDP port 53, never cluster hosts.
 qcl_ci_dns_servers: [203.0.113.53]
 qcl_apply_host_policy: false
+# Explicit compatibility only when an existing iptables-legacy FORWARD policy
+# otherwise drops the QCL outbound/return traffic (e.g. an existing Docker host).
+qcl_legacy_forward_compat: false
 qcl_pnetlab_vm_id: null
 qcl_pnetlab_memory_mib: 8192
 qcl_pnetlab_balloon_mib: 3072

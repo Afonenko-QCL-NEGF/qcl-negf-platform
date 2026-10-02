@@ -26,7 +26,7 @@ resource "proxmox_virtual_environment_vm" "builder" {
   on_boot         = false
   started         = true
   stop_on_destroy = true
-  boot_order      = ["ide2", "virtio0"]
+  boot_order      = var.installer_boot ? ["ide2", "virtio0"] : ["virtio0"]
   agent {
     enabled = true
     wait_for_ip { disabled = true }
@@ -46,9 +46,12 @@ resource "proxmox_virtual_environment_vm" "builder" {
     serial       = "qcl-bootstrap-root"
     backup       = false
   }
-  cdrom {
-    file_id   = proxmox_virtual_environment_file.installer.id
-    interface = "ide2"
+  dynamic "cdrom" {
+    for_each = var.installer_boot ? [true] : []
+    content {
+      file_id   = proxmox_virtual_environment_file.installer.id
+      interface = "ide2"
+    }
   }
   network_device {
     bridge      = var.ci_bridge
@@ -58,4 +61,7 @@ resource "proxmox_virtual_environment_vm" "builder" {
   serial_device {}
   vga { type = "serial0" }
   operating_system { type = "l26" }
+  # Proxmox restricts arbitrary QEMU args to the root host user. The paired
+  # bootstrap-media playbook owns only these temporary installer arguments.
+  lifecycle { ignore_changes = [kvm_arguments] }
 }

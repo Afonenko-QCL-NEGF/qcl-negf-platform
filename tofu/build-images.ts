@@ -1,10 +1,16 @@
 /** Build private-site images and attach their actual hashes to provider input files. */
 export const roles = ["storage", "control", "compute", "ci", "arch-worker"] as const;
-export function validateBase(primary: unknown, arch: unknown): {
+export function imageRoles(archFile: string): readonly (typeof roles)[number][] {
+  return archFile === "-" ? roles.filter((role) => role !== "arch-worker") : roles;
+}
+export function validateBase(primary: unknown, arch: unknown, includeArch = true): {
   primary: Record<string, unknown> & { vms: Record<string, Record<string, unknown>> };
   arch: Record<string, unknown>;
 } {
-  if (!primary || typeof primary !== "object" || !arch || typeof arch !== "object") {
+  if (
+    !primary || typeof primary !== "object" ||
+    (includeArch && (!arch || typeof arch !== "object"))
+  ) {
     throw new Error("Site input files must contain JSON objects.");
   }
   const p = primary as Record<string, unknown>;
@@ -17,7 +23,7 @@ export function validateBase(primary: unknown, arch: unknown): {
   }
   return {
     primary: p as Record<string, unknown> & { vms: Record<string, Record<string, unknown>> },
-    arch: arch as Record<string, unknown>,
+    arch: includeArch ? arch as Record<string, unknown> : {},
   };
 }
 async function nix(args: string[]): Promise<string> {
@@ -33,15 +39,16 @@ export async function main(args: string[]): Promise<void> {
     site.startsWith("-") || site.includes("#")
   ) {
     throw new Error(
-      "Usage: build-images.ts SITE_FLAKE PROXMOX_BASE.json ARCH_BASE.json OUTPUT_DIRECTORY",
+      "Usage: build-images.ts SITE_FLAKE PROXMOX_BASE.json ARCH_BASE.json|- OUTPUT_DIRECTORY",
     );
   }
   const base = validateBase(
     JSON.parse(await Deno.readTextFile(primaryFile)),
-    JSON.parse(await Deno.readTextFile(archFile)),
+    archFile === "-" ? null : JSON.parse(await Deno.readTextFile(archFile)),
+    archFile !== "-",
   );
   const artifacts: Record<string, { image_path: string; image_sha256: string }> = {};
-  for (const role of roles) {
+  for (const role of imageRoles(archFile)) {
     const built = JSON.parse(
       await nix(["build", "--no-link", "--json", `${site}#${role}-image`]),
     ) as { outputs?: { out?: string } }[];
@@ -62,12 +69,12 @@ export async function main(args: string[]): Promise<void> {
     else Object.assign(base.primary.vms[role]!, artifacts[role]);
   }
   await Deno.mkdir(outputDirectory, { recursive: true });
-  for (
-    const [file, value] of [["proxmox.tfvars.json", base.primary], [
-      "arch-libvirt.tfvars.json",
-      base.arch,
-    ], ["images.json", artifacts]] as const
-  ) {
+  const outputs: [string, unknown][] = [
+    ["proxmox.tfvars.json", base.primary],
+    ["images.json", artifacts],
+  ];
+  if (archFile !== "-") outputs.push(["arch-libvirt.tfvars.json", base.arch]);
+  for (const [file, value] of outputs) {
     await Deno.writeTextFile(`${outputDirectory}/${file}`, `${JSON.stringify(value, null, 2)}\n`, {
       mode: 0o600,
     });

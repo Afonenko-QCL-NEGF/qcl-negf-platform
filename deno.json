@@ -1,7 +1,8 @@
 {
   "compilerOptions": { "strict": true, "noUncheckedIndexedAccess": true },
   "tasks": {
-    "check": "deno fmt --check ops tests tofu/*.ts deno.json && deno lint ops tests tofu/*.ts && deno check ops/*.ts tests/*.ts tests/infrastructure/*.ts tofu/*.ts && deno test tests",
+    "check": "deno fmt --check ops tests tofu/*.ts deno.json && deno lint ops tests tofu/*.ts && deno check ops/*.ts tests/*.ts tests/infrastructure/*.ts tofu/*.ts && deno test tests && deno task test:state",
+    "test:state": "python3 -m unittest discover -s tests -p 'test_*.py'",
     "ops": "deno run --allow-read --allow-run=nix,nixos-rebuild,nixos-install ops/main.ts",
     "bootstrap": "deno run --allow-read --allow-sys=uid --allow-run=verdi ops/bootstrap.ts"
   },

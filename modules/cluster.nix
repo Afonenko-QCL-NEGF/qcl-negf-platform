@@ -25,6 +25,11 @@ in {
         { assertion = lib.hasPrefix "/" cfg.mungeKeyFile && !(lib.hasPrefix "/nix/store/" cfg.mungeKeyFile); message = "Munge secret must be a runtime absolute path outside the store."; }
       ];
       services.munge.password = cfg.mungeKeyFile;
+      systemd.services.munge = {
+        requires = config.qclNegf.runtimeSecretUnits;
+        after = config.qclNegf.runtimeSecretUnits;
+        unitConfig.RequiresMountsFor = cfg.mungeKeyFile;
+      };
       services.slurm = {
         server.enable = cfg.controller;
         client.enable = cfg.worker;

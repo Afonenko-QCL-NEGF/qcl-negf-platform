@@ -30,6 +30,7 @@ provisioning, disk protection and recovery boundaries.
 | `qclNegf.application` | AiiDA, PostgreSQL and optional authenticated HTTP API                           |
 | `qclNegf.runner`      | One runner registered to the root repository, with CPU/RAM limits               |
 | `qclNegf.cache`       | Signed, read-only Nix binary cache endpoint                                     |
+| `qclNegf.stateArchive` | Manual coordinated controller archive, verification and empty-state restore |
 | `ops/`                | TypeScript commands for build, activation, clean installation and profile setup |
 
 ## Development and validation

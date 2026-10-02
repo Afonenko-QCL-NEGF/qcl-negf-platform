@@ -16,6 +16,7 @@
     qcl_ci_denied_cidrs: []
     qcl_ci_dns_servers: []
     qcl_apply_host_policy: false
+    qcl_legacy_forward_compat: false
     qcl_pnetlab_vm_id: null
     qcl_pnetlab_memory_mib: 8192
     qcl_pnetlab_balloon_mib: 3072
@@ -38,6 +39,7 @@
           - (qcl_pnetlab_balloon_mib | int) > 0
           - (qcl_pnetlab_balloon_mib | int) <= (qcl_pnetlab_memory_mib | int)
           - ansible_check_mode or (qcl_apply_host_policy | bool)
+          - qcl_legacy_forward_compat is boolean
         fail_msg: Set private CIDRs, denied management/LAN networks and qcl_apply_host_policy=true only for a reviewed apply.
     - name: Validate IPv4 CIDRs and non-overlapping isolated subnets
       ansible.builtin.command:
@@ -70,14 +72,10 @@
         argv: [python3, -c, "from pathlib import Path; p=Path('/etc/network/interfaces').read_text(); assert 'source /etc/network/interfaces.d/*' in p or 'source-directory /etc/network/interfaces.d' in p; assert Path('/sys/class/net/vmbr0/bridge').exists(); assert Path('/usr/sbin/qm').exists()"]
       changed_when: false
       check_mode: false
-    - name: Inspect isolated bridge ownership before writing the managed drop-in
-      ansible.builtin.stat:
-        path: /etc/network/interfaces.d/qcl-negf
-      register: qcl_network_owned
-    - name: Refuse to adopt existing bridges without the managed drop-in
-      ansible.builtin.command:
-        argv: [python3, -c, "from pathlib import Path; import sys; assert all(not Path('/sys/class/net', name).exists() for name in sys.argv[1:]), 'Existing bridge needs explicit ownership review'", "{{ qcl_cluster_bridge }}", "{{ qcl_ci_bridge }}"]
-      when: not qcl_network_owned.stat.exists
+    - name: Enforce immutable owned bridge names before changing the drop-in
+      ansible.builtin.script:
+        cmd: "../ops/network_ownership.py {{ qcl_cluster_bridge }} {{ qcl_ci_bridge }}"
+        executable: python3
       changed_when: false
       check_mode: false
     - name: Install isolated bridge declarations
@@ -105,6 +103,28 @@
         mode: '0644'
         validate: /usr/sbin/nft --check --file %s
       notify: Activate QCL forwarding policy
+    - name: Refuse an unowned pre-existing legacy compatibility chain
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - >-
+            from pathlib import Path; import subprocess, shutil, sys;
+            assert sys.argv[1] == 'false' or shutil.which('iptables-legacy'), 'Legacy compatibility needs the existing iptables-legacy tool';
+            owned = Path('/etc/qcl-negf-legacy-forwarding.py');
+            exists = bool(shutil.which('iptables-legacy')) and subprocess.run(['iptables-legacy','-S','QCL-NEGF'], capture_output=True).returncode == 0;
+            assert not exists or (owned.is_file() and 'QCL-owned compatibility chain' in owned.read_text()), 'Existing QCL-NEGF chain needs explicit ownership review'
+          - "{{ 'true' if qcl_legacy_forward_compat else 'false' }}"
+      changed_when: false
+      check_mode: false
+    - name: Install scoped legacy forwarding compatibility program
+      ansible.builtin.copy:
+        src: ../ops/legacy_forwarding.py
+        dest: /etc/qcl-negf-legacy-forwarding.py
+        owner: root
+        group: root
+        mode: '0700'
+      notify: Activate QCL forwarding policy
     - name: Install persistent QCL network policy service
       ansible.builtin.copy:
         dest: /etc/systemd/system/qcl-negf-network.service
@@ -114,13 +134,23 @@
         content: |
           [Unit]
           Description=QCL isolated guest forwarding and NAT tables
-          After=network-online.target pve-firewall.service proxmox-firewall.service
+          After=network-online.target pve-firewall.service proxmox-firewall.service docker.service
           Wants=network-online.target
           [Service]
           Type=oneshot
           RemainAfterExit=yes
           ExecStart=/usr/sbin/nft --file /etc/qcl-negf-network.nft
+          {% if qcl_legacy_forward_compat %}
+          ExecStart=/usr/bin/python3 /etc/qcl-negf-legacy-forwarding.py {{ qcl_management_bridge }} {{ qcl_cluster_bridge }} {{ qcl_cluster_cidr }} {{ qcl_ci_bridge }} {{ qcl_ci_cidr }}
+          {% else %}
+          ExecStart=/usr/bin/python3 /etc/qcl-negf-legacy-forwarding.py --disable
+          {% endif %}
           ExecReload=/usr/sbin/nft --file /etc/qcl-negf-network.nft
+          {% if qcl_legacy_forward_compat %}
+          ExecReload=/usr/bin/python3 /etc/qcl-negf-legacy-forwarding.py {{ qcl_management_bridge }} {{ qcl_cluster_bridge }} {{ qcl_cluster_cidr }} {{ qcl_ci_bridge }} {{ qcl_ci_cidr }}
+          {% else %}
+          ExecReload=/usr/bin/python3 /etc/qcl-negf-legacy-forwarding.py --disable
+          {% endif %}
           [Install]
           WantedBy=multi-user.target
       notify: Activate QCL forwarding policy

@@ -29,26 +29,49 @@ temporary shared files, and a lost worker disk loses work not yet delivered. See
 
 ## Create the AiiDA profile
 
-Enable `qclNegf.application` with the root's concrete application package. On the controller, run
-these commands from this repository as the `qcl-negf` Unix account with `verdi` on PATH:
+Enable `qclNegf.application` with the root's concrete application package and
+`application.bootstrap.enable = true`. Supply the private site's service email,
+stable Code label and `cluster.solverPackage`. The bootstrap oneshot waits for
+PostgreSQL and the persistent profile mount, reconciles the local Slurm Computer
+and immutable installed Code, and publishes `aiida/bootstrap.json` plus
+`aiida/code-uuid`. Daemon/API startup requires this completed service. The API's
+runtime UUID allowlist reads that file, so a first installation does not need
+a guessed UUID in Nix configuration.
+
+For manual provisioning, run the same operations from this repository as the
+`qcl-negf` Unix account with `verdi` and the immutable solver on PATH:
 
 ```sh
-deno task bootstrap research@example.org
-deno task bootstrap research@example.org --apply
+deno task bootstrap research@example.org /nix/store/SOLVER/bin/qcl-negf --label qcl-negf-v1
+deno task bootstrap research@example.org /nix/store/SOLVER/bin/qcl-negf --label qcl-negf-v1 --apply
 ```
 
 Use the service address appropriate for your installation. The command creates a PostgreSQL profile
 using local socket peer authentication and AiiDA's ZeroMQ broker for the single-controller daemon.
-It registers a local Slurm computer and refuses to overwrite an existing profile. Services wait
-until the profile configuration exists. Restart `qcl-negf-aiida` after provisioning, then check
+It registers a local Slurm Computer and `core.code.installed` Code with
+`qcl_negf.execution` and `with_mpi=False`. Retrying after a partial setup retains
+stored UUIDs and completes missing authentication/readiness. An existing profile,
+Computer or Code with different storage/transport/solver settings fails instead
+of being replaced. Use a new Code label for a new immutable solver path. Services wait
+until the profile configuration exists. Restart `qcl-negf-aiida` after manual provisioning, then check
 `AIIDA_PATH=/var/lib/qcl-negf/aiida verdi -p qcl-negf status` as the service account.
 
-Register the immutable `qcl-negf` executable from QCLNEGFRunner.jl using
-`verdi code create core.code.installed`, selecting `qcl_negf.execution`, `--no-with-mpi`, and the
-`slurm` computer. Retain the same solver store path on the controller and every worker. Record the
-Code UUID in `qclNegf.application.api.allowedCodes`; HTTP submissions select only configured Codes.
+Retain the same solver store path on the controller and every worker. Automatic
+bootstrap uses `application.api.allowedCodesFile`; with manual provisioning set
+that runtime file or record the published Code UUID in `api.allowedCodes`.
+HTTP submissions select only configured Codes.
 The API binds to loopback. Use a TLS reverse proxy or an SSH tunnel, and provide its configured
 authentication token.
+
+Declare `qclNegf.runtimeSecretUnits` for the private site's secret provisioner.
+The private-site example's `site.modules` can import its NixOS secret-service
+declarations without modifying the public host definitions.
+Munge, API, cache signing and runner registration wait for those units rather
+than racing files under `/run/secrets`. Declare only the units needed on each
+role: CI receives its own registration secret and no scientific credentials.
+Set `api.exportDiskBytes` and `api.exportTtlSeconds` from the controller's
+measured free temporary disk and retention policy. A capacity setting does not
+reserve physical disk space.
 
 Each calculation uses one process on one node. Slurm assigns its CPUs and RAM; numerical threads
 stay within that allocation. Independent executions scale across workers through AiiDA. The solver
@@ -111,6 +134,12 @@ profile configuration. Preserve required SSH/Munge keys and Slurm controller sta
 dataset separately. Restart only one authoritative controller against the restored data. Copy any
 needed incomplete scratch work before replacing a worker; it is not a durable shared checkpoint
 service.
+
+For the implemented manual local archive and empty-state restore procedure,
+enable `qclNegf.stateArchive` and follow [the state archive contract](state-archive.md).
+Local staging counts as an independent backup only after the archive and its
+hash have been copied to an external medium and verified there. The NFS data
+requires its own external copy and manifest.
 
 Test restoration onto a separate VM with writes paused before relying on backups. PostgreSQL major
 version changes and AiiDA storage migrations require their own maintenance procedure. Rolling back a

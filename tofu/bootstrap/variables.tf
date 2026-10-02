@@ -9,6 +9,11 @@ variable "node" { type = string }
 variable "iso_datastore" { type = string }
 variable "root_datastore" { type = string }
 variable "ci_bridge" { type = string }
+variable "installer_boot" {
+  type        = bool
+  default     = true
+  description = "Boot the official installer; set false after successful installation to boot the root disk and detach ISO."
+}
 variable "vm_id" {
   type = number
   validation {

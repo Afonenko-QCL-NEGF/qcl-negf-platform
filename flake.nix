@@ -47,7 +47,6 @@
         cd source
         export DENO_DIR="$TMPDIR/deno"
         deno task check
-        python -m unittest discover -s tests -p 'test_*.py'
         touch "$out"
       '';
     });

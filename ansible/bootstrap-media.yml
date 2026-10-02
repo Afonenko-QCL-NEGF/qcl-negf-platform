@@ -1,0 +1,97 @@
+---
+# Host tooling only: the ISO remains official, unmodified and read-only.
+- name: Expose checksum-pinned official installer for serial kernel boot
+  hosts: proxmox
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Require explicit bootstrap media and pinned checksum
+      ansible.builtin.assert:
+        that:
+          - qcl_installer_iso is match('^/var/lib/vz/template/iso/[A-Za-z0-9._-]+[.]iso$')
+          - qcl_installer_sha256 is match('^[0-9a-f]{64}$')
+          - qcl_installer_vm_id | int >= 100
+          - qcl_installer_boot is boolean
+          - qcl_installer_restart is boolean
+          - qcl_installer_media.kernel is match('^/var/lib/qclinstaller/boot/nix/store/[a-z0-9.-]+/bzImage$')
+          - qcl_installer_media.initrd is match('^/var/lib/qclinstaller/boot/nix/store/[a-z0-9.-]+/initrd$')
+          - qcl_installer_media.init is match('^/nix/store/[a-z0-9.-]+/init$')
+    - name: Inspect the explicitly selected bootstrap VM
+      ansible.builtin.command:
+        argv: [qm, config, "{{ qcl_installer_vm_id | string }}"]
+      changed_when: false
+      check_mode: false
+      register: qcl_bootstrap_vm
+    - name: Define the exact temporary official boot arguments
+      ansible.builtin.set_fact:
+        qcl_boot_args: "-kernel {{ qcl_installer_media.kernel }} -initrd {{ qcl_installer_media.initrd }} -append \"init={{ qcl_installer_media.init }} nohibernate root=fstab loglevel=4 lsm=landlock,yama,bpf console=ttyS0,115200n8\""
+    - name: Refuse other VM roles or QEMU argument owners before writing host state
+      ansible.builtin.script:
+        cmd: "../ops/bootstrap_ownership.py {{ qcl_installer_vm_id | string | quote }} {{ qcl_boot_args | quote }}"
+        executable: python3
+      changed_when: false
+      check_mode: false
+    - name: Verify official installer bytes
+      ansible.builtin.stat:
+        path: "{{ qcl_installer_iso }}"
+        checksum_algorithm: sha256
+      register: qcl_iso
+    - name: Refuse changed or missing installer
+      ansible.builtin.assert:
+        that:
+          - qcl_iso.stat.isreg | default(false)
+          - qcl_iso.stat.checksum | default('') == qcl_installer_sha256
+    - name: Prepare installer mount point
+      ansible.builtin.file:
+        path: /var/lib/qclinstaller
+        state: directory
+    - name: Declare read-only installer mount
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/var-lib-qclinstaller.mount
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Checksum-pinned QCL bootstrap installation media
+          Before=pve-guests.service
+          [Mount]
+          What={{ qcl_installer_iso }}
+          Where=/var/lib/qclinstaller
+          Type=iso9660
+          Options=loop,ro,nosuid,nodev
+          [Install]
+          WantedBy=multi-user.target
+      register: qcl_media_unit
+    - name: Activate declared mount
+      ansible.builtin.systemd_service:
+        name: var-lib-qclinstaller.mount
+        daemon_reload: "{{ qcl_media_unit.changed }}"
+        enabled: true
+        state: "{{ 'restarted' if qcl_media_unit.changed else 'started' }}"
+      when: not ansible_check_mode
+    - name: Show reviewed bootstrap transition
+      ansible.builtin.debug:
+        msg:
+          vm_id: "{{ qcl_installer_vm_id }}"
+          installer_boot: "{{ qcl_installer_boot }}"
+          restart: "{{ qcl_installer_restart }}"
+          args: "{{ qcl_boot_args if qcl_installer_boot else 'remove' }}"
+    - name: Configure declared serial boot as the Proxmox root host user
+      ansible.builtin.command:
+        argv: [qm, set, "{{ qcl_installer_vm_id | string }}", --args, "{{ qcl_boot_args }}"]
+      when: "qcl_installer_boot and ('args: ' ~ qcl_boot_args) not in qcl_bootstrap_vm.stdout_lines"
+      register: qcl_args_enabled
+    - name: Remove temporary installer arguments after installation
+      ansible.builtin.command:
+        argv: [qm, set, "{{ qcl_installer_vm_id | string }}", --delete, args]
+      when: not qcl_installer_boot and qcl_bootstrap_vm.stdout is search('(?m)^args:')
+      register: qcl_args_removed
+    - name: Stop only the explicitly selected bootstrap VM for boot transition
+      ansible.builtin.command:
+        argv: [qm, stop, "{{ qcl_installer_vm_id | string }}"]
+      when: qcl_installer_restart and (qcl_args_enabled.changed or qcl_args_removed.changed)
+    - name: Start the declared bootstrap boot configuration
+      ansible.builtin.command:
+        argv: [qm, start, "{{ qcl_installer_vm_id | string }}"]
+      when: qcl_installer_restart and (qcl_args_enabled.changed or qcl_args_removed.changed)

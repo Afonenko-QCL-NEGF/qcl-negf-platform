@@ -1,4 +1,4 @@
-import { roles, validateBase } from "../../tofu/build-images.ts";
+import { imageRoles, roles, validateBase } from "../../tofu/build-images.ts";
 function rejects(fn: () => unknown) {
   let failed = false;
   try {
@@ -16,4 +16,13 @@ Deno.test("image inputs require all four Proxmox role objects", () => {
   rejects(() => validateBase({ vms: { control: {} } }, {}));
   rejects(() => validateBase({ vms: { ...vms, storage: null } }, {}));
   rejects(() => validateBase(null, {}));
+});
+Deno.test("single-server image build excludes the optional Arch worker", () => {
+  if (imageRoles("-").join() !== "storage,control,compute,ci") {
+    throw new Error("Single-server builds must only build the four Proxmox roles");
+  }
+  if (imageRoles("arch.json").join() !== roles.join()) throw new Error("Default roles changed");
+  const vms = Object.fromEntries(imageRoles("-").map((name) => [name, {}]));
+  validateBase({ vms }, null, false);
+  rejects(() => validateBase({ vms }, null));
 });
