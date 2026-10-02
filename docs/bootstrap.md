@@ -61,7 +61,13 @@ mode result first. Set `qcl_installer_restart = true` only for an authorized
 boot transition; it stops this temporary VM without a guest shutdown.
 After installation, set `qcl_installer_boot = false` with restart disabled to
 remove direct kernel arguments, set provider `installer_boot = false` to remove
-the CD device, then perform the reviewed reboot into the installed OS.
+the ISO from the explicit `ide2` CD-ROM, then perform the reviewed reboot into
+the installed OS. The empty drive remains declared: the pinned provider defaults
+an absent `cdrom` block to a physical drive on `ide3`, which can fail to start on
+a headless host and is outside q35's supported IDE interfaces. Disk boot keeps
+`virtio0` first and the empty `ide2` second. Final role VMs explicitly use an
+empty `ide0`, reserve `ide2` for cloud-init and boot `virtio0`. See the pinned
+[provider CD-ROM contract](https://github.com/bpg/terraform-provider-proxmox/blob/v0.114.0/docs/resources/virtual_environment_vm.md#argument-reference).
 
 Inside the official installer, select only the new builder root disk. Prepare
 and mount the root filesystem under `/mnt`, generate its hardware module with

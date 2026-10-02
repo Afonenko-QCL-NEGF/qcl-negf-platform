@@ -55,10 +55,16 @@ resource "proxmox_virtual_environment_vm" "persistent" {
   tags                                 = ["qcl-negf", each.key]
   bios                                 = "seabios"
   machine                              = "q35"
+  boot_order                           = ["virtio0"]
   on_boot                              = true
   protection                           = true
   delete_unreferenced_disks_on_destroy = false
   agent { enabled = true }
+  # Reserve ide2 for cloud-init. Never use the provider's physical CD default.
+  cdrom {
+    file_id   = "none"
+    interface = "ide0"
+  }
   cpu {
     cores = each.value.vcpus
     type  = "host"
@@ -104,9 +110,14 @@ resource "proxmox_virtual_environment_vm" "replaceable" {
   tags            = ["qcl-negf", each.key]
   bios            = "seabios"
   machine         = "q35"
+  boot_order      = ["virtio0"]
   on_boot         = true
   stop_on_destroy = true
   agent { enabled = true }
+  cdrom {
+    file_id   = "none"
+    interface = "ide0"
+  }
   cpu {
     cores = each.value.vcpus
     type  = "host"

@@ -26,7 +26,7 @@ resource "proxmox_virtual_environment_vm" "builder" {
   on_boot         = false
   started         = true
   stop_on_destroy = true
-  boot_order      = var.installer_boot ? ["ide2", "virtio0"] : ["virtio0"]
+  boot_order      = var.installer_boot ? ["ide2", "virtio0"] : ["virtio0", "ide2"]
   agent {
     enabled = true
     wait_for_ip { disabled = true }
@@ -46,12 +46,11 @@ resource "proxmox_virtual_environment_vm" "builder" {
     serial       = "qcl-bootstrap-root"
     backup       = false
   }
-  dynamic "cdrom" {
-    for_each = var.installer_boot ? [true] : []
-    content {
-      file_id   = proxmox_virtual_environment_file.installer.id
-      interface = "ide2"
-    }
+  # The pinned provider defaults an absent block to a physical CD-ROM on ide3.
+  # q35 supports ide0/ide2 and a headless host has no physical media device.
+  cdrom {
+    file_id   = var.installer_boot ? proxmox_virtual_environment_file.installer.id : "none"
+    interface = "ide2"
   }
   network_device {
     bridge      = var.ci_bridge

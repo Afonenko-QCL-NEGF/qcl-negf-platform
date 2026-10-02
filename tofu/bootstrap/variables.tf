@@ -12,7 +12,7 @@ variable "ci_bridge" { type = string }
 variable "installer_boot" {
   type        = bool
   default     = true
-  description = "Boot the official installer; set false after successful installation to boot the root disk and detach ISO."
+  description = "Boot the official installer; set false after installation to boot the root disk and leave the ide2 CD-ROM empty."
 }
 variable "vm_id" {
   type = number
