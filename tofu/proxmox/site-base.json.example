@@ -3,6 +3,7 @@
   "node": "pve",
   "image_datastore": "local",
   "snippet_datastore": "local",
+  "resource_prefix": "qcl-negf",
   "root_datastore": "local-lvm",
   "data_datastore": "local-lvm",
   "cluster_bridge": "vmbr-cluster",

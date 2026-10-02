@@ -18,6 +18,15 @@ variable "snippet_datastore" {
   type        = string
   description = "Existing datastore permitting snippets content."
 }
+variable "resource_prefix" {
+  type        = string
+  default     = "qcl-negf"
+  description = "Stable namespace for cloud-init snippet files; choose a distinct prefix for each deployment sharing a snippet datastore."
+  validation {
+    condition     = length(var.resource_prefix) <= 48 && can(regex("^[a-z][a-z0-9]*(-[a-z0-9]+)*$", var.resource_prefix))
+    error_message = "resource_prefix must be a lowercase ASCII slug starting with a letter, with at most 48 characters and single hyphen separators."
+  }
+}
 variable "root_datastore" {
   type        = string
   description = "Datastore for replaceable VM root disks and cloud-init disks."

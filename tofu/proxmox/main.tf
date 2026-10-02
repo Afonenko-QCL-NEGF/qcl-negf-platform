@@ -27,7 +27,7 @@ resource "proxmox_virtual_environment_file" "user_data" {
   datastore_id = var.snippet_datastore
   content_type = "snippets"
   source_raw {
-    file_name = "qcl-negf-${each.key}-user-data.yaml"
+    file_name = "${var.resource_prefix}-${each.key}-user-data.yaml"
     data      = "#cloud-config\n${yamlencode({ hostname = each.key, ssh_pwauth = false, ssh_authorized_keys = var.ssh_public_keys })}"
   }
 }
@@ -37,7 +37,7 @@ resource "proxmox_virtual_environment_file" "network_data" {
   datastore_id = var.snippet_datastore
   content_type = "snippets"
   source_raw {
-    file_name = "qcl-negf-${each.key}-network.yaml"
+    file_name = "${var.resource_prefix}-${each.key}-network.yaml"
     data = yamlencode({ version = 2, ethernets = { cluster0 = {
       match       = { macaddress = lower(each.value.mac) }
       "set-name"  = "cluster0"

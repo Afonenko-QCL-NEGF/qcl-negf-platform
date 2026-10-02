@@ -138,6 +138,35 @@ Apply a reviewed plan from the normal administrative environment when ready. Thi
 not apply infrastructure as part of a source or unit-test job. Changing a root image is an
 infrastructure change and belongs in a reviewed maintenance plan.
 
+### Multiple deployments on one Proxmox host
+
+Use separate private backend state, generated inputs, saved plans and VM IDs for
+each deployment. Distinct backends do not isolate remote datastore file names.
+Set `resource_prefix` to a distinct, stable lowercase ASCII slug, for example
+`qcl-negf-rehearsal`, when deployments share a snippet datastore. The prefix is
+limited to 48 characters, starts with a letter and permits single hyphen
+separators. It namespaces both cloud-init files for every role:
+`PREFIX-ROLE-user-data.yaml` and `PREFIX-ROLE-network.yaml`.
+The default `qcl-negf` preserves all existing file names. Changing the prefix of
+an existing deployment is a reviewed resource migration, not a routine cleanup.
+Image file names and protected disk lifecycle retain their existing contracts.
+
+The VM resources start newly created guests during apply. Capacity admission
+must therefore account for all other running deployments before apply;
+sequential health verification does not make VM startup sequential. Provider
+resource checks budget only the four VMs in the current inventory.
+
+For a disposable rehearsal, inspect its separate state and actual VM IDs/MACs
+before removing anything. Storage/control retain `prevent_destroy` and Proxmox
+protection, so a generic destroy intentionally refuses their deletion. Explicit
+teardown of those disposable VMs requires a reviewed lifecycle step tied to
+their recorded IDs and newly created volumes; do not weaken the public guards
+or operate on production state. Removing an entry from state does not remove
+its remote VM or file. Delete only that deployment's recorded snippet file IDs
+after their consumers are removed. SHA-addressed staged images are separately
+retained artifacts and may be shared; verify all import dependencies before
+removing them. Reconcile only the rehearsal state after manual lifecycle work.
+
 ## Existing Arch host
 
 The optional `ansible/arch-libvirt.yml` installs libvirt/QEMU, starts libvirt, prepares a dedicated
@@ -208,6 +237,11 @@ require local plugin IPC. Run Ansible `--syntax-check`, TypeScript checking for
 integration check boots a dedicated storage VM, controller and worker; it verifies real Slurm
 submission, independent local scratch, NFS output ownership and result persistence across controller
 restart. Image expression evaluation does not prove that a built QCOW2 boots.
+
+After provider initialization, run `tofu test -filter=tests/snippet_namespace.tftest.hcl`
+in `tofu/proxmox`. Its plan-only mocked provider checks unchanged default snippet
+names, disjoint rehearsal names on the same datastore and invalid-prefix
+rejection. It neither calls Proxmox nor establishes VM boot or remote cleanup.
 
 Primary interfaces are pinned to
 [bpg/proxmox 0.114.0](https://github.com/bpg/terraform-provider-proxmox/tree/v0.114.0/docs),
