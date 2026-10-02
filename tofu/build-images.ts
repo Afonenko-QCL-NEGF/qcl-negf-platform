@@ -47,7 +47,10 @@ export async function main(args: string[]): Promise<void> {
     archFile === "-" ? null : JSON.parse(await Deno.readTextFile(archFile)),
     archFile !== "-",
   );
-  const artifacts: Record<string, { image_path: string; image_sha256: string }> = {};
+  const artifacts: Record<
+    string,
+    { image_path: string; image_sha256: string; image_bytes: number }
+  > = {};
   for (const role of imageRoles(archFile)) {
     const built = JSON.parse(
       await nix(["build", "--no-link", "--json", `${site}#${role}-image`]),
@@ -64,7 +67,11 @@ export async function main(args: string[]): Promise<void> {
     const image_path = images[0]!;
     const image_sha256 = await nix(["hash", "file", "--type", "sha256", "--base16", image_path]);
     if (!/^[0-9a-f]{64}$/.test(image_sha256)) throw new Error("Invalid image digest.");
-    artifacts[role] = { image_path, image_sha256 };
+    const image_bytes = (await Deno.stat(image_path)).size;
+    if (!Number.isSafeInteger(image_bytes) || image_bytes < 72) {
+      throw new Error("Invalid measured image byte count.");
+    }
+    artifacts[role] = { image_path, image_sha256, image_bytes };
     if (role === "arch-worker") Object.assign(base.arch, artifacts[role]);
     else Object.assign(base.primary.vms[role]!, artifacts[role]);
   }

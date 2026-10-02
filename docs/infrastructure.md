@@ -93,6 +93,14 @@ JSON plus an image manifest. It does not contact either hypervisor. Rebuilding u
 paths and digests automatically. Generated provider inputs contain site information and remain
 private.
 
+When images are built on an isolated CI VM and the administrative controller has
+limited disk space, use the [host-initiated image transport](image-transfer.md).
+Only metadata JSON crosses the controller; Proxmox pulls and verifies complete
+QCOW2 files through restricted SSH, and the resulting provider input uses existing
+`image_file_id` values. This keeps Proxmox credentials outside CI and avoids a
+controller-local image copy. Local image uploads remain available for sites that
+already keep their images on the administrative controller.
+
 For a site using only the primary Proxmox server, pass `-` in place of the Arch
 base JSON argument. It builds only the four Proxmox roles and does not evaluate
 or generate an Arch worker artifact/provider input. The default five-role mode

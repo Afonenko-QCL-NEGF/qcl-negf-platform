@@ -1,0 +1,42 @@
+---
+# Run from the administrative controller; image bytes travel CI -> Proxmox only.
+# The separate image-pull key and pinned known_hosts already exist on Proxmox.
+- name: Stage reviewed immutable QCOW2 images through restricted host-initiated SSH
+  hosts: proxmox
+  become: true
+  gather_facts: false
+  vars:
+    qcl_image_request:
+      source: "{{ qcl_image_source }}"
+      datastore: "{{ qcl_image_datastore }}"
+      images: "{{ lookup('ansible.builtin.file', qcl_image_manifest) | from_json }}"
+      base: "{{ lookup('ansible.builtin.file', qcl_image_base) | from_json }}"
+      timeout_seconds: "{{ qcl_image_timeout_seconds | default(1800) }}"
+      reserve_bytes: "{{ qcl_image_reserve_bytes | default(67108864) }}"
+  tasks:
+    - name: Require explicit metadata input and controller receipt destination
+      ansible.builtin.assert:
+        that:
+          - qcl_image_manifest is match('^/')
+          - qcl_image_base is match('^/')
+          - qcl_image_receipt is match('^/')
+          - qcl_image_datastore is match('^[A-Za-z][A-Za-z0-9_-]*$')
+          - qcl_image_source.identity_file is match('^/')
+          - qcl_image_source.known_hosts_file is match('^/')
+    - name: Verify the transport contract or stream and verify the complete images
+      ansible.builtin.script:
+        cmd: "../ops/image_stage.py --request {{ qcl_image_request | to_json | b64encode | quote }} {{ '--check' if ansible_check_mode else '' }}"
+        executable: python3
+      check_mode: false
+      no_log: true
+      register: qcl_images_staged
+      changed_when: qcl_images_staged.rc == 0 and (qcl_images_staged.stdout | from_json).changed
+    - name: Save only verified provider metadata on the administrative controller
+      ansible.builtin.copy:
+        dest: "{{ qcl_image_receipt }}"
+        content: "{{ (qcl_images_staged.stdout | from_json).provider_inputs | to_nice_json }}\n"
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+      no_log: true
+      when: not ansible_check_mode

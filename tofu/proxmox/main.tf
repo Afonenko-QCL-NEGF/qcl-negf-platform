@@ -1,9 +1,11 @@
 locals {
-  persistent  = { for name, vm in var.vms : name => vm if contains(["storage", "control"], name) }
-  replaceable = { for name, vm in var.vms : name => vm if contains(["compute", "ci"], name) }
+  persistent   = { for name, vm in var.vms : name => vm if contains(["storage", "control"], name) }
+  replaceable  = { for name, vm in var.vms : name => vm if contains(["compute", "ci"], name) }
+  local_images = { for name, vm in var.vms : name => vm if vm.image_file_id == null }
+  root_images  = { for name, vm in var.vms : name => vm.image_file_id != null ? vm.image_file_id : proxmox_virtual_environment_file.root_image[name].id }
 }
 resource "proxmox_virtual_environment_file" "root_image" {
-  for_each     = var.vms
+  for_each     = local.local_images
   node_name    = var.node
   datastore_id = var.image_datastore
   content_type = "import"
@@ -67,7 +69,7 @@ resource "proxmox_virtual_environment_vm" "persistent" {
   }
   disk {
     datastore_id = var.root_datastore
-    import_from  = proxmox_virtual_environment_file.root_image[each.key].id
+    import_from  = local.root_images[each.key]
     interface    = "virtio0"
     size         = each.value.root_gib
     serial       = "qcl-root"
@@ -115,7 +117,7 @@ resource "proxmox_virtual_environment_vm" "replaceable" {
   }
   disk {
     datastore_id = var.root_datastore
-    import_from  = proxmox_virtual_environment_file.root_image[each.key].id
+    import_from  = local.root_images[each.key]
     interface    = "virtio0"
     size         = each.value.root_gib
     serial       = "qcl-root"

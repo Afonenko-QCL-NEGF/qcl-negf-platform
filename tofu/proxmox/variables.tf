@@ -48,15 +48,16 @@ variable "ssh_public_keys" {
 }
 variable "vms" {
   type = map(object({
-    vm_id        = number
-    vcpus        = number
-    memory_mib   = number
-    root_gib     = number
-    mac          = string
-    address      = string
-    gateway      = string
-    image_path   = string
-    image_sha256 = string
+    vm_id         = number
+    vcpus         = number
+    memory_mib    = number
+    root_gib      = number
+    mac           = string
+    address       = string
+    gateway       = string
+    image_path    = optional(string)
+    image_file_id = optional(string)
+    image_sha256  = string
   }))
   description = "Exactly storage, control, compute and ci, with real site addresses and measured resource budgets."
   validation {
@@ -66,6 +67,14 @@ variable "vms" {
   validation {
     condition     = alltrue([for vm in values(var.vms) : vm.vcpus >= 1 && vm.memory_mib >= 1024 && vm.root_gib >= 16 && can(cidrhost(vm.address, 0)) && can(regex("^[0-9a-f]{64}$", vm.image_sha256))])
     error_message = "VMs need positive resources, an IPv4 CIDR and a SHA-256 pinned QCOW2 image."
+  }
+  validation {
+    condition     = alltrue([for vm in values(var.vms) : (vm.image_path != null) != (vm.image_file_id != null)])
+    error_message = "Choose exactly one image source: an operator-local image_path or a verified existing image_file_id."
+  }
+  validation {
+    condition     = alltrue([for name, vm in var.vms : vm.image_file_id == null ? true : vm.image_file_id == "${var.image_datastore}:import/qcl-negf-${name}-${vm.image_sha256}.qcow2"])
+    error_message = "Existing images must be staged in image_datastore with the full reviewed SHA-256 filename."
   }
   validation {
     condition     = sum([for vm in values(var.vms) : vm.memory_mib]) <= var.host_memory_mib - var.host_reserve_mib
