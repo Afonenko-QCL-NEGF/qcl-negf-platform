@@ -1,0 +1,11 @@
+{
+  "endpoint": "https://proxmox.example.invalid:8006/",
+  "node": "REPLACE_WITH_EXISTING_NODE",
+  "iso_datastore": "local",
+  "root_datastore": "local-lvm",
+  "ci_bridge": "vmbr710ci",
+  "vm_id": 709,
+  "mac": "02:00:00:00:07:09",
+  "iso_path": "/absolute/private-site/nixos-minimal.iso",
+  "iso_sha256": "REPLACE_WITH_VERIFIED_OFFICIAL_ISO_SHA256"
+}

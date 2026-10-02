@@ -63,6 +63,11 @@ and image checks are described in [infrastructure](docs/infrastructure.md).
 
 ## Deployment
 
+For the first CI/build host, use the [platform-only bootstrap](docs/bootstrap.md)
+from official installation media. It has no application, solver or Julia-depot
+dependency. [The host policy](docs/host-network.md) declaratively creates the
+isolated guest bridges while retaining the existing management bridge.
+
 Create a private site flake from `examples/private-site/`, set measured resources, hardware, network
 and runtime secrets, and attach the root application's and solver's immutable packages. Copy
 `examples/inventory.json` into that private site and replace its flake references and SSH targets.

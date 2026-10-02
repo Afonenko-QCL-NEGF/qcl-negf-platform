@@ -30,6 +30,9 @@ requires `/etc/network/interfaces` to source `interfaces.d`, existing `vmbr0`,
 Proxmox `qm`, and nftables >= 1.0.9. It refuses to adopt already present QCL
 bridge names without the managed `/etc/network/interfaces.d/qcl-negf` drop-in.
 Existing bridges require an explicit ownership review first.
+Check mode reports file and command changes; systemd activation is skipped
+because the new unit does not exist until the real apply. It does not establish
+VM reachability, firewall enforcement or guest boot.
 
 Set `qcl_apply_host_policy: true` in the private vars only for the reviewed
 apply, then repeat the command without `--check`. The dedicated systemd service

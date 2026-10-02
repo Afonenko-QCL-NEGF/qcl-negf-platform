@@ -132,6 +132,7 @@
         enabled: true
         state: started
         daemon_reload: true
+      when: not ansible_check_mode
     - name: Read only the selected existing Pnetlab VM configuration
       ansible.builtin.command:
         argv: [qm, config, "{{ qcl_pnetlab_vm_id | string }}"]
@@ -167,3 +168,4 @@
         state: restarted
         enabled: true
         daemon_reload: true
+      when: not ansible_check_mode

@@ -1,0 +1,20 @@
+{
+  description = "Private QCL-NEGF bootstrap builder; no application or solver dependency";
+  # Pin the reviewed platform commit in flake.lock before installation.
+  inputs.platform.url = "github:Afonenko-QCL-NEGF/qcl-negf-platform";
+  outputs = { platform, ... }: let
+    system = "x86_64-linux";
+    nixpkgs = platform.inputs.nixpkgs;
+    site = import ./site.nix;
+  in {
+    nixosConfigurations.ci = nixpkgs.lib.nixosSystem {
+      inherit system;
+      modules = [
+        platform.nixosModules.default
+        ./hardware-configuration.nix
+        (platform.outPath + "/examples/bootstrap-site/host.nix")
+        site
+      ];
+    };
+  };
+}
