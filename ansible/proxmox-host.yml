@@ -1,0 +1,169 @@
+---
+# The private site's administrative apply owns these bridges. OpenTofu consumes
+# their names and never imports/reconfigures the existing management bridge.
+- name: Prepare isolated QCL networks on an existing Proxmox host
+  hosts: proxmox_hypervisors
+  become: true
+  gather_facts: true
+  vars:
+    qcl_management_bridge: vmbr0
+    qcl_cluster_bridge: vmbrqcl
+    qcl_ci_bridge: vmbr710ci
+    qcl_cluster_cidr: ""
+    qcl_cluster_gateway_cidr: ""
+    qcl_ci_cidr: ""
+    qcl_ci_gateway_cidr: ""
+    qcl_ci_denied_cidrs: []
+    qcl_ci_dns_servers: []
+    qcl_apply_host_policy: false
+    qcl_pnetlab_vm_id: null
+    qcl_pnetlab_memory_mib: 8192
+    qcl_pnetlab_balloon_mib: 3072
+  tasks:
+    - name: Validate private site network intent and explicit administrative scope
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['os_family'] == 'Debian'
+          - qcl_management_bridge == 'vmbr0'
+          - qcl_cluster_bridge is match('^vmbr[a-zA-Z0-9_]{1,6}$')
+          - qcl_ci_bridge is match('^vmbr[a-zA-Z0-9_]{1,6}$')
+          - qcl_cluster_bridge != qcl_ci_bridge
+          - qcl_cluster_bridge != qcl_management_bridge
+          - qcl_ci_bridge != qcl_management_bridge
+          - qcl_cluster_cidr | length > 0
+          - qcl_ci_cidr | length > 0
+          - qcl_cluster_gateway_cidr | length > 0
+          - qcl_ci_gateway_cidr | length > 0
+          - qcl_ci_denied_cidrs | length > 0
+          - (qcl_pnetlab_balloon_mib | int) > 0
+          - (qcl_pnetlab_balloon_mib | int) <= (qcl_pnetlab_memory_mib | int)
+          - ansible_check_mode or (qcl_apply_host_policy | bool)
+        fail_msg: Set private CIDRs, denied management/LAN networks and qcl_apply_host_policy=true only for a reviewed apply.
+    - name: Validate IPv4 CIDRs and non-overlapping isolated subnets
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - >-
+            import ipaddress, sys;
+            cluster, ci = [ipaddress.ip_network(x, strict=True) for x in sys.argv[1:3]];
+            assert cluster.version == ci.version == 4 and not cluster.overlaps(ci);
+            assert ipaddress.ip_interface(sys.argv[3]).network == cluster;
+            assert ipaddress.ip_interface(sys.argv[4]).network == ci;
+            assert all(ipaddress.ip_network(x).version == 4 for x in sys.argv[5].split());
+            assert all(ipaddress.ip_address(x).version == 4 and ipaddress.ip_address(x) not in cluster for x in sys.argv[6].split())
+          - "{{ qcl_cluster_cidr }}"
+          - "{{ qcl_ci_cidr }}"
+          - "{{ qcl_cluster_gateway_cidr }}"
+          - "{{ qcl_ci_gateway_cidr }}"
+          - "{{ qcl_ci_denied_cidrs | join(' ') }}"
+          - "{{ qcl_ci_dns_servers | join(' ') }}"
+      changed_when: false
+      check_mode: false
+    - name: Require nftables with idempotent atomic table replacement
+      ansible.builtin.command:
+        argv: [python3, -c, "import re, subprocess; s=subprocess.check_output(['nft', '--version'], text=True); assert tuple(map(int,re.search(r'v([0-9]+)[.]([0-9]+)[.]([0-9]+)',s).groups())) >= (1,0,9)"]
+      changed_when: false
+      check_mode: false
+    - name: Check existing Proxmox management and interfaces.d support
+      ansible.builtin.command:
+        argv: [python3, -c, "from pathlib import Path; p=Path('/etc/network/interfaces').read_text(); assert 'source /etc/network/interfaces.d/*' in p or 'source-directory /etc/network/interfaces.d' in p; assert Path('/sys/class/net/vmbr0/bridge').exists(); assert Path('/usr/sbin/qm').exists()"]
+      changed_when: false
+      check_mode: false
+    - name: Inspect isolated bridge ownership before writing the managed drop-in
+      ansible.builtin.stat:
+        path: /etc/network/interfaces.d/qcl-negf
+      register: qcl_network_owned
+    - name: Refuse to adopt existing bridges without the managed drop-in
+      ansible.builtin.command:
+        argv: [python3, -c, "from pathlib import Path; import sys; assert all(not Path('/sys/class/net', name).exists() for name in sys.argv[1:]), 'Existing bridge needs explicit ownership review'", "{{ qcl_cluster_bridge }}", "{{ qcl_ci_bridge }}"]
+      when: not qcl_network_owned.stat.exists
+      changed_when: false
+      check_mode: false
+    - name: Install isolated bridge declarations
+      ansible.builtin.template:
+        src: templates/proxmox-networks.j2
+        dest: /etc/network/interfaces.d/qcl-negf
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Activate isolated networks
+    - name: Enable routed IPv4 for the declared guest networks
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/90-qcl-negf-forwarding.conf
+        content: "net.ipv4.ip_forward = 1\n"
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Activate IPv4 forwarding
+    - name: Install only QCL owned nftables tables
+      ansible.builtin.template:
+        src: templates/proxmox-firewall.j2
+        dest: /etc/qcl-negf-network.nft
+        owner: root
+        group: root
+        mode: '0644'
+        validate: /usr/sbin/nft --check --file %s
+      notify: Activate QCL forwarding policy
+    - name: Install persistent QCL network policy service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/qcl-negf-network.service
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=QCL isolated guest forwarding and NAT tables
+          After=network-online.target pve-firewall.service proxmox-firewall.service
+          Wants=network-online.target
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/sbin/nft --file /etc/qcl-negf-network.nft
+          ExecReload=/usr/sbin/nft --file /etc/qcl-negf-network.nft
+          [Install]
+          WantedBy=multi-user.target
+      notify: Activate QCL forwarding policy
+    - name: Apply reviewed network changes before permitting guest startup
+      ansible.builtin.meta: flush_handlers
+    - name: Enable QCL policy across host restarts
+      ansible.builtin.systemd_service:
+        name: qcl-negf-network.service
+        enabled: true
+        state: started
+        daemon_reload: true
+    - name: Read only the selected existing Pnetlab VM configuration
+      ansible.builtin.command:
+        argv: [qm, config, "{{ qcl_pnetlab_vm_id | string }}"]
+      when: qcl_pnetlab_vm_id is not none
+      register: qcl_pnetlab_config
+      changed_when: false
+      check_mode: false
+    - name: Set only the selected Pnetlab VM RAM ceiling and balloon floor
+      ansible.builtin.command:
+        argv: [qm, set, "{{ qcl_pnetlab_vm_id | string }}", --memory, "{{ qcl_pnetlab_memory_mib | string }}", --balloon, "{{ qcl_pnetlab_balloon_mib | string }}"]
+      when:
+        - qcl_pnetlab_vm_id is not none
+        - "(qcl_pnetlab_config.stdout | regex_search('(?m)^memory: ' ~ (qcl_pnetlab_memory_mib | string) ~ '$')) is none or (qcl_pnetlab_config.stdout | regex_search('(?m)^balloon: ' ~ (qcl_pnetlab_balloon_mib | string) ~ '$')) is none"
+      changed_when: true
+    - name: Report selected VM pending settings without restarting unrelated work
+      ansible.builtin.command:
+        argv: [qm, pending, "{{ qcl_pnetlab_vm_id | string }}"]
+      when: qcl_pnetlab_vm_id is not none
+      changed_when: false
+      check_mode: false
+  handlers:
+    - name: Activate isolated networks
+      ansible.builtin.command:
+        argv: [ifreload, -a]
+      changed_when: true
+    - name: Activate IPv4 forwarding
+      ansible.builtin.command:
+        argv: [sysctl, --load=/etc/sysctl.d/90-qcl-negf-forwarding.conf]
+      changed_when: true
+    - name: Activate QCL forwarding policy
+      ansible.builtin.systemd_service:
+        name: qcl-negf-network.service
+        state: restarted
+        enabled: true
+        daemon_reload: true

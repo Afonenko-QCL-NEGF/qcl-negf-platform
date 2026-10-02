@@ -1,0 +1,33 @@
+# destroy is idempotent on nft >= 1.0.9. Replace only these tables atomically;
+# never flush the host ruleset or change existing Proxmox firewall tables.
+destroy table inet qcl_negf
+destroy table ip qcl_negf_nat
+table inet qcl_negf {
+    set ci_denied {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        elements = { {{ ([qcl_cluster_cidr] + qcl_ci_denied_cidrs) | join(', ') }} }
+    }
+    chain forward {
+        type filter hook forward priority -10; policy accept;
+        iifname "{{ qcl_ci_bridge }}" meta nfproto ipv6 drop
+        iifname "{{ qcl_ci_bridge }}" ip saddr != {{ qcl_ci_cidr }} drop
+{% if qcl_ci_dns_servers | length > 0 %}
+        iifname "{{ qcl_ci_bridge }}" ip daddr { {{ qcl_ci_dns_servers | join(', ') }} } meta l4proto { tcp, udp } th dport 53 accept
+{% endif %}
+        iifname "{{ qcl_ci_bridge }}" ip daddr @ci_denied drop
+        iifname "{{ qcl_cluster_bridge }}" oifname "{{ qcl_ci_bridge }}" drop
+    }
+    chain input {
+        type filter hook input priority -10; policy accept;
+        ct state established,related accept
+        iifname "{{ qcl_ci_bridge }}" drop
+    }
+}
+table ip qcl_negf_nat {
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        ip saddr { {{ qcl_cluster_cidr }}, {{ qcl_ci_cidr }} } oifname "{{ qcl_management_bridge }}" masquerade
+    }
+}

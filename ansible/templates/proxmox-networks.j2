@@ -1,0 +1,14 @@
+# Managed by qcl-negf-platform/ansible/proxmox-host.yml; vmbr0 remains external.
+auto {{ qcl_cluster_bridge }}
+iface {{ qcl_cluster_bridge }} inet static
+    address {{ qcl_cluster_gateway_cidr }}
+    bridge-ports none
+    bridge-stp off
+    bridge-fd 0
+
+auto {{ qcl_ci_bridge }}
+iface {{ qcl_ci_bridge }} inet static
+    address {{ qcl_ci_gateway_cidr }}
+    bridge-ports none
+    bridge-stp off
+    bridge-fd 0
