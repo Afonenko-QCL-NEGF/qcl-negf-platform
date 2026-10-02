@@ -104,11 +104,38 @@ optional build produces the Nix application. Julia packages and VM images are se
 follow [application composition](application.md) and [infrastructure](infrastructure.md) to build
 and deploy the complete site.
 
-Supply a narrowly scoped runner-management token in `qclNegf.runner.tokenDirectory/qcl-negf`,
-outside the Nix store. A personal account uses a repository registration endpoint. The CI runner has
-no production deployment keys, API credentials or database access. Its systemd slice enforces
-`cpuQuota` and `memoryMax`; `maxJobs` separately limits parallel Nix daemon builds. Size the VM and
-build core limits for the host's resource budget.
+Keep the repository-management PAT on the administrative controller. Request a short-lived
+repository registration token there, then provision only that token at
+`qclNegf.runner.tokenDirectory/qcl-negf`, outside Git, Nix inputs and OpenTofu state. The file must
+contain the token without a trailing newline and be readable only by root. A site runtime secret
+unit should validate its owner/mode and reject access-token prefixes before starting the runner.
+Registration is persistent (`ephemeral=false`): an unchanged configuration/token preserves the
+registered credentials across service restarts. Changing registration settings or token contents,
+or clearing runner state, requires a fresh token; a one-hour registration token cannot renew itself.
+Use the [controller registration command](github-registration.md); it prints only path/expiry
+metadata and never publishes a PAT to the guest.
+
+Jobs run as `github-runner-qcl-negf`, with a private group and no wheel, Nix trusted-user or
+administrative `qcl-negf-build` membership. Their writable release directory is
+`/var/lib/qcl-negf-ci/releases`; administrative releases/artifacts and private vaults are inaccessible
+to the job service. Keep the administrative builder account separate in the private site.
+
+Enabling the runner enables the dedicated builder module by default. Select
+`qclNegf.builder.profile="standard"` (4 vCPU/8 GiB) or the admitted `"burst"` profile (12 vCPU/24 GiB).
+The Nix daemon, administrative build parents and runner jobs share `qcl-build.slice`, one parallel
+Nix build, and the profile's aggregate CPU/memory/swap limits. Former runner options `cpuQuota`,
+`memoryMax`, `maxJobs` and `buildCores` are removed; use the owning builder profile. A NixOS profile
+selection alone does not resize the VM or establish host admission. Follow the finite deadline and
+host/compute checks in [bootstrap](bootstrap.md) before a reviewed resource transition.
+
+Focused evaluation covers runner+builder together under both profiles, including account isolation:
+
+```sh
+nix-instantiate --store dummy:// --eval --strict --json tests/infrastructure/runner-isolation.nix --argstr nixpkgs /absolute/pinned-nixpkgs-source
+```
+
+This evaluates the merged NixOS configuration; real registration, service restart, runtime group
+membership and a bounded GitHub smoke job remain deployment acceptance checks.
 
 The CI role provides `nix-ld` and an explicit library environment for upstream Julia and Python
 binary dependencies. These settings are confined to CI; scientific nodes use their built solver and

@@ -28,7 +28,8 @@ provisioning, disk protection and recovery boundaries.
 | `qclNegf.storage`     | Dedicated NFS server and client allowlist                                       |
 | `qclNegf.stateDisk`   | Persistent controller application and scheduler state                           |
 | `qclNegf.application` | AiiDA, PostgreSQL and optional authenticated HTTP API                           |
-| `qclNegf.runner`      | One runner registered to the root repository, with CPU/RAM limits               |
+| `qclNegf.builder`     | Shared daemon/admin/jobs slice and standard/burst resource profiles             |
+| `qclNegf.runner`      | Isolated persistent root-repository runner with controller-issued registration |
 | `qclNegf.cache`       | Signed, read-only Nix binary cache endpoint                                     |
 | `qclNegf.stateArchive` | Manual coordinated controller archive, verification and empty-state restore |
 | `ops/`                | TypeScript commands for build, activation, clean installation and profile setup |

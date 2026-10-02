@@ -33,6 +33,28 @@ Replace these values with the machine's usable RAM and the needs of other guests
 validation rejects allocations exceeding the declared host budgets and reserves; it does not infer
 available capacity from Proxmox.
 
+For dedicated CI, `build_profile = "standard"` selects the shared
+`ops/build-profiles.json` contract: 4 vCPU/8 GiB, one Nix build, and an aggregate
+4-CPU/7-GiB slice with no swap. `"burst"` selects 12 vCPU/24 GiB and an aggregate
+12-CPU/22-GiB slice, also one build and no swap. Set the same
+`qclNegf.builder.profile` in the CI OS; OpenTofu requires CI CPU/RAM to match
+the selected profile. The default `build_profile = null` retains custom site
+resources. It does not enable the NixOS builder module.
+
+Each VM's `started` and `on_boot` default to `true`. Burst requires both fields
+to be `false` on compute. The declared CPU/RAM budget includes any VM started
+now or on host boot; a stopped compute VM keeps its identity, disks and resource
+declaration. Before applying a burst plan, verify actual compute is off, the
+Slurm queue is empty, CI has no active build/job, and measured host memory leaves
+8 GiB for the host plus the maximum 8 GiB pnetlab guest allocation. A missing
+controller/compute pair is admissible only when the host inventory confirms
+both are undeployed; an unreachable existing controller is a refusal. These
+runtime facts are not proved by variable validation. The
+[read-only snapshot admission helper](build-admission.md) validates collected
+facts without collecting them or applying changes. Switch only between idle
+builds, review the saved plan and guest limits after reboot, and restore standard
+before starting compute. This procedure does not stop or cancel running work.
+
 The Arch worker defaults to 30 GiB and 12 vCPU on a host with 32 GiB and 12 logical CPUs/6 physical
 cores. This leaves a nominal 2 GiB outside the guest before QEMU overhead. Ansible requires
 at least 1 GiB of measured host RAM beyond the guest allocation; firmware reservations mean
@@ -151,10 +173,16 @@ The default `qcl-negf` preserves all existing file names. Changing the prefix of
 an existing deployment is a reviewed resource migration, not a routine cleanup.
 Image file names and protected disk lifecycle retain their existing contracts.
 
-The VM resources start newly created guests during apply. Capacity admission
+The VM resources start newly created guests during apply unless their inventory
+sets `started = false`. Capacity admission
 must therefore account for all other running deployments before apply;
 sequential health verification does not make VM startup sequential. Provider
 resource checks budget only the four VMs in the current inventory.
+
+Use the published owning module directory with a separate `TF_DATA_DIR` and an
+absolute private backend path for each installation. Alternatively copy the
+complete owning platform tree, preserving relative assets: copying only
+`tofu/proxmox/*.tf` omits the shared profile JSON and is unsupported.
 
 For a disposable rehearsal, inspect its separate state and actual VM IDs/MACs
 before removing anything. Storage/control retain `prevent_destroy` and Proxmox

@@ -1,8 +1,9 @@
 locals {
-  persistent   = { for name, vm in var.vms : name => vm if contains(["storage", "control"], name) }
-  replaceable  = { for name, vm in var.vms : name => vm if contains(["compute", "ci"], name) }
-  local_images = { for name, vm in var.vms : name => vm if vm.image_file_id == null }
-  root_images  = { for name, vm in var.vms : name => vm.image_file_id != null ? vm.image_file_id : proxmox_virtual_environment_file.root_image[name].id }
+  build_profiles = jsondecode(file("${path.module}/../../ops/build-profiles.json"))
+  persistent     = { for name, vm in var.vms : name => vm if contains(["storage", "control"], name) }
+  replaceable    = { for name, vm in var.vms : name => vm if contains(["compute", "ci"], name) }
+  local_images   = { for name, vm in var.vms : name => vm if vm.image_file_id == null }
+  root_images    = { for name, vm in var.vms : name => vm.image_file_id != null ? vm.image_file_id : proxmox_virtual_environment_file.root_image[name].id }
 }
 resource "proxmox_virtual_environment_file" "root_image" {
   for_each     = local.local_images
@@ -56,7 +57,8 @@ resource "proxmox_virtual_environment_vm" "persistent" {
   bios                                 = "seabios"
   machine                              = "q35"
   boot_order                           = ["virtio0"]
-  on_boot                              = true
+  on_boot                              = each.value.on_boot
+  started                              = each.value.started
   protection                           = true
   delete_unreferenced_disks_on_destroy = false
   agent { enabled = true }
@@ -103,16 +105,18 @@ resource "proxmox_virtual_environment_vm" "persistent" {
   lifecycle { prevent_destroy = true }
 }
 resource "proxmox_virtual_environment_vm" "replaceable" {
-  for_each        = local.replaceable
-  name            = each.key
-  node_name       = var.node
-  vm_id           = each.value.vm_id
-  tags            = ["qcl-negf", each.key]
-  bios            = "seabios"
-  machine         = "q35"
-  boot_order      = ["virtio0"]
-  on_boot         = true
-  stop_on_destroy = true
+  for_each            = local.replaceable
+  name                = each.key
+  node_name           = var.node
+  vm_id               = each.value.vm_id
+  tags                = ["qcl-negf", each.key]
+  bios                = "seabios"
+  machine             = "q35"
+  boot_order          = ["virtio0"]
+  on_boot             = each.value.on_boot
+  started             = each.value.started
+  reboot_after_update = true
+  stop_on_destroy     = true
   agent { enabled = true }
   cdrom {
     file_id   = "none"

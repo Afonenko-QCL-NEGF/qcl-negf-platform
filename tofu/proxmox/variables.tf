@@ -43,6 +43,16 @@ variable "ci_bridge" {
   type        = string
   description = "Existing isolated CI network bridge with outbound GitHub access."
 }
+variable "build_profile" {
+  type        = string
+  default     = null
+  nullable    = true
+  description = "Optional standard/burst CI profile from the shared build table; null preserves custom site resources. Select only after fresh host/queue admission."
+  validation {
+    condition     = var.build_profile == null ? true : contains(["standard", "burst"], var.build_profile)
+    error_message = "build_profile must be null, standard or burst."
+  }
+}
 variable "dns_servers" {
   type        = list(string)
   description = "Site DNS server addresses."
@@ -64,6 +74,8 @@ variable "vms" {
     mac           = string
     address       = string
     gateway       = string
+    started       = optional(bool, true)
+    on_boot       = optional(bool, true)
     image_path    = optional(string)
     image_file_id = optional(string)
     image_sha256  = string
@@ -86,12 +98,24 @@ variable "vms" {
     error_message = "Existing images must be staged in image_datastore with the full reviewed SHA-256 filename."
   }
   validation {
-    condition     = sum([for vm in values(var.vms) : vm.memory_mib]) <= var.host_memory_mib - var.host_reserve_mib
-    error_message = "VM memory exceeds the physical host budget after its reserve."
+    condition     = sum(concat([0], [for vm in values(var.vms) : vm.memory_mib if vm.started || vm.on_boot])) <= var.host_memory_mib - var.host_reserve_mib
+    error_message = "VMs started now or on host boot exceed the physical host memory budget after its reserve."
   }
   validation {
-    condition     = sum([for vm in values(var.vms) : vm.vcpus]) <= var.host_logical_cpus - var.host_reserved_cpus
-    error_message = "VM vCPUs exceed the non-overcommitted logical CPU budget."
+    condition     = sum(concat([0], [for vm in values(var.vms) : vm.vcpus if vm.started || vm.on_boot])) <= var.host_logical_cpus - var.host_reserved_cpus
+    error_message = "VMs started now or on host boot exceed the non-overcommitted logical CPU budget."
+  }
+  validation {
+    condition = var.build_profile == null ? true : try(
+      var.vms["ci"].vcpus == local.build_profiles[var.build_profile].vcpus &&
+      var.vms["ci"].memory_mib == local.build_profiles[var.build_profile].memory_mib,
+      !contains(["standard", "burst"], var.build_profile)
+    )
+    error_message = "CI CPU/RAM must exactly match the selected shared build profile and the NixOS builder profile."
+  }
+  validation {
+    condition     = var.build_profile == "burst" ? (!var.vms["compute"].started && !var.vms["compute"].on_boot) : true
+    error_message = "Burst requires compute.started=false and compute.on_boot=false; restore standard before starting compute."
   }
 
 }

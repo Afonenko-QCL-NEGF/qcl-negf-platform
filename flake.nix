@@ -41,7 +41,8 @@
         checked = import ./tests/infrastructure/invariants.nix { inherit nixpkgs; platform = self; };
         checkedMunge = import ./tests/infrastructure/munge.nix { inherit nixpkgs; platform = self; };
         checkedBuilder = import ./tests/infrastructure/builder-profiles.nix { nixpkgs = nixpkgs.outPath; };
-      in builtins.deepSeq [ checked checkedMunge checkedBuilder ] (pkgs.runCommand "qcl-negf-infrastructure-check" {} "touch $out");
+        checkedRunner = import ./tests/infrastructure/runner-isolation.nix { nixpkgs = nixpkgs.outPath; };
+      in builtins.deepSeq [ checked checkedMunge checkedBuilder checkedRunner ] (pkgs.runCommand "qcl-negf-infrastructure-check" {} "touch $out");
       slurm-vm = import ./tests/slurm-vm.nix { inherit pkgs; module = self.nixosModules.default; };
       operations = pkgs.runCommand "qcl-negf-operations-check" { nativeBuildInputs = [ pkgs.deno pkgs.python314 ]; } ''
         cp -r ${./.} source
