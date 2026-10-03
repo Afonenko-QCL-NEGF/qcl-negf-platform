@@ -1,0 +1,27 @@
+all:
+  vars:
+    ansible_user: root
+    ansible_python_interpreter: /run/current-system/sw/bin/python3
+    ansible_ssh_private_key_file: /absolute/private/lab/id_ed25519
+    ansible_ssh_common_args: '-o StrictHostKeyChecking=yes -o UserKnownHostsFile=/absolute/private/lab/known_hosts'
+    qcl_lab_namespace: qcl-local
+    qcl_lab_munge_key_file: /absolute/private/lab/munge.key
+  children:
+    local_lab:
+      hosts:
+        storage:
+          ansible_host: 192.168.231.11
+          qcl_lab_role: storage
+          qcl_lab_system: /nix/store/REPLACE-nixos-system-storage
+        control:
+          ansible_host: 192.168.231.10
+          qcl_lab_role: control
+          qcl_lab_system: /nix/store/REPLACE-nixos-system-control
+        worker-1:
+          ansible_host: 192.168.231.21
+          qcl_lab_role: worker-1
+          qcl_lab_system: /nix/store/REPLACE-nixos-system-worker-1
+        worker-2:
+          ansible_host: 192.168.231.22
+          qcl_lab_role: worker-2
+          qcl_lab_system: /nix/store/REPLACE-nixos-system-worker-2

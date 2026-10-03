@@ -1,0 +1,15 @@
+{
+  "namespace": "qcl-local",
+  "libvirt_uri": "qemu:///system",
+  "pool_path": "/absolute/private/lab/pool",
+  "ownership_verified": false,
+  "bootstrap_image": "/absolute/private/lab/bootstrap.qcow2",
+  "bootstrap_sha256": "REPLACE_WITH_ACTUAL_SHA256",
+  "ssh_public_key": "ssh-ed25519 REPLACE_PUBLIC_KEY operator",
+  "seed_images": {
+    "storage": "/absolute/private/lab/storage-cidata.iso",
+    "control": "/absolute/private/lab/control-cidata.iso",
+    "worker-1": "/absolute/private/lab/worker-1-cidata.iso",
+    "worker-2": "/absolute/private/lab/worker-2-cidata.iso"
+  }
+}
