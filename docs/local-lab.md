@@ -99,6 +99,55 @@ export disk512 MiB; `site.api` может задавать подходящие 
 Application stage closures можно `nix copy` отдельно перед
 повторным Ansible; не требуется импортировать новый защищённый backing image.
 
+### Первый application handoff
+
+На platform-only гостях release command ещё может отсутствовать. До смены ролей
+caller копирует application, solver и новые role closures в каждый нужный guest
+store, а также pinned `ops/application_release.py` из того же platform commit в
+private path гостя. Затем под root вызывает на controller:
+
+```sh
+python3 /absolute/private/lab/application_release.py prepare-initial \
+  --manifest /absolute/private/lab/release.json --role controller
+```
+
+После успешной подготовки controller та же команда запускается на каждом worker
+с `--role worker`. Установленный `qcl-negf-release prepare-initial` имеет тот же
+интерфейс. Defaults: runtime `/var/lib/qcl-negf/runtime`, gate
+`/srv/qcl-negf/jobs/.release-admission.json`; CLI сериализуется через локальный
+`activation.lock`. Manifest выбирает exact immutable application/solver paths и
+release ID. `nix-store --verify-path` проверяет уже доступные closures; если
+manifest содержит `closures` с narHash, они также проверяются локально. Cache
+не загружается этой фазой.
+
+Только первый controller без runtime identity может создать отсутствующий gate:
+сначала `squeue --all --noheader --format %i` должен быть пустым, затем gate
+публикуется закрытым через owning helper от UID3000 для NFS root_squash.
+Worker требует уже существующий закрытый gate с тем же release ID. Открытый,
+чужой или исчезнувший после предыдущей подготовки gate приводит к отказу.
+Фаза создаёт только отсутствующие stable application/solver profiles и атомарные
+`service.env`/`release.json` с `ready:false`; иной existing profile или release
+требует обычного CD, а не замены initial preparation. Повтор exact preparation
+сохраняет имеющиеся ready status, Code UUID и runtime provenance побайтно.
+
+Чтение shared gate под root использует того же scientific owner UID/GID3000,
+что и publication: NFS `root_squash` не даёт anonymous root пройти jobs directory
+mode0750. Credentials восстанавливаются после чтения, включая ошибку. Это
+относится только к exact shared gate path; чтение локального runtime и проверки
+admission сохраняют прежние права и условия. Permission error не считается
+отсутствующим gate и остаётся отказом. VM receipt должен отдельно подтвердить
+реальный NFS доступ; локальные command-boundary тесты проверяют эту смену authority.
+
+Теперь caller передаёт controller API token и активирует новые роли Ansible.
+Worker `node-check` принимает подготовленную identity с `ready:false` и закрытым
+gate; job guard продолжает отклонять исполнение. Controller bootstrap выбирает
+из runtime exact solver и Code label `qcl-negf-<release_id>`. Сама preparation
+не запускает службы, не создаёт AiiDA Code, не выполняет self-check и не заявляет
+health. После успешной смены ролей обычный `activate`/`check` подтверждает каждый
+selected node, включая конечный solver self-check; admission открывается только
+после проверки всего выбранного pool owning release delivery. Произвольные
+ошибки `switch-to-configuration` не подавляются, release guard не отключается.
+
 ## Ограниченная проверка
 
 ```sh

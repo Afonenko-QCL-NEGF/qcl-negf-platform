@@ -6,6 +6,7 @@ The command boundary is injectable for local fault-injection tests.
 """
 import argparse
 import base64
+from contextlib import contextmanager
 import fcntl
 import json
 import os
@@ -146,6 +147,38 @@ def load(path):
     return json.loads(Path(path).read_text())
 
 
+@contextmanager
+def admission_reader(path):
+    """Read the shared gate with its NFS owner; retain authority for local state."""
+    if Path(path) != GATE or os.geteuid() != 0:
+        yield
+        return
+    user = pwd.getpwnam("qcl-negf")
+    previous_group = os.getegid()
+    try:
+        os.setegid(user.pw_gid)
+        os.seteuid(user.pw_uid)
+        yield
+    finally:
+        os.seteuid(0)
+        os.setegid(previous_group)
+
+
+def read_admission(path, *, missing=False):
+    """Only ENOENT means absent; permission errors must remain failures."""
+    with admission_reader(path):
+        try:
+            return Path(path).read_bytes()
+        except FileNotFoundError:
+            if not missing:
+                raise
+            return None
+
+
+def load_admission(path):
+    return json.loads(read_admission(path))
+
+
 def bootstrap_selection(runtime, initial_solver, initial_label):
     """A reboot must not publish the image seed Code after a CD release switch."""
     if Path(runtime).exists():
@@ -176,6 +209,72 @@ def check(manifest_value, *, profile=PROFILE, runtime=RUNTIME, role="worker", ru
     for unit in units:
         run(["systemctl", "is-active", "--quiet", unit])
     solver_self_check(expected, run)
+    return current
+
+
+def prepare_initial(manifest_value, *, profile=PROFILE, runtime=RUNTIME, gate=GATE,
+                    role="worker", run=command):
+    """Prepare a cold role switch with closed admission, without starting services.
+
+    This is initial provisioning, never a replacement for normal CD activation.
+    Only absent profiles/runtime files are initialized; existing exact evidence
+    (including readiness, Code UUID and provenance) is preserved byte for byte.
+    """
+    expected = manifest(manifest_value)
+    if role not in ("controller", "worker"):
+        raise ValueError("Initial preparation role must be controller or worker")
+    profile, runtime, gate = Path(profile), Path(runtime), Path(gate)
+    record, environment = runtime / "release.json", runtime / "service.env"
+    record_exists = os.path.lexists(record)
+    current = load(record) if record_exists else None
+    if record_exists and (manifest(current) != expected or
+            not (current.get("ready") is True or current.get("ready") is False)):
+        raise ValueError("Existing release identity conflicts; use normal CD activation")
+    profiles = [(profile, expected["application_path"]),
+                (profile.with_name(profile.name + "-solver"),
+                 str(Path(expected["solver_executable"]).parents[1]))]
+    for path, selected in profiles:
+        if os.path.lexists(path) and path.resolve() != Path(selected):
+            raise ValueError("Existing application or solver profile conflicts; use normal CD activation")
+    service_environment = "\n".join([
+        "QCL_NEGF_RELEASE_ID=" + expected["release_id"],
+        "QCL_NEGF_SOLVER_EXECUTABLE=" + expected["solver_executable"],
+        "QCL_NEGF_RELEASE_GATE=" + str(gate),
+    ]) + "\n"
+    if os.path.lexists(environment) and environment.read_text() != service_environment:
+        raise ValueError("Existing runtime environment conflicts; use normal CD activation")
+    gate_bytes = read_admission(gate, missing=True)
+    if gate_bytes is None:
+        if role != "controller" or current is not None or os.path.lexists(environment):
+            raise ValueError("Only a cold initial controller may create the missing admission gate")
+    else:
+        admission = json.loads(gate_bytes)
+        if (not isinstance(admission, dict) or admission.get("open") is not False
+                or admission.get("release_id") != expected["release_id"]):
+            raise ValueError("Initial preparation requires the matching closed admission gate")
+    # Verify local contents before publishing anything. Optional manifest narHash
+    # receipts are checked locally too; initial provisioning never fetches a cache.
+    run(["nix-store", "--verify-path", *[selected for _, selected in profiles]])
+    if "closures" in manifest_value:
+        prefetch_controller_closures({key: value for key, value in manifest_value.items()
+                                      if key != "cache_uri"}, run)
+    if gate_bytes is None and run(["squeue", "--all", "--noheader", "--format", "%i"]).strip():
+        raise RuntimeError("Slurm still has running or queued jobs; resolve them before initial preparation")
+    # A gate changed during local verification belongs to another operation.
+    if read_admission(gate, missing=True) != gate_bytes:
+        raise ValueError("Admission gate changed during initial preparation")
+    if gate_bytes is None:
+        publish_admission(gate, {"open": False, "release_id": expected["release_id"]})
+    for path, selected in profiles:
+        if not os.path.lexists(path):
+            run(["nix-env", "--profile", str(path), "--set", selected])
+        if path.resolve() != Path(selected):
+            raise ValueError("Initial application or solver profile differs from the selected closure")
+    if not os.path.lexists(environment):
+        publish(environment, service_environment)
+    if current is None:
+        current = {**expected, "ready": False}
+        publish_json(record, current)
     return current
 
 
@@ -231,7 +330,7 @@ def activate(manifest_value, *, profile=PROFILE, runtime=RUNTIME, role="worker",
 
 
 def guard(release_id, solver_executable, runtime=RUNTIME / "release.json", gate=GATE):
-    current, admission = load(runtime), load(gate)
+    current, admission = load(runtime), load_admission(gate)
     if admission.get("open") is not True:
         raise ValueError("Application admission is closed")
     if current.get("ready") is not True:
@@ -246,7 +345,7 @@ def guard(release_id, solver_executable, runtime=RUNTIME / "release.json", gate=
 
 def node_check(runtime=RUNTIME / "release.json", gate=GATE, profile=PROFILE, *, run=command):
     """slurmd boot gate: selected immutable identity; job guard checks admission."""
-    current, admission = manifest(load(runtime)), load(gate)
+    current, admission = manifest(load(runtime)), load_admission(gate)
     if current["release_id"] != admission.get("release_id"):
         raise ValueError("Worker release differs from the selected release")
     if Path(profile).resolve() != Path(current["application_path"]):
@@ -334,7 +433,7 @@ def deliver_cli(expected, pool, run=command):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["activate", "check", "guard", "node-check", "bootstrap-identity", "deliver"])
+    parser.add_argument("action", choices=["prepare-initial", "activate", "check", "guard", "node-check", "bootstrap-identity", "deliver"])
     parser.add_argument("--manifest")
     parser.add_argument("--manifest-base64")
     parser.add_argument("--role", choices=["controller", "worker"], default="worker")
@@ -374,8 +473,10 @@ def main():
                     parser.error("Delivery requires an explicit --pool")
                 result = deliver_cli(manifest_value, load(args.pool))
                 publish_json(args.runtime / "delivery-report.json", result)
+            elif args.action == "prepare-initial":
+                result = prepare_initial(manifest_value, runtime=args.runtime, gate=args.gate, role=args.role)
             else:
-                admission = load(args.gate)
+                admission = load_admission(args.gate)
                 if admission.get("release_id") != expected["release_id"] or (
                     admission.get("open") is not False and not (args.returning_worker and args.role == "worker")
                 ):
