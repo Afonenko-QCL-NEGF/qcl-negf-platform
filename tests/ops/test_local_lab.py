@@ -1,0 +1,238 @@
+"""Host admission and ownership checks; these tests never launch a VM."""
+import importlib.util
+import json
+from pathlib import Path
+import subprocess
+
+import pytest
+
+spec = importlib.util.spec_from_file_location("local_lab", Path(__file__).parents[2] / "ops/local_lab.py")
+lab = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(lab)
+
+
+def config():
+    return {"namespace": "qcl-lab", "network_cidr": "192.168.231.0/24",
+            "resources": lab.DEFAULT_RESOURCES, "pool_path": "/var/tmp/qcl-negf-qcl-lab",
+            "host_reserve_mib": 1024, "host_reserved_cpus": 1,
+            "disk_reserve_bytes": 2 * 1024**3, "image_bytes": 1024**3}
+
+
+def snapshot():
+    return {"kvm_rw": True, "memory_available_mib": 12 * 1024, "logical_cpus": 16,
+            "disk_free_bytes": 10 * 1024**3, "running": {}}
+
+
+def test_address_and_mac_contract():
+    machines = lab.machines(config())
+    assert machines["control"]["ip"] == "192.168.231.10"
+    assert machines["worker-2"]["ip"] == "192.168.231.22"
+    assert machines["worker-1"]["mac"].endswith(":00:15")
+    assert len({m["mac"] for m in machines.values()}) == 4
+
+
+@pytest.mark.parametrize("field,value,match", [
+    ("kvm_rw", False, "KVM"), ("memory_available_mib", 8000, "RAM"),
+    ("logical_cpus", 7, "CPU"), ("disk_free_bytes", 2 * 1024**3, "disk"),
+])
+def test_measured_host_admission_refuses_shortfall(field, value, match):
+    measured = snapshot()
+    measured[field] = value
+    with pytest.raises(ValueError, match=match):
+        lab.admit(config(), measured, set())
+
+
+def test_running_owned_memory_is_not_charged_twice_but_foreign_cpu_is_counted():
+    measured = snapshot()
+    measured["running"] = {"qcl-lab-" + role: dict(resources)
+                           for role, resources in lab.DEFAULT_RESOURCES.items()}
+    measured["memory_available_mib"] = 2048
+    assert lab.admit(config(), measured, set(measured["running"]))["additional_guest_memory_mib"] == 0
+    measured["running"]["foreign"] = {"memory_mib": 1024, "vcpus": 10}
+    with pytest.raises(ValueError, match="CPU"):
+        lab.admit(config(), measured, set(measured["running"]) - {"foreign"})
+
+
+def test_only_exact_state_resource_ids_allow_partial_apply_recovery():
+    actual = {"domains": {"qcl-lab-control": "uuid-a"}, "networks": {}, "pools": {}}
+    tracked = {"domains": {"qcl-lab-control": "uuid-a"}, "networks": {}, "pools": {}, "volumes": {}}
+    assert lab.verify_ownership(config(), actual, tracked) == {"qcl-lab-control"}
+    for state in ({}, {**tracked, "domains": {"qcl-lab-control": "uuid-b"}}):
+        with pytest.raises(ValueError, match="foreign"):
+            lab.verify_ownership(config(), actual, state)
+
+
+def test_foreign_pool_path_collision_is_refused_even_with_different_name():
+    actual = {"domains": {}, "networks": {}, "pools": {
+        "production": {"uuid": "foreign", "path": config()["pool_path"]}}}
+    with pytest.raises(ValueError, match="pool path"):
+        lab.verify_ownership(config(), actual, {})
+
+
+def test_network_overlap_ignores_only_proven_owned_bridge():
+    with pytest.raises(ValueError, match="overlap"):
+        lab.check_overlaps(config()["network_cidr"], [{"cidr": "192.168.231.0/25", "owner": "foreign"}], set())
+    lab.check_overlaps(config()["network_cidr"], [{"cidr": "192.168.231.0/24", "owner": "uuid-a"}], {"uuid-a"})
+    with pytest.raises(ValueError, match="overlap"):
+        lab.check_overlaps(config()["network_cidr"], [{"cidr": "192.168.0.0/16", "owner": "uuid-a"}], {"uuid-a"})
+
+
+def test_tfstate_is_authority_for_each_domain_and_network_uuid(tmp_path):
+    state = tmp_path / "terraform.tfstate"
+    state.write_text(json.dumps({"resources": [{"type": "libvirt_domain", "instances": [
+        {"attributes": {"name": "qcl-lab-control", "id": "uuid-a"}}]},
+        {"type": "libvirt_network", "instances": [{"attributes": {"name": "qcl-lab-network", "id": "uuid-n"}}]}]}))
+    tracked = lab.read_state(state)
+    assert tracked["domains"] == {"qcl-lab-control": "uuid-a"}
+    assert tracked["networks"] == {"qcl-lab-network": "uuid-n"}
+
+
+def test_existing_private_keys_are_preserved_and_never_enter_provider_vars(tmp_path):
+    private = tmp_path / "private"
+    private.mkdir()
+    (private / "id_ed25519").write_bytes(b"existing private bytes")
+    (private / "id_ed25519.pub").write_text("ssh-ed25519 AAAATEST lab\n")
+    (private / "munge.key").write_bytes(b"x" * 1024)
+    runner = lab.Commands(tmp_path, timeout=5)
+    before = {p.name: p.read_bytes() for p in private.iterdir()}
+    lab.ensure_keys(private, runner)
+    assert {p.name: p.read_bytes() for p in private.iterdir()} == before
+    cfg = config() | {"libvirt_uri": "qemu:///system", "image": "/nix/store/example/image.qcow2", "image_sha256": "a" * 64}
+    values = lab.provider_vars(cfg, private)
+    encoded = json.dumps(values)
+    assert "existing private bytes" not in encoded and "x" * 1024 not in encoded
+    assert "munge" not in encoded and "id_ed25519" not in encoded
+    assert values["ssh_public_key"] == "ssh-ed25519 AAAATEST lab"
+
+
+def test_commands_pass_literal_argv_and_finite_timeout_without_shell(tmp_path, monkeypatch):
+    calls = []
+    def execute(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0)
+    monkeypatch.setattr(lab.subprocess, "run", execute)
+    runner = lab.Commands(tmp_path, timeout=13)
+    runner.run(["printf", "$(touch /tmp/must-not-exist); `false`"])
+    argv, kwargs = calls[0]
+    assert argv[1] == "$(touch /tmp/must-not-exist); `false`"
+    assert kwargs["shell"] is False and kwargs["timeout"] == 13
+
+
+def test_private_directory_rejects_git_tracked_destination(tmp_path, monkeypatch):
+    monkeypatch.setattr(lab, "is_ignored", lambda path: False)
+    with pytest.raises(ValueError, match="ignored"):
+        lab.private_directory(tmp_path / "runtime")
+
+
+def test_provider_never_receives_ownership_true_until_actual_preflight(tmp_path):
+    private = tmp_path / "private"
+    private.mkdir()
+    (private / "id_ed25519.pub").write_text("ssh-ed25519 AAAATEST lab\n")
+    values = lab.provider_vars(config() | {"libvirt_uri": "qemu:///system",
+        "image": "/nix/store/test/image.qcow2", "image_sha256": "a" * 64}, private)
+    assert values["ownership_verified"] is False
+
+
+@pytest.mark.parametrize("field,value", [("vcpus", True), ("memory_mib", 1), ("vcpus", 0)])
+def test_invalid_resource_budget_is_refused(field, value):
+    cfg = config()
+    cfg["resources"] = {role: dict(values) for role, values in lab.DEFAULT_RESOURCES.items()}
+    cfg["resources"]["worker-1"][field] = value
+    with pytest.raises(ValueError, match="RAM/CPU"):
+        lab.admit(cfg, snapshot(), set())
+
+
+def test_inventory_enrolls_once_then_uses_strict_hosts_and_local_python(tmp_path, monkeypatch):
+    cfg = config() | {"systems": {role: "/nix/store/system-" + role for role in lab.ROLES}, "libvirt_uri": "qemu:///system"}
+    expected = lab.machines(cfg)
+    actual = {"domains": {m["domain"]: "uuid-" + role for role, m in expected.items()}, "networks": {}, "pools": {}}
+    monkeypatch.setattr(lab, "load_config", lambda directory: cfg)
+    monkeypatch.setattr(lab, "read_state", lambda path: actual | {"volumes": {}})
+    monkeypatch.setattr(lab, "actual_inventory", lambda *args: (actual, {}, []))
+    monkeypatch.setattr(lab, "source_identity", lambda: {"commit": "test"})
+    (tmp_path / "private").mkdir()
+    calls = []
+    class Runner:
+        def run(self, argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"inventory": {"value": expected}}), "")
+    result = lab.inventory(tmp_path, Runner(), enroll=True)
+    assert result["all"]["children"]["orchestrator"]["hosts"]["localhost"]["ansible_python_interpreter"] == lab.sys.executable
+    assert all("StrictHostKeyChecking=accept-new" in command for command in calls if command[0] == "ssh")
+    calls.clear()
+    lab.inventory(tmp_path, Runner(), enroll=True)
+    assert all("StrictHostKeyChecking=yes" in command for command in calls if command[0] == "ssh")
+
+
+def test_apply_refuses_destructive_plan_before_provider_mutation(tmp_path, monkeypatch):
+    cfg = config() | {"libvirt_uri": "qemu:///system", "image": "immutable", "image_sha256": "a" * 64}
+    monkeypatch.setattr(lab, "load_config", lambda directory: cfg)
+    monkeypatch.setattr(lab, "preflight", lambda *args: {"status": "pass"})
+    monkeypatch.setattr(lab, "provider_vars", lambda *args: {"ownership_verified": False})
+    calls = []
+    class Runner:
+        def run(self, argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"resource_changes": [{"change": {"actions": ["delete", "create"]}}]}), "")
+    with pytest.raises(ValueError, match="destructive"):
+        lab.apply(tmp_path, Runner(), 5)
+    assert not any("apply" in argv for argv in calls)
+    assert json.loads((tmp_path / "tofu/lab.auto.tfvars.json").read_text())["ownership_verified"] is True
+
+
+def test_guest_probe_rejects_root_backed_durable_mount_and_missing_uuid():
+    cfg = config() | {"systems": {role: "closure" for role in lab.ROLES}}
+    result = {"hostname": "storage", "system": "closure", "uid": 3000, "cgroup_v2": True,
+        "resolution": {name: m["ip"] for name, m in lab.machines(cfg).items()}, "durable_device": 2,
+        "exports": "/srv/qcl-negf/jobs root_squash", "mounts": {
+            "/": {"device": 1}, "/srv/qcl-negf": {"device": 2, "findmnt": {"fstype": "ext4", "uuid": "uuid-d"}}}}
+    lab.verify_guest(cfg, "storage", result)
+    result["mounts"]["/srv/qcl-negf"]["findmnt"]["uuid"] = None
+    with pytest.raises(ValueError, match="measured UUID"):
+        lab.verify_guest(cfg, "storage", result)
+    result["mounts"]["/srv/qcl-negf"]["device"] = 1
+    with pytest.raises(ValueError, match="root filesystem"):
+        lab.verify_guest(cfg, "storage", result)
+
+
+def test_seed_is_public_only_and_repeat_generation_keeps_existing_iso(tmp_path, monkeypatch):
+    private = tmp_path / "private"
+    private.mkdir()
+    (private / "id_ed25519.pub").write_text("ssh-ed25519 AAAATEST lab\n")
+    (private / "id_ed25519").write_text("SSH PRIVATE MATERIAL")
+    (private / "munge.key").write_text("MUNGE PRIVATE MATERIAL")
+    monkeypatch.setattr(lab.shutil, "which", lambda name: "/usr/bin/" + name)
+    calls = []
+    class Runner:
+        def run(self, argv, **kwargs):
+            calls.append(argv)
+            Path(argv[2]).write_bytes(b"fake public ISO")
+    lab.create_seeds(config(), private, Runner())
+    assert len(calls) == 4
+    for path in (private / "seeds").rglob("*"):
+        if path.is_file():
+            assert b"PRIVATE MATERIAL" not in path.read_bytes()
+    before = {path: path.read_bytes() for path in (private / "seeds").rglob("*") if path.is_file()}
+    lab.create_seeds(config(), private, Runner())
+    assert len(calls) == 4 and all(path.read_bytes() == content for path, content in before.items())
+
+
+def test_untracked_pool_file_is_refused_before_init_or_apply(tmp_path, monkeypatch):
+    image = tmp_path / "image.qcow2"
+    image.write_bytes(b"immutable image fixture")
+    pool = tmp_path / "pool"
+    pool.mkdir()
+    (pool / "foreign.qcow2").write_text("preserve foreign data")
+    cfg = config() | {"image": str(image), "image_sha256": lab.sha256(image), "pool_path": str(pool)}
+    monkeypatch.setattr(lab, "actual_inventory", lambda *args: ({"domains": {}, "pools": {}, "networks": {}}, {}, []))
+    with pytest.raises(ValueError, match="untracked/foreign"):
+        lab.preflight(tmp_path, cfg, None)
+    assert (pool / "foreign.qcow2").read_text() == "preserve foreign data"
+
+
+def test_command_failure_records_status_and_cannot_be_pass(tmp_path):
+    runner = lab.Commands(tmp_path, timeout=5)
+    with pytest.raises(RuntimeError, match="status=7"):
+        runner.run([lab.sys.executable, "-c", "raise SystemExit(7)"])
+    event = json.loads((tmp_path / "commands.jsonl").read_text())
+    assert event["returncode"] == 7 and "pass" not in event.values()
