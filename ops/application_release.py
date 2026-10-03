@@ -15,6 +15,7 @@ import re
 import shlex
 import subprocess
 import tempfile
+from urllib.parse import urlsplit
 
 
 RUNTIME = Path("/var/lib/qcl-negf/runtime")
@@ -23,6 +24,7 @@ GATE = Path("/srv/qcl-negf/jobs/.release-admission.json")
 IDENTIFIER = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}\Z")
 STORE_PATH = re.compile(r"/nix/store/[a-zA-Z0-9][a-zA-Z0-9+._?-]*\Z")
 TARGET = re.compile(r"(?:[a-z_][a-z0-9_-]*@)?[a-zA-Z0-9][a-zA-Z0-9.-]*\Z")
+NAR_HASH = re.compile(r"sha256-[A-Za-z0-9+/]{43}=\Z")
 
 
 def command(args):
@@ -41,6 +43,62 @@ def manifest(value):
     if not isinstance(solver, str) or not solver.endswith("/bin/qcl-negf") or not STORE_PATH.fullmatch(solver[:-len("/bin/qcl-negf")]):
         raise ValueError("Solver must be an immutable /nix/store/.../bin/qcl-negf executable")
     return {key: value[key] for key in ("schema", "release_id", "application_path", "solver_executable")}
+
+
+def prefetch_controller_closures(value, run=command):
+    """Fetch and verify immutable release evidence before maintenance begins."""
+    expected = manifest(value)
+    paths = [expected["application_path"], str(Path(expected["solver_executable"]).parents[1])]
+    required = set(paths)
+    cache = value.get("cache_uri")
+    if "cache_uri" in value:
+        if (not isinstance(cache, str) or not cache or cache.startswith("-")
+                or any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in cache)):
+            raise ValueError("Invalid cache URI argument")
+        try:
+            if urlsplit(cache).password is not None:
+                raise ValueError("Cache URI must not embed a password")
+        except ValueError as error:
+            raise ValueError("Invalid cache URI; embedded credentials are not supported") from error
+    inventory = value.get("closures")
+    if not isinstance(inventory, list) or len(inventory) != len(paths):
+        raise ValueError("Delivery requires manifest closure hashes for application and solver")
+    hashes = {}
+    for item in inventory:
+        if (not isinstance(item, dict) or not isinstance(item.get("path"), str) or item["path"] not in required
+                or not isinstance(item.get("narHash"), str) or not NAR_HASH.fullmatch(item["narHash"])
+                or item["path"] in hashes):
+            raise ValueError("Malformed or duplicated manifest closure hash evidence")
+        hashes[item["path"]] = item["narHash"]
+    if set(hashes) != required:
+        raise ValueError("Manifest lacks application or solver closure hash evidence")
+    if "cache_uri" in value:
+        run(["nix", "copy", "--from", cache, *paths])
+    raw = run(["nix", "path-info", "--json", *paths])
+    def unique_object(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError("Duplicate local closure evidence")
+            result[key] = item
+        return result
+    try:
+        if not isinstance(raw, str) or len(raw.encode()) > 1024 * 1024:
+            raise ValueError("Local closure evidence exceeds its metadata budget")
+        evidence = json.loads(raw, object_pairs_hook=unique_object)
+    except (ValueError, TypeError) as error:
+        raise ValueError("Malformed local closure hash evidence") from error
+    if isinstance(evidence, list):
+        if (not all(isinstance(item, dict) and isinstance(item.get("path"), str) for item in evidence)
+                or len({item["path"] for item in evidence}) != len(evidence)):
+            raise ValueError("Malformed or duplicate local closure evidence")
+        evidence = {item["path"]: item for item in evidence}
+    if not isinstance(evidence, dict) or set(evidence) != required:
+        raise ValueError("Local closure evidence lacks application or solver")
+    for path, digest in hashes.items():
+        if not isinstance(evidence[path], dict) or evidence[path].get("narHash") != digest:
+            raise ValueError("Local closure narHash differs from the manifest")
+    return hashes
 
 
 def publish(path, value):
@@ -240,6 +298,10 @@ def deliver_cli(expected, pool, run=command):
         raise ValueError("Pool node names must be unique")
     if sum(node["role"] == "controller" for node in nodes) != 1:
         raise ValueError("Select exactly one controller in the active pool")
+    # The controller initially receives only the manifest, never CI's local store.
+    # A bad cache or hash must leave both admission and current services untouched.
+    prefetch_controller_closures(expected, run)
+    expected = manifest(expected)
     workers = [node["name"] for node in nodes if node["role"] == "worker"]
     by_name = {node["name"]: node for node in nodes}
     encoded = base64.urlsafe_b64encode(json.dumps(expected).encode()).decode()
@@ -296,7 +358,8 @@ def main():
         return
     if bool(args.manifest) == bool(args.manifest_base64):
         parser.error("Provide exactly one --manifest or --manifest-base64")
-    expected = manifest(load(args.manifest) if args.manifest else json.loads(base64.urlsafe_b64decode(args.manifest_base64)))
+    manifest_value = load(args.manifest) if args.manifest else json.loads(base64.urlsafe_b64decode(args.manifest_base64))
+    expected = manifest(manifest_value)
     if args.action == "check":
         result = check(expected, runtime=args.runtime, role=args.role)
     else:
@@ -309,7 +372,7 @@ def main():
             if args.action == "deliver":
                 if not args.pool:
                     parser.error("Delivery requires an explicit --pool")
-                result = deliver_cli(expected, load(args.pool))
+                result = deliver_cli(manifest_value, load(args.pool))
                 publish_json(args.runtime / "delivery-report.json", result)
             else:
                 admission = load(args.gate)

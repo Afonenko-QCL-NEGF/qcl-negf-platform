@@ -27,8 +27,18 @@ that provenance with the release. JSON manifest:
 ```json
 {"schema":"qcl-negf-release-v1","release_id":"example-release",
 "application_path":"/nix/store/EXAMPLE-application",
-"solver_executable":"/nix/store/EXAMPLE-solver/bin/qcl-negf"}
+"solver_executable":"/nix/store/EXAMPLE-solver/bin/qcl-negf",
+"closures":[{"path":"/nix/store/EXAMPLE-application","narHash":"sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},
+{"path":"/nix/store/EXAMPLE-solver","narHash":"sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}],
+"cache_uri":"https://cache.example.invalid"}
 ```
+
+The paths and hashes above are placeholders. The umbrella assembler supplies the
+actual application and solver `narHash` evidence. `cache_uri` is an optional
+delivery route and does not change release identity. It must be a nonempty string
+without whitespace, control characters, a leading dash or an embedded password.
+Keep credentials outside the URI and manifest. Nix retains its normal signature
+and trust checks; this procedure does not disable `require-sigs`.
 
 An explicit private pool is separate from the manual credentials inventory;
 offline daytime workers are omitted:
@@ -51,7 +61,17 @@ For an SSH pipeline, `--manifest /dev/stdin` accepts the manifest without copyin
 the controller's private pool to CI. SSH keys/cache signing keys remain outside
 Git, Nix inputs and scientific archives.
 
-Delivery closes `/srv/qcl-negf/jobs/.release-admission.json`, stops API/AiiDA,
+Before maintenance, the controller fetches both named closures with
+`nix copy --from CACHE_URI APPLICATION SOLVER` and verifies their exact manifest
+hashes using local `nix path-info --json APPLICATION SOLVER`. Fetch failure,
+malformed or missing evidence, and either hash mismatch stop delivery before any
+gate change, service stop, worker drain or remote command. An older assembled
+manifest without `cache_uri` remains supported when both closures already exist
+in the controller store and match its declared hashes. Delivery cannot accept a
+manifest without both hashes; minimal four-field manifests remain valid for
+activation and runtime identity checks.
+
+After this preflight, delivery closes `/srv/qcl-negf/jobs/.release-admission.json`, stops API/AiiDA,
 drains selected workers and rejects a nonempty Slurm queue. The maintenance owner
 first completes/cancels the old research and removes its automatic resume/queued
 attempts. The command never cancels or restarts research on the user's behalf.
@@ -84,7 +104,7 @@ release instead of publishing the original image's seed Code UUID again.
 AiiDA pins release and immutable Code for each attempt and executes before solver:
 
 ```console
-qcl-negf-release guard --release-id PINNED_RELEASE --solver-executable /nix/store/PINNED-solver/bin/qcl-negf
+/run/current-system/sw/bin/qcl-negf-release guard --release-id PINNED_RELEASE --solver-executable /nix/store/PINNED-solver/bin/qcl-negf
 ```
 
 It requires shared gate open, exact pinned release/solver and local ready status;

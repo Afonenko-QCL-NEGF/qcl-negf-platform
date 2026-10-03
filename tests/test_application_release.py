@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import sys
+from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location(
     "application_release", Path(__file__).parents[1] / "ops" / "application_release.py"
@@ -43,11 +45,156 @@ def release():
             "solver_executable": "/nix/store/solver/bin/qcl-negf"}
 
 
+HASH = "sha256-" + "A" * 43 + "="
+OTHER_HASH = "sha256-" + "B" * 43 + "="
+
+
+def delivery_manifest(cache=True):
+    value = {**release(), "closures": [{"path": "/nix/store/application", "narHash": HASH},
+                                       {"path": "/nix/store/solver", "narHash": HASH}]}
+    if cache:
+        value["cache_uri"] = "https://cache.example.invalid"
+    return value
+
+
+POOL = {"nodes": [{"name": "controller", "target": "admin@controller", "role": "controller"},
+                  {"name": "worker", "target": "admin@worker", "role": "worker"}]}
+
+
+class DeliveryCommands:
+    """Only local command boundaries are simulated; gate writes stay real."""
+    def __init__(self, gate):
+        self.gate = gate
+        self.calls = []
+        self.failure = False
+        self.evidence = {"/nix/store/application": {"narHash": HASH},
+                         "/nix/store/solver": {"narHash": HASH}}
+        self.prefetch_gate_snapshots = []
+
+    def __call__(self, args):
+        self.calls.append(args)
+        if args[:3] == ["nix", "copy", "--from"]:
+            self.prefetch_gate_snapshots.append(self.gate.read_bytes())
+            if self.failure:
+                raise RuntimeError("cache fetch failed")
+        if args[:3] == ["nix", "path-info", "--json"]:
+            self.prefetch_gate_snapshots.append(self.gate.read_bytes())
+            return self.evidence if isinstance(self.evidence, str) else json.dumps(self.evidence)
+        if args[0] == "ssh" and " check " in args[-1]:
+            return json.dumps({**release(), "ready": True})
+        return ""
+
+
 class ApplicationReleaseTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.ops = importlib.util.module_from_spec(SPEC)
         SPEC.loader.exec_module(cls.ops)
+
+    def test_controller_fetches_and_checks_both_hashes_before_closing_admission(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            gate = Path(temporary) / "admission.json"
+            gate.write_text(json.dumps({"open": True, "release_id": "old"}))
+            original = gate.read_bytes()
+            run = DeliveryCommands(gate)
+            with patch.object(self.ops, "publish_admission", lambda _path, value: self.ops.publish_json(gate, value)):
+                report = self.ops.deliver_cli(delivery_manifest(), POOL, run=run)
+            self.assertTrue(report["open"])
+            self.assertEqual(run.calls[:2], [
+                ["nix", "copy", "--from", "https://cache.example.invalid", "/nix/store/application", "/nix/store/solver"],
+                ["nix", "path-info", "--json", "/nix/store/application", "/nix/store/solver"]])
+            self.assertEqual(run.prefetch_gate_snapshots, [original, original])
+            self.assertEqual(run.calls[2][:2], ["systemctl", "stop"])
+
+    def test_cache_fetch_failure_leaves_gate_and_services_unchanged(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            gate = Path(temporary) / "admission.json"
+            gate.write_text(json.dumps({"open": True, "release_id": "old"}))
+            original, run = gate.read_bytes(), DeliveryCommands(gate)
+            run.failure = True
+            with patch.object(self.ops, "publish_admission", lambda _path, value: self.ops.publish_json(gate, value)):
+                with self.assertRaisesRegex(RuntimeError, "cache fetch"):
+                    self.ops.deliver_cli(delivery_manifest(), POOL, run=run)
+            self.assertEqual(gate.read_bytes(), original)
+            self.assertFalse(any(args[0] in ("systemctl", "scontrol", "ssh") for args in run.calls))
+
+    def test_hash_mismatch_missing_paths_or_malformed_evidence_does_not_quiesce(self):
+        evidence = ["malformed", [], {}, {"/nix/store/application": {"narHash": HASH}},
+                    {"/nix/store/solver": {"narHash": HASH}},
+                    {"/nix/store/application": {"narHash": OTHER_HASH}, "/nix/store/solver": {"narHash": HASH}},
+                    [{"path": "/nix/store/application", "narHash": HASH}, {"path": "/nix/store/application", "narHash": HASH}],
+                    {"/nix/store/application": None, "/nix/store/solver": {"narHash": HASH}}]
+        for value in evidence:
+            with self.subTest(evidence=value), tempfile.TemporaryDirectory() as temporary:
+                gate = Path(temporary) / "admission.json"
+                gate.write_text(json.dumps({"open": True, "release_id": "old"}))
+                original, run = gate.read_bytes(), DeliveryCommands(gate)
+                run.evidence = value
+                with patch.object(self.ops, "publish_admission", lambda _path, value: self.ops.publish_json(gate, value)):
+                    with self.assertRaisesRegex(ValueError, "closure|hash|evidence"):
+                        self.ops.deliver_cli(delivery_manifest(), POOL, run=run)
+                self.assertEqual(gate.read_bytes(), original)
+                self.assertFalse(any(args[0] in ("systemctl", "scontrol", "ssh") for args in run.calls))
+
+    def test_manifest_without_cache_uri_verifies_local_closures_before_quiesce(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            gate = Path(temporary) / "admission.json"
+            gate.write_text(json.dumps({"open": True, "release_id": "old"}))
+            original, run = gate.read_bytes(), DeliveryCommands(gate)
+            run.evidence = [{"path": path, **value} for path, value in run.evidence.items()]
+            with patch.object(self.ops, "publish_admission", lambda _path, value: self.ops.publish_json(gate, value)):
+                self.ops.deliver_cli(delivery_manifest(False), POOL, run=run)
+            self.assertEqual(run.calls[0][:3], ["nix", "path-info", "--json"])
+            self.assertFalse(any(args[:3] == ["nix", "copy", "--from"] for args in run.calls))
+            self.assertEqual(run.prefetch_gate_snapshots, [original])
+
+    def test_invalid_cache_argument_or_absent_manifest_hashes_refuses_before_commands(self):
+        for cache in (None, "", " ", "-option", "https://cache.invalid\n--option", "https://cache.invalid path",
+                      "https://user:password@cache.invalid", 123, True):
+            value = delivery_manifest()
+            value["cache_uri"] = cache
+            with self.subTest(cache=cache), tempfile.TemporaryDirectory() as temporary:
+                gate = Path(temporary) / "admission.json"
+                gate.write_text("unchanged")
+                run = DeliveryCommands(gate)
+                with patch.object(self.ops, "publish_admission", lambda _path, value: self.ops.publish_json(gate, value)):
+                    with self.assertRaisesRegex(ValueError, "cache"):
+                        self.ops.deliver_cli(value, POOL, run=run)
+                self.assertEqual(gate.read_text(), "unchanged")
+                self.assertEqual(run.calls, [])
+        calls = []
+        with self.assertRaisesRegex(ValueError, "closure"):
+            self.ops.deliver_cli(release(), POOL, run=lambda args: calls.append(args))
+        self.assertEqual(calls, [])
+
+    def test_malformed_manifest_closure_inventory_refuses_before_commands(self):
+        for inventory in ([], [{"path": "/nix/store/application", "narHash": HASH}],
+                          [{"path": ["invalid"], "narHash": HASH}, {"path": "/nix/store/solver", "narHash": HASH}],
+                          [{"path": "/nix/store/application", "narHash": "invalid"},
+                           {"path": "/nix/store/solver", "narHash": HASH}]):
+            with self.subTest(inventory=inventory):
+                value = delivery_manifest()
+                value["closures"] = inventory
+                calls = []
+                with self.assertRaisesRegex(ValueError, "closure"):
+                    self.ops.deliver_cli(value, POOL, run=lambda args: calls.append(args))
+                self.assertEqual(calls, [])
+
+    def test_cli_keeps_operational_cache_and_closure_fields_for_controller_prefetch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, pool = root / "release.json", root / "pool.json"
+            source.write_text(json.dumps(delivery_manifest()))
+            pool.write_text(json.dumps(POOL))
+            observed = []
+            def deliver(value, selected_pool):
+                observed.append((value, selected_pool))
+                return {"open": True}
+            args = ["qcl-negf-release", "deliver", "--manifest", str(source), "--pool", str(pool),
+                    "--runtime", str(root / "runtime")]
+            with patch.object(sys, "argv", args), patch.object(self.ops, "deliver_cli", deliver), patch("builtins.print"):
+                self.ops.main()
+            self.assertEqual(observed, [(delivery_manifest(), POOL)])
 
     def test_activation_publishes_only_after_identity_and_health_check_then_retry_is_idempotent(self):
         with tempfile.TemporaryDirectory() as temporary:
