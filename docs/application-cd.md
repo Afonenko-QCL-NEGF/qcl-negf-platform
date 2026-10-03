@@ -70,6 +70,12 @@ does admission open. Partial failure leaves it closed and publishes node statuse
 in `/var/lib/qcl-negf/runtime/delivery-report.json`; fix the cause and repeat the
 same idempotent command. A repeated successful activation retains profile/Code
 identity and repeats checks.
+Each required unit is checked separately. Activation also runs the pinned
+solver `self-check` as `qcl-negf`, with one Julia/BLAS thread and a 300-second
+limit, before readiness. This small analytic PV/HDF5 execution check verifies
+the installed runtime, not stationary convergence or scientific acceptance.
+An identical retry starts any services stopped by maintenance without
+replacing the immutable profile or Code.
 After reboot, bootstrap derives solver/Code selection from the current runtime
 release instead of publishing the original image's seed Code UUID again.
 

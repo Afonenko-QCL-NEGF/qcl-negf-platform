@@ -20,21 +20,31 @@ from application_release import (GATE, IDENTIFIER, RUNTIME, STORE_PATH, TARGET, 
 JOB = re.compile(r"[0-9]+(?:[_+][0-9]+)?\Z")
 OWNER = re.compile(r"[a-z_][a-z0-9_-]{0,63}\Z")
 PREFIX = "qcl-negf-attempt-v1:"
+TERMINAL_STATES = {"BOOT_FAIL", "CANCELLED", "COMPLETED", "DEADLINE", "FAILED",
+                   "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED", "TIMEOUT"}
 
 
 def jobs(node, run=command, shared_root=Path("/srv/qcl-negf/jobs")):
     if not IDENTIFIER.fullmatch(node):
         raise ValueError("Invalid Slurm node")
     listing = run(["squeue", "--all", "--noheader", "--nodes", node,
-                   "--states", "RUNNING,COMPLETING", "--format", "%i|%u|%k|%Z"])
+                   "--states", "all", "--format", "%i|%u|%k|%Z|%N|%T"])
     result = {}
     for line in listing.splitlines():
         if not line.strip():
             continue
-        parts = line.strip().split("|", 3)
-        if len(parts) != 4 or not JOB.fullmatch(parts[0]) or not OWNER.fullmatch(parts[1]):
+        parts = line.strip().split("|", 5)
+        if len(parts) != 6 or not JOB.fullmatch(parts[0]) or not OWNER.fullmatch(parts[1]):
             raise ValueError("Malformed Slurm job identity/owner")
-        job_id, owner, comment, workdir = parts
+        job_id, owner, comment, workdir, allocated_nodes, state = parts
+        if allocated_nodes in ("", "(null)", "N/A", "None"):
+            continue
+        # Completed records may remain in squeue for MinJobAge. Any captured
+        # earlier attempt remains in shutdown's durable snapshot until proof.
+        if state in TERMINAL_STATES:
+            continue
+        if state not in ("RUNNING", "COMPLETING", "CONFIGURING"):
+            raise ValueError(f"Allocated job {job_id} is {state}; release or resume it before shutdown")
         if not comment.startswith(PREFIX):
             raise ValueError("Active job has no Runner attempt descriptor; manual resolution required")
         try:

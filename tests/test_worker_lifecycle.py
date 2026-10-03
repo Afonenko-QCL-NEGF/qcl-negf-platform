@@ -18,7 +18,7 @@ def job(job_id, owner, attempt=1):
     descriptor = {"execution_id": "execution-" + job_id, "attempt": attempt,
                   "output_directory": "results", "solver_executable": "/nix/store/solver/bin/qcl-negf"}
     comment = "qcl-negf-attempt-v1:" + base64.urlsafe_b64encode(json.dumps(descriptor).encode()).decode()
-    return f"{job_id}|{owner}|{comment}|/srv/qcl-negf/jobs/{job_id}"
+    return f"{job_id}|{owner}|{comment}|/srv/qcl-negf/jobs/{job_id}|worker|RUNNING"
 
 
 class Slurm:
@@ -84,9 +84,40 @@ class WorkerLifecycleTests(unittest.TestCase):
 
     def test_unmanaged_job_cannot_be_treated_as_idle_or_safe(self):
         with tempfile.TemporaryDirectory() as temporary:
-            slurm = Slurm(["101|alice|unknown|/srv/qcl-negf/jobs/101"])
+            slurm = Slurm(["101|alice|unknown|/srv/qcl-negf/jobs/101|worker|RUNNING"])
             with self.assertRaisesRegex(ValueError, "descriptor"):
                 self.ops.shutdown_step("worker", Path(temporary), run=slurm)
+            self.assertEqual(slurm.paused, [])
+
+    def test_suspended_allocation_blocks_shutdown_instead_of_becoming_false_idle(self):
+        class StateFilteringSlurm(Slurm):
+            def __call__(self, args):
+                if args[0] == "squeue" and args[args.index("--states") + 1] != "all":
+                    return ""
+                return super().__call__(args)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            slurm = StateFilteringSlurm([job("101", "alice").replace("|RUNNING", "|SUSPENDED")])
+            with self.assertRaisesRegex(ValueError, "SUSPENDED"):
+                self.ops.shutdown_step("worker", Path(temporary), run=slurm)
+
+    def test_configuring_allocation_waits_for_stop_proof(self):
+        class StateFilteringSlurm(Slurm):
+            def __call__(self, args):
+                if args[0] == "squeue" and args[args.index("--states") + 1] != "all":
+                    return ""
+                return super().__call__(args)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            slurm = StateFilteringSlurm([job("101", "alice").replace("|RUNNING", "|CONFIGURING")])
+            self.assertFalse(self.ops.shutdown_step("worker", Path(temporary), run=slurm))
+            self.assertEqual(slurm.paused, ["execution-101"])
+
+    def test_terminal_and_unallocated_pending_records_do_not_require_new_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            slurm = Slurm([job("101", "alice").replace("|RUNNING", "|COMPLETED"),
+                           job("102", "bob").replace("|worker|RUNNING", "|(null)|PENDING")])
+            self.assertTrue(self.ops.shutdown_step("worker", Path(temporary), run=slurm))
             self.assertEqual(slurm.paused, [])
 
     def test_escaping_shared_directory_is_rejected_before_pause(self):

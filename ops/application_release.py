@@ -96,6 +96,17 @@ def bootstrap_selection(runtime, initial_solver, initial_label):
     return initial_solver, initial_label
 
 
+def solver_self_check(expected, run):
+    output = run(["timeout", "--kill-after=10s", "300s", "runuser", "-u", "qcl-negf", "--",
+                  "env", "JULIA_NUM_THREADS=1", "OPENBLAS_NUM_THREADS=1",
+                  expected["solver_executable"], "self-check"])
+    receipt = json.loads(output.strip().splitlines()[-1])
+    if (receipt.get("schema") != "qcl-negf-self-check-v1" or receipt.get("status") != "completed"
+            or receipt.get("scientific_accepted") is not False):
+        raise ValueError("Pinned solver execution self-check failed")
+    return receipt
+
+
 def check(manifest_value, *, profile=PROFILE, runtime=RUNTIME, role="worker", run=command):
     expected = manifest(manifest_value)
     current = load(Path(runtime) / "release.json")
@@ -104,7 +115,9 @@ def check(manifest_value, *, profile=PROFILE, runtime=RUNTIME, role="worker", ru
     run(["nix-store", "--verify-path", expected["application_path"],
          str(Path(expected["solver_executable"]).parents[1])])
     units = ["slurmd.service"] if role == "worker" else ["qcl-negf-aiida.service", "qcl-negf-api.service"]
-    run(["systemctl", "is-active", "--quiet", *units])
+    for unit in units:
+        run(["systemctl", "is-active", "--quiet", unit])
+    solver_self_check(expected, run)
     return current
 
 
@@ -148,9 +161,12 @@ def activate(manifest_value, *, profile=PROFILE, runtime=RUNTIME, role="worker",
     # Jobs still fail the ready+shared-admission guard until health succeeds.
     publish_json(record, {**identity, "ready": False})
     units = ["slurmd.service"] if role == "worker" else ["qcl-negf-aiida.service", "qcl-negf-api.service"]
-    if not same:
-        run(["systemctl", "restart", *units])
-    run(["systemctl", "is-active", "--quiet", *units])
+    # Fleet delivery quiesces the controller even on an identical retry.
+    # Reuse the immutable profile/Code, but ensure stopped units run again.
+    run(["systemctl", "start" if same else "restart", *units])
+    for unit in units:
+        run(["systemctl", "is-active", "--quiet", unit])
+    solver_self_check(expected, run)
     identity["ready"] = True
     publish_json(record, identity)
     return identity
@@ -192,7 +208,7 @@ def deliver_pool(manifest_value, nodes, gate=GATE, *, deliver, quiesce, admit=la
     for node in nodes:
         try:
             identity = deliver(node, expected)
-            if identity.get("ready") is not True or manifest(identity) != expected:
+            if not isinstance(identity, dict) or identity.get("ready") is not True or manifest(identity) != expected:
                 raise ValueError("Node verified a different release identity")
             report["nodes"][node] = {"status": "verified", "identity": identity}
         except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:

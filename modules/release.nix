@@ -11,7 +11,7 @@ let
   '';
   releaseCommand = pkgs.writeShellApplication {
     name = "qcl-negf-release";
-    runtimeInputs = [ pkgs.nix pkgs.systemd pkgs.slurm pkgs.openssh pkgs.util-linux pkgs.python314 ];
+    runtimeInputs = [ pkgs.nix pkgs.systemd pkgs.slurm pkgs.openssh pkgs.util-linux pkgs.coreutils pkgs.python314 ];
     text = ''exec python3 ${operations}/ops/application_release.py "$@"'';
   };
   lifecycleCommand = pkgs.writeShellApplication {

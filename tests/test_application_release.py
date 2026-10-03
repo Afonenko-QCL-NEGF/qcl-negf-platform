@@ -31,6 +31,9 @@ class Commands:
         if "register_aiida.py" in " ".join(args):
             return json.dumps({"code_uuid": self.registered,
                                "solver_executable": "/nix/store/solver/bin/qcl-negf"})
+        if "self-check" in args:
+            return json.dumps({"schema": "qcl-negf-self-check-v1", "status": "completed",
+                               "scientific_accepted": False})
         return ""
 
 
@@ -134,6 +137,15 @@ class ApplicationReleaseTests(unittest.TestCase):
             self.assertFalse(report["open"])
             self.assertEqual(report["nodes"]["worker"]["status"], "failed")
 
+    def test_malformed_remote_identity_is_reported_per_node(self):
+        for response in (None, []):
+            with self.subTest(response=response), tempfile.TemporaryDirectory() as temporary:
+                gate = Path(temporary) / "admission.json"
+                report = self.ops.deliver_pool(release(), ["worker"], gate, quiesce=lambda: None,
+                    deliver=lambda _n, _m: response)
+                self.assertFalse(report["open"])
+                self.assertEqual(report["nodes"]["worker"]["status"], "failed")
+
     def test_controller_activation_registers_immutable_code_before_ready_and_publishes_uuid(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -146,6 +158,71 @@ class ApplicationReleaseTests(unittest.TestCase):
             registration = next(call for call in commands.calls if call[0] == "runuser")
             self.assertIn("/nix/store/solver/bin/qcl-negf", registration)
             self.assertEqual(registration[-1], "qcl-negf-release-a")
+
+    def test_identical_controller_delivery_recovers_services_stopped_for_maintenance(self):
+        class StatefulCommands(Commands):
+            def __init__(self):
+                super().__init__()
+                self.active = set()
+
+            def __call__(self, args):
+                result = super().__call__(args)
+                if args[:2] in (["systemctl", "start"], ["systemctl", "restart"]):
+                    self.active.update(args[2:])
+                elif args[:2] == ["systemctl", "stop"]:
+                    self.active.difference_update(args[2:])
+                elif args[:3] == ["systemctl", "is-active", "--quiet"]:
+                    if not set(args[3:]) <= self.active:
+                        raise RuntimeError("controller services stopped")
+                return result
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root, commands = Path(temporary), StatefulCommands()
+            arguments = dict(profile=root / "profile", runtime=root / "runtime",
+                             role="controller", email="test@example.invalid", run=commands,
+                             allowed_codes_file=root / "code-uuid")
+            first = self.ops.activate(release(), **arguments)
+            commands(["systemctl", "stop", "qcl-negf-aiida.service", "qcl-negf-api.service"])
+            before = len([call for call in commands.calls if call[0] == "nix-env"])
+            self.assertEqual(self.ops.activate(release(), **arguments), first)
+            self.assertEqual(len([call for call in commands.calls if call[0] == "nix-env"]), before)
+
+    def test_one_failed_controller_unit_cannot_publish_ready(self):
+        class OrHealthCommands(Commands):
+            def __call__(self, args):
+                result = super().__call__(args)
+                if args[:3] == ["systemctl", "is-active", "--quiet"]:
+                    # Actual systemctl succeeds if ANY requested unit is active.
+                    if "qcl-negf-aiida.service" not in args[3:]:
+                        raise RuntimeError("required API unit inactive")
+                return result
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(RuntimeError, "API unit inactive"):
+                self.ops.activate(release(), profile=root / "profile", runtime=root / "runtime",
+                    role="controller", email="test@example.invalid", run=OrHealthCommands(),
+                    allowed_codes_file=root / "code-uuid")
+            self.assertIsNot(json.loads((root / "runtime/release.json").read_text()).get("ready"), True)
+
+    def test_failed_pinned_solver_self_check_cannot_publish_ready(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root, commands = Path(temporary), Commands()
+            commands.failure = "self-check"
+            with self.assertRaisesRegex(RuntimeError, "injected"):
+                self.ops.activate(release(), profile=root / "profile", runtime=root / "runtime",
+                                  role="worker", run=commands)
+            self.assertIsNot(json.loads((root / "runtime/release.json").read_text()).get("ready"), True)
+
+    def test_health_executes_pinned_solver_as_scientific_user_with_finite_budget(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root, commands = Path(temporary), Commands()
+            self.ops.activate(release(), profile=root / "profile", runtime=root / "runtime",
+                              role="worker", run=commands)
+            call = next(call for call in commands.calls if "self-check" in call)
+            self.assertEqual(call[:3], ["timeout", "--kill-after=10s", "300s"])
+            self.assertIn("qcl-negf", call)
+            self.assertEqual(call[-2:], ["/nix/store/solver/bin/qcl-negf", "self-check"])
 
     def test_failed_final_resume_leaves_admission_closed_with_node_report(self):
         with tempfile.TemporaryDirectory() as temporary:
