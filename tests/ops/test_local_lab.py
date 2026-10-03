@@ -270,3 +270,47 @@ def test_command_failure_records_status_and_cannot_be_pass(tmp_path):
         runner.run([lab.sys.executable, "-c", "raise SystemExit(7)"])
     event = json.loads((tmp_path / "commands.jsonl").read_text())
     assert event["returncode"] == 7 and "pass" not in event.values()
+
+
+def test_volume_table_preserves_path_spaces_and_accepts_empty_pool():
+    assert lab.parse_volume_table(" Name   Path\n----------------\n owned.qcow2   /pool with spaces/owned.qcow2\n") == [
+        ("owned.qcow2", "/pool with spaces/owned.qcow2")]
+    assert lab.parse_volume_table("Name Path\n---------\n") == []
+
+
+@pytest.mark.parametrize("row", ["foreign volume   /pool/foreign", "foreign  name   /pool/foreign",
+    "owned.qcow2   -", "unparseable", "owned.qcow2   /pool/owned\nowned.qcow2   /pool/other"])
+def test_volume_table_refuses_unknown_or_ambiguous_rows(row):
+    with pytest.raises(ValueError, match="volume table"):
+        lab.parse_volume_table("Name Path\n---------\n" + row)
+
+
+@pytest.mark.parametrize("foreign", [False, True])
+def test_volume_ownership_uses_supported_cli_and_checks_each_key_and_path(foreign):
+    calls = []
+    class Runner:
+        def run(self, argv, **kwargs):
+            calls.append(argv)
+            assert "--name" not in argv
+            operation = argv[3]
+            text = {"vol-list": " Name  Path\n-------------\n owned.qcow2   /pool with spaces/owned.qcow2\n" +
+                    (" foreign.qcow2   /pool/foreign.qcow2\n" if foreign else ""),
+                    "vol-key": "key-owned", "vol-path": "/pool with spaces/owned.qcow2"}[operation]
+            return subprocess.CompletedProcess(argv, 0, text, "")
+    cfg = config() | {"libvirt_uri": "qemu:///system"}
+    if foreign:
+        with pytest.raises(ValueError, match="foreign"):
+            lab.verify_pool_volumes(cfg, Runner(), "qcl-lab-pool", {"owned.qcow2": "key-owned"})
+    else:
+        lab.verify_pool_volumes(cfg, Runner(), "qcl-lab-pool", {"owned.qcow2": "key-owned"})
+    assert calls[0][-2:] == ["vol-list", "qcl-lab-pool"]
+
+
+def test_volume_table_cannot_disguise_foreign_spaced_name_as_owned_name():
+    class Runner:
+        def run(self, argv, **kwargs):
+            text = {"vol-list": "Name Path\n---------\nowned.qcow2  /fake name   /real/foreign\n",
+                    "vol-key": "owned-key", "vol-path": "/real/owned"}[argv[3]]
+            return subprocess.CompletedProcess(argv, 0, text, "")
+    with pytest.raises(ValueError, match="volume path"):
+        lab.verify_pool_volumes(config() | {"libvirt_uri": "qemu:///system"}, Runner(), "pool", {"owned.qcow2": "owned-key"})

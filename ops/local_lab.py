@@ -375,6 +375,34 @@ def measure_host(config, running, runner):
             "disk_free_bytes": shutil.disk_usage(disk).free, "disk_measurement_path": str(disk), "running": running}
 
 
+def parse_volume_table(output):
+    """Read virsh's Name/Path table without dropping unknown or ambiguous rows."""
+    lines = output.strip().splitlines()
+    require(len(lines) >= 2 and lines[0].split() == ["Name", "Path"] and
+            re.fullmatch(r"-+", lines[1].strip()), "Unrecognized virsh volume table header")
+    rows, names = [], set()
+    for line in lines[2:]:
+        # Managed names have no whitespace. Paths may contain spaces; checking
+        # vol-path below prevents a foreign spaced name masquerading as one.
+        match = re.fullmatch(r"\s*(\S+)\s{2,}(/.+?)\s*", line)
+        require(match is not None, "Unparseable virsh volume table row: " + line)
+        name, path = match.groups()
+        require(name not in names, "Duplicate virsh volume table name: " + name)
+        names.add(name)
+        rows.append((name, path))
+    return rows
+
+
+def verify_pool_volumes(config, runner, pool_name, tracked):
+    # vol-list has no --name option on supported installed virsh versions.
+    for name, path in parse_volume_table(virsh(config, runner, "vol-list", pool_name)):
+        require(name in tracked, "Refusing untracked/foreign pool volume: " + name)
+        key = virsh(config, runner, "vol-key", name, "--pool", pool_name)
+        require(tracked[name] == key, "Refusing untracked/foreign pool volume: " + name)
+        actual_path = virsh(config, runner, "vol-path", name, "--pool", pool_name)
+        require(actual_path == path, "Ambiguous or foreign volume path in virsh volume table: " + name)
+
+
 def preflight(directory, config, runner):
     require(sha256(Path(config["image"])) == config["image_sha256"], "Bootstrap image SHA256 mismatch")
     actual, running, sources = actual_inventory(config, runner)
@@ -388,9 +416,7 @@ def preflight(directory, config, runner):
         require(all(path.name in allowed and path.is_file() and not path.is_symlink() for path in pool.iterdir()),
                 "Pool directory contains untracked/foreign files")
     if pool_name in actual["pools"]:
-        for name in virsh(config, runner, "vol-list", pool_name, "--name").splitlines():
-            key = virsh(config, runner, "vol-key", name, "--pool", pool_name)
-            require(state["volumes"].get(name) == key, "Refusing untracked/foreign pool volume: " + name)
+        verify_pool_volumes(config, runner, pool_name, state["volumes"])
     network_name = config["namespace"] + "-network"
     owned_networks = {actual["networks"][network_name]} if network_name in actual["networks"] else set()
     check_overlaps(config["network_cidr"], sources, owned_networks)
