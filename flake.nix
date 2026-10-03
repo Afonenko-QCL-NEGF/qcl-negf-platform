@@ -46,8 +46,9 @@
         checkedRunner = import ./tests/infrastructure/runner-isolation.nix { nixpkgs = nixpkgs.outPath; };
         checkedRelease = import ./tests/infrastructure/application-release.nix { nixpkgs = nixpkgs.outPath; };
         checkedLocalLab = import ./tests/infrastructure/local-lab.nix { inherit nixpkgs; platform = self; };
+        checkedSlurmNetwork = import ./tests/infrastructure/slurm-network.nix { inherit nixpkgs; platform = self; };
         checkedMonitoring = import ./tests/infrastructure/monitoring.nix { nixpkgs = nixpkgs.outPath; };
-      in builtins.deepSeq [ checked checkedMunge checkedBuilder checkedRunner checkedRelease checkedMonitoring checkedLocalLab ] (pkgs.runCommand "qcl-negf-infrastructure-check" {} "touch $out");
+      in builtins.deepSeq [ checked checkedMunge checkedBuilder checkedRunner checkedRelease checkedMonitoring checkedLocalLab checkedSlurmNetwork ] (pkgs.runCommand "qcl-negf-infrastructure-check" {} "touch $out");
       slurm-vm = import ./tests/slurm-vm.nix { inherit pkgs; module = self.nixosModules.default; };
       operations = pkgs.runCommand "qcl-negf-operations-check" { nativeBuildInputs = [ pkgs.deno (pkgs.python314.withPackages (ps: [ ps.pytest ])) ]; } ''
         cp -r ${./.} source

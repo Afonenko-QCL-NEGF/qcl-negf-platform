@@ -7,6 +7,19 @@ consistently and set each role's private interface accordingly. Slurm and NFS po
 network. Scientific nodes share the `qclNegf.uid` identity, default 3000; reserve it before
 installation and verify shared file ownership. CI has a separate subnet and no scientific mounts.
 
+`srun` also needs incoming worker callbacks for launch and I/O, beyond the daemon
+ports 6817/6818. `qclNegf.cluster.srunPortRange` defaults to
+`{ from = 60001; to = 60128; }`, emitted into Slurm configuration and opened only
+on `qclNegf.privateInterface` for active cluster roles. Use the same range on
+controller, submit hosts and workers; a worker may start `srun` inside a batch
+allocation. Keep at least five ports and size for concurrent steps: up to 48
+hosts use four listeners per `srun`, plus one for `--pty`.
+See the [Slurm network guide](https://slurm.schedmd.com/network.html) and
+[SrunPortRange](https://slurm.schedmd.com/slurm.conf.html#OPT_SrunPortRange).
+An `sbatch` script that invokes one executable directly does not exercise this
+callback path. Check an owned bounded `srun hostname` separately after activating
+the matching role configurations; successful batch jobs do not prove it.
+
 Provision one random Munge key to `qclNegf.cluster.mungeKeyFile` on the controller and workers,
 owned by `munge:munge`, mode 0400. Use a runtime string path such as `/run/secrets/munge.key`; a Nix
 path literal copies the secret into the store. The site's secret manager must restore persistent

@@ -9,6 +9,16 @@ in {
     controllerHost = lib.mkOption { type = lib.types.str; default = "control"; description = "Resolvable short hostname of Slurm controller."; };
     nodes = lib.mkOption { type = lib.types.listOf lib.types.str; default = []; description = "Slurm NodeName lines, including measured CPU and RAM limits."; };
     partitions = lib.mkOption { type = lib.types.listOf lib.types.str; default = []; description = "Slurm PartitionName lines."; };
+    srunPortRange = lib.mkOption {
+      type = lib.types.submodule {
+        options = {
+          from = lib.mkOption { type = lib.types.port; };
+          to = lib.mkOption { type = lib.types.port; };
+        };
+      };
+      default = { from = 60001; to = 60128; };
+      description = "Bounded TCP callback listeners for srun on the private cluster interface. Use the same range on every role; allow at least five ports and size for concurrent steps (four ports per srun up to 48 hosts, one extra with --pty).";
+    };
     mungeKeyFile = lib.mkOption { type = lib.types.str; default = "/run/secrets/munge.key"; description = "Runtime path to identical Munge key, owned by munge, mode0400; never a Nix path literal."; };
     jobDirectory = lib.mkOption { type = lib.types.str; default = "/srv/qcl-negf/jobs"; description = "Shared Slurm working directory; identical absolute path on all nodes."; };
     storageHost = lib.mkOption { type = lib.types.str; default = "storage"; description = "Dedicated primary NFS server reachable on the cluster network."; };
@@ -23,6 +33,8 @@ in {
         { assertion = cfg.nodes != []; message = "Supply measured Slurm node resources."; }
         { assertion = cfg.partitions != []; message = "Declare a Slurm partition."; }
         { assertion = lib.hasPrefix "/" cfg.mungeKeyFile && !(lib.hasPrefix "/nix/store/" cfg.mungeKeyFile); message = "Munge secret must be a runtime absolute path outside the store."; }
+        { assertion = cfg.srunPortRange.from >= 1024 && cfg.srunPortRange.to - cfg.srunPortRange.from >= 4; message = "srun requires at least five unprivileged callback ports in ascending order."; }
+        { assertion = cfg.srunPortRange.to < 6817 || cfg.srunPortRange.from > 6818; message = "srun callback ports must not overlap Slurm daemon ports 6817/6818."; }
       ];
       services.munge.password = cfg.mungeKeyFile;
       systemd.services.munged = {
@@ -43,6 +55,7 @@ in {
           AuthType=auth/munge
           SlurmctldPort=6817
           SlurmdPort=6818
+          SrunPortRange=${toString cfg.srunPortRange.from}-${toString cfg.srunPortRange.to}
           SelectType=select/cons_tres
           SelectTypeParameters=CR_Core_Memory
           SchedulerType=sched/backfill
@@ -65,8 +78,12 @@ in {
         OPENBLAS_NUM_THREADS = "1"; OMP_NUM_THREADS = "1"; MKL_NUM_THREADS = "1";
       };
       environment.systemPackages = lib.optional (cfg.solverPackage != null) cfg.solverPackage;
-      networking.firewall.interfaces.${config.qclNegf.privateInterface}.allowedTCPPorts =
-        lib.optional cfg.controller 6817 ++ lib.optional cfg.worker 6818;
+      # slurmstepd connects back to srun, including steps started inside a batch
+      # allocation on a worker. No public/global or ephemeral-range opening.
+      networking.firewall.interfaces.${config.qclNegf.privateInterface} = {
+        allowedTCPPorts = lib.optional cfg.controller 6817 ++ lib.optional cfg.worker 6818;
+        allowedTCPPortRanges = [ cfg.srunPortRange ];
+      };
     })
     (lib.mkIf active {
       fileSystems.${cfg.jobDirectory} = {

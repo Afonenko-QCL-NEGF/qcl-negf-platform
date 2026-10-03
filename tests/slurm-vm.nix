@@ -43,6 +43,8 @@ pkgs.testers.runNixOSTest {
     control.succeed("su -s /bin/sh qcl-negf -c 'cd /srv/qcl-negf/jobs && sbatch --wait --output=smoke.txt --wrap=hostname'")
     control.succeed("su -s /bin/sh qcl-negf -c 'grep -Fx worker /srv/qcl-negf/jobs/smoke.txt'")
     storage.succeed("test $(stat -c %u /srv/qcl-negf/jobs/smoke.txt) = 3000")
+    # Interactive steps require worker->srun callbacks in addition to sbatch RPC.
+    assert control.succeed("su -s /bin/sh qcl-negf -c 'cd /srv/qcl-negf/jobs && timeout 90s srun --nodes=1 --ntasks=1 --cpus-per-task=1 --mem=128M --time=00:01:00 hostname'").strip() == "worker"
     worker.succeed("su -s /bin/sh qcl-negf -c 'touch /scratch/qcl-negf/local-only'")
     control.fail("test -e /srv/qcl-negf/jobs/local-only")
     storage.succeed("findmnt -n -o SOURCE /srv/qcl-negf | grep -v '/dev/vda'")
