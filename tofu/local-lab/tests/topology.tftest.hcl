@@ -26,6 +26,10 @@ run "four_roles_and_separate_disks" {
     condition     = alltrue([for m in libvirt_domain.machine : startswith(m.name, "qcl-test-") && m.type == "kvm"])
     error_message = "Only namespaced KVM domains belong to this lab."
   }
+  assert {
+    condition     = alltrue([for m in libvirt_domain.machine : m.devices.serials[0].source == null && m.devices.consoles[0].source == null])
+    error_message = "Host-allocated PTY sources must not be pinned to empty paths."
+  }
 }
 run "reject_unverified_ownership" {
   command = plan

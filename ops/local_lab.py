@@ -150,8 +150,11 @@ def read_state(path):
             continue
         for instance in resource.get("instances", []):
             attributes = instance.get("attributes", {})
-            if attributes.get("id") and attributes.get("name"):
-                result[mapping[resource["type"]]][attributes["name"]] = attributes["id"]
+            # Provider0.9's domain id is a numeric runtime handle, which changes
+            # after a restart. Its uuid is the persistent ownership identity.
+            identity = attributes.get("uuid" if resource["type"] == "libvirt_domain" else "id")
+            if identity and attributes.get("name"):
+                result[mapping[resource["type"]]][attributes["name"]] = identity
     return result
 
 
@@ -268,6 +271,14 @@ def create_seeds(config, private, runner):
                         *(source / name for name in payloads)])
 
 
+def sync_module(destination):
+    """Refresh declarative inputs only; preserve local state, plans and secrets."""
+    destination.mkdir(mode=0o700, exist_ok=True)
+    for source in (ROOT / "tofu/local-lab").iterdir():
+        if source.suffix == ".tf" or source.name == ".terraform.lock.hcl":
+            shutil.copyfile(source, destination / source.name)
+
+
 def prepare(args, runner):
     private = args.directory / "private"
     private.mkdir(mode=0o700, exist_ok=True)
@@ -298,7 +309,7 @@ def prepare(args, runner):
     write_json(existing, config)
     create_seeds(config, private, runner)
     tofu = args.directory / "tofu"
-    tofu.mkdir(mode=0o700, exist_ok=True)
+    sync_module(tofu)
     write_json(tofu / "lab.auto.tfvars.json", provider_vars(config, private))
     result = {"status": "prepared", "directory": str(args.directory), "image_sha256": config["image_sha256"],
               "machines": machines(config), "source": config["source"], "vm_execution": "not_measured"}
@@ -394,10 +405,7 @@ def apply(directory, runner, operation_timeout):
     config = load_config(directory)
     preflight(directory, config, runner)
     tofu = directory / "tofu"
-    tofu.mkdir(mode=0o700, exist_ok=True)
-    for source in (ROOT / "tofu/local-lab").iterdir():
-        if source.suffix == ".tf" or source.name == ".terraform.lock.hcl":
-            shutil.copyfile(source, tofu / source.name)
+    sync_module(tofu)
     values = provider_vars(config, directory / "private")
     values["ownership_verified"] = True
     write_json(tofu / "lab.auto.tfvars.json", values)

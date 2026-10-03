@@ -80,11 +80,45 @@ def test_network_overlap_ignores_only_proven_owned_bridge():
 def test_tfstate_is_authority_for_each_domain_and_network_uuid(tmp_path):
     state = tmp_path / "terraform.tfstate"
     state.write_text(json.dumps({"resources": [{"type": "libvirt_domain", "instances": [
-        {"attributes": {"name": "qcl-lab-control", "id": "uuid-a"}}]},
+        {"attributes": {"name": "qcl-lab-control", "id": 1, "uuid": "uuid-a"}}]},
         {"type": "libvirt_network", "instances": [{"attributes": {"name": "qcl-lab-network", "id": "uuid-n"}}]}]}))
     tracked = lab.read_state(state)
     assert tracked["domains"] == {"qcl-lab-control": "uuid-a"}
     assert tracked["networks"] == {"qcl-lab-network": "uuid-n"}
+
+
+def test_tainted_partial_domain_state_uses_persistent_uuid_not_numeric_runtime_id(tmp_path):
+    state = tmp_path / "terraform.tfstate"
+    uuid = "493b2d7b-8140-41b7-9610-42a2b2695fee"
+    actual = {"domains": {"qcl-lab-control": uuid}, "networks": {}, "pools": {}}
+    for runtime_id in (1, 999, None):
+        state.write_text(json.dumps({"resources": [{"type": "libvirt_domain", "instances": [
+            {"status": "tainted", "attributes": {"name": "qcl-lab-control", "id": runtime_id, "uuid": uuid}}]}]}))
+        assert lab.verify_ownership(config(), actual, lab.read_state(state)) == {"qcl-lab-control"}
+    actual["domains"]["qcl-lab-control"] = "80a93f19-da34-4feb-a402-bfd4f1ee8ad9"
+    with pytest.raises(ValueError, match="foreign"):
+        lab.verify_ownership(config(), actual, lab.read_state(state))
+
+
+def test_numeric_domain_id_cannot_establish_ownership_without_uuid(tmp_path):
+    state = tmp_path / "terraform.tfstate"
+    state.write_text(json.dumps({"resources": [{"type": "libvirt_domain", "instances": [
+        {"attributes": {"name": "qcl-lab-control", "id": 1}}]}]}))
+    assert "qcl-lab-control" not in lab.read_state(state)["domains"]
+
+
+def test_module_sync_preserves_existing_private_state_and_keys(tmp_path):
+    destination = tmp_path / "tofu"
+    destination.mkdir()
+    state = destination / "terraform.tfstate"
+    state.write_bytes(b"existing partial state")
+    keys = tmp_path / "private"
+    keys.mkdir()
+    (keys / "munge.key").write_bytes(b"preserve private key")
+    lab.sync_module(destination)
+    assert state.read_bytes() == b"existing partial state"
+    assert (keys / "munge.key").read_bytes() == b"preserve private key"
+    assert (destination / "main.tf").read_bytes() == (lab.ROOT / "tofu/local-lab/main.tf").read_bytes()
 
 
 def test_existing_private_keys_are_preserved_and_never_enter_provider_vars(tmp_path):

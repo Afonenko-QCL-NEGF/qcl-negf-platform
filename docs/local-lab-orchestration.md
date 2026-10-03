@@ -44,11 +44,21 @@ Sparse capacities 24 GiB root / 8 GiB durable не являются резерв
 свободного места или гарантией достаточного бюджета будущего solver.
 
 Actual domain/network/pool UUID должны совпадать с именем и ID из exact
-`tofu/terraform.tfstate`. Это позволяет восстановить partial apply лишь для
+`tofu/terraform.tfstate`: для domain используется `attributes.uuid`, для
+network/pool — `attributes.id`. Числовой domain `id` в provider0.9 — runtime
+handle, меняющийся после restart, и не доказывает владение. Это позволяет
+восстановить partial apply лишь для
 ресурсов, уже отражённых в state. Чужой совпавший namespace, pool path,
 untracked volume/file или перекрывающий host/libvirt subnet останавливает
 apply. Owned bridge исключается из overlap лишь для своего точного /24.
 `ownership_verified=true` записывается после фактического preflight.
+Serial/console source paths назначает libvirt; конфигурация задаёт только
+guest target. После provider consistency error tainted domain остаётся
+owned лишь при совпадении persistent UUID. CLI не снимает taint автоматически:
+оператор отдельно проверяет XML, state и отсутствие активных jobs, прежде чем
+снять taint. Saved plan всё равно должен содержать только неразрушительные
+действия. Повторный prepare синхронизирует декларативные module files в private
+`tofu/`, сохраняя state и ключи.
 Module копируется в private `tofu/`, затем выполняются init, saved plan и
 apply; планы с delete/replacement отклоняются. После apply сохраняется
 `private/ownership.json` с actual UUID и state IDs. Нет автоматического destroy,

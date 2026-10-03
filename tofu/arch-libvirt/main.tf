@@ -66,8 +66,9 @@ resource "libvirt_domain" "worker" {
       { device = "cdrom", source = { file = { file = libvirt_volume.seed.path } }, target = { dev = "sda", bus = "sata" }, read_only = true }
     ]
     interfaces = [{ model = { type = "virtio" }, mac = { address = var.mac }, source = { bridge = { bridge = var.bridge } } }]
-    serials    = [{ source = { pty = {} }, target = { port = 0 } }]
-    consoles   = [{ source = { pty = {} }, target = { type = "serial", port = 0 } }]
-    channels   = [{ source = { unix = { mode = "bind" } }, target = { virt_io = { name = "org.qemu.guest_agent.0" } } }]
+    # Libvirt allocates PTY source paths; only the guest target is declarative.
+    serials  = [{ target = { port = 0 } }]
+    consoles = [{ target = { type = "serial", port = 0 } }]
+    channels = [{ source = { unix = { mode = "bind" } }, target = { virt_io = { name = "org.qemu.guest_agent.0" } } }]
   }
 }

@@ -91,7 +91,8 @@ resource "libvirt_domain" "machine" {
       { device = "cdrom", driver = { name = "qemu", type = "raw" }, source = { file = { file = libvirt_volume.seed[each.key].path } }, target = { dev = "hda", bus = "ide" }, read_only = true }
     ]
     interfaces = [{ model = { type = "virtio" }, mac = { address = local.macs[each.key] }, source = { network = { network = libvirt_network.lab.name } } }]
-    serials    = [{ source = { pty = { path = "" } }, target = { port = 0 } }]
-    consoles   = [{ source = { pty = { path = "" } }, target = { type = "serial", port = 0 } }]
+    # Libvirt allocates PTY source paths; only the guest target is declarative.
+    serials  = [{ target = { port = 0 } }]
+    consoles = [{ target = { type = "serial", port = 0 } }]
   }
 }
