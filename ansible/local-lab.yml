@@ -27,9 +27,43 @@
           - qcl_lab_system is match('^/nix/store/[a-z0-9]{32}-nixos-system-')
           - qcl_lab_role in ['control', 'storage', 'worker-1', 'worker-2']
           - ansible_user | default('root') == 'root'
+      tags: [nix-trust]
     - name: Wait for SSH using the caller's verified known hosts
       ansible.builtin.wait_for_connection:
         timeout: 240
+      tags: [nix-trust]
+    - name: Configure optional public Nix cache trust
+      when: qcl_lab_nix_public_key_file is defined
+      tags: [nix-trust]
+      block:
+        - name: Read only the caller's declared public cache key
+          ansible.builtin.set_fact:
+            qcl_lab_nix_public_key: "{{ lookup('ansible.builtin.file', qcl_lab_nix_public_key_file) | trim }}"
+          no_log: true
+        - name: Refuse private, malformed or noncanonical cache keys
+          ansible.builtin.assert:
+            that:
+              - qcl_lab_nix_public_key is match('^[A-Za-z0-9][A-Za-z0-9._-]{0,127}:[A-Za-z0-9+/]{43}=$')
+              - (qcl_lab_nix_public_key.split(':')[1] | b64decode(encoding='latin-1') | length) == 32
+              - (qcl_lab_nix_public_key.split(':')[1] | b64decode(encoding='latin-1') | b64encode(encoding='latin-1')) == qcl_lab_nix_public_key.split(':')[1]
+          no_log: true
+        - name: Create root's private Nix configuration directory
+          ansible.builtin.file:
+            path: /root/.config/nix
+            state: directory
+            owner: root
+            group: root
+            mode: '0700'
+        - name: Retain other Nix settings and add the declared public trust block
+          ansible.builtin.blockinfile:
+            path: /root/.config/nix/nix.conf
+            create: true
+            owner: root
+            group: root
+            mode: '0600'
+            marker: '# {mark} qcl-local-lab trusted cache key'
+            block: "extra-trusted-public-keys = {{ qcl_lab_nix_public_key }}\n"
+          no_log: true
     - name: Confirm role closure was included in the common image
       ansible.builtin.stat:
         path: "{{ qcl_lab_system }}/bin/switch-to-configuration"

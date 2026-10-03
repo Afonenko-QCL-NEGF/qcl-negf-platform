@@ -1,5 +1,6 @@
 """Host admission and ownership checks; these tests never launch a VM."""
 import importlib.util
+import base64
 import json
 from pathlib import Path
 import subprocess
@@ -196,6 +197,91 @@ def test_inventory_enrolls_once_then_uses_strict_hosts_and_local_python(tmp_path
     calls.clear()
     lab.inventory(tmp_path, Runner(), enroll=True)
     assert all("StrictHostKeyChecking=yes" in command for command in calls if command[0] == "ssh")
+
+
+@pytest.fixture
+def trust_inventory(tmp_path, monkeypatch):
+    cfg = config() | {"systems": {role: "/nix/store/system-" + role for role in lab.ROLES},
+                      "libvirt_uri": "qemu:///system"}
+    expected = lab.machines(cfg)
+    actual = {"domains": {m["domain"]: "uuid-" + role for role, m in expected.items()},
+              "networks": {}, "pools": {}}
+    monkeypatch.setattr(lab, "load_config", lambda directory: cfg)
+    monkeypatch.setattr(lab, "read_state", lambda path: actual | {"volumes": {}})
+    monkeypatch.setattr(lab, "actual_inventory", lambda *args: (actual, {}, []))
+    monkeypatch.setattr(lab, "source_identity", lambda: {"commit": "test"})
+    (tmp_path / "private").mkdir()
+    calls = []
+    class Runner:
+        def run(self, argv, **kwargs):
+            calls.append([str(a) for a in argv])
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"inventory": {"value": expected}}), "")
+    return Runner(), calls, actual
+
+
+def test_public_nix_key_is_optional_inventory_input_only(tmp_path, trust_inventory):
+    runner, calls, actual = trust_inventory
+    public = tmp_path / "private/nix-cache-public.key"
+    value = "qcl-test-1:" + base64.b64encode(bytes(range(32))).decode()
+    public.write_text(value + "\n")
+    result = lab.inventory(tmp_path, runner, enroll=True)
+    assert result["all"]["vars"]["qcl_lab_nix_public_key_file"] == str(public)
+    assert value not in json.dumps(result)
+    assert "trusted-users" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("value", [
+    "qcl-test-1:" + base64.b64encode(bytes(range(64))).decode(),
+    "bad name:" + base64.b64encode(bytes(range(32))).decode(),
+    "qcl-test-1:" + base64.b64encode(bytes(range(32))).decode() + "\nrequire-sigs = false",
+    "qcl-test-1:" + base64.b64encode(bytes(range(31))).decode(),
+    "qcl-test-1:" + base64.b64encode(bytes(range(32))).decode()[:-2] + "9=",
+])
+def test_inventory_refuses_private_or_invalid_nix_key_before_ssh(tmp_path, trust_inventory, value):
+    runner, calls, actual = trust_inventory
+    (tmp_path / "private/nix-cache-public.key").write_text(value + "\n")
+    with pytest.raises(ValueError, match="public"):
+        lab.inventory(tmp_path, runner, enroll=True)
+    assert not any(command[0] == "ssh" for command in calls)
+
+
+def test_trust_uses_guarded_enrollment_then_only_the_tagged_playbook(tmp_path, trust_inventory):
+    runner, calls, actual = trust_inventory
+    public = tmp_path / "private/nix-cache-public.key"
+    public.write_text("qcl-test-1:" + base64.b64encode(bytes(range(32))).decode() + "\n")
+    result = lab.trust(tmp_path, runner, 17)
+    assert result["signed_import"] == "not_measured" and result["role_activation"] == "not_performed"
+    assert calls[-1] == ["ansible-playbook", "-i", str(tmp_path / "private/inventory.json"),
+                         str(lab.ROOT / "ansible/local-lab.yml"), "--tags", "nix-trust"]
+    assert len([call for call in calls if call[0] == "ssh"]) == 4
+    calls.clear()
+    lab.trust(tmp_path, runner, 17)
+    assert all("StrictHostKeyChecking=yes" in call for call in calls if call[0] == "ssh")
+
+
+def test_trust_refuses_uuid_collision_before_ssh_or_playbook(tmp_path, trust_inventory, monkeypatch):
+    runner, calls, actual = trust_inventory
+    (tmp_path / "private/nix-cache-public.key").write_text(
+        "qcl-test-1:" + base64.b64encode(bytes(range(32))).decode() + "\n")
+    monkeypatch.setattr(lab, "read_state", lambda path: {"domains": {}, "networks": {}, "pools": {}})
+    with pytest.raises(ValueError, match="foreign"):
+        lab.trust(tmp_path, runner, 17)
+    assert not any(call[0] in ("ssh", "ansible-playbook") for call in calls)
+
+
+def test_trust_requires_declared_public_key_before_inventory(tmp_path, monkeypatch):
+    monkeypatch.setattr(lab, "inventory", lambda *a, **kw: pytest.fail("inventory before public key"))
+    with pytest.raises(ValueError, match="public"):
+        lab.trust(tmp_path, None, 17)
+
+
+def test_inventory_rejects_indirect_public_key_file(tmp_path, trust_inventory):
+    runner, calls, actual = trust_inventory
+    target = tmp_path / "valid-public.key"
+    target.write_text("qcl-test-1:" + base64.b64encode(bytes(range(32))).decode() + "\n")
+    (tmp_path / "private/nix-cache-public.key").symlink_to(target)
+    with pytest.raises(ValueError, match="regular Nix public"):
+        lab.inventory(tmp_path, runner, enroll=True)
 
 
 def test_apply_refuses_destructive_plan_before_provider_mutation(tmp_path, monkeypatch):

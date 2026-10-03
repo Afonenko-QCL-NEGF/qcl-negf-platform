@@ -6,6 +6,8 @@ all:
     ansible_ssh_common_args: '-o StrictHostKeyChecking=yes -o UserKnownHostsFile=/absolute/private/lab/known_hosts'
     qcl_lab_namespace: qcl-local
     qcl_lab_munge_key_file: /absolute/private/lab/munge.key
+    # Optional, public key only; sign closures separately outside Git/store.
+    # qcl_lab_nix_public_key_file: /absolute/private/lab/nix-cache-public.key
   children:
     local_lab:
       hosts:

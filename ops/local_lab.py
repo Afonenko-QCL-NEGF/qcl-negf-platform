@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import hashlib
 import ipaddress
@@ -461,8 +462,29 @@ def ssh_command(directory, ip, *, enrolling=False):
             "-o", "StrictHostKeyChecking=" + ("accept-new" if enrolling else "yes"), "root@" + ip]
 
 
+def public_nix_key(path):
+    """Accept a single canonical Ed25519 public key, never a signing key."""
+    require(path.is_file() and not path.is_symlink(), "Require a regular Nix public key file")
+    raw = path.read_bytes()
+    require(len(raw) <= 1024, "Invalid Nix public key")
+    try:
+        value = raw.decode("ascii").strip()
+    except UnicodeError:
+        raise ValueError("Invalid Nix public key") from None
+    require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}:[A-Za-z0-9+/]{43}=", value),
+            "Require name:base64 Nix public key, not a private signing key")
+    encoded = value.split(":", 1)[1]
+    decoded = base64.b64decode(encoded, validate=True)
+    require(len(decoded) == 32 and base64.b64encode(decoded).decode() == encoded,
+            "Require canonical 32-byte Nix public key")
+    return value
+
+
 def inventory(directory, runner, *, enroll=False):
     config = load_config(directory)
+    nix_public = directory / "private/nix-cache-public.key"
+    if nix_public.exists() or nix_public.is_symlink():
+        public_nix_key(nix_public)
     output = json.loads(runner.run(["tofu", "-chdir=" + str(directory / "tofu"), "output", "-json"]).stdout)
     observed = output["inventory"]["value"]
     require(set(observed) == set(ROLES), "Actual Tofu output must cover four roles")
@@ -491,6 +513,8 @@ def inventory(directory, runner, *, enroll=False):
                  "qcl_lab_munge_key_file": str(private / "munge.key")}
     if (private / "api-token").exists():
         variables["qcl_lab_api_token_file"] = str(private / "api-token")
+    if nix_public.exists():
+        variables["qcl_lab_nix_public_key_file"] = str(nix_public)
     result = {"all": {"vars": variables, "children": {"local_lab": {"hosts": {
         role: {"ansible_host": machine["ip"], "qcl_lab_role": role, "qcl_lab_system": config["systems"][role]}
         for role, machine in observed.items()}}, "orchestrator": {"hosts": {
@@ -506,6 +530,18 @@ def bootstrap(directory, runner, operation_timeout):
     runner.run(["ansible-playbook", "-i", directory / "private/inventory.json", ROOT / "ansible/local-lab.yml"], timeout=operation_timeout)
     result = {"status": "pass", "source": source_identity(), "systems": load_config(directory)["systems"]}
     write_json(directory / "private/bootstrap-evidence.json", result)
+    return result
+
+
+def trust(directory, runner, operation_timeout):
+    public = directory / "private/nix-cache-public.key"
+    public_nix_key(public)
+    inventory(directory, runner, enroll=True)
+    runner.run(["ansible-playbook", "-i", directory / "private/inventory.json",
+                ROOT / "ansible/local-lab.yml", "--tags", "nix-trust"], timeout=operation_timeout)
+    result = {"status": "pass", "source": source_identity(), "public_key_sha256": sha256(public),
+              "signed_import": "not_measured", "role_activation": "not_performed"}
+    write_json(directory / "private/nix-trust-evidence.json", result)
     return result
 
 
@@ -665,7 +701,7 @@ def probe(directory, runner):
 def main(arguments=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("prepare", "apply", "inventory", "bootstrap", "probe"):
+    for name in ("prepare", "apply", "inventory", "bootstrap", "trust", "probe"):
         command = commands.add_parser(name)
         command.add_argument("--directory", type=Path, required=True)
         command.add_argument("--timeout", type=int, default=300)
@@ -696,6 +732,8 @@ def main(arguments=None):
         result = inventory(args.directory, runner, enroll=args.enroll)
     elif args.command == "bootstrap":
         result = bootstrap(args.directory, runner, args.operation_timeout)
+    elif args.command == "trust":
+        result = trust(args.directory, runner, args.operation_timeout)
     else:
         result = probe(args.directory, runner)
     print(json.dumps(result, ensure_ascii=False))

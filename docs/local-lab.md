@@ -99,6 +99,45 @@ export disk512 MiB; `site.api` может задавать подходящие 
 Application stage closures можно `nix copy` отдельно перед
 повторным Ansible; не требуется импортировать новый защищённый backing image.
 
+### Подписанный импорт до смены application роли
+
+Private caller может положить **публичный** Nix cache key в
+`private/nix-cache-public.key`. Helper проверяет single canonical
+`name:base64` Ed25519 public key (44 base64 символа, decoded32 bytes), отвергает
+private signing key, malformed/noncanonical data и symlink. Private signing key
+остаётся у подписывающего caller вне Git, Nix store, OpenTofu и guest inventory.
+Inventory содержит только optional путь `qcl_lab_nix_public_key_file`.
+
+После решения оператора доверять этому ключу на четырёх owned lab VM выполните:
+
+```sh
+python3 ops/local_lab.py trust --directory /absolute/ignored/lab \
+  --timeout 300 --operation-timeout 300
+```
+
+Команда сверяет actual libvirt UUIDs со state всех четырёх domains и использует
+existing SSH enrollment/strict known_hosts, затем запускает только
+`ansible/local-lab.yml --tags nix-trust`. Closure presence, Munge provisioning и
+role switch не исполняются этой командой: доверие нужно до signed `nix copy`.
+Full bootstrap содержит те же optional tasks перед closure presence check.
+
+Managed block в `/root/.config/nix/nix.conf`:
+
+```text
+# BEGIN qcl-local-lab trusted cache key
+extra-trusted-public-keys = CACHE_NAME:PUBLIC_BASE64
+# END qcl-local-lab trusted cache key
+```
+
+Directory mode0700, file root:root0600; другие existing settings сохраняются.
+`require-sigs` и `trusted-users` helper не меняет. `trust` receipt подтверждает
+только исполнение tagged provisioning; signature acceptance требует отдельного
+измеренного signed import. Это root-client bootstrap trust, не изменение
+NixOS daemon configuration или production cache policy. Provisioning нового
+trust key меняет границу доверия и требует явного решения оператора.
+Назначение public trust key и проверки signatures описано в
+[Nix configuration reference](https://nix.dev/manual/nix/2.31/command-ref/conf-file.html#conf-trusted-public-keys).
+
 ### Первый application handoff
 
 На platform-only гостях release command ещё может отсутствовать. До смены ролей
