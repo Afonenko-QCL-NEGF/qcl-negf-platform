@@ -70,7 +70,9 @@ resource "libvirt_volume" "seed" {
   for_each = local.machines
   name     = "${var.namespace}-${each.key}-cidata.iso"
   pool     = libvirt_pool.lab.name
-  target   = { format = { type = "raw" } }
+  # Libvirt probes uploaded NoCloud media as ISO. Declaring raw here creates
+  # perpetual format drift; provider0.9 cannot update an existing volume.
+  target   = { format = { type = "iso" } }
   create   = { content = { url = abspath(var.seed_images[each.key]) } }
 }
 resource "libvirt_domain" "machine" {
