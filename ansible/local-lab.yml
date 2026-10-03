@@ -75,6 +75,23 @@
         argv: [readlink, -f, /nix/var/nix/profiles/system]
       register: qcl_lab_boot
       changed_when: false
+    # Switching from the common image updates /etc/hostname, but can preserve
+    # its transient kernel hostname. Slurm requires the role before activation.
+    - name: Inspect the current kernel hostname
+      ansible.builtin.command:
+        argv: [hostname]
+      register: qcl_lab_hostname
+      changed_when: false
+    - name: Select the role's transient hostname before cluster activation
+      ansible.builtin.command:
+        argv: [hostname, "{{ qcl_lab_role }}"]
+      when: qcl_lab_hostname.stdout != qcl_lab_role
+    - name: Confirm the kernel hostname matches the inventory role
+      ansible.builtin.command:
+        argv: [hostname]
+      register: qcl_lab_hostname_after
+      changed_when: false
+      failed_when: qcl_lab_hostname_after.stdout != qcl_lab_role
     - name: Select the exact boot closure
       ansible.builtin.command:
         argv: [nix-env, --profile, /nix/var/nix/profiles/system, --set, "{{ qcl_lab_system }}"]
