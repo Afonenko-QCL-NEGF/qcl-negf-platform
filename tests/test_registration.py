@@ -93,6 +93,13 @@ def adapter():
 
 
 class RegistrationTests(unittest.TestCase):
+    def test_mutable_solver_path_is_rejected_before_any_provenance_object_is_stored(self):
+        orm, manager, stored, _failure = adapter()
+        with self.assertRaisesRegex(ValueError, "immutable"):
+            registration.reconcile(orm, manager, "research@example.org",
+                                   "/nix/var/nix/profiles/solver/bin/qcl-negf", "qcl-negf")
+        self.assertEqual(stored, {"users": {}, "computers": [], "codes": []})
+
     def test_retry_after_auth_failure_reuses_both_uuid_and_completes_configuration(self):
         orm, manager, stored, failure = adapter()
         failure["configure"] = True

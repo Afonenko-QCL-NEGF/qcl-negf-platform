@@ -1,11 +1,13 @@
 { config, lib, pkgs, ... }:
 let cfg = config.qclNegf.application;
+    applicationProfile = "/nix/var/nix/profiles/qcl-negf-application";
     bootstrapUnits = lib.optional cfg.bootstrap.enable "qcl-negf-bootstrap.service";
     operations = pkgs.runCommand "qcl-negf-bootstrap-operations" {} ''
       mkdir -p "$out/ops"
       cp ${../ops/bootstrap.ts} "$out/ops/bootstrap.ts"
       cp ${../ops/plan.ts} "$out/ops/plan.ts"
       cp ${../ops/register_aiida.py} "$out/ops/register_aiida.py"
+      cp ${../ops/application_release.py} "$out/ops/application_release.py"
     '';
     apiStart = pkgs.writeShellScript "qcl-negf-api-start" ''
       set -eu
@@ -13,7 +15,7 @@ let cfg = config.qclNegf.application;
         export QCL_NEGF_ALLOWED_CODES="$(cat ${lib.escapeShellArg cfg.api.allowedCodesFile})"
         test -n "$QCL_NEGF_ALLOWED_CODES"
       ''}
-      exec ${cfg.package}/bin/qcl-negf-api --host 127.0.0.1 --port ${toString cfg.api.port}
+      exec ${applicationProfile}/bin/qcl-negf-api --host 127.0.0.1 --port ${toString cfg.api.port}
     '';
 in {
   options.qclNegf.application = {
@@ -29,7 +31,7 @@ in {
       enable = lib.mkEnableOption "Scientific HTTP API";
       tokenFile = lib.mkOption { type = lib.types.str; default = "/run/secrets/qcl-negf-api-token"; description = "Runtime bearer token file outside the Nix store."; };
       allowedCodes = lib.mkOption { type = lib.types.listOf lib.types.str; default = []; description = "AiiDA Code UUIDs admitted by the API."; };
-      allowedCodesFile = lib.mkOption { type = lib.types.nullOr lib.types.str; default = if cfg.bootstrap.enable then "/var/lib/qcl-negf/aiida/code-uuid" else null; description = "Runtime comma-separated UUID allowlist; when set this is authoritative instead of allowedCodes."; };
+      allowedCodesFile = lib.mkOption { type = lib.types.nullOr lib.types.str; default = if cfg.bootstrap.enable || config.qclNegf.release.enable then "/var/lib/qcl-negf/aiida/code-uuid" else null; description = "Runtime comma-separated UUID allowlist; when set this is authoritative instead of allowedCodes."; };
       exportDiskBytes = lib.mkOption { type = lib.types.ints.positive; default = 107374182400; description = "Aggregate temporary export disk admission budget in bytes; align with controller free disk."; };
       exportTtlSeconds = lib.mkOption { type = lib.types.ints.positive; default = 86400; description = "Retention in seconds of downloadable export archives."; };
       maxCores = lib.mkOption { type = lib.types.ints.positive; default = 4; description = "Maximum CPUs per API submission; align with the selected partition."; };
@@ -61,11 +63,11 @@ in {
     systemd.services.qcl-negf-bootstrap = lib.mkIf cfg.bootstrap.enable {
       description = "Reconcile the declared AiiDA profile and immutable installed Code";
       wantedBy = [ "multi-user.target" ];
-      requires = [ "postgresql.service" ];
-      after = [ "postgresql.service" ];
+      requires = [ "postgresql.service" "qcl-negf-application-profile.service" ];
+      after = [ "postgresql.service" "qcl-negf-application-profile.service" ];
       before = [ "qcl-negf-aiida.service" "qcl-negf-api.service" ];
       unitConfig.RequiresMountsFor = "/var/lib/qcl-negf";
-      path = [ pkgs.deno cfg.package pkgs.openssh pkgs.slurm ];
+      path = [ pkgs.deno pkgs.openssh pkgs.slurm ];
       environment.AIIDA_PATH = "/var/lib/qcl-negf/aiida";
       serviceConfig = {
         Type = "oneshot"; RemainAfterExit = true;
@@ -75,19 +77,24 @@ in {
         ReadWritePaths = [ "/var/lib/qcl-negf" ];
       };
       script = ''
+        export PATH=${applicationProfile}/bin:$PATH
+        identity="$(${pkgs.python314}/bin/python3 ${operations}/ops/application_release.py bootstrap-identity \
+          --solver-executable ${config.qclNegf.cluster.solverPackage}/bin/qcl-negf \
+          --initial-label ${lib.escapeShellArg cfg.bootstrap.codeLabel})"
+        solver="''${identity%%$'\n'*}"
+        label="''${identity#*$'\n'}"
         deno run --allow-read --allow-sys=uid --allow-run=verdi \
           ${operations}/ops/bootstrap.ts ${lib.escapeShellArg cfg.bootstrap.email} \
-          ${config.qclNegf.cluster.solverPackage}/bin/qcl-negf \
-          --label ${lib.escapeShellArg cfg.bootstrap.codeLabel} --apply
+          "$solver" --label "$label" --apply
       '';
     };
     systemd.services.qcl-negf-aiida = {
       description = "AiiDA workflow daemon";
       wantedBy = [ "multi-user.target" ];
-      requires = [ "postgresql.service" "munged.service" ] ++ lib.optional config.qclNegf.cluster.controller "slurmctld.service" ++ bootstrapUnits ++ config.qclNegf.runtimeSecretUnits;
+      requires = [ "postgresql.service" "munged.service" "qcl-negf-application-profile.service" ] ++ lib.optional config.qclNegf.cluster.controller "slurmctld.service" ++ bootstrapUnits ++ config.qclNegf.runtimeSecretUnits;
       partOf = bootstrapUnits;
       wants = [ "network-online.target" ];
-      after = [ "postgresql.service" "network-online.target" "munged.service" ] ++ lib.optional config.qclNegf.cluster.controller "slurmctld.service" ++ bootstrapUnits ++ config.qclNegf.runtimeSecretUnits;
+      after = [ "postgresql.service" "network-online.target" "munged.service" "qcl-negf-application-profile.service" ] ++ lib.optional config.qclNegf.cluster.controller "slurmctld.service" ++ bootstrapUnits ++ config.qclNegf.runtimeSecretUnits;
       unitConfig.RequiresMountsFor = [ "/var/lib/qcl-negf" config.qclNegf.cluster.jobDirectory ];
       unitConfig.ConditionPathExists = "/var/lib/qcl-negf/aiida/config.json";
       environment = {
@@ -98,7 +105,8 @@ in {
       serviceConfig = {
         User = "qcl-negf"; Group = "qcl-negf";
         WorkingDirectory = "/var/lib/qcl-negf";
-        ExecStart = "${cfg.package}/bin/verdi -p ${cfg.profile} daemon start --foreground";
+        EnvironmentFile = "-/var/lib/qcl-negf/runtime/service.env";
+        ExecStart = "${applicationProfile}/bin/verdi -p ${cfg.profile} daemon start --foreground";
         Restart = "on-failure"; RestartSec = 5;
         NoNewPrivileges = true;
         ProtectSystem = "strict";
@@ -108,9 +116,9 @@ in {
     systemd.services.qcl-negf-api = lib.mkIf cfg.api.enable {
       description = "QCL-NEGF scientific API";
       wantedBy = [ "multi-user.target" ];
-      requires = [ "qcl-negf-aiida.service" ] ++ bootstrapUnits ++ config.qclNegf.runtimeSecretUnits;
+      requires = [ "qcl-negf-aiida.service" "qcl-negf-application-profile.service" ] ++ bootstrapUnits ++ config.qclNegf.runtimeSecretUnits;
       partOf = bootstrapUnits;
-      after = [ "qcl-negf-aiida.service" ] ++ bootstrapUnits ++ config.qclNegf.runtimeSecretUnits;
+      after = [ "qcl-negf-aiida.service" "qcl-negf-application-profile.service" ] ++ bootstrapUnits ++ config.qclNegf.runtimeSecretUnits;
       unitConfig.RequiresMountsFor = [ "/var/lib/qcl-negf" cfg.api.tokenFile ];
       unitConfig.ConditionPathExists = "/var/lib/qcl-negf/aiida/config.json";
       environment = {
@@ -130,6 +138,7 @@ in {
         User = "qcl-negf"; Group = "qcl-negf";
         WorkingDirectory = "/var/lib/qcl-negf";
         LoadCredential = "api-token:${cfg.api.tokenFile}";
+        EnvironmentFile = "-/var/lib/qcl-negf/runtime/service.env";
         ExecStart = apiStart;
         Restart = "on-failure";
         NoNewPrivileges = true;

@@ -6,11 +6,14 @@ fails closed: provenance objects are never relabelled, replaced or deleted.
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 
 
 def reconcile(orm, manager, email, executable, label):
+    if not re.fullmatch(r"/nix/store/[A-Za-z0-9][A-Za-z0-9+._?-]*/bin/qcl-negf", executable):
+        raise ValueError("InstalledCode requires an immutable /nix/store/.../bin/qcl-negf executable")
     profile = manager.get_profile()
     if profile.name != "qcl-negf":
         raise ValueError("Bootstrap requires the qcl-negf profile")

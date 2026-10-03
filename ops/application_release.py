@@ -1,0 +1,313 @@
+"""Small application-only release procedure, not a daemon or OS deployment tool.
+
+Run delivery on the controller after the user's maintenance decision. Nix closures
+are immutable; runtime readiness and the shared admission gate are atomic files.
+The command boundary is injectable for local fault-injection tests.
+"""
+import argparse
+import base64
+import fcntl
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import shlex
+import subprocess
+import tempfile
+
+
+RUNTIME = Path("/var/lib/qcl-negf/runtime")
+PROFILE = Path("/nix/var/nix/profiles/qcl-negf-application")
+GATE = Path("/srv/qcl-negf/jobs/.release-admission.json")
+IDENTIFIER = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}\Z")
+STORE_PATH = re.compile(r"/nix/store/[a-zA-Z0-9][a-zA-Z0-9+._?-]*\Z")
+TARGET = re.compile(r"(?:[a-z_][a-z0-9_-]*@)?[a-zA-Z0-9][a-zA-Z0-9.-]*\Z")
+
+
+def command(args):
+    """No shell for local commands; a failed command cannot publish readiness."""
+    return subprocess.run(args, check=True, text=True, capture_output=True).stdout
+
+
+def manifest(value):
+    if not isinstance(value, dict) or value.get("schema") != "qcl-negf-release-v1":
+        raise ValueError("Expected qcl-negf-release-v1 manifest")
+    if not isinstance(value.get("release_id"), str) or not IDENTIFIER.fullmatch(value["release_id"]):
+        raise ValueError("Invalid release identity")
+    if not isinstance(value.get("application_path"), str) or not STORE_PATH.fullmatch(value["application_path"]):
+        raise ValueError("Application must be an immutable Nix store path")
+    solver = value.get("solver_executable", "")
+    if not isinstance(solver, str) or not solver.endswith("/bin/qcl-negf") or not STORE_PATH.fullmatch(solver[:-len("/bin/qcl-negf")]):
+        raise ValueError("Solver must be an immutable /nix/store/.../bin/qcl-negf executable")
+    return {key: value[key] for key in ("schema", "release_id", "application_path", "solver_executable")}
+
+
+def publish(path, value):
+    """Publish complete public runtime configuration and fsync the directory."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as handle:
+        temporary = Path(handle.name)
+        try:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+            os.fchmod(handle.fileno(), 0o644)
+            os.replace(temporary, path)
+            directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def publish_json(path, value):
+    publish(path, json.dumps(value, sort_keys=True) + "\n")
+
+
+def publish_admission(path, value):
+    """NFS uses root_squash: publish the shared gate as the scientific UID."""
+    if Path(path) != GATE or os.geteuid() != 0:
+        publish_json(path, value)
+        return
+    user = pwd.getpwnam("qcl-negf")
+    previous_group = os.getegid()
+    try:
+        os.setegid(user.pw_gid)
+        os.seteuid(user.pw_uid)
+        publish_json(path, value)
+    finally:
+        os.seteuid(0)
+        os.setegid(previous_group)
+
+
+def load(path):
+    return json.loads(Path(path).read_text())
+
+
+def bootstrap_selection(runtime, initial_solver, initial_label):
+    """A reboot must not publish the image seed Code after a CD release switch."""
+    if Path(runtime).exists():
+        selected = manifest(load(runtime))
+        return selected["solver_executable"], "qcl-negf-" + selected["release_id"]
+    return initial_solver, initial_label
+
+
+def check(manifest_value, *, profile=PROFILE, runtime=RUNTIME, role="worker", run=command):
+    expected = manifest(manifest_value)
+    current = load(Path(runtime) / "release.json")
+    if current.get("ready") is not True or manifest(current) != expected or Path(profile).resolve() != Path(expected["application_path"]):
+        raise ValueError("Installed application profile or runtime release identity differs")
+    run(["nix-store", "--verify-path", expected["application_path"],
+         str(Path(expected["solver_executable"]).parents[1])])
+    units = ["slurmd.service"] if role == "worker" else ["qcl-negf-aiida.service", "qcl-negf-api.service"]
+    run(["systemctl", "is-active", "--quiet", *units])
+    return current
+
+
+def activate(manifest_value, *, profile=PROFILE, runtime=RUNTIME, role="worker", run=command,
+             email=None, allowed_codes_file=Path("/var/lib/qcl-negf/aiida/code-uuid")):
+    expected = manifest(manifest_value)
+    if role not in ("controller", "worker"):
+        raise ValueError("Activation role must be controller or worker")
+    profile, runtime = Path(profile), Path(runtime)
+    runtime.mkdir(parents=True, exist_ok=True)
+    record = runtime / "release.json"
+    current = load(record) if record.exists() else None
+    same = current is not None and current.get("ready") is True and manifest(current) == expected and profile.resolve() == Path(expected["application_path"])
+    # An interrupted activation cannot leave a local ready marker for new jobs.
+    record.unlink(missing_ok=True)
+    run(["nix-store", "--verify-path", expected["application_path"],
+         str(Path(expected["solver_executable"]).parents[1])])
+    if not same:
+        run(["nix-env", "--profile", str(profile), "--set", expected["application_path"]])
+        run(["nix-env", "--profile", str(profile.with_name(profile.name + "-solver")), "--set",
+             str(Path(expected["solver_executable"]).parents[1])])
+    identity = dict(expected)
+    if role == "controller":
+        if not email:
+            raise ValueError("Controller activation requires the declared service email")
+        output = run(["runuser", "-u", "qcl-negf", "--", "env",
+                      "AIIDA_PATH=/var/lib/qcl-negf/aiida", str(profile / "bin/verdi"),
+                      "-p", "qcl-negf", "run", str(Path(__file__).with_name("register_aiida.py")),
+                      "--", email, expected["solver_executable"], "qcl-negf-" + expected["release_id"]])
+        registered = json.loads(output.strip().splitlines()[-1])
+        if registered.get("solver_executable") != expected["solver_executable"] or not registered.get("code_uuid"):
+            raise ValueError("InstalledCode identity does not match the immutable solver")
+        identity["code_uuid"] = registered["code_uuid"]
+        publish(allowed_codes_file, identity["code_uuid"] + "\n")
+    publish(runtime / "service.env", "\n".join([
+        "QCL_NEGF_RELEASE_ID=" + expected["release_id"],
+        "QCL_NEGF_SOLVER_EXECUTABLE=" + expected["solver_executable"],
+        "QCL_NEGF_RELEASE_GATE=" + str(GATE),
+    ]) + "\n")
+    # A prepared configuration may start slurmd for a closed release delivery.
+    # Jobs still fail the ready+shared-admission guard until health succeeds.
+    publish_json(record, {**identity, "ready": False})
+    units = ["slurmd.service"] if role == "worker" else ["qcl-negf-aiida.service", "qcl-negf-api.service"]
+    if not same:
+        run(["systemctl", "restart", *units])
+    run(["systemctl", "is-active", "--quiet", *units])
+    identity["ready"] = True
+    publish_json(record, identity)
+    return identity
+
+
+def guard(release_id, solver_executable, runtime=RUNTIME / "release.json", gate=GATE):
+    current, admission = load(runtime), load(gate)
+    if admission.get("open") is not True:
+        raise ValueError("Application admission is closed")
+    if current.get("ready") is not True:
+        raise ValueError("Worker application release is not ready")
+    if release_id != admission.get("release_id") or release_id != current.get("release_id"):
+        raise ValueError("Job or worker release differs from the selected release")
+    if solver_executable != current.get("solver_executable"):
+        raise ValueError("Job solver executable differs from the immutable solver identity")
+    manifest(current)
+    return current
+
+
+def node_check(runtime=RUNTIME / "release.json", gate=GATE, profile=PROFILE, *, run=command):
+    """slurmd boot gate: selected immutable identity; job guard checks admission."""
+    current, admission = manifest(load(runtime)), load(gate)
+    if current["release_id"] != admission.get("release_id"):
+        raise ValueError("Worker release differs from the selected release")
+    if Path(profile).resolve() != Path(current["application_path"]):
+        raise ValueError("Worker application profile differs from the selected release")
+    run(["nix-store", "--verify-path", current["application_path"],
+         str(Path(current["solver_executable"]).parents[1])])
+    return current
+
+
+def deliver_pool(manifest_value, nodes, gate=GATE, *, deliver, quiesce, admit=lambda: None):
+    expected = manifest(manifest_value)
+    if not nodes or len(set(nodes)) != len(nodes):
+        raise ValueError("Select a nonempty pool of unique active nodes")
+    publish_admission(gate, {"open": False, "release_id": expected["release_id"]})
+    quiesce()
+    report = {"release_id": expected["release_id"], "open": False, "nodes": {}}
+    for node in nodes:
+        try:
+            identity = deliver(node, expected)
+            if identity.get("ready") is not True or manifest(identity) != expected:
+                raise ValueError("Node verified a different release identity")
+            report["nodes"][node] = {"status": "verified", "identity": identity}
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
+            report["nodes"][node] = {"status": "failed", "reason": str(error)}
+    if all(item["status"] == "verified" for item in report["nodes"].values()):
+        try:
+            admit()
+            publish_admission(gate, {"open": True, "release_id": expected["release_id"]})
+            report["open"] = True
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+            report["admission_error"] = str(error)
+    return report
+
+
+def ssh(target, args, run=command):
+    if not TARGET.fullmatch(target):
+        raise ValueError("Invalid SSH target")
+    return run(["ssh", "-oBatchMode=yes", target, shlex.join(args)])
+
+
+def deliver_cli(expected, pool, run=command):
+    """Controller-local orchestration; explicit active inventory, no discovery."""
+    nodes = pool.get("nodes", [])
+    if not nodes or not all(isinstance(node, dict) and IDENTIFIER.fullmatch(node.get("name", ""))
+                            and node.get("role") in ("controller", "worker")
+                            and TARGET.fullmatch(node.get("target", "")) for node in nodes):
+        raise ValueError("Pool requires named controller/worker nodes and SSH targets")
+    if len({node["name"] for node in nodes}) != len(nodes):
+        raise ValueError("Pool node names must be unique")
+    if sum(node["role"] == "controller" for node in nodes) != 1:
+        raise ValueError("Select exactly one controller in the active pool")
+    workers = [node["name"] for node in nodes if node["role"] == "worker"]
+    by_name = {node["name"]: node for node in nodes}
+    encoded = base64.urlsafe_b64encode(json.dumps(expected).encode()).decode()
+
+    def quiesce():
+        run(["systemctl", "stop", "qcl-negf-api.service", "qcl-negf-aiida.service"])
+        for worker in workers:
+            run(["scontrol", "update", "NodeName=" + worker, "State=DRAIN", "Reason=application-release"])
+        # All queued/running research must be resolved by the maintenance owner;
+        # never cancel, requeue, or silently accept an old workflow here.
+        if run(["squeue", "--all", "--noheader", "--format", "%i"]).strip():
+            raise RuntimeError("Slurm still has running or queued jobs; resolve the old research before delivery")
+
+    def deliver(name, value):
+        node = by_name[name]
+        run(["nix", "copy", "--to", "ssh-ng://" + node["target"], value["application_path"],
+             str(Path(value["solver_executable"]).parents[1])])
+        ssh(node["target"], ["sudo", "-n", "qcl-negf-release", "activate", "--manifest-base64", encoded,
+                            "--role", node["role"]], run)
+        result = ssh(node["target"], ["sudo", "-n", "qcl-negf-release", "check", "--manifest-base64", encoded,
+                                     "--role", node["role"]], run)
+        return json.loads(result)
+
+    def admit():
+        for worker in workers:
+            run(["scontrol", "update", "NodeName=" + worker, "State=RESUME"])
+
+    return deliver_pool(expected, list(by_name), deliver=deliver, quiesce=quiesce, admit=admit)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=["activate", "check", "guard", "node-check", "bootstrap-identity", "deliver"])
+    parser.add_argument("--manifest")
+    parser.add_argument("--manifest-base64")
+    parser.add_argument("--role", choices=["controller", "worker"], default="worker")
+    parser.add_argument("--pool")
+    parser.add_argument("--release-id")
+    parser.add_argument("--solver-executable")
+    parser.add_argument("--runtime", type=Path, default=RUNTIME)
+    parser.add_argument("--gate", type=Path, default=GATE)
+    parser.add_argument("--returning-worker", action="store_true")
+    parser.add_argument("--initial-label")
+    args = parser.parse_args()
+    if args.action == "bootstrap-identity":
+        solver, label = bootstrap_selection(args.runtime / "release.json", args.solver_executable, args.initial_label)
+        print(solver + "\n" + label)
+        return
+    if args.action == "node-check":
+        node_check(args.runtime / "release.json", args.gate)
+        return
+    if args.action == "guard":
+        guard(args.release_id, args.solver_executable, args.runtime / "release.json", args.gate)
+        return
+    if bool(args.manifest) == bool(args.manifest_base64):
+        parser.error("Provide exactly one --manifest or --manifest-base64")
+    expected = manifest(load(args.manifest) if args.manifest else json.loads(base64.urlsafe_b64decode(args.manifest_base64)))
+    if args.action == "check":
+        result = check(expected, runtime=args.runtime, role=args.role)
+    else:
+        args.runtime.mkdir(parents=True, exist_ok=True)
+        # One finite invocation at a time. This is a local flock, not a lease
+        # service; a dead process releases it automatically.
+        lock_file = "delivery.lock" if args.action == "deliver" else "activation.lock"
+        with (args.runtime / lock_file).open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if args.action == "deliver":
+                if not args.pool:
+                    parser.error("Delivery requires an explicit --pool")
+                result = deliver_cli(expected, load(args.pool))
+                publish_json(args.runtime / "delivery-report.json", result)
+            else:
+                admission = load(args.gate)
+                if admission.get("release_id") != expected["release_id"] or (
+                    admission.get("open") is not False and not (args.returning_worker and args.role == "worker")
+                ):
+                    raise ValueError("Close admission for the selected release before activation")
+                settings = load("/etc/qcl-negf/release-config.json")
+                result = activate(expected, runtime=args.runtime, role=args.role, email=settings.get("email"),
+                                  allowed_codes_file=Path(settings.get("allowed_codes_file") or "/var/lib/qcl-negf/aiida/code-uuid"))
+    print(json.dumps(result, sort_keys=True))
+    if args.action == "deliver" and not result["open"]:
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

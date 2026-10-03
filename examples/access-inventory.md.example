@@ -1,0 +1,11 @@
+# Private manual access inventory — fictional template
+
+Copy to your protected private location. This file is not an input to CD and does
+not create users, synchronize secrets or discover machines. No real credentials
+belong in source, Nix inputs/store, scientific archives or CI artifacts.
+
+| Host/VM | Purpose | Address | User | Connection | Password or key location | sudo/admin | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| example-control | CPU controller | 192.0.2.10 | example-admin | SSH | private local key path | reviewed sudo | fictional |
+| example-worker | CPU Linux worker | 192.0.2.20 | example-admin | SSH | empty | reviewed sudo | fictional |
+| example-windows | Hyper-V host | 192.0.2.30 | example-local-admin | local/RDP | empty | local Administrator | Hyper-V not_verified |

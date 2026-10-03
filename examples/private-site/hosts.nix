@@ -5,6 +5,7 @@ let
   shared = {
     qclNegf.privateInterface = "cluster0";
     qclNegf.runtimeSecretUnits = site.runtimeSecretUnits;
+    qclNegf.release.applicationPackage = application;
     qclNegf.cluster = {
       controllerHost = "control";
       storageHost = "storage";

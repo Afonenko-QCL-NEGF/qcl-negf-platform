@@ -47,7 +47,8 @@ in {
           SelectTypeParameters=CR_Core_Memory
           SchedulerType=sched/backfill
           TaskPlugin=task/cgroup,task/affinity
-          ReturnToService=2
+          ReturnToService=0
+          JobRequeue=0
           JobAcctGatherType=jobacct_gather/cgroup
           JobAcctGatherFrequency=30
           DefMemPerCPU=1024

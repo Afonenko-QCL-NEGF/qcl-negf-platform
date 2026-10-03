@@ -149,6 +149,11 @@ automatically change running scientific machines.
 
 ## Replacement and recovery
 
+Routine application updates follow [application CD and admission](application-cd.md).
+The [Windows lifecycle adapter](windows-workers.md) uses the same Linux worker
+role, release gate and permanent-node Runner verification. Optional
+[monitoring](monitoring.md) is best effort; it never replaces checkpoint proof.
+
 Prefer a clean OS installation from the pinned private site configuration when replacing a machine.
 Storage and control VM identities/data disks are protected against automatic replacement. Prepare
 only a replacement root filesystem and keep the state/data disk attached, or restore it onto a

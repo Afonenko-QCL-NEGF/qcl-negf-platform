@@ -45,6 +45,11 @@ Use the output as `qclNegf.application.package`; enable the API separately with 
 
 ## Wheels and delivery
 
+After one-time image preparation, [application CD](application-cd.md) updates the
+stable profile/runtime configuration without rebuilding the OS and preserves
+immutable solver Code identities. Routine delivery uses the existing umbrella
+GitHub Actions workflow.
+
 Build the browser before distributable Python wheels:
 
 ```console
