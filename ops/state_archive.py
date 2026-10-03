@@ -222,7 +222,7 @@ def main(argv=None):
     if args.operation == "create":
         if not args.source_revision or not re.fullmatch(r"[0-9a-f]{40}", args.source_revision):
             raise ValueError("Record the deployed root Git revision")
-        profile = json.loads((args.profile_directory / "config.json").read_text())["profiles"]["qcl-negf"]
+        profile = json.loads((args.profile_directory / ".aiida" / "config.json").read_text())["profiles"]["qcl-negf"]
         if (profile["storage"]["backend"] != "core.psql_dos"
                 or profile["storage"]["config"]["database_name"] != args.database
                 or profile["storage"]["config"].get("database_hostname") != "/run/postgresql"

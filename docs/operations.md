@@ -49,7 +49,10 @@ PostgreSQL and the persistent profile mount, reconciles the local Slurm Computer
 and immutable installed Code, and publishes `aiida/bootstrap.json` plus
 `aiida/code-uuid`. Daemon/API startup requires this completed service. The API's
 runtime UUID allowlist reads that file, so a first installation does not need
-a guessed UUID in Nix configuration.
+a guessed UUID in Nix configuration. With this installation's
+`AIIDA_PATH=/var/lib/qcl-negf/aiida`, AiiDA stores its configuration in
+`aiida/.aiida/config.json`. Bootstrap and service startup read that nested file;
+the published identity files and repository remain directly under `aiida/`.
 
 For manual provisioning, run the same operations from this repository as the
 `qcl-negf` Unix account with `verdi` and the immutable solver on PATH:

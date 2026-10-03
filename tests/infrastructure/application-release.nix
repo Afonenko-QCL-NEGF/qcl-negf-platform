@@ -35,6 +35,11 @@ assert lib.hasInfix "qcl-negf-release node-check" worker.systemd.services.slurmd
 assert lib.hasInfix "ReturnToService=0" worker.services.slurm.extraConfig;
 assert lib.hasInfix "JobRequeue=0" worker.services.slurm.extraConfig;
 assert lib.elem "qcl-negf-application-profile.service" controller.systemd.services.qcl-negf-aiida.requires;
+assert controller.systemd.services.qcl-negf-aiida.unitConfig.ConditionPathExists == "/var/lib/qcl-negf/aiida/.aiida/config.json";
+assert controller.systemd.services.qcl-negf-api.unitConfig.ConditionPathExists == "/var/lib/qcl-negf/aiida/.aiida/config.json";
+assert controller.systemd.services.qcl-negf-aiida.environment.AIIDA_PATH == "/var/lib/qcl-negf/aiida";
+assert controller.systemd.services.qcl-negf-api.environment.AIIDA_PATH == "/var/lib/qcl-negf/aiida";
+assert controller.qclNegf.application.api.allowedCodesFile == "/var/lib/qcl-negf/aiida/code-uuid";
 {
   controllerStart = controller.systemd.services.qcl-negf-aiida.serviceConfig.ExecStart;
   workerGate = worker.systemd.services.slurmd.serviceConfig.ExecStartPre;

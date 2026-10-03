@@ -96,7 +96,7 @@ in {
       wants = [ "network-online.target" ];
       after = [ "postgresql.service" "network-online.target" "munged.service" "qcl-negf-application-profile.service" ] ++ lib.optional config.qclNegf.cluster.controller "slurmctld.service" ++ bootstrapUnits ++ config.qclNegf.runtimeSecretUnits;
       unitConfig.RequiresMountsFor = [ "/var/lib/qcl-negf" config.qclNegf.cluster.jobDirectory ];
-      unitConfig.ConditionPathExists = "/var/lib/qcl-negf/aiida/config.json";
+      unitConfig.ConditionPathExists = "/var/lib/qcl-negf/aiida/.aiida/config.json";
       environment = {
         AIIDA_PATH = "/var/lib/qcl-negf/aiida";
         SLURM_CONF = "${config.services.slurm.etcSlurm}/slurm.conf";
@@ -120,7 +120,7 @@ in {
       partOf = bootstrapUnits;
       after = [ "qcl-negf-aiida.service" "qcl-negf-application-profile.service" ] ++ bootstrapUnits ++ config.qclNegf.runtimeSecretUnits;
       unitConfig.RequiresMountsFor = [ "/var/lib/qcl-negf" cfg.api.tokenFile ];
-      unitConfig.ConditionPathExists = "/var/lib/qcl-negf/aiida/config.json";
+      unitConfig.ConditionPathExists = "/var/lib/qcl-negf/aiida/.aiida/config.json";
       environment = {
         AIIDA_PATH = "/var/lib/qcl-negf/aiida";
         SLURM_CONF = "${config.services.slurm.etcSlurm}/slurm.conf";

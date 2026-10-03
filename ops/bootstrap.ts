@@ -10,6 +10,11 @@ const storage = {
   repository_uri: "file:///var/lib/qcl-negf/aiida/repository",
 };
 
+export async function readExistingConfiguration(aiidaPath = "/var/lib/qcl-negf/aiida") {
+  // AiiDA appends .aiida to this installation's AIIDA_PATH identity root.
+  return JSON.parse(await Deno.readTextFile(`${aiidaPath}/.aiida/config.json`));
+}
+
 export function profileSetupRequired(value: unknown): boolean {
   if (!value || typeof value !== "object" || !("profiles" in value)) {
     throw new Error("Invalid existing AiiDA configuration; inspect it before bootstrap.");
@@ -114,7 +119,7 @@ if (import.meta.main) {
         throw new Error("Run bootstrap as the qcl-negf service account, not root.");
       }
       try {
-        const existing = JSON.parse(await Deno.readTextFile("/var/lib/qcl-negf/aiida/config.json"));
+        const existing = await readExistingConfiguration();
         if (!profileSetupRequired(existing)) plan = plan.slice(1);
       } catch (error) {
         if (!(error instanceof Deno.errors.NotFound)) throw error;

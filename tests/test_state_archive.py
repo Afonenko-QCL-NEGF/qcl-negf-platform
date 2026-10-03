@@ -123,7 +123,9 @@ class StateArchiveTests(unittest.TestCase):
                 "database_port": 5432, "database_username": "qcl-negf", "database_password": "",
                 "repository_uri": (sources["aiida"] / "repository").as_uri(),
             }}}}}
-            (sources["aiida"] / "config.json").write_text(json.dumps(config))
+            (sources["aiida"] / ".aiida").mkdir()
+            (sources["aiida"] / ".aiida" / "config.json").write_text(json.dumps(config))
+            (sources["aiida"] / "config.json").write_text("root-level decoy is not AiiDA configuration")
             sql = {"SELECT pg_database_size(current_database())": str(8 * 1024**2),
                    "SHOW server_version_num": "170006", "SHOW data_directory": str(database),
                    "SELECT count(*) FROM pg_tablespace WHERE spcname NOT IN ('pg_default','pg_global')": "0"}
@@ -140,7 +142,10 @@ class StateArchiveTests(unittest.TestCase):
                 archive.main(["create", str(output), "--profile-directory", str(sources["aiida"]),
                               "--slurm-directory", str(sources["slurm"]), "--source-revision", "a" * 40,
                               "--disk-budget-bytes", str(256 * 1024**2), "--writers-paused"])
-            self.assertEqual(archive.verify(output).get("postgresql_database_bytes"), 8388608)
+            saved = archive.verify(output)
+            self.assertEqual(saved.get("postgresql_database_bytes"), 8388608)
+            self.assertIn("aiida/.aiida/config.json", saved["files"])
+            self.assertIn("aiida/repository/object", saved["files"])
 
     def fixture(self, root):
         sources = {"aiida": root / "profile", "slurm": root / "slurm"}
