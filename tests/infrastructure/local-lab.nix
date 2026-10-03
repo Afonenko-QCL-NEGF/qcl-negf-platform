@@ -47,6 +47,10 @@ assert appControl.qclNegf.application.api.enable;
 assert appControl.qclNegf.application.api.maxMemoryKiB == 1792 * 1024;
 assert appControl.qclNegf.application.api.defaultMemoryKiB == 1024 * 1024;
 assert appControl.qclNegf.release.enable && appWorker.qclNegf.release.enable;
+assert appControl.systemd.services.postgresql.unitConfig.RequiresMountsFor == appControl.services.postgresql.dataDir;
+assert nixpkgs.lib.hasInfix
+  "RequiresMountsFor=${appControl.services.postgresql.dataDir}"
+  appControl.systemd.units."postgresql.service".text;
 assert builtins.match ".*node-check.*" appWorker.systemd.services.slurmd.serviceConfig.ExecStartPre != null;
 assert lab.bootstrap.config.services.openssh.settings.PermitRootLogin == "prohibit-password";
 true

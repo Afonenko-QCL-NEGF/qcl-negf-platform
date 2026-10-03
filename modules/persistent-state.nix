@@ -29,7 +29,8 @@ in {
         install -d -o qcl-negf -g qcl-negf -m 0750 /var/lib/qcl-negf-state/aiida
       '';
     };
-    systemd.services.postgresql.unitConfig.RequiresMountsFor = "/var/lib/qcl-negf-state";
+    # The PostgreSQL module requires its configured dataDir, which includes
+    # this state mount. A second string definition conflicts with that unit.
     systemd.services.slurmctld.unitConfig.RequiresMountsFor = "/var/lib/qcl-negf-state";
     systemd.services.qcl-negf-aiida.unitConfig.RequiresMountsFor = [ "/var/lib/qcl-negf" ];
     systemd.services.qcl-negf-api.unitConfig.RequiresMountsFor = [ "/var/lib/qcl-negf" ];
