@@ -465,7 +465,8 @@ def ssh_command(directory, ip, *, enrolling=False):
 def public_nix_key(path):
     """Accept a single canonical Ed25519 public key, never a signing key."""
     require(path.is_file() and not path.is_symlink(), "Require a regular Nix public key file")
-    raw = path.read_bytes()
+    with path.open("rb") as stream:
+        raw = stream.read(1025)
     require(len(raw) <= 1024, "Invalid Nix public key")
     try:
         value = raw.decode("ascii").strip()

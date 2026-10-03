@@ -2,6 +2,7 @@
 import importlib.util
 import base64
 import json
+from contextlib import contextmanager
 from pathlib import Path
 import subprocess
 
@@ -228,6 +229,45 @@ def test_public_nix_key_is_optional_inventory_input_only(tmp_path, trust_invento
     assert result["all"]["vars"]["qcl_lab_nix_public_key_file"] == str(public)
     assert value not in json.dumps(result)
     assert "trusted-users" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("oversized", [False, True], ids=["valid-small-key", "oversized-sparse-file"])
+def test_public_nix_key_bounds_input_read_before_size_validation(tmp_path, monkeypatch, oversized):
+    public = tmp_path / "public.key"
+    value = "qcl-test-1:" + base64.b64encode(bytes(range(32))).decode()
+    public.write_text(value + "\n")
+    if oversized:
+        # Sparse on disk: a regression must fail before requesting this payload.
+        with public.open("r+b") as stream:
+            stream.truncate(3 * 1024**3)
+    original_open = Path.open
+    bytes_read = []
+
+    @contextmanager
+    def observed_open(path, *args, **kwargs):
+        with original_open(path, *args, **kwargs) as stream:
+            if path != public:
+                yield stream
+                return
+
+            class BoundedReader:
+                def read(self, size=-1):
+                    assert 0 <= size <= 1025, "public key parser requests an unbounded input read"
+                    data = stream.read(size)
+                    bytes_read.append(len(data))
+                    assert sum(bytes_read) <= 1025
+                    return data
+
+            yield BoundedReader()
+
+    monkeypatch.setattr(Path, "open", observed_open)
+    if oversized:
+        with pytest.raises(ValueError, match="Invalid Nix public key"):
+            lab.public_nix_key(public)
+        assert sum(bytes_read) == 1025
+    else:
+        assert lab.public_nix_key(public) == value
+        assert sum(bytes_read) == len(value) + 1
 
 
 @pytest.mark.parametrize("value", [
