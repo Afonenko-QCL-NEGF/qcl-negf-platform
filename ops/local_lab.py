@@ -522,13 +522,16 @@ paths = ["/"] + (["/srv/qcl-negf"] if role == "storage" else
     ["/srv/qcl-negf/jobs", "/var/lib/qcl-negf-state"] if role == "control" else
     ["/srv/qcl-negf/jobs", "/scratch"])
 mounts = {}
+def measure_mount(path):
+    filesystems = json.loads(command(["findmnt", "-J", "-o", "TARGET,SOURCE,FSTYPE,UUID", "-T", path]))["filesystems"]
+    return {"device": os.stat(path).st_dev, "findmnt": filesystems[-1]}
 for path in paths:
-    mounts[path] = {"device": os.stat(path).st_dev,
-        "findmnt": json.loads(command(["findmnt", "-J", "-o", "TARGET,SOURCE,FSTYPE,UUID", "-T", path]))["filesystems"][0]}
+    mounts[path] = measure_mount(path)
 result = {"hostname": socket.gethostname(), "system": os.path.realpath("/run/current-system"),
     "boot_id": pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
     "uid": pwd.getpwnam("qcl-negf").pw_uid, "mounts": mounts,
     "resolution": {name: socket.gethostbyname(name) for name in settings["hosts"]},
+    "resolution_addresses": {name: sorted(set(socket.gethostbyname_ex(name)[2])) for name in settings["hosts"]},
     "cgroup_v2": pathlib.Path("/sys/fs/cgroup/cgroup.controllers").is_file()}
 local = "/srv/qcl-negf" if role == "storage" else "/var/lib/qcl-negf-state" if role == "control" else "/scratch"
 serial = "qcl-data" if role == "storage" else "qcl-state" if role == "control" else "qcl-scratch"
@@ -556,6 +559,9 @@ else:
     marker = "/srv/qcl-negf/jobs/" + settings["namespace"] + "-uid3000-probe.json"
     program = "import pathlib; p=pathlib.Path(" + repr(marker) + "); body=" + repr(settings["namespace"]) + "; assert not p.exists() or p.read_text()==body; p.write_text(body); print(p.stat().st_uid)"
     result["nfs_receipt_uid"] = int(command(["runuser", "-u", "qcl-negf", "--", "/run/current-system/sw/bin/python3", "-c", program]))
+    # The write activates NixOS's automount. findmnt reports both autofs and
+    # the active NFS mount; record the top mount after access, not its trigger.
+    mounts["/srv/qcl-negf/jobs"] = measure_mount("/srv/qcl-negf/jobs")
 if role == "control":
     result["sinfo"] = command(["sinfo", "--noheader", "--format=%N|%T"])
 print(json.dumps(result))
@@ -564,12 +570,14 @@ print(json.dumps(result))
 SLURM_PROBE = r'''
 import json, os, pathlib, subprocess, time
 settings = SETTINGS
+if os.getuid() != 3000:
+    raise RuntimeError("Slurm probe and its NFS receipts must run as UID3000")
 directory = "/srv/qcl-negf/jobs/" + settings["namespace"] + "-slurm-probe"
-subprocess.run(["runuser", "-u", "qcl-negf", "--", "mkdir", "-p", directory], check=True, timeout=10)
+pathlib.Path(directory).mkdir(exist_ok=True)
 results = []
 for worker in ("worker-1", "worker-2"):
     output = directory + "/" + worker + "-%j.out"
-    arguments = ["runuser", "-u", "qcl-negf", "--", "sbatch", "--parsable", "--wait", "--nodes=1", "--ntasks=1",
+    arguments = ["sbatch", "--parsable", "--wait", "--nodes=1", "--ntasks=1",
         "--cpus-per-task=1", "--mem=64M", "--time=00:01:00", "--nodelist=" + worker,
         "--job-name=" + settings["namespace"] + "-probe", "--chdir=" + directory,
         "--output=" + output, "--wrap=hostname; cat /proc/self/cgroup"]
@@ -598,7 +606,9 @@ print(json.dumps(results))
 def verify_guest(config, role, result):
     require(result["hostname"] == role and result["system"] == config["systems"][role], "Guest hostname/system identity mismatch: " + role)
     require(result["uid"] == 3000 and result["cgroup_v2"], "Guest UID3000/cgroup v2 check failed")
-    require(result["resolution"] == {name: m["ip"] for name, m in machines(config).items()}, "Guest hostname resolution mismatch")
+    addresses = result.get("resolution_addresses", {name: [ip] for name, ip in result["resolution"].items()})
+    require(set(addresses) == set(ROLES) and all(machine["ip"] in addresses[name]
+            for name, machine in machines(config).items()), "Guest hostname resolution mismatch")
     root_device = result["mounts"]["/"]["device"]
     require(all(mount["device"] != root_device for path, mount in result["mounts"].items() if path != "/"), "Guest state/data/scratch/NFS is on root filesystem")
     local = "/srv/qcl-negf" if role == "storage" else "/var/lib/qcl-negf-state" if role == "control" else "/scratch"
@@ -612,9 +622,13 @@ def verify_guest(config, role, result):
         require(result["mounts"]["/srv/qcl-negf/jobs"]["findmnt"]["fstype"] in ("nfs", "nfs4"), "Shared jobs must be a real NFS mount")
 
 
-def remote_python(directory, ip, script, settings, runner, timeout=None):
+def remote_python(directory, ip, script, settings, runner, timeout=None, *, as_user=None):
     program = script.replace("SETTINGS", repr(settings), 1)
-    return json.loads(runner.run([*ssh_command(directory, ip), "/run/current-system/sw/bin/python3", "-"],
+    require(as_user in (None, "qcl-negf"), "Only the lab service user may run a guest probe")
+    command = ["/run/current-system/sw/bin/python3", "-"]
+    if as_user is not None:
+        command = ["runuser", "-u", as_user, "--", *command]
+    return json.loads(runner.run([*ssh_command(directory, ip), *command],
                                  input=program, timeout=timeout).stdout)
 
 
@@ -631,7 +645,7 @@ def probe(directory, runner):
         result = remote_python(directory, machine["ip"], GUEST_PROBE, settings | {"role": role}, runner)
         verify_guest(config, role, result)
         guests[role] = result
-    jobs = remote_python(directory, expected["control"]["ip"], SLURM_PROBE, settings, runner)
+    jobs = remote_python(directory, expected["control"]["ip"], SLURM_PROBE, settings, runner, as_user="qcl-negf")
     require(len(jobs) == 2 and all(job["output_uid"] == 3000 for job in jobs), "Two owned UID3000 Slurm jobs required")
     result = {"schema": "qcl-local-lab-probe.v1", "status": "pass", "source": source_identity(), "guests": guests,
               "slurm_jobs": jobs, "scientific_validation": "not_performed", "controller_reboot": "not_measured"}
