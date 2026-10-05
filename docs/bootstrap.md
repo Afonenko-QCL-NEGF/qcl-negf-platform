@@ -173,3 +173,81 @@ this bootstrap host.
 References: [official NixOS downloads](https://nixos.org/download/),
 [NixOS installation manual](https://nixos.org/manual/nixos/stable/#sec-installation),
 [Proxmox VM resource schema](https://github.com/bpg/terraform-provider-proxmox/blob/v0.114.0/docs/resources/virtual_environment_vm.md).
+
+## Preflight and complete disk accounting
+
+Copy `examples/private-site/production.nix.example` into the private site and
+add it with `modules = [ ./production.nix ];` in `site.nix`, only after
+replacing its documentation addresses and NIC MAC inventory and
+provisioning the actual NIC names and runtime TLS files. With networkd a static
+gateway includes both `address` and `interface`; a string leaves the interface
+unset. The example uses Nixpkgs' recommended proxy headers, including `Host
+$host`, with strict nginx validation enabled. API download links are relative,
+so the browser retains a localhost SSH tunnel's port. A raw `$http_host` header
+must not bypass this check. The example does not provision secrets or assert
+that the guests have booted.
+
+Before application/native/image builds, evaluate **all four** production role
+toplevels and build only the strict control nginx configuration. Run one finite
+preflight, without automatic retry:
+
+```sh
+python3 ops/bootstrap_build.py --receipt /absolute/private-site/preflight.json preflight \
+  --site /absolute/private-site --nix /run/current-system/sw/bin/nix --check-nginx
+```
+
+The helper applies the unary `nix/site-preflight.nix` function explicitly with
+`--apply`; `--file` alone does not apply a Nix function. Each child has a 60-second
+deadline and a combined 1 MiB stdout/stderr cap, and cleanup kills its owned
+process group even after the immediate parent exits. The receipt retains the
+child exit status and bounded primary diagnostics. Evaluation and strict config
+build establish configuration acceptance, not image boot, transport, CI or
+scientific acceptance. Without `--check-nginx`, status is `evaluation_only` and `nginx_build` is
+`not_measured`; this does not satisfy the pre-build gate.
+Strict writer exit0 is the configuration gate. A cache hit may print no gixy
+counters; `nginx_severity_counters` remains `not_measured`, never invented zeros.
+Keep the lock and source revision fixed between this preflight and the producer.
+
+Systemd build units must name an absolute executable and pass an explicit PATH
+for its child tools, e.g. `/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin`.
+They also select `qcl-build.slice`, the admitted CPU/RAM limits, one attempt and
+a finite wall/output budget. The public application services already use
+immutable store executables and declared tool paths. Private source directories
+needed by the `ci` Nix client require explicit post-create `chmod 0750` and
+`chmod 0640` with the appropriate group: an inherited `UMask=0077` masks modes
+passed to `mkdir` and `open`. Secret files retain their separate restrictive
+modes; do not make the entire private tree readable.
+
+Final disk accounting runs as root, separately from a `ci` producer. A single
+`du` invocation includes the Nix store, **all** release history and artifact
+history, deduplicating hardlinks across those roots. Add logical minus allocated
+bytes only for the explicitly selected QCOW images inside those roots:
+
+```sh
+python3 ops/bootstrap_build.py --receipt /absolute/private-site/disk-usage.json account \
+  --du /run/current-system/sw/bin/du --limit-bytes 107374182400 \
+  --root /nix/store --root /var/lib/qcl-negf-releases --root /var/lib/qcl-negf-artifacts \
+  --image /absolute/accounted/artifacts/storage.qcow2 \
+  --image /absolute/accounted/artifacts/control.qcow2 \
+  --image /absolute/accounted/artifacts/compute.qcow2 \
+  --image /absolute/accounted/artifacts/ci.qcow2
+```
+
+Replace those four image paths with actual output paths beneath the supplied
+roots. Any `du` permission/error result fails with retained diagnostics; excluding
+root-only history would undercount usage. Retain the original terminal unit and
+failed accounting report when a later read-only root accounting operation
+completes the engineering evidence. Do not rewrite that unit as `SUCCESS`.
+Free-space admission remains separate and must be measured on the actual target
+filesystems before each authorized stage. A 100 GiB aggregate cap does not prove
+that any individual filesystem has sufficient free space.
+
+The local lab intentionally retains its existing cloud-init network owner.
+Earlier boot success does not establish an independently generated declarative
+`eth0` DHCP configuration. Changing that backend requires a generated-network
+oracle and a bounded lab boot check; it is not implied by a private production
+gateway correction. Private sibling flake inputs also need a coherent source
+boundary: a root flake's relative `../other-site` input crosses that boundary.
+Render a reviewed canonical absolute input in an external private overlay, or
+keep the sibling beneath one common flake source tree; do not copy a temporary
+server path into public source.
