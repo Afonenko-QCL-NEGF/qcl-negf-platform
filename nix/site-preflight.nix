@@ -9,7 +9,9 @@ let
     value = site.nixosConfigurations.${name}.config.system.build.toplevel.drvPath;
   }) roles);
   control = site.nixosConfigurations.control.config;
-  context = builtins.getContext control.systemd.services.nginx.serviceConfig.ExecStart;
+  context = builtins.getContext (if control.services.nginx.enableReload
+    then toString control.environment.etc."nginx/nginx.conf".source
+    else control.systemd.services.nginx.serviceConfig.ExecStart);
   targets = map (drv: assert context.${drv}.outputs == [ "out" ]; "${drv}^out")
     (builtins.filter (drv: builtins.match ".*-nginx[.]conf[.]drv" drv != null)
       (builtins.attrNames context));

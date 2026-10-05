@@ -187,6 +187,11 @@ so the browser retains a localhost SSH tunnel's port. A raw `$http_host` header
 must not bypass this check. The example does not provision secrets or assert
 that the guests have booted.
 
+The platform `tofu/build-images.ts` entry point automatically completes four
+role evaluations and the strict nginx writer build before its first image stage.
+It retains the existing private path/flake URI input API; a failed gate starts
+no image stage. Its full command budget still belongs to the admitted producer.
+
 Before application/native/image builds, evaluate **all four** production role
 toplevels and build only the strict control nginx configuration. Run one finite
 preflight, without automatic retry:

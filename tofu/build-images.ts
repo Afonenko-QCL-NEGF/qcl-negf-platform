@@ -26,6 +26,54 @@ export function validateBase(primary: unknown, arch: unknown, includeArch = true
     arch: includeArch ? arch as Record<string, unknown> : {},
   };
 }
+type NixCommand = (args: string[]) => Promise<string>;
+const derivation = /^\/nix\/store\/[0-9abcdfghijklmnpqrsvwxyz]{32}-[A-Za-z0-9+._-]+[.]drv$/;
+const nginxTarget = /^\/nix\/store\/[0-9abcdfghijklmnpqrsvwxyz]{32}-nginx[.]conf[.]drv\^out$/;
+const nginxQuery = `c: let context = builtins.getContext (if c.services.nginx.enableReload
+    then toString c.environment.etc."nginx/nginx.conf".source
+    else c.systemd.services.nginx.serviceConfig.ExecStart);
+  paths = builtins.filter (p: builtins.match ".*-nginx[.]conf[.]drv" p != null) (builtins.attrNames context);
+  in { enabled = c.services.nginx.enable; validated = c.services.nginx.validateConfigFile;
+    targets = map (p: assert context.\${p}.outputs == [ "out" ]; p + "^out") paths; }`;
+
+/** All configuration gates finish before any image callback. Flake URIs remain supported. */
+export async function imageStages(
+  site: string,
+  archFile: string,
+  command: NixCommand,
+  image: (role: (typeof roles)[number]) => Promise<void>,
+): Promise<void> {
+  for (const role of imageRoles("-")) {
+    const drv = await command([
+      "eval",
+      "--raw",
+      "--no-write-lock-file",
+      `${site}#nixosConfigurations.${role}.config.system.build.toplevel.drvPath`,
+    ]);
+    if (!derivation.test(drv)) throw new Error(`Invalid evaluated derivation for ${role}.`);
+  }
+  const config = JSON.parse(
+    await command([
+      "eval",
+      "--json",
+      "--no-write-lock-file",
+      `${site}#nixosConfigurations.control.config`,
+      "--apply",
+      nginxQuery,
+    ]),
+  );
+  if (
+    config?.enabled !== true || config?.validated !== true ||
+    !Array.isArray(config.targets) || config.targets.length !== 1 ||
+    typeof config.targets[0] !== "string" || !nginxTarget.test(config.targets[0])
+  ) {
+    throw new Error("One strict validated nginx.conf writer required before images.");
+  }
+  // Exit0 is writer acceptance; a cache hit does not measure fresh severity counters.
+  await command(["build", "--no-link", "--json", "--no-write-lock-file", config.targets[0]]);
+  for (const role of imageRoles(archFile)) await image(role);
+}
+
 async function nix(args: string[]): Promise<string> {
   const result = await new Deno.Command("nix", { args, stdout: "piped", stderr: "inherit" })
     .output();
@@ -51,7 +99,7 @@ export async function main(args: string[]): Promise<void> {
     string,
     { image_path: string; image_sha256: string; image_bytes: number }
   > = {};
-  for (const role of imageRoles(archFile)) {
+  await imageStages(site, archFile, nix, async (role) => {
     const built = JSON.parse(
       await nix(["build", "--no-link", "--json", `${site}#${role}-image`]),
     ) as { outputs?: { out?: string } }[];
@@ -74,7 +122,7 @@ export async function main(args: string[]): Promise<void> {
     artifacts[role] = { image_path, image_sha256, image_bytes };
     if (role === "arch-worker") Object.assign(base.arch, artifacts[role]);
     else Object.assign(base.primary.vms[role]!, artifacts[role]);
-  }
+  });
   await Deno.mkdir(outputDirectory, { recursive: true });
   const outputs: [string, unknown][] = [
     ["proxmox.tfvars.json", base.primary],
