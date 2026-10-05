@@ -178,6 +178,18 @@ run "reject_unknown_profile" {
   expect_failures = [var.build_profile]
 }
 
+run "reject_temporary_production_build_in_final_site" {
+  command = plan
+  variables { build_profile = "production-build" }
+  expect_failures = [var.build_profile]
+}
+
+run "reject_debug_profile_in_final_site" {
+  command = plan
+  variables { build_profile = "local-debug" }
+  expect_failures = [var.build_profile]
+}
+
 run "all_roles_stopped_need_no_active_guest_budget" {
   command = plan
   variables {

@@ -1,7 +1,9 @@
 # Temporary installer/builder. Its configuration does not depend on the solver
 # or on a previously built application image. Keep its state in the private site.
 locals {
-  build_profile = jsondecode(file("${path.module}/../../ops/build-profiles.json"))[var.build_profile]
+  build_profile    = jsondecode(file("${path.module}/../../ops/build-profiles.json"))[var.build_profile]
+  build_vcpus      = var.build_profile == "production-build" ? coalesce(var.production_build_vcpus, 1) : local.build_profile.vcpus
+  build_memory_mib = var.build_profile == "production-build" ? coalesce(var.production_build_memory_mib, 1) : local.build_profile.memory_mib
 }
 resource "proxmox_virtual_environment_file" "installer" {
   node_name    = var.node
@@ -36,11 +38,11 @@ resource "proxmox_virtual_environment_vm" "builder" {
     wait_for_ip { disabled = true }
   }
   cpu {
-    cores = local.build_profile.vcpus
+    cores = local.build_vcpus
     type  = "host"
   }
   memory {
-    dedicated = local.build_profile.memory_mib
+    dedicated = local.build_memory_mib
     floating  = 0
   }
   disk {
@@ -66,5 +68,15 @@ resource "proxmox_virtual_environment_vm" "builder" {
   operating_system { type = "l26" }
   # Proxmox restricts arbitrary QEMU args to the root host user. The paired
   # bootstrap-media playbook owns only these temporary installer arguments.
-  lifecycle { ignore_changes = [kvm_arguments] }
+  lifecycle {
+    ignore_changes = [kvm_arguments]
+    precondition {
+      condition = var.build_profile == "production-build" ? try(
+        var.production_build_vcpus <= var.host_logical_cpus &&
+        var.production_build_memory_mib > local.build_profile.guest_reserve_mib,
+        false
+      ) : var.production_build_vcpus == null && var.production_build_memory_mib == null
+      error_message = "Temporary production-build requires explicit CPU/RAM and measured host CPU count; guest CPUs cannot exceed the host. Fixed profiles reject resource overrides."
+    }
+  }
 }

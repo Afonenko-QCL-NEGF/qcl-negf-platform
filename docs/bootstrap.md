@@ -38,6 +38,35 @@ with compute stopped and its queue empty. CPU/RAM and Nix resource caps share
 the owning `ops/build-profiles.json`. Resizing explicitly permits the provider
 to reboot the idle builder; it never interrupts an active build.
 
+`local-debug` names the same small 4 CPU/8 GiB budget explicitly. For a finite
+production artifact build on the temporary bootstrap only, select
+`production-build` and supply `production_build_vcpus`,
+`production_build_memory_mib` and the freshly measured `host_logical_cpus` to
+`tofu/bootstrap`. All are site decisions; no host size is assumed. Set the same
+CPU/RAM in the private NixOS site:
+
+```nix
+qclNegf.builder = {
+  enable = true;
+  profile = "production-build";
+  resources = { vcpus = chosenVcpus; memoryMiB = chosenMemoryMiB; };
+};
+```
+
+These variable names denote the actual admitted site values. The profile runs
+one Nix job, sets daemon cores and shared slice CPU quota from that CPU count,
+keeps 2048 MiB of guest RAM outside its slice, and disables slice swap. The
+bootstrap remains `on_boot=false`. The independent
+[fresh admission](build-admission.md#temporary-production-build) must establish
+idle/empty queue/compute off, complete maximum guest RAM allocations, 8 GiB host
+reserve and enough `MemAvailable`, crediting only the owned QEMU process's
+observed anonymous resident RAM minus 256 MiB. Only this explicit temporary
+profile permits sharing physical host CPUs with other guests, bounded by the
+actual host CPU count per builder; it adds no exclusive pinning or guest/job
+cancellation. Provider validation alone establishes none of that runtime
+evidence. Final four-role production/CI keeps the conservative standard/burst
+contract; restore the small builder before resuming compute or retiring it.
+
 Initialize the local backend with an absolute state path inside the private
 site (`tofu init -backend-config=path=/private/site/state/bootstrap.tfstate`).
 Keep that directory mode `0700` and the state files mode `0600`. A plan's
@@ -121,6 +150,8 @@ The example enables `qclNegf.builder` independently of GitHub registration.
 Its `profile` must match the reviewed VM profile. One Nix build runs at a time;
 the Nix daemon, administrative builds and runner jobs share `qcl-build.slice`,
 with CPU 400% / RAM 7G for standard or CPU 1200% / RAM 22G for burst, swap0.
+`local-debug` uses standard's limits; temporary `production-build` derives
+matching CPU and RAM-minus-2-GiB limits from its explicit guest resources.
 Administrative transient builds explicitly select this slice. Set matching site VM CPU/RAM ceilings,
 finite build wall time, output budget and attempt count before any full build.
 

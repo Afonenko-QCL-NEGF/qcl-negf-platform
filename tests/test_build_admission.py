@@ -27,6 +27,13 @@ def snapshot():
     }
 
 
+def production_snapshot():
+    value = snapshot()
+    value["temporary_bootstrap"] = True
+    value["builder_memory"] = {"resident_anonymous_mib": 8192, "source": "RssAnon", "vm_id": 709, "pid": 1234}
+    return value
+
+
 class BuildAdmissionTests(unittest.TestCase):
     def test_snapshot_fifo_refused_without_waiting_for_a_writer(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -118,6 +125,104 @@ class BuildAdmissionTests(unittest.TestCase):
         self.assertEqual(accepted["planned_guest_memory_mib"], 16384)
         self.assertEqual(accepted["required_available_memory_mib"], 16384)
         self.assertEqual(accepted["planned_guest_vcpus"], 12)
+
+    def test_local_debug_admits_small_unchanged_resource_budget(self):
+        accepted = admission.admit(snapshot(), "local-debug", now=1010)
+        self.assertEqual(accepted["planned_guest_memory_mib"], 16384)
+        self.assertEqual(accepted["planned_guest_vcpus"], 12)
+
+    def test_production_bootstrap_allows_shared_cpus_without_guest_oversizing(self):
+        value = production_snapshot()
+        value["host"]["memory_available_mib"] = 60000
+        accepted = admission.admit(value, "production-build", now=1010,
+                                   resources={"vcpus": 32, "memory_mib": 49152})
+        self.assertEqual(accepted["planned_guest_vcpus"], 40)
+        self.assertEqual(accepted["planned_guest_memory_mib"], 57344)
+        self.assertEqual(accepted["required_available_memory_mib"], 57600)
+        self.assertTrue(accepted["shared_host_cpus"])
+        self.assertEqual(accepted["builder_resources"]["memory_max"], "47104M")
+        self.assertEqual(accepted["builder_resources"]["cpu_quota"], "3200%")
+
+    def test_production_resources_need_explicit_temporary_bootstrap(self):
+        with self.assertRaisesRegex(ValueError, "temporary bootstrap"):
+            admission.admit(snapshot(), "production-build", now=1010,
+                            resources={"vcpus": 24, "memory_mib": 32768})
+
+    def test_dynamic_profile_requires_complete_integer_resources(self):
+        value = production_snapshot()
+        for resources in (None, {}, {"vcpus": 32}, {"vcpus": True, "memory_mib": 49152},
+                          {"vcpus": 0, "memory_mib": 49152}, {"vcpus": 32, "memory_mib": 2048},
+                          {"vcpus": 32, "memory_mib": 49152, "ignored": 1}):
+            with self.subTest(resources=resources), self.assertRaises(ValueError):
+                admission.admit(value, "production-build", now=1010, resources=resources)
+        with self.assertRaisesRegex(ValueError, "only production-build"):
+            admission.admit(value, "standard", now=1010,
+                            resources={"vcpus": 32, "memory_mib": 49152})
+
+    def test_production_shared_cpu_exception_never_weakens_memory_or_physical_cpu_gate(self):
+        value = production_snapshot()
+        for cpus, memory, expected in ((33, 32768, "host CPU"), (32, 50176, "memory budget"),
+                                       (32, 49152, "available")):
+            bad = copy.deepcopy(value)
+            if expected == "available":
+                bad["host"]["memory_available_mib"] = 57343
+            with self.subTest(cpus=cpus, memory=memory), self.assertRaisesRegex(ValueError, expected):
+                admission.admit(bad, "production-build", now=1010,
+                                resources={"vcpus": cpus, "memory_mib": memory})
+
+    def test_production_rejects_compute_activity_queue_and_running_builds(self):
+        value = production_snapshot()
+        for reason in ("compute", "queue", "idle", "fresh"):
+            bad = copy.deepcopy(value)
+            now = 1010
+            if reason == "compute":
+                bad["vms"].append({"vm_id": 713, "status": "running", "memory_mib": 4096, "vcpus": 2})
+            elif reason == "queue":
+                bad["vms"].append({"vm_id": 712, "status": "stopped", "memory_mib": 4096, "vcpus": 2})
+                bad["queue"] = {"status": "read", "jobs": 1}
+            elif reason == "idle":
+                bad["idle"]["nix_builds"] = 1
+            else:
+                now = 1061
+            with self.subTest(reason=reason), self.assertRaisesRegex(ValueError, reason):
+                admission.admit(bad, "production-build", now=now,
+                                resources={"vcpus": 24, "memory_mib": 32768})
+
+    def test_production_credit_uses_anonymous_resident_not_unused_configured_maximum(self):
+        value = production_snapshot()
+        value["vms"][0]["memory_mib"] = 24576
+        value["host"]["memory_available_mib"] = 37132
+        value["builder_memory"]["resident_anonymous_mib"] = 20192
+        accepted = admission.admit(value, "production-build", now=1010,
+                                   resources={"vcpus": 32, "memory_mib": 39936})
+        self.assertEqual(accepted["builder_memory_credit_mib"], 19936)
+        self.assertEqual(accepted["required_available_memory_mib"], 36384)
+        with self.assertRaisesRegex(ValueError, "available"):
+            admission.admit(value, "production-build", now=1010,
+                            resources={"vcpus": 32, "memory_mib": 40960})
+
+    def test_production_rejects_missing_wrong_owner_or_raw_rss_measurement(self):
+        for measurement in (None, {"rss_mib": 8192},
+                            {"resident_anonymous_mib": 8192, "source": "VmRSS", "vm_id": 709, "pid": 1234},
+                            {"resident_anonymous_mib": 8192, "source": "RssAnon", "vm_id": 710, "pid": 1234},
+                            {"resident_anonymous_mib": 8192, "source": "RssAnon", "vm_id": 709, "pid": 0}):
+            value = production_snapshot()
+            value["builder_memory"] = measurement
+            with self.subTest(measurement=measurement), self.assertRaisesRegex(ValueError, "measurement|anonymous|owner|PID"):
+                admission.admit(value, "production-build", now=1010,
+                                resources={"vcpus": 24, "memory_mib": 32768})
+
+    def test_production_credit_caps_oversized_measurement_and_stopped_builder_gets_zero(self):
+        value = production_snapshot()
+        value["builder_memory"]["resident_anonymous_mib"] = 10000
+        accepted = admission.admit(value, "production-build", now=1010,
+                                   resources={"vcpus": 24, "memory_mib": 32768})
+        self.assertEqual(accepted["builder_memory_credit_mib"], 7936)
+        value["vms"][0]["status"] = "stopped"
+        value["builder_memory"] = {"resident_anonymous_mib": 0, "source": "stopped", "vm_id": 709, "pid": None}
+        accepted = admission.admit(value, "production-build", now=1010,
+                                   resources={"vcpus": 24, "memory_mib": 32768})
+        self.assertEqual(accepted["builder_memory_credit_mib"], 0)
 
 
 if __name__ == "__main__":

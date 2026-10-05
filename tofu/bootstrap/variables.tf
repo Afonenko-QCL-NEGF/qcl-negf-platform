@@ -14,8 +14,35 @@ variable "build_profile" {
   default     = "standard"
   description = "Select after host admission; resource changes reboot the idle builder."
   validation {
-    condition     = contains(["standard", "burst"], var.build_profile)
-    error_message = "Use the standard or burst build profile."
+    condition     = contains(["standard", "burst", "local-debug", "production-build"], var.build_profile)
+    error_message = "Use standard, burst, local-debug or temporary production-build."
+  }
+}
+variable "production_build_vcpus" {
+  type        = number
+  default     = null
+  description = "Explicit production-build CPU choice from fresh actual host admission; no exclusive CPU pinning."
+  validation {
+    condition     = var.production_build_vcpus == null ? true : var.production_build_vcpus >= 1 && floor(var.production_build_vcpus) == var.production_build_vcpus
+    error_message = "production_build_vcpus must be a positive integer."
+  }
+}
+variable "production_build_memory_mib" {
+  type        = number
+  default     = null
+  description = "Explicit production-build guest RAM from fresh maximum-allocation and anonymous resident-memory admission."
+  validation {
+    condition     = var.production_build_memory_mib == null ? true : var.production_build_memory_mib > 2048 && floor(var.production_build_memory_mib) == var.production_build_memory_mib
+    error_message = "production_build_memory_mib must leave more than 2 GiB for the shared build slice and guest OS."
+  }
+}
+variable "host_logical_cpus" {
+  type        = number
+  default     = null
+  description = "Fresh measured host logical CPU count, required for temporary production-build admission."
+  validation {
+    condition     = var.host_logical_cpus == null ? true : var.host_logical_cpus >= 1 && floor(var.host_logical_cpus) == var.host_logical_cpus
+    error_message = "host_logical_cpus must be a positive integer."
   }
 }
 variable "installer_boot" {

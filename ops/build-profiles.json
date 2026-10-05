@@ -8,6 +8,22 @@
     "build_cores": 4,
     "max_jobs": 1
   },
+  "local-debug": {
+    "vcpus": 4,
+    "memory_mib": 8192,
+    "cpu_quota": "400%",
+    "memory_max": "7G",
+    "memory_swap_max": 0,
+    "build_cores": 4,
+    "max_jobs": 1
+  },
+  "production-build": {
+    "dynamic": true,
+    "guest_reserve_mib": 2048,
+    "memory_credit_reserve_mib": 256,
+    "memory_swap_max": 0,
+    "max_jobs": 1
+  },
   "burst": {
     "vcpus": 12,
     "memory_mib": 24576,
