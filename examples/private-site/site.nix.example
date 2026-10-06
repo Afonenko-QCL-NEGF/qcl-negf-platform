@@ -2,6 +2,14 @@
 # These documentation-only addresses are not suitable for an actual deployment.
 {
   initializeBlankDisks = false;
+  serviceEmail = "research@example.org";
+  codeLabel = "qcl-negf-v1";
+  # Define these units in the private site and make each complete only after
+  # secrets exist with their required owner/mode. Never put secret bytes here.
+  runtimeSecretUnits = [ "site-runtime-secrets.service" ];
+  # Add PRIVATE NixOS modules defining those services for the appropriate hosts.
+  # Keep only runtime file paths here; secret bytes never enter a Nix expression.
+  modules = [];
   hosts = {
     "192.0.2.10" = [ "storage" ];
     "192.0.2.11" = [ "control" ];

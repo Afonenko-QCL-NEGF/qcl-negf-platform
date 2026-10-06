@@ -1,9 +1,12 @@
 locals {
-  persistent  = { for name, vm in var.vms : name => vm if contains(["storage", "control"], name) }
-  replaceable = { for name, vm in var.vms : name => vm if contains(["compute", "ci"], name) }
+  build_profiles = jsondecode(file("${path.module}/../../ops/build-profiles.json"))
+  persistent     = { for name, vm in var.vms : name => vm if contains(["storage", "control"], name) }
+  replaceable    = { for name, vm in var.vms : name => vm if contains(["compute", "ci"], name) }
+  local_images   = { for name, vm in var.vms : name => vm if vm.image_file_id == null }
+  root_images    = { for name, vm in var.vms : name => vm.image_file_id != null ? vm.image_file_id : proxmox_virtual_environment_file.root_image[name].id }
 }
 resource "proxmox_virtual_environment_file" "root_image" {
-  for_each     = var.vms
+  for_each     = local.local_images
   node_name    = var.node
   datastore_id = var.image_datastore
   content_type = "import"
@@ -25,7 +28,7 @@ resource "proxmox_virtual_environment_file" "user_data" {
   datastore_id = var.snippet_datastore
   content_type = "snippets"
   source_raw {
-    file_name = "qcl-negf-${each.key}-user-data.yaml"
+    file_name = "${var.resource_prefix}-${each.key}-user-data.yaml"
     data      = "#cloud-config\n${yamlencode({ hostname = each.key, ssh_pwauth = false, ssh_authorized_keys = var.ssh_public_keys })}"
   }
 }
@@ -35,7 +38,7 @@ resource "proxmox_virtual_environment_file" "network_data" {
   datastore_id = var.snippet_datastore
   content_type = "snippets"
   source_raw {
-    file_name = "qcl-negf-${each.key}-network.yaml"
+    file_name = "${var.resource_prefix}-${each.key}-network.yaml"
     data = yamlencode({ version = 2, ethernets = { cluster0 = {
       match       = { macaddress = lower(each.value.mac) }
       "set-name"  = "cluster0"
@@ -53,10 +56,17 @@ resource "proxmox_virtual_environment_vm" "persistent" {
   tags                                 = ["qcl-negf", each.key]
   bios                                 = "seabios"
   machine                              = "q35"
-  on_boot                              = true
+  boot_order                           = ["virtio0"]
+  on_boot                              = each.value.on_boot
+  started                              = each.value.started
   protection                           = true
   delete_unreferenced_disks_on_destroy = false
   agent { enabled = true }
+  # Reserve ide2 for cloud-init. Never use the provider's physical CD default.
+  cdrom {
+    file_id   = "none"
+    interface = "ide0"
+  }
   cpu {
     cores = each.value.vcpus
     type  = "host"
@@ -67,7 +77,7 @@ resource "proxmox_virtual_environment_vm" "persistent" {
   }
   disk {
     datastore_id = var.root_datastore
-    import_from  = proxmox_virtual_environment_file.root_image[each.key].id
+    import_from  = local.root_images[each.key]
     interface    = "virtio0"
     size         = each.value.root_gib
     serial       = "qcl-root"
@@ -95,16 +105,23 @@ resource "proxmox_virtual_environment_vm" "persistent" {
   lifecycle { prevent_destroy = true }
 }
 resource "proxmox_virtual_environment_vm" "replaceable" {
-  for_each        = local.replaceable
-  name            = each.key
-  node_name       = var.node
-  vm_id           = each.value.vm_id
-  tags            = ["qcl-negf", each.key]
-  bios            = "seabios"
-  machine         = "q35"
-  on_boot         = true
-  stop_on_destroy = true
+  for_each            = local.replaceable
+  name                = each.key
+  node_name           = var.node
+  vm_id               = each.value.vm_id
+  tags                = ["qcl-negf", each.key]
+  bios                = "seabios"
+  machine             = "q35"
+  boot_order          = ["virtio0"]
+  on_boot             = each.value.on_boot
+  started             = each.value.started
+  reboot_after_update = true
+  stop_on_destroy     = true
   agent { enabled = true }
+  cdrom {
+    file_id   = "none"
+    interface = "ide0"
+  }
   cpu {
     cores = each.value.vcpus
     type  = "host"
@@ -115,7 +132,7 @@ resource "proxmox_virtual_environment_vm" "replaceable" {
   }
   disk {
     datastore_id = var.root_datastore
-    import_from  = proxmox_virtual_environment_file.root_image[each.key].id
+    import_from  = local.root_images[each.key]
     interface    = "virtio0"
     size         = each.value.root_gib
     serial       = "qcl-root"

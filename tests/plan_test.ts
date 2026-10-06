@@ -47,12 +47,37 @@ Deno.test("clean installation requires a separate mounted root", () => {
   assert(installPlan(host, "/mnt")[0]!.args.includes("--no-root-password"));
 });
 
-Deno.test("bootstrap pins local Slurm and peer-authenticated PostgreSQL", async () => {
+Deno.test("bootstrap registers the immutable installed code as part of recovery", async () => {
   const { bootstrapPlan } = await import("../ops/bootstrap.ts");
   rejects(() => bootstrapPlan("invalid"));
-  const plan = bootstrapPlan("research@example.org");
-  assert(plan.length === 3);
-  assert(plan[0]!.args.includes("core.zeromq"));
-  assert(plan[0]!.args.includes("/run/postgresql"));
-  assert(plan[1]!.args.includes("core.slurm") && plan[1]!.args.includes("core.local"));
+  const plan = bootstrapPlan("research@example.org", "/nix/store/example/bin/qcl-negf");
+  assert(plan.length === 2);
+  assert(plan[0]!.args[0]!.endsWith("/bootstrap_profile.py"));
+  assert(plan[0]!.args.includes("research@example.org"));
+  assert(plan[1]!.args.includes("run"));
+  assert(plan[1]!.args.includes("/nix/store/example/bin/qcl-negf"));
+  rejects(() => bootstrapPlan("research@example.org", "/run/current-system/sw/bin/qcl-negf"));
+});
+
+Deno.test("existing profile permits recovery only for the same local storage contract", async () => {
+  const { profileSetupRequired } = await import("../ops/bootstrap.ts");
+  assert(profileSetupRequired({ profiles: {} }));
+  rejects(() => profileSetupRequired(null));
+  const profile = {
+    storage: {
+      backend: "core.psql_dos",
+      config: {
+        database_hostname: "/run/postgresql",
+        database_port: 5432,
+        database_username: "qcl-negf",
+        database_password: "",
+        database_name: "qcl-negf",
+        repository_uri: "file:///var/lib/qcl-negf/aiida/repository",
+      },
+    },
+    process_control: { backend: "core.zeromq" },
+  };
+  assert(profileSetupRequired({ profiles: { "qcl-negf": profile } }));
+  profile.storage.config.repository_uri = "file:///different/repository";
+  rejects(() => profileSetupRequired({ profiles: { "qcl-negf": profile } }));
 });

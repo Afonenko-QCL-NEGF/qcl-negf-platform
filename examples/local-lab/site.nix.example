@@ -1,0 +1,18 @@
+# Public inputs only. Copy to an ignored private lab flake/configuration.
+{
+  sshPublicKey = "ssh-ed25519 REPLACE_WITH_PUBLIC_KEY operator";
+  hosts = {
+    "192.168.231.10" = [ "control" ];
+    "192.168.231.11" = [ "storage" ];
+    "192.168.231.21" = [ "worker-1" ];
+    "192.168.231.22" = [ "worker-2" ];
+  };
+  # Initial bootstrap declaration; record actual slurmd -C evidence before jobs.
+  nodes = [ "worker-[1-2] CPUs=2 RealMemory=2048 State=UNKNOWN" ];
+  partitions = [ "compute Nodes=worker-[1-2] Default=YES State=UP" ];
+  initializeBlankDisks = true;
+  # Application stage only after infrastructure proof:
+  # application = <immutable application derivation>;
+  # solver = <immutable solver derivation>;
+  # serviceEmail = "private-site-supplied-email";
+}

@@ -4,6 +4,8 @@
 let
   shared = {
     qclNegf.privateInterface = "cluster0";
+    qclNegf.runtimeSecretUnits = site.runtimeSecretUnits;
+    qclNegf.release.applicationPackage = application;
     qclNegf.cluster = {
       controllerHost = "control";
       storageHost = "storage";
@@ -15,7 +17,7 @@ let
   make = name: modules: nixpkgs.lib.nixosSystem {
     system = "x86_64-linux";
     modules = [ platform.nixosModules.default (platform.outPath + "/modules/image.nix") shared
-      { networking.hostName = name; } ] ++ modules;
+      { networking.hostName = name; } ] ++ (site.modules or []) ++ modules;
   };
 in {
   storage = make "storage" [{ qclNegf.storage = {
@@ -25,7 +27,11 @@ in {
   control = make "control" [{
     qclNegf.cluster = { controller = true; submit = true; };
     qclNegf.stateDisk = { enable = true; initializeBlankDisk = site.initializeBlankDisks; };
-    qclNegf.application = { enable = true; package = application; api.enable = true; };
+    qclNegf.application = {
+      enable = true; package = application; api.enable = true;
+      bootstrap = { enable = true; email = site.serviceEmail; codeLabel = site.codeLabel; };
+    };
+    qclNegf.stateArchive.enable = true;
   }];
   compute = make "compute" [{ qclNegf.cluster = {
     worker = true; scratchDevice = "/dev/disk/by-id/virtio-qcl-scratch";

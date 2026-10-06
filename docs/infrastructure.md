@@ -33,6 +33,28 @@ Replace these values with the machine's usable RAM and the needs of other guests
 validation rejects allocations exceeding the declared host budgets and reserves; it does not infer
 available capacity from Proxmox.
 
+For dedicated CI, `build_profile = "standard"` selects the shared
+`ops/build-profiles.json` contract: 4 vCPU/8 GiB, one Nix build, and an aggregate
+4-CPU/7-GiB slice with no swap. `"burst"` selects 12 vCPU/24 GiB and an aggregate
+12-CPU/22-GiB slice, also one build and no swap. Set the same
+`qclNegf.builder.profile` in the CI OS; OpenTofu requires CI CPU/RAM to match
+the selected profile. The default `build_profile = null` retains custom site
+resources. It does not enable the NixOS builder module.
+
+Each VM's `started` and `on_boot` default to `true`. Burst requires both fields
+to be `false` on compute. The declared CPU/RAM budget includes any VM started
+now or on host boot; a stopped compute VM keeps its identity, disks and resource
+declaration. Before applying a burst plan, verify actual compute is off, the
+Slurm queue is empty, CI has no active build/job, and measured host memory leaves
+8 GiB for the host plus the maximum 8 GiB pnetlab guest allocation. A missing
+controller/compute pair is admissible only when the host inventory confirms
+both are undeployed; an unreachable existing controller is a refusal. These
+runtime facts are not proved by variable validation. The
+[read-only snapshot admission helper](build-admission.md) validates collected
+facts without collecting them or applying changes. Switch only between idle
+builds, review the saved plan and guest limits after reboot, and restore standard
+before starting compute. This procedure does not stop or cancel running work.
+
 The Arch worker defaults to 30 GiB and 12 vCPU on a host with 32 GiB and 12 logical CPUs/6 physical
 cores. This leaves a nominal 2 GiB outside the guest before QEMU overhead. Ansible requires
 at least 1 GiB of measured host RAM beyond the guest allocation; firmware reservations mean
@@ -51,6 +73,12 @@ BLAS/OpenMP defaults are one thread; Slurm cgroup v2 enforces the assigned CPU s
 limits. Every compute node and submission host must retain the same immutable solver store path.
 
 ## Source to provisioned VM
+
+For a first installation without an existing builder, start with the
+[platform-only official-ISO bootstrap](bootstrap.md). It does not require any
+scientific artifacts. Prepare its isolated networks through the
+[private host policy](host-network.md), then build the reviewed scientific
+environment on that guest under the authorized finite build budget.
 
 1. Check out a reviewed root Git revision with all submodules. Run its tests and build the
    application/solver environment. Prepare the Julia depot using the root project's preparation
@@ -78,14 +106,33 @@ deno run --allow-read --allow-write --allow-run=nix \
   /absolute/private-site \
   /absolute/private-site/proxmox-base.json \
   /absolute/private-site/arch-base.json \
-  /absolute/private-site/generated
+  /absolute/private-site/generated \
+  --preflight-receipt /absolute/private-site/preflight.json
 ```
+
+First complete the [actual nginx preflight](nginx-preflight.md) on the admitted
+trusted builder. The image entry point requires its passed receipt and checks
+the four current role derivations, nginx executable/config and config hash against
+that receipt before any image stage. Writer-only receipts are rejected.
 
 The helper builds `storage-image`, `control-image`, `compute-image`, `ci-image` and
 `arch-worker-image`, finds their QCOW2 files, computes SHA-256 with Nix, and writes provider input
 JSON plus an image manifest. It does not contact either hypervisor. Rebuilding updates the image
 paths and digests automatically. Generated provider inputs contain site information and remain
 private.
+
+When images are built on an isolated CI VM and the administrative controller has
+limited disk space, use the [host-initiated image transport](image-transfer.md).
+Only metadata JSON crosses the controller; Proxmox pulls and verifies complete
+QCOW2 files through restricted SSH, and the resulting provider input uses existing
+`image_file_id` values. This keeps Proxmox credentials outside CI and avoids a
+controller-local image copy. Local image uploads remain available for sites that
+already keep their images on the administrative controller.
+
+For a site using only the primary Proxmox server, pass `-` in place of the Arch
+base JSON argument. It builds only the four Proxmox roles and does not evaluate
+or generate an Arch worker artifact/provider input. The default five-role mode
+remains available when that separate host is part of the site.
 
 The image imports `modules/image.nix`: BIOS GRUB on the VirtIO root disk, an automatically resized
 root filesystem, serial console, QEMU guest agent and cloud-init NoCloud networking/SSH seed
@@ -118,6 +165,41 @@ provider lock files verify exact provider versions and hashes.
 Apply a reviewed plan from the normal administrative environment when ready. This repository does
 not apply infrastructure as part of a source or unit-test job. Changing a root image is an
 infrastructure change and belongs in a reviewed maintenance plan.
+
+### Multiple deployments on one Proxmox host
+
+Use separate private backend state, generated inputs, saved plans and VM IDs for
+each deployment. Distinct backends do not isolate remote datastore file names.
+Set `resource_prefix` to a distinct, stable lowercase ASCII slug, for example
+`qcl-negf-rehearsal`, when deployments share a snippet datastore. The prefix is
+limited to 48 characters, starts with a letter and permits single hyphen
+separators. It namespaces both cloud-init files for every role:
+`PREFIX-ROLE-user-data.yaml` and `PREFIX-ROLE-network.yaml`.
+The default `qcl-negf` preserves all existing file names. Changing the prefix of
+an existing deployment is a reviewed resource migration, not a routine cleanup.
+Image file names and protected disk lifecycle retain their existing contracts.
+
+The VM resources start newly created guests during apply unless their inventory
+sets `started = false`. Capacity admission
+must therefore account for all other running deployments before apply;
+sequential health verification does not make VM startup sequential. Provider
+resource checks budget only the four VMs in the current inventory.
+
+Use the published owning module directory with a separate `TF_DATA_DIR` and an
+absolute private backend path for each installation. Alternatively copy the
+complete owning platform tree, preserving relative assets: copying only
+`tofu/proxmox/*.tf` omits the shared profile JSON and is unsupported.
+
+For a disposable rehearsal, inspect its separate state and actual VM IDs/MACs
+before removing anything. Storage/control retain `prevent_destroy` and Proxmox
+protection, so a generic destroy intentionally refuses their deletion. Explicit
+teardown of those disposable VMs requires a reviewed lifecycle step tied to
+their recorded IDs and newly created volumes; do not weaken the public guards
+or operate on production state. Removing an entry from state does not remove
+its remote VM or file. Delete only that deployment's recorded snippet file IDs
+after their consumers are removed. SHA-addressed staged images are separately
+retained artifacts and may be shared; verify all import dependencies before
+removing them. Reconcile only the rehearsal state after manual lifecycle work.
 
 ## Existing Arch host
 
@@ -190,8 +272,22 @@ integration check boots a dedicated storage VM, controller and worker; it verifi
 submission, independent local scratch, NFS output ownership and result persistence across controller
 restart. Image expression evaluation does not prove that a built QCOW2 boots.
 
+After provider initialization, run `tofu test -filter=tests/snippet_namespace.tftest.hcl`
+in `tofu/proxmox`. Its plan-only mocked provider checks unchanged default snippet
+names, disjoint rehearsal names on the same datastore and invalid-prefix
+rejection. It neither calls Proxmox nor establishes VM boot or remote cleanup.
+
 Primary interfaces are pinned to
 [bpg/proxmox 0.114.0](https://github.com/bpg/terraform-provider-proxmox/tree/v0.114.0/docs),
 [dmacvicar/libvirt 0.9.9](https://github.com/dmacvicar/terraform-provider-libvirt/tree/v0.9.9/docs),
 and the platform's Nixpkgs lock. The libvirt configuration uses the current 0.9 attribute-based
 schema, including a separately uploaded cloud-init ISO; it does not use removed 0.8 block syntax.
+
+The main `tofu/proxmox` configuration declares a local backend. Initialize it
+with an absolute private state path, for example
+`tofu -chdir=tofu/proxmox init -backend-config=path=/private/site/state/proxmox.tfstate`.
+Keep that directory mode0700 and state/plan files mode0600; neither belongs in
+the public checkout. For an existing initialized working directory, review the
+state migration explicitly before using `init -migrate-state`; do not silently
+create a second empty state. Offline syntax/provider validation uses
+`init -backend=false` and does not establish the production backend.

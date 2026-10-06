@@ -28,8 +28,10 @@ provisioning, disk protection and recovery boundaries.
 | `qclNegf.storage`     | Dedicated NFS server and client allowlist                                       |
 | `qclNegf.stateDisk`   | Persistent controller application and scheduler state                           |
 | `qclNegf.application` | AiiDA, PostgreSQL and optional authenticated HTTP API                           |
-| `qclNegf.runner`      | One runner registered to the root repository, with CPU/RAM limits               |
+| `qclNegf.builder`     | Shared daemon/admin/jobs slice and standard/burst resource profiles             |
+| `qclNegf.runner`      | Isolated persistent root-repository runner with controller-issued registration |
 | `qclNegf.cache`       | Signed, read-only Nix binary cache endpoint                                     |
+| `qclNegf.stateArchive` | Manual coordinated controller archive, verification and empty-state restore |
 | `ops/`                | TypeScript commands for build, activation, clean installation and profile setup |
 
 ## Development and validation
@@ -62,6 +64,11 @@ KVM or supported QEMU emulation. Expression evaluation does not establish that a
 and image checks are described in [infrastructure](docs/infrastructure.md).
 
 ## Deployment
+
+For the first CI/build host, use the [platform-only bootstrap](docs/bootstrap.md)
+from official installation media. It has no application, solver or Julia-depot
+dependency. [The host policy](docs/host-network.md) declaratively creates the
+isolated guest bridges while retaining the existing management bridge.
 
 Create a private site flake from `examples/private-site/`, set measured resources, hardware, network
 and runtime secrets, and attach the root application's and solver's immutable packages. Copy

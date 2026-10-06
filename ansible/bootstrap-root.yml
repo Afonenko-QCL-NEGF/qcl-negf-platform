@@ -1,0 +1,64 @@
+---
+# The minimal official ISO has no Python. Raw is used only for this finite,
+# guarded initial root operation; scientific data/state disks are never selected.
+- name: Prepare a new empty bootstrap root in the official installer
+  hosts: bootstrap
+  gather_facts: false
+  tasks:
+    - name: Require a finite authorized root budget
+      ansible.builtin.assert:
+        that:
+          - qcl_bootstrap_root_gib is number
+          - qcl_bootstrap_root_gib | int == qcl_bootstrap_root_gib
+          - qcl_bootstrap_root_gib >= 16
+          - qcl_bootstrap_root_gib <= 100
+    - name: Inspect the exact empty bootstrap disk before formatting
+      ansible.builtin.raw: |
+        set -eu
+        disk=/dev/disk/by-id/virtio-qcl-bootstrap-root
+        test -b "$disk"
+        test "$(lsblk -nr -o NAME "$disk" | wc -l)" -eq 1
+        test -z "$(lsblk -nr -o FSTYPE,MOUNTPOINT "$disk" | tr -d ' ')"
+        test -z "$(wipefs --no-act --noheadings --output TYPE "$disk")"
+        lsblk -o NAME,SIZE,SERIAL,FSTYPE,MOUNTPOINTS "$disk"
+      check_mode: false
+      changed_when: false
+      when: not (qcl_bootstrap_resume | default(false))
+    - name: Inspect a previously prepared root when resuming explicitly
+      ansible.builtin.raw: |
+        set -eu
+        disk=/dev/disk/by-id/virtio-qcl-bootstrap-root
+        test -b "$disk-part1"
+        test "$(lsblk -nr -o NAME "$disk" | wc -l)" -eq 2
+        test "$(blkid -s TYPE -o value "$disk-part1")" = ext4
+        test "$(blkid -s LABEL -o value "$disk-part1")" = nixos
+        test "$(lsblk -bdnr -o SIZE "$disk-part1")" -le {{ qcl_bootstrap_root_gib | int * 1073741824 }}
+        lsblk -o NAME,SIZE,SERIAL,FSTYPE,MOUNTPOINTS "$disk"
+      check_mode: false
+      changed_when: false
+      when: qcl_bootstrap_resume | default(false)
+    - name: Partition only the verified empty bootstrap root
+      ansible.builtin.raw: |
+        set -eu
+        disk=/dev/disk/by-id/virtio-qcl-bootstrap-root
+        test -b "$disk"
+        test "$(lsblk -nr -o NAME "$disk" | wc -l)" -eq 1
+        test -z "$(wipefs --no-act --noheadings --output TYPE "$disk")"
+        test "$(lsblk -bdnr -o SIZE "$disk")" -gt {{ qcl_bootstrap_root_gib | int * 1073741824 }}
+        parted --script "$disk" mklabel msdos mkpart primary ext4 1MiB {{ qcl_bootstrap_root_gib | int }}GiB set 1 boot on
+        udevadm settle
+        mkfs.ext4 -L nixos "$disk-part1"
+        udevadm settle
+      when: not ansible_check_mode and not (qcl_bootstrap_resume | default(false))
+    - name: Mount the declared ext4 root and generate its hardware module
+      ansible.builtin.raw: |
+        set -eu
+        disk=/dev/disk/by-id/virtio-qcl-bootstrap-root
+        mkdir -p /mnt
+        if mountpoint -q /mnt; then
+          test "$(findmnt -n -o SOURCE /mnt)" = "$(readlink -f "$disk-part1")"
+        else
+          mount -t ext4 "$disk-part1" /mnt
+        fi
+        nixos-generate-config --root /mnt
+      when: not ansible_check_mode

@@ -1,0 +1,179 @@
+---
+- name: Check the existing local KVM API without host modification
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+  tasks:
+    - name: Require operator access to KVM
+      ansible.builtin.command:
+        argv: [sh, -c, 'test -r /dev/kvm && test -w /dev/kvm']
+      changed_when: false
+    - name: Check the configured non-root libvirt API
+      ansible.builtin.command:
+        argv: [virsh, --connect, "{{ qcl_lab_libvirt_uri | default('qemu:///system') }}", uri]
+      changed_when: false
+
+# Storage starts before controller and workers consume its NFS export.
+- name: Bootstrap dedicated storage from an already built NixOS root
+  hosts: storage
+  become: false
+  gather_facts: false
+  tasks: &bootstrap_tasks
+    - name: Require a namespaced lab and an immutable system closure
+      ansible.builtin.assert:
+        that:
+          - qcl_lab_namespace is match('^qcl-[a-z0-9][a-z0-9-]{1,30}$')
+          - qcl_lab_system is match('^/nix/store/[a-z0-9]{32}-nixos-system-')
+          - qcl_lab_role in ['control', 'storage', 'worker-1', 'worker-2']
+          - ansible_user | default('root') == 'root'
+      tags: [nix-trust]
+    - name: Wait for SSH using the caller's verified known hosts
+      ansible.builtin.wait_for_connection:
+        timeout: 240
+      tags: [nix-trust]
+    - name: Configure optional public Nix cache trust
+      when: qcl_lab_nix_public_key_file is defined
+      tags: [nix-trust]
+      block:
+        - name: Read only the caller's declared public cache key
+          ansible.builtin.set_fact:
+            qcl_lab_nix_public_key: "{{ lookup('ansible.builtin.file', qcl_lab_nix_public_key_file) | trim }}"
+          no_log: true
+        - name: Refuse private, malformed or noncanonical cache keys
+          ansible.builtin.assert:
+            that:
+              - qcl_lab_nix_public_key is match('^[A-Za-z0-9][A-Za-z0-9._-]{0,127}:[A-Za-z0-9+/]{43}=$')
+              - (qcl_lab_nix_public_key.split(':')[1] | b64decode(encoding='latin-1') | length) == 32
+              - (qcl_lab_nix_public_key.split(':')[1] | b64decode(encoding='latin-1') | b64encode(encoding='latin-1')) == qcl_lab_nix_public_key.split(':')[1]
+          no_log: true
+        - name: Create root's private Nix configuration directory
+          ansible.builtin.file:
+            path: /root/.config/nix
+            state: directory
+            owner: root
+            group: root
+            mode: '0700'
+        - name: Retain other Nix settings and add the declared public trust block
+          ansible.builtin.blockinfile:
+            path: /root/.config/nix/nix.conf
+            create: true
+            owner: root
+            group: root
+            mode: '0600'
+            marker: '# {mark} qcl-local-lab trusted cache key'
+            block: "extra-trusted-public-keys = {{ qcl_lab_nix_public_key }}\n"
+          no_log: true
+    - name: Confirm role closure was included in the common image
+      ansible.builtin.stat:
+        path: "{{ qcl_lab_system }}/bin/switch-to-configuration"
+      register: qcl_lab_closure
+    - name: Refuse an absent or incomplete closure
+      ansible.builtin.assert:
+        that: qcl_lab_closure.stat.exists and qcl_lab_closure.stat.executable
+    - name: Create private persistent runtime input directory
+      ansible.builtin.file:
+        path: /var/lib/qcl-lab-secrets
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+      when: qcl_lab_role != 'storage'
+    - name: Deliver the shared Munge key outside the Nix store and OpenTofu state
+      ansible.builtin.copy:
+        src: "{{ qcl_lab_munge_key_file }}"
+        dest: /var/lib/qcl-lab-secrets/munge.key
+        owner: root
+        group: root
+        mode: '0400'
+      no_log: true
+      register: qcl_lab_key
+      when: qcl_lab_role != 'storage'
+    - name: Deliver optional controller API runtime token before application activation
+      ansible.builtin.copy:
+        src: "{{ qcl_lab_api_token_file }}"
+        dest: /var/lib/qcl-lab-secrets/api-token
+        owner: root
+        group: root
+        mode: '0400'
+      no_log: true
+      register: qcl_lab_api_token
+      when: qcl_lab_role == 'control' and qcl_lab_api_token_file is defined
+    - name: Inspect active role identity
+      ansible.builtin.command:
+        argv: [readlink, -f, /run/current-system]
+      register: qcl_lab_current
+      changed_when: false
+    - name: Inspect boot role identity
+      ansible.builtin.command:
+        argv: [readlink, -f, /nix/var/nix/profiles/system]
+      register: qcl_lab_boot
+      changed_when: false
+    # Switching from the common image updates /etc/hostname, but can preserve
+    # its transient kernel hostname. Slurm requires the role before activation.
+    - name: Inspect the current kernel hostname
+      ansible.builtin.command:
+        argv: [hostname]
+      register: qcl_lab_hostname
+      changed_when: false
+    - name: Select the role's transient hostname before cluster activation
+      ansible.builtin.command:
+        argv: [hostname, "{{ qcl_lab_role }}"]
+      when: qcl_lab_hostname.stdout != qcl_lab_role
+    - name: Confirm the kernel hostname matches the inventory role
+      ansible.builtin.command:
+        argv: [hostname]
+      register: qcl_lab_hostname_after
+      changed_when: false
+      failed_when: qcl_lab_hostname_after.stdout != qcl_lab_role
+    - name: Select the exact boot closure
+      ansible.builtin.command:
+        argv: [nix-env, --profile, /nix/var/nix/profiles/system, --set, "{{ qcl_lab_system }}"]
+      when: qcl_lab_boot.stdout != qcl_lab_system
+    - name: Activate the role and its boot configuration
+      ansible.builtin.command:
+        argv: ["{{ qcl_lab_system }}/bin/switch-to-configuration", switch]
+      when: qcl_lab_current.stdout != qcl_lab_system or qcl_lab_boot.stdout != qcl_lab_system
+    - name: Reload runtime secret after private key provisioning
+      ansible.builtin.systemd_service:
+        name: qcl-lab-runtime-secrets.service
+        state: restarted
+      when: qcl_lab_role != 'storage' and (qcl_lab_key.changed or qcl_lab_api_token.changed)
+    - name: Restart authentication after a changed key
+      ansible.builtin.systemd_service:
+        name: munged.service
+        state: restarted
+      when: qcl_lab_role != 'storage' and (qcl_lab_key.changed or qcl_lab_api_token.changed)
+    - name: Ensure the role's cluster daemon is running
+      ansible.builtin.systemd_service:
+        name: "{{ 'slurmctld.service' if qcl_lab_role == 'control' else 'slurmd.service' }}"
+        state: "{{ 'restarted' if qcl_lab_key.changed else 'started' }}"
+      when: qcl_lab_role != 'storage'
+    - name: Inspect the controller API unit before runtime credential reload
+      ansible.builtin.stat:
+        path: /etc/systemd/system/qcl-negf-api.service
+      register: qcl_lab_api_unit
+      when: qcl_lab_role == 'control'
+    - name: Reload the controller API credential after a changed token
+      ansible.builtin.systemd_service:
+        name: qcl-negf-api.service
+        state: restarted
+      when: qcl_lab_role == 'control' and qcl_lab_api_token.changed and qcl_lab_api_unit.stat.exists
+    - name: Ensure the storage export is running
+      ansible.builtin.systemd_service:
+        name: nfs-server.service
+        state: started
+      when: qcl_lab_role == 'storage'
+    - name: Confirm active role identity after bootstrap
+      ansible.builtin.command:
+        argv: [readlink, -f, /run/current-system]
+      register: qcl_lab_after
+      changed_when: false
+      failed_when: qcl_lab_after.stdout != qcl_lab_system
+
+- name: Bootstrap controller and workers against the dedicated storage server
+  hosts: local_lab:!storage
+  serial: 1
+  become: false
+  gather_facts: false
+  tasks: *bootstrap_tasks

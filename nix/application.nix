@@ -28,7 +28,9 @@ in
 assert lib.hasPrefix "3.14." pkgs.python314.version;
 environment.overrideAttrs (old: {
   postInstall = (old.postInstall or "") + ''
-    "$out/bin/python" - <<'PY'
+    # AiiDA imports initialize configuration directories even without a profile.
+    # Keep the integrity check's mutable state in the build sandbox.
+    AIIDA_PATH="$TMPDIR/qcl-negf-application-check" "$out/bin/python" - <<'PY'
     from importlib.metadata import distribution
     import aiida_qcl_negf, qcl_negf_api, qcl_negf_contracts, qcl_negf_results
     from aiida.plugins import CalculationFactory, ParserFactory, WorkflowFactory

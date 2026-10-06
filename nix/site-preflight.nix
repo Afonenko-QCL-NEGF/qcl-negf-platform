@@ -1,0 +1,41 @@
+# Unary function: `nix eval --file ... --apply 'f: f "/absolute/private-site"'`.
+# Evaluate ALL role toplevels before the first expensive image/application build.
+siteDir:
+let
+  site = builtins.getFlake siteDir;
+  roles = [ "storage" "control" "compute" "ci" ];
+  paths = builtins.listToAttrs (map (name: {
+    inherit name;
+    value = site.nixosConfigurations.${name}.config.system.build.toplevel.drvPath;
+  }) roles);
+  control = site.nixosConfigurations.control.config;
+  context = builtins.getContext (if control.services.nginx.enableReload
+    then toString control.environment.etc."nginx/nginx.conf".source
+    else control.systemd.services.nginx.serviceConfig.ExecStart);
+  targets = map (drv: assert context.${drv}.outputs == [ "out" ]; "${drv}^out")
+    (builtins.filter (drv: builtins.match ".*-nginx[.]conf[.]drv" drv != null)
+      (builtins.attrNames context));
+  result = {
+    roles = paths;
+    nginx = {
+      enabled = control.services.nginx.enable;
+      validated = control.services.nginx.validateConfigFile;
+      executable = "${control.services.nginx.package}/bin/nginx";
+      exec_start = control.systemd.services.nginx.serviceConfig.ExecStart;
+      reload = control.services.nginx.enableReload;
+      config_file = if control.services.nginx.enableReload
+        then toString control.environment.etc."nginx/nginx.conf".source else null;
+      tls_credentials = builtins.concatLists (map (vhost:
+        if !(vhost.onlySSL || vhost.addSSL || vhost.forceSSL ||
+          builtins.any (listen: listen.ssl or false) vhost.listen) then [] else [{
+          directive = "ssl_certificate";
+          path = toString vhost.sslCertificate;
+        } {
+          directive = "ssl_certificate_key";
+          path = toString vhost.sslCertificateKey;
+        }]
+      ) (builtins.attrValues control.services.nginx.virtualHosts));
+      inherit targets;
+    };
+  };
+in builtins.deepSeq result result

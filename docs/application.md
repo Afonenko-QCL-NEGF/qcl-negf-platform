@@ -43,7 +43,51 @@ The build verifies all component versions and the AiiDA calculation, parser and 
 
 Use the output as `qclNegf.application.package`; enable the API separately with `qclNegf.application.api.enable = true`. Mutable AiiDA state, credentials and calculation data remain outside the immutable package. Private site configuration defines the service token and allowed Code UUIDs.
 
+### Local profile bootstrap and TLS
+
+Automatic bootstrap uses the Python from the declared application profile, before
+`verdi run` can load a database environment. `ops/bootstrap_profile.py` validates
+the standard `core.psql_dos` storage fields and supplies the supported
+`engine_kwargs.connect_args` for `/run/postgresql`, database `qcl-negf`, port 5432.
+The raw declared hostname stays unchanged; PostgreSQL remains peer authenticated
+without TCP. The profile CLI alone cannot retain this runtime field.
+
+For a new profile, bootstrap checks the peer identity and an empty database in a
+read-only transaction, and requires an absent or completely empty repository.
+Only then does it call the public storage lifecycle with `reset=False`, store
+the Profile and create its default user. AiiDA can internally clear a partial
+container even with `reset=False`; bootstrap therefore refuses all partial or
+nonempty repositories rather than resetting or recovering them automatically.
+Inspect and preserve such state separately. For a matching existing profile,
+bootstrap only fills missing socket connection settings, preserving UUID,
+other engine options and provenance; conflicting settings fail closed. Computer
+and immutable InstalledCode registration follows the existing reconciliation.
+
+An optional common proxy replaces site-local nginx boilerplate:
+
+```nix
+qclNegf.application.api.tls = {
+  enable = true;
+  # Runtime files provisioned by the site's secret service, outside the store.
+  certificateFile = "/run/secrets/qcl-negf-tls.crt";
+  keyFile = "/run/secrets/qcl-negf-tls.key";
+  serverName = "localhost";
+};
+```
+
+The proxy listens only on `127.0.0.1:443` (TLS port is configurable), uses
+`onlySSL = true`, and forwards to the existing loopback API port. systemd
+`LoadCredential` supplies readable private copies to nginx after the declared
+`qclNegf.runtimeSecretUnits`. The private site supplies certificate identity,
+keys and any external access tunnel. Remove a site's duplicate API virtual host
+when enabling this option. TLS is opt-in; existing sites remain unchanged.
+
 ## Wheels and delivery
+
+After one-time image preparation, [application CD](application-cd.md) updates the
+stable profile/runtime configuration without rebuilding the OS and preserves
+immutable solver Code identities. Routine delivery uses the existing umbrella
+GitHub Actions workflow.
 
 Build the browser before distributable Python wheels:
 

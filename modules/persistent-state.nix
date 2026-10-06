@@ -1,5 +1,6 @@
 { config, lib, ... }:
 let cfg = config.qclNegf.stateDisk;
+    stateConsumers = [ "var-lib-qcl\\x2dnegf.mount" "slurmctld.service" ] ++ lib.optional config.services.postgresql.enable "postgresql.service";
 in {
   options.qclNegf.stateDisk = {
     enable = lib.mkEnableOption "separate persistent controller state disk";
@@ -17,8 +18,8 @@ in {
     services.slurm.stateSaveLocation = "/var/lib/qcl-negf-state/slurm";
     systemd.tmpfiles.rules = [ "d /var/lib/qcl-negf-state/aiida 0750 qcl-negf qcl-negf -" ];
     systemd.services.qcl-negf-state-directories = {
-      requiredBy = [ "var-lib-qcl\\x2dnegf.mount" "slurmctld.service" ] ++ lib.optional config.services.postgresql.enable "postgresql.service";
-      before = [ "var-lib-qcl\\x2dnegf.mount" ];
+      requiredBy = stateConsumers;
+      before = stateConsumers;
       unitConfig = { RequiresMountsFor = "/var/lib/qcl-negf-state"; DefaultDependencies = false; };
       serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
       script = ''
@@ -27,11 +28,17 @@ in {
           exit 1
         fi
         install -d -o qcl-negf -g qcl-negf -m 0750 /var/lib/qcl-negf-state/aiida
+        ${lib.optionalString config.services.postgresql.enable ''
+          # The custom persistent dataDir must exist before PostgreSQL creates
+          # its service mount namespace. PostgreSQL alone owns initdb/migration.
+          install -d -o postgres -g postgres -m 0700 ${lib.escapeShellArg config.services.postgresql.dataDir}
+        ''}
       '';
     };
-    systemd.services.postgresql.unitConfig.RequiresMountsFor = "/var/lib/qcl-negf-state";
+    # The PostgreSQL module requires its configured dataDir, which includes
+    # this state mount. A second string definition conflicts with that unit.
     systemd.services.slurmctld.unitConfig.RequiresMountsFor = "/var/lib/qcl-negf-state";
-    systemd.services.qcl-negf-aiida.unitConfig.RequiresMountsFor = "/var/lib/qcl-negf";
-    systemd.services.qcl-negf-api.unitConfig.RequiresMountsFor = "/var/lib/qcl-negf";
+    systemd.services.qcl-negf-aiida.unitConfig.RequiresMountsFor = [ "/var/lib/qcl-negf" ];
+    systemd.services.qcl-negf-api.unitConfig.RequiresMountsFor = [ "/var/lib/qcl-negf" ];
   };
 }

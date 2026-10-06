@@ -18,6 +18,15 @@ variable "snippet_datastore" {
   type        = string
   description = "Existing datastore permitting snippets content."
 }
+variable "resource_prefix" {
+  type        = string
+  default     = "qcl-negf"
+  description = "Stable namespace for cloud-init snippet files; choose a distinct prefix for each deployment sharing a snippet datastore."
+  validation {
+    condition     = length(var.resource_prefix) <= 48 && can(regex("^[a-z][a-z0-9]*(-[a-z0-9]+)*$", var.resource_prefix))
+    error_message = "resource_prefix must be a lowercase ASCII slug starting with a letter, with at most 48 characters and single hyphen separators."
+  }
+}
 variable "root_datastore" {
   type        = string
   description = "Datastore for replaceable VM root disks and cloud-init disks."
@@ -34,6 +43,16 @@ variable "ci_bridge" {
   type        = string
   description = "Existing isolated CI network bridge with outbound GitHub access."
 }
+variable "build_profile" {
+  type        = string
+  default     = null
+  nullable    = true
+  description = "Optional standard/burst CI profile from the shared build table; null preserves custom site resources. Select only after fresh host/queue admission."
+  validation {
+    condition     = var.build_profile == null ? true : contains(["standard", "burst"], var.build_profile)
+    error_message = "build_profile must be null, standard or burst."
+  }
+}
 variable "dns_servers" {
   type        = list(string)
   description = "Site DNS server addresses."
@@ -48,15 +67,18 @@ variable "ssh_public_keys" {
 }
 variable "vms" {
   type = map(object({
-    vm_id        = number
-    vcpus        = number
-    memory_mib   = number
-    root_gib     = number
-    mac          = string
-    address      = string
-    gateway      = string
-    image_path   = string
-    image_sha256 = string
+    vm_id         = number
+    vcpus         = number
+    memory_mib    = number
+    root_gib      = number
+    mac           = string
+    address       = string
+    gateway       = string
+    started       = optional(bool, true)
+    on_boot       = optional(bool, true)
+    image_path    = optional(string)
+    image_file_id = optional(string)
+    image_sha256  = string
   }))
   description = "Exactly storage, control, compute and ci, with real site addresses and measured resource budgets."
   validation {
@@ -68,12 +90,32 @@ variable "vms" {
     error_message = "VMs need positive resources, an IPv4 CIDR and a SHA-256 pinned QCOW2 image."
   }
   validation {
-    condition     = sum([for vm in values(var.vms) : vm.memory_mib]) <= var.host_memory_mib - var.host_reserve_mib
-    error_message = "VM memory exceeds the physical host budget after its reserve."
+    condition     = alltrue([for vm in values(var.vms) : (vm.image_path != null) != (vm.image_file_id != null)])
+    error_message = "Choose exactly one image source: an operator-local image_path or a verified existing image_file_id."
   }
   validation {
-    condition     = sum([for vm in values(var.vms) : vm.vcpus]) <= var.host_logical_cpus - var.host_reserved_cpus
-    error_message = "VM vCPUs exceed the non-overcommitted logical CPU budget."
+    condition     = alltrue([for name, vm in var.vms : vm.image_file_id == null ? true : vm.image_file_id == "${var.image_datastore}:import/qcl-negf-${name}-${vm.image_sha256}.qcow2"])
+    error_message = "Existing images must be staged in image_datastore with the full reviewed SHA-256 filename."
+  }
+  validation {
+    condition     = sum(concat([0], [for vm in values(var.vms) : vm.memory_mib if vm.started || vm.on_boot])) <= var.host_memory_mib - var.host_reserve_mib
+    error_message = "VMs started now or on host boot exceed the physical host memory budget after its reserve."
+  }
+  validation {
+    condition     = sum(concat([0], [for vm in values(var.vms) : vm.vcpus if vm.started || vm.on_boot])) <= var.host_logical_cpus - var.host_reserved_cpus
+    error_message = "VMs started now or on host boot exceed the non-overcommitted logical CPU budget."
+  }
+  validation {
+    condition = var.build_profile == null ? true : try(
+      var.vms["ci"].vcpus == local.build_profiles[var.build_profile].vcpus &&
+      var.vms["ci"].memory_mib == local.build_profiles[var.build_profile].memory_mib,
+      !contains(["standard", "burst"], var.build_profile)
+    )
+    error_message = "CI CPU/RAM must exactly match the selected shared build profile and the NixOS builder profile."
+  }
+  validation {
+    condition     = var.build_profile == "burst" ? (!var.vms["compute"].started && !var.vms["compute"].on_boot) : true
+    error_message = "Burst requires compute.started=false and compute.on_boot=false; restore standard before starting compute."
   }
 
 }

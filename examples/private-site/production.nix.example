@@ -1,0 +1,49 @@
+# Copy into the private site, import through site.modules, and replace PUBLIC
+# documentation inventory. These values are not a deployable real inventory.
+{ config, lib, ... }:
+let
+  inventory = {
+    storage = { mac = "02:00:00:00:00:10"; address = "192.0.2.10"; gateway = "192.0.2.1"; };
+    control = { mac = "02:00:00:00:00:11"; address = "192.0.2.11"; gateway = "192.0.2.1"; };
+    compute = { mac = "02:00:00:00:00:12"; address = "192.0.2.12"; gateway = "192.0.2.1"; };
+    ci = { mac = "02:00:00:00:00:13"; address = "198.51.100.13"; gateway = "198.51.100.1"; };
+    arch-worker = { mac = "02:00:00:00:00:14"; address = "192.0.2.14"; gateway = "192.0.2.1"; };
+  };
+  selected = inventory.${config.networking.hostName};
+in {
+  # Replace the documentation MACs with the measured provider/guest inventory.
+  systemd.network.links."10-cluster0" = {
+    matchConfig.MACAddress = selected.mac;
+    linkConfig.Name = "cluster0";
+  };
+  # Choose one network owner; this example uses static declarative networkd.
+  services.cloud-init.network.enable = lib.mkForce false;
+  networking = {
+    useNetworkd = true;
+    useDHCP = false;
+    interfaces.cluster0.ipv4.addresses = [{ address = selected.address; prefixLength = 24; }];
+    defaultGateway = { address = selected.gateway; interface = "cluster0"; };
+    nameservers = [ "192.0.2.53" ];
+  };
+  services.nginx = lib.mkIf (config.networking.hostName == "control") {
+    enable = true;
+    validateConfigFile = true;
+    recommendedProxySettings = true; # Upstream supplies canonical Host $host.
+    virtualHosts."control.example.org" = {
+      forceSSL = true;
+      sslCertificate = "/run/secrets/portal.crt";
+      sslCertificateKey = "/run/secrets/portal.key";
+      locations."/" = {
+        proxyPass = "http://127.0.0.1:${toString config.qclNegf.application.api.port}";
+        extraConfig = ''
+          proxy_buffering off;
+        '';
+      };
+    };
+  };
+  # The site's runtime secret unit must provision the certificate/key first.
+  systemd.services.nginx = lib.mkIf (config.networking.hostName == "control") {
+    requires = config.qclNegf.runtimeSecretUnits;
+    after = config.qclNegf.runtimeSecretUnits;
+  };
+}
