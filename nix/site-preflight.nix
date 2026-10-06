@@ -20,6 +20,21 @@ let
     nginx = {
       enabled = control.services.nginx.enable;
       validated = control.services.nginx.validateConfigFile;
+      executable = "${control.services.nginx.package}/bin/nginx";
+      exec_start = control.systemd.services.nginx.serviceConfig.ExecStart;
+      reload = control.services.nginx.enableReload;
+      config_file = if control.services.nginx.enableReload
+        then toString control.environment.etc."nginx/nginx.conf".source else null;
+      tls_credentials = builtins.concatLists (map (vhost:
+        if !(vhost.onlySSL || vhost.addSSL || vhost.forceSSL ||
+          builtins.any (listen: listen.ssl or false) vhost.listen) then [] else [{
+          directive = "ssl_certificate";
+          path = toString vhost.sslCertificate;
+        } {
+          directive = "ssl_certificate_key";
+          path = toString vhost.sslCertificateKey;
+        }]
+      ) (builtins.attrValues control.services.nginx.virtualHosts));
       inherit targets;
     };
   };

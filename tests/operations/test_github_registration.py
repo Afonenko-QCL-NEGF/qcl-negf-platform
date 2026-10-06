@@ -33,6 +33,7 @@ class Response:
             {"token": TOKEN, "expires_at": EXPIRY}
         ).encode()
         self.status = status
+        self.headers = {"Date": "Fri, 02 Oct 2026 12:00:00 GMT"}
         self.read_limits = []
 
     def __enter__(self):
@@ -114,6 +115,37 @@ class RegistrationTests(unittest.TestCase):
         self.assertNotIn(TOKEN, out)
         self.assertEqual(opener.open.call_count, 1)
         self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["pat", "registration"])
+
+    def test_fractional_expiry_is_conservatively_normalized(self):
+        response = Response(body=json.dumps({
+            "token": TOKEN, "expires_at": "2026-10-02T13:00:00.9876543Z"
+        }).encode())
+        result, out, err, opener, _ = self.invoke(response=response)
+        self.assertEqual(result, 0, err)
+        self.assertEqual(json.loads(out)["expires_at"], EXPIRY)
+        self.assertEqual(self.output.read_bytes(), TOKEN.encode("ascii"))
+        self.assertEqual(opener.open.call_count, 1)
+
+    def test_verified_http_issuer_clock_bounds_one_hour_ttl(self):
+        response = Response(body=json.dumps({
+            "token": TOKEN, "expires_at": "2026-10-02T13:00:01.123Z"
+        }).encode())
+        response.headers["Date"] = "Fri, 02 Oct 2026 12:00:01 GMT"
+        result, out, err, opener, _ = self.invoke(response=response)
+        self.assertEqual(result, 0, err)
+        self.assertEqual(json.loads(out)["expires_at"], "2026-10-02T13:00:01Z")
+        self.assertEqual(opener.open.call_count, 1)
+
+    def test_rejects_missing_invalid_or_skewed_issuer_date(self):
+        for value in [None, "invalid", "Fri, 02 Oct 2026 12:01:00 GMT",
+                      "Fri, 02 Oct 2026 11:59:00 GMT"]:
+            with self.subTest(date=value):
+                self.output.unlink(missing_ok=True)
+                response = Response()
+                response.headers = {"Date": value}
+                result, out, err, opener, _ = self.invoke(response=response)
+                self.assert_safe_failure(result, out, err)
+                self.assertEqual(opener.open.call_count, 1)
 
     def test_request_uses_post_fixed_endpoint_headers_and_finite_timeout(self):
         _, _, _, opener, _ = self.invoke()

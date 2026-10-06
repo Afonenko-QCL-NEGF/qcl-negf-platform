@@ -187,8 +187,9 @@ so the browser retains a localhost SSH tunnel's port. A raw `$http_host` header
 must not bypass this check. The example does not provision secrets or assert
 that the guests have booted.
 
-The platform `tofu/build-images.ts` entry point automatically completes four
-role evaluations and the strict nginx writer build before its first image stage.
+The platform `tofu/build-images.ts` entry point requires
+`--preflight-receipt ACTUAL_PREFLIGHT.json`, completes four role evaluations,
+and binds its generated nginx config to the passed native test before its first image stage.
 It retains the existing private path/flake URI input API; a failed gate starts
 no image stage. Its full command budget still belongs to the admitted producer.
 
@@ -198,19 +199,26 @@ preflight, without automatic retry:
 
 ```sh
 python3 ops/bootstrap_build.py --receipt /absolute/private-site/preflight.json preflight \
-  --site /absolute/private-site --nix /run/current-system/sw/bin/nix --check-nginx
+  --site /absolute/private-site --nix /run/current-system/sw/bin/nix --check-nginx \
+  --openssl /absolute/measured/openssl --mount /absolute/measured/mount \
+  --nginx-namespace '["/run/current-system/sw/bin/sudo","-n","/run/current-system/sw/bin/unshare","--mount","--net","--propagation","private"]'
 ```
 
 The helper applies the unary `nix/site-preflight.nix` function explicitly with
 `--apply`; `--file` alone does not apply a Nix function. Each child has a 60-second
 deadline and a combined 1 MiB stdout/stderr cap, and cleanup kills its owned
 process group even after the immediate parent exits. The receipt retains the
-child exit status and bounded primary diagnostics. Evaluation and strict config
-build establish configuration acceptance, not image boot, transport, CI or
+child exit status and bounded primary diagnostics. The namespace entry is an explicit
+trusted-builder choice; a root operator can omit sudo. Only engineering TLS
+paths are substituted, and production credentials are not read. See the
+[native nginx contract](nginx-preflight.md).
+Evaluation and a successful native nginx test establish configuration acceptance, not image boot, transport, CI or
 scientific acceptance. Without `--check-nginx`, status is `evaluation_only` and `nginx_build` is
 `not_measured`; this does not satisfy the pre-build gate.
-Strict writer exit0 is the configuration gate. A cache hit may print no gixy
-counters; `nginx_severity_counters` remains `not_measured`, never invented zeros.
+Strict writer exit0 does not close the configuration gate. A real `nginx -t`
+must pass with measured zero warn/error/crit/alert/emerg counters in
+`nginx_severity_counters`. A cache hit may print no gixy counters; their absence
+does not count as a measured zero.
 Keep the lock and source revision fixed between this preflight and the producer.
 
 Systemd build units must name an absolute executable and pass an explicit PATH

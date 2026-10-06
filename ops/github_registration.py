@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 import json
 import os
 from pathlib import Path
@@ -124,7 +125,7 @@ def unique_json_object(pairs):
     return result
 
 
-def validate_response(body):
+def validate_response(body, *, issuer_time=None):
     if len(body) > MAX_RESPONSE_BYTES:
         raise RegistrationError("GitHub response exceeds 64 KiB")
     try:
@@ -137,16 +138,22 @@ def validate_response(body):
     if (not isinstance(token, str)
             or not re.fullmatch(r"[A-Za-z0-9_-]{20,512}", token, flags=re.ASCII)
             or not isinstance(expires_at, str)
-            or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", expires_at)):
+            or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z", expires_at)):
         raise RegistrationError("GitHub response has an invalid token or expiry")
     try:
-        expiry = datetime.strptime(expires_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00")).replace(microsecond=0)
     except ValueError:
         raise RegistrationError("GitHub response has an invalid expiry") from None
     now = utc_now()
-    if not now < expiry <= now + timedelta(hours=1):
+    # HTTP Date is received over verified TLS. Permit only a measured small
+    # clock difference; retain the issuer's one-hour limit and local expiry.
+    issuer = now if issuer_time is None else issuer_time
+    if (issuer.tzinfo is None or issuer.utcoffset() != timedelta(0)
+            or abs((issuer - now).total_seconds()) > 5):
+        raise RegistrationError("GitHub issuer clock differs from local UTC; check time synchronization")
+    if not now < expiry <= issuer + timedelta(hours=1):
         raise RegistrationError("GitHub token expiry must be in the future and within one hour")
-    return token, expires_at
+    return token, expiry.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def request_token(pat, repository):
@@ -168,6 +175,10 @@ def request_token(pat, repository):
             if response.status != 201:
                 raise RegistrationError("GitHub HTTP status " + str(int(response.status)))
             body = response.read(MAX_RESPONSE_BYTES + 1)
+            try:
+                issuer_time = parsedate_to_datetime(response.headers.get("Date"))
+            except (TypeError, ValueError, OverflowError):
+                raise RegistrationError("GitHub response has an invalid issuer date") from None
     except urllib.error.HTTPError as error:
         status = int(error.code)
         with contextlib.suppress(Exception):
@@ -177,7 +188,7 @@ def request_token(pat, repository):
         raise
     except Exception:
         raise RegistrationError("GitHub request failed; outcome may be unknown; no automatic retry") from None
-    return validate_response(body)
+    return validate_response(body, issuer_time=issuer_time)
 
 
 def publish_token(parent, name, token):

@@ -1,10 +1,12 @@
 { config, lib, pkgs, ... }:
 let cfg = config.qclNegf.application;
     applicationProfile = "/nix/var/nix/profiles/qcl-negf-application";
+    exportSpoolDirectory = "/var/lib/qcl-negf/exports";
     bootstrapUnits = lib.optional cfg.bootstrap.enable "qcl-negf-bootstrap.service";
     operations = pkgs.runCommand "qcl-negf-bootstrap-operations" {} ''
       mkdir -p "$out/ops"
       cp ${../ops/bootstrap.ts} "$out/ops/bootstrap.ts"
+      cp ${../ops/bootstrap_profile.py} "$out/ops/bootstrap_profile.py"
       cp ${../ops/plan.ts} "$out/ops/plan.ts"
       cp ${../ops/register_aiida.py} "$out/ops/register_aiida.py"
       cp ${../ops/application_release.py} "$out/ops/application_release.py"
@@ -38,6 +40,13 @@ in {
       maxMemoryKiB = lib.mkOption { type = lib.types.ints.positive; default = 7168000; description = "Maximum RAM KiB per API submission; align with Slurm RealMemory."; };
       defaultMemoryKiB = lib.mkOption { type = lib.types.ints.positive; default = 4194304; description = "Default RAM KiB per API submission."; };
       port = lib.mkOption { type = lib.types.port; default = 8080; description = "Loopback API port for an authenticated TLS proxy."; };
+      tls = {
+        enable = lib.mkEnableOption "loopback-only TLS API proxy with runtime credentials";
+        port = lib.mkOption { type = lib.types.port; default = 443; description = "Loopback TLS proxy port."; };
+        serverName = lib.mkOption { type = lib.types.str; default = "localhost"; description = "TLS virtual host name; certificate identity is a private site choice."; };
+        certificateFile = lib.mkOption { type = lib.types.str; default = "/run/secrets/qcl-negf-tls.crt"; description = "Runtime certificate file outside the Nix store."; };
+        keyFile = lib.mkOption { type = lib.types.str; default = "/run/secrets/qcl-negf-tls.key"; description = "Runtime private key file outside the Nix store."; };
+      };
     };
   };
   config = lib.mkIf cfg.enable {
@@ -47,6 +56,7 @@ in {
       { assertion = !cfg.bootstrap.enable || (cfg.profile == "qcl-negf" && cfg.bootstrap.email != "" && config.qclNegf.cluster.solverPackage != null); message = "Automatic bootstrap requires profile qcl-negf, a service email and the immutable cluster solver package."; }
       { assertion = !cfg.api.enable || (lib.hasPrefix "/" cfg.api.tokenFile && !(lib.hasPrefix "/nix/store/" cfg.api.tokenFile)); message = "API token requires a runtime absolute path outside the store."; }
       { assertion = cfg.api.allowedCodesFile == null || (lib.hasPrefix "/" cfg.api.allowedCodesFile && !(lib.hasPrefix "/nix/store/" cfg.api.allowedCodesFile)); message = "API Code allowlist file must be a runtime absolute path outside the store."; }
+      { assertion = !cfg.api.tls.enable || (cfg.api.enable && cfg.api.tls.port != cfg.api.port && builtins.all (path: lib.hasPrefix "/" path && !(lib.hasPrefix "/nix/store/" path)) [ cfg.api.tls.certificateFile cfg.api.tls.keyFile ]); message = "TLS requires an enabled API, a separate port and runtime certificate/key paths outside the store."; }
     ];
     services.postgresql = {
       enable = true; package = pkgs.postgresql_17;
@@ -59,7 +69,7 @@ in {
       '';
     };
     environment.systemPackages = [ cfg.package ];
-    systemd.tmpfiles.rules = [ "d /var/lib/qcl-negf/aiida 0700 qcl-negf qcl-negf -" ];
+    systemd.tmpfiles.rules = [ "d /var/lib/qcl-negf/aiida 0700 qcl-negf qcl-negf -" ] ++ lib.optional cfg.api.enable "d ${exportSpoolDirectory} 0700 qcl-negf qcl-negf -";
     systemd.services.qcl-negf-bootstrap = lib.mkIf cfg.bootstrap.enable {
       description = "Reconcile the declared AiiDA profile and immutable installed Code";
       wantedBy = [ "multi-user.target" ];
@@ -83,10 +93,41 @@ in {
           --initial-label ${lib.escapeShellArg cfg.bootstrap.codeLabel})"
         solver="''${identity%%$'\n'*}"
         label="''${identity#*$'\n'}"
-        deno run --allow-read --allow-sys=uid --allow-run=verdi \
+        deno run --allow-read --allow-sys=uid --allow-run=verdi,${applicationProfile}/bin/python \
           ${operations}/ops/bootstrap.ts ${lib.escapeShellArg cfg.bootstrap.email} \
           "$solver" --label "$label" --apply
       '';
+    };
+    services.nginx = lib.mkIf cfg.api.tls.enable {
+      enable = true;
+      virtualHosts."qcl-negf-api" = {
+        serverName = cfg.api.tls.serverName;
+        onlySSL = true;
+        listen = [{ addr = "127.0.0.1"; port = cfg.api.tls.port; ssl = true; }];
+        sslCertificate = "/run/credentials/nginx.service/qcl-api-cert";
+        sslCertificateKey = "/run/credentials/nginx.service/qcl-api-key";
+        locations."/" = {
+          proxyPass = "http://127.0.0.1:${toString cfg.api.port}";
+          extraConfig = ''
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-Proto https;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_buffering off;
+            proxy_request_buffering off;
+            proxy_max_temp_file_size 0;
+            proxy_read_timeout 3600s;
+            proxy_send_timeout 3600s;
+          '';
+        };
+      };
+    };
+    systemd.services.nginx = lib.mkIf cfg.api.tls.enable {
+      requires = config.qclNegf.runtimeSecretUnits;
+      after = config.qclNegf.runtimeSecretUnits;
+      serviceConfig.LoadCredential = [
+        "qcl-api-cert:${cfg.api.tls.certificateFile}"
+        "qcl-api-key:${cfg.api.tls.keyFile}"
+      ];
     };
     systemd.services.qcl-negf-aiida = {
       description = "AiiDA workflow daemon";
@@ -133,6 +174,7 @@ in {
         QCL_NEGF_DEFAULT_MEMORY_KB = toString cfg.api.defaultMemoryKiB;
         QCL_NEGF_EXPORT_DISK_BYTES = toString cfg.api.exportDiskBytes;
         QCL_NEGF_EXPORT_TTL_SECONDS = toString cfg.api.exportTtlSeconds;
+        TMPDIR = exportSpoolDirectory;
       };
       serviceConfig = {
         User = "qcl-negf"; Group = "qcl-negf";

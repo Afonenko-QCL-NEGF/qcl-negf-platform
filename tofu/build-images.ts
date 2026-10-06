@@ -34,7 +34,66 @@ const nginxQuery = `c: let context = builtins.getContext (if c.services.nginx.en
     else c.systemd.services.nginx.serviceConfig.ExecStart);
   paths = builtins.filter (p: builtins.match ".*-nginx[.]conf[.]drv" p != null) (builtins.attrNames context);
   in { enabled = c.services.nginx.enable; validated = c.services.nginx.validateConfigFile;
+    executable = "\${c.services.nginx.package}/bin/nginx";
+    exec_start = c.systemd.services.nginx.serviceConfig.ExecStart;
+    reload = c.services.nginx.enableReload;
+    config_file = if c.services.nginx.enableReload then toString c.environment.etc."nginx/nginx.conf".source else null;
     targets = map (p: assert context.\${p}.outputs == [ "out" ]; p + "^out") paths; }`;
+
+type NativePreflight = {
+  schema: string;
+  operation: string;
+  status: string;
+  configuration: {
+    roles: Record<string, string>;
+    nginx: {
+      targets: string[];
+      executable: string;
+      exec_start: string;
+      reload: boolean;
+      config_file: string | null;
+    };
+  };
+  nginx_build: { exit_code: number; failure: unknown; stdout: string };
+  nginx_actual_config: {
+    path: string;
+    sha256: string;
+    test_sha256: string;
+    executable: string;
+    exec_start: string;
+  };
+  nginx_test: { exit_code: number; failure: unknown; stdout: string; stderr: string };
+  nginx_severity_counters: Record<string, number>;
+};
+
+function nativePreflight(value: unknown): NativePreflight {
+  const receipt = value as NativePreflight;
+  const test = receipt?.nginx_test;
+  const counters = receipt?.nginx_severity_counters;
+  const actual = receipt?.nginx_actual_config;
+  const roles = receipt?.configuration?.roles;
+  if (
+    receipt?.schema !== "qcl.bootstrap-preflight.v1" || receipt.operation !== "preflight" ||
+    receipt.status !== "pass" ||
+    !roles || Object.keys(roles).sort().join() !== "ci,compute,control,storage" ||
+    !Object.values(roles).every((path) => typeof path === "string" && derivation.test(path)) ||
+    test?.exit_code !== 0 || test.failure !== null || typeof test.stdout !== "string" ||
+    typeof test.stderr !== "string" ||
+    !counters || Object.keys(counters).sort().join() !== "alert,crit,emerg,error,warn" ||
+    !Object.values(counters).every((count) => count === 0) ||
+    receipt.nginx_build?.exit_code !== 0 || receipt.nginx_build.failure !== null ||
+    typeof receipt.nginx_build.stdout !== "string" ||
+    !actual || !/^[0-9a-f]{64}$/.test(actual.sha256) || !/^[0-9a-f]{64}$/.test(actual.test_sha256)
+  ) throw new Error("A passed actual nginx preflight receipt is required before images.");
+  const output = test.stdout + test.stderr;
+  if (
+    !output.includes("syntax is ok") || !output.includes("test is successful") ||
+    /\[(warn|error|crit|alert|emerg)\]/.test(output)
+  ) {
+    throw new Error("Preflight receipt lacks a strict successful native nginx test.");
+  }
+  return receipt;
+}
 
 /** All configuration gates finish before any image callback. Flake URIs remain supported. */
 export async function imageStages(
@@ -42,7 +101,9 @@ export async function imageStages(
   archFile: string,
   command: NixCommand,
   image: (role: (typeof roles)[number]) => Promise<void>,
+  preflightReceipt?: unknown,
 ): Promise<void> {
+  const receipt = nativePreflight(preflightReceipt);
   for (const role of imageRoles("-")) {
     const drv = await command([
       "eval",
@@ -51,6 +112,9 @@ export async function imageStages(
       `${site}#nixosConfigurations.${role}.config.system.build.toplevel.drvPath`,
     ]);
     if (!derivation.test(drv)) throw new Error(`Invalid evaluated derivation for ${role}.`);
+    if (receipt.configuration.roles[role] !== drv) {
+      throw new Error(`Preflight receipt has a different derivation for ${role}.`);
+    }
   }
   const config = JSON.parse(
     await command([
@@ -69,8 +133,30 @@ export async function imageStages(
   ) {
     throw new Error("One strict validated nginx.conf writer required before images.");
   }
-  // Exit0 is writer acceptance; a cache hit does not measure fresh severity counters.
-  await command(["build", "--no-link", "--json", "--no-write-lock-file", config.targets[0]]);
+  const recorded = receipt.configuration.nginx;
+  const actual = receipt.nginx_actual_config;
+  const outputs = JSON.parse(receipt.nginx_build.stdout);
+  const match = typeof config.exec_start === "string"
+    ? config.exec_start.match(/^([^ ]+) -c '?([^' ]+)'?$/)
+    : null;
+  if (
+    recorded?.targets?.length !== 1 || recorded.targets[0] !== config.targets[0] ||
+    recorded.executable !== config.executable || recorded.exec_start !== config.exec_start ||
+    recorded.reload !== config.reload || recorded.config_file !== config.config_file ||
+    actual.executable !== config.executable || actual.exec_start !== config.exec_start ||
+    !match || match[1] !== config.executable ||
+    actual.path !== (config.reload === true ? config.config_file : match[2]) ||
+    (config.reload === true && match[2] !== "/etc/nginx/nginx.conf") ||
+    !/^\/nix\/store\/[0-9abcdfghijklmnpqrsvwxyz]{32}-nginx[.]conf$/.test(actual.path) ||
+    !Array.isArray(outputs) || outputs.length !== 1 ||
+    outputs[0]?.drvPath !== config.targets[0].replace(/\^out$/, "") ||
+    Object.keys(outputs[0]?.outputs ?? {}).join() !== "out" ||
+    outputs[0].outputs.out !== actual.path
+  ) throw new Error("Actual evaluated nginx config differs from the native preflight receipt.");
+  const digest = await command(["hash", "file", "--type", "sha256", "--base16", actual.path]);
+  if (!/^[0-9a-f]{64}$/.test(digest) || digest !== actual.sha256) {
+    throw new Error("Actual nginx config hash differs from its preflight receipt.");
+  }
   for (const role of imageRoles(archFile)) await image(role);
 }
 
@@ -81,15 +167,21 @@ async function nix(args: string[]): Promise<string> {
   return new TextDecoder().decode(result.stdout).trim();
 }
 export async function main(args: string[]): Promise<void> {
-  const [site, primaryFile, archFile, outputDirectory] = args;
+  const [site, primaryFile, archFile, outputDirectory, receiptFlag, receiptFile] = args;
   if (
-    !site || !primaryFile || !archFile || !outputDirectory || args.length !== 4 ||
+    !site || !primaryFile || !archFile || !outputDirectory || args.length !== 6 ||
+    receiptFlag !== "--preflight-receipt" || !receiptFile ||
     site.startsWith("-") || site.includes("#")
   ) {
     throw new Error(
-      "Usage: build-images.ts SITE_FLAKE PROXMOX_BASE.json ARCH_BASE.json|- OUTPUT_DIRECTORY",
+      "Usage: build-images.ts SITE_FLAKE PROXMOX_BASE.json ARCH_BASE.json|- OUTPUT_DIRECTORY --preflight-receipt ACTUAL_PREFLIGHT.json",
     );
   }
+  const receiptInfo = await Deno.lstat(receiptFile);
+  if (!receiptInfo.isFile || receiptInfo.size > 8 * 1024 * 1024) {
+    throw new Error("Preflight receipt must be a bounded regular JSON file.");
+  }
+  const preflight = nativePreflight(JSON.parse(await Deno.readTextFile(receiptFile)));
   const base = validateBase(
     JSON.parse(await Deno.readTextFile(primaryFile)),
     archFile === "-" ? null : JSON.parse(await Deno.readTextFile(archFile)),
@@ -122,7 +214,7 @@ export async function main(args: string[]): Promise<void> {
     artifacts[role] = { image_path, image_sha256, image_bytes };
     if (role === "arch-worker") Object.assign(base.arch, artifacts[role]);
     else Object.assign(base.primary.vms[role]!, artifacts[role]);
-  });
+  }, preflight);
   await Deno.mkdir(outputDirectory, { recursive: true });
   const outputs: [string, unknown][] = [
     ["proxmox.tfvars.json", base.primary],

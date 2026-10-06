@@ -106,8 +106,14 @@ deno run --allow-read --allow-write --allow-run=nix \
   /absolute/private-site \
   /absolute/private-site/proxmox-base.json \
   /absolute/private-site/arch-base.json \
-  /absolute/private-site/generated
+  /absolute/private-site/generated \
+  --preflight-receipt /absolute/private-site/preflight.json
 ```
+
+First complete the [actual nginx preflight](nginx-preflight.md) on the admitted
+trusted builder. The image entry point requires its passed receipt and checks
+the four current role derivations, nginx executable/config and config hash against
+that receipt before any image stage. Writer-only receipts are rejected.
 
 The helper builds `storage-image`, `control-image`, `compute-image`, `ci-image` and
 `arch-worker-image`, finds their QCOW2 files, computes SHA-256 with Nix, and writes provider input

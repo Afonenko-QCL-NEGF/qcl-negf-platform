@@ -1,5 +1,6 @@
 """Bootstrap boundaries use local files/processes, never Nix or a server."""
 import importlib.util
+import json
 import os
 from pathlib import Path
 import sys
@@ -107,3 +108,135 @@ def test_accounting_rejects_image_changed_during_du(tmp_path, monkeypatch):
     monkeypatch.setattr(m, "run", mutate)
     with pytest.raises(ValueError, match="changed"):
         m.account([tmp_path], [image], 1000000, "/usr/bin/du")
+
+
+def test_check_nginx_never_accepts_writer_only_validation(tmp_path, monkeypatch):
+    """A successful gixy writer is not evidence that nginx can parse the config."""
+    m = load()
+    value = {"roles": {name: "/nix/store/" + "a" * 32 + "-system.drv" for name in m.ROLES},
+             "nginx": {"enabled": True, "validated": True,
+                       "targets": ["/nix/store/" + "b" * 32 + "-nginx.conf.drv^out"]}}
+    def external_nix(argv, *args, **kwargs):
+        if argv[1] == "eval":
+            return {"argv": argv, "stdout": json.dumps(value), "stderr": "", "exit_code": 0}
+        if argv[1] == "build":
+            return {"argv": argv, "stdout": json.dumps([{"outputs": {"out": "/nix/store/" + "c" * 32 + "-nginx.conf"}}]),
+                    "stderr": "", "exit_code": 0}
+        pytest.fail("Unexpected external operation")
+    monkeypatch.setattr(m, "run", external_nix)
+    receipt = tmp_path / "receipt.json"
+    monkeypatch.setattr(sys, "argv", [str(SOURCE), "--receipt", str(receipt), "preflight",
+                                    "--site", str(tmp_path), "--nix", "/fake/nix", "--check-nginx"])
+    try:
+        m.main()
+    except SystemExit:
+        pass
+    result = json.loads(receipt.read_text())
+    assert result["status"] == "failed", "gixy-only build was incorrectly accepted as real nginx validation"
+    assert result.get("nginx_test", "not_measured") == "not_measured"
+
+
+def test_engineering_config_changes_only_declared_tls_paths():
+    m = load()
+    assert callable(getattr(m, "nginx_test_config", None)), "Actual engineering config check is missing"
+    source = """pid /run/nginx/nginx.pid;
+http { server {
+listen 127.0.0.1:443 ssl;
+ssl_certificate /run/credentials/nginx.service/tls-cert;
+ssl_certificate_key /run/credentials/nginx.service/tls-key;
+location / { proxy_pass http://127.0.0.1:8080; }
+} }
+"""
+    credentials = [{"directive": "ssl_certificate", "path": "/run/credentials/nginx.service/tls-cert"},
+                   {"directive": "ssl_certificate_key", "path": "/run/credentials/nginx.service/tls-key"}]
+    expected = source.replace("/run/credentials/nginx.service/tls-cert", "/run/qcl-nginx-test/cert.pem").replace(
+        "/run/credentials/nginx.service/tls-key", "/run/qcl-nginx-test/key.pem")
+    assert m.nginx_test_config(source, credentials) == expected
+    for bad in [source.replace("ssl_certificate /run/credentials/nginx.service/tls-cert;", ""),
+                source.replace("ssl_certificate_key", "unrelated_directive")]:
+        with pytest.raises(ValueError, match="certificate"):
+            m.nginx_test_config(bad, credentials)
+
+
+def test_namespace_prefix_requires_explicit_absolute_executable():
+    m = load()
+    assert callable(getattr(m, "namespace_prefix", None)), "Explicit namespace admission is missing"
+    assert m.namespace_prefix('["/usr/bin/sudo","-n","/usr/bin/unshare","--mount","--net"]') == [
+        "/usr/bin/sudo", "-n", "/usr/bin/unshare", "--mount", "--net"]
+    for value in [None, '[]', '["unshare","--mount"]', '"/usr/bin/unshare"', '["/usr/bin/unshare",3]']:
+        with pytest.raises(ValueError):
+            m.namespace_prefix(value)
+
+
+@pytest.mark.parametrize("native_output,accepted", [
+    ("nginx: configuration file syntax is ok\nnginx: configuration file test is successful\n", True),
+    ("nginx: [warn] conflicting server name\nnginx: configuration file syntax is ok\nnginx: configuration file test is successful\n", False),
+    ("gixy validation completed\n", False),
+])
+def test_actual_nginx_result_controls_acceptance(tmp_path, monkeypatch, native_output, accepted):
+    """External Nix/namespace calls are stubbed; binding, files and acceptance are real."""
+    m = load()
+    config_path = "/nix/store/" + "c" * 32 + "-nginx.conf"
+    executable = "/nix/store/" + "d" * 32 + "-nginx/bin/nginx"
+    target = "/nix/store/" + "b" * 32 + "-nginx.conf.drv^out"
+    source = tmp_path / "actual.conf"
+    source.write_text("""pid /run/nginx/nginx.pid;
+events {}
+http { server {
+listen 127.0.0.1:443 ssl;
+ssl_certificate /run/secrets/test.crt;
+ssl_certificate_key /run/secrets/test.key;
+} }
+""")
+    credentials = [{"directive": "ssl_certificate", "path": "/run/secrets/test.crt"},
+                   {"directive": "ssl_certificate_key", "path": "/run/secrets/test.key"}]
+    cfg = {"targets": [target], "executable": executable, "exec_start": executable+" -c '"+config_path+"'",
+           "reload": False, "config_file": None, "tls_credentials": credentials}
+    original_read = Path.read_bytes
+    original_stat = Path.lstat
+    monkeypatch.setattr(Path, "read_bytes", lambda p: original_read(source if str(p) == config_path else p))
+    monkeypatch.setattr(Path, "lstat", lambda p: original_stat(source if str(p) == config_path else p))
+    monkeypatch.setattr(m.os, "access", lambda p, mode: p in (executable, "/fake/openssl", "/fake/mount"))
+    def external(argv, *args, **kwargs):
+        if argv[0] == "/fake/openssl":
+            Path(argv[argv.index("-keyout")+1]).write_text("dummy test key")
+            Path(argv[argv.index("-out")+1]).write_text("dummy test cert")
+            output = ""
+        elif argv[0] == "/fake/namespace":
+            tested = Path(argv[-3]) / "nginx.conf"
+            assert tested.read_text() == """pid /run/nginx/nginx.pid;
+events {}
+http { server {
+listen 127.0.0.1:443 ssl;
+ssl_certificate /run/qcl-nginx-test/cert.pem;
+ssl_certificate_key /run/qcl-nginx-test/key.pem;
+} }
+"""
+            assert argv[-4] == executable
+            output = native_output
+        else:
+            pytest.fail("Unexpected external operation")
+        return {"argv": argv, "stdout": "", "stderr": output, "exit_code": 0}
+    monkeypatch.setattr(m, "run", external)
+    built = {"stdout": json.dumps([{"drvPath": target.removesuffix("^out"), "outputs": {"out": config_path}}])}
+    receipt = {}
+    if accepted:
+        m.check_nginx({"nginx": cfg}, built, "/fake/openssl", "/fake/mount", '["/fake/namespace"]', receipt)
+        assert receipt["nginx_severity_counters"] == {x: 0 for x in ("warn", "error", "crit", "alert", "emerg")}
+    else:
+        with pytest.raises(ValueError, match="Strict actual nginx"):
+            m.check_nginx({"nginx": cfg}, built, "/fake/openssl", "/fake/mount", '["/fake/namespace"]', receipt)
+    assert receipt["nginx_test"]["stderr"] == native_output
+    wrong = {"stdout": json.dumps([{"drvPath": target.removesuffix("^out"),
+                                     "outputs": {"out": "/nix/store/" + "f" * 32 + "-nginx.conf"}}])}
+    with pytest.raises(ValueError, match="differs"):
+        m.check_nginx({"nginx": cfg}, wrong, "/fake/openssl", "/fake/mount", '["/fake/namespace"]', {})
+
+
+def test_namespace_child_refuses_host_namespace_before_any_mount(tmp_path):
+    m = load()
+    with pytest.raises(m.CommandFailure) as error:
+        m.run([sys.executable, "-c", m.NGINX_NAMESPACE_TEST, "/invalid/mount", "/invalid/nginx", str(tmp_path),
+               os.readlink("/proc/self/ns/mnt"), os.readlink("/proc/self/ns/net")], 5, 4096)
+    assert "Separate root mount/network engineering namespace required" in error.value.record["stderr"]
+    assert "invalid/mount" not in error.value.record["stderr"]

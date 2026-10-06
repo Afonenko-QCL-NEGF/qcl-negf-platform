@@ -52,8 +52,8 @@ Deno.test("bootstrap registers the immutable installed code as part of recovery"
   rejects(() => bootstrapPlan("invalid"));
   const plan = bootstrapPlan("research@example.org", "/nix/store/example/bin/qcl-negf");
   assert(plan.length === 2);
-  assert(plan[0]!.args.includes("core.zeromq"));
-  assert(plan[0]!.args.includes("/run/postgresql"));
+  assert(plan[0]!.args[0]!.endsWith("/bootstrap_profile.py"));
+  assert(plan[0]!.args.includes("research@example.org"));
   assert(plan[1]!.args.includes("run"));
   assert(plan[1]!.args.includes("/nix/store/example/bin/qcl-negf"));
   rejects(() => bootstrapPlan("research@example.org", "/run/current-system/sw/bin/qcl-negf"));
@@ -77,7 +77,7 @@ Deno.test("existing profile permits recovery only for the same local storage con
     },
     process_control: { backend: "core.zeromq" },
   };
-  assert(!profileSetupRequired({ profiles: { "qcl-negf": profile } }));
+  assert(profileSetupRequired({ profiles: { "qcl-negf": profile } }));
   profile.storage.config.repository_uri = "file:///different/repository";
   rejects(() => profileSetupRequired({ profiles: { "qcl-negf": profile } }));
 });

@@ -32,7 +32,11 @@ export function profileSetupRequired(value: unknown): boolean {
   ) {
     throw new Error("Existing qcl-negf profile differs from the declared local storage/broker.");
   }
-  return false;
+  const connect = profile.storage.config?.engine_kwargs as {
+    connect_args?: Record<string, unknown>;
+  } | undefined;
+  return connect?.connect_args?.host !== "/run/postgresql" ||
+    connect?.connect_args?.dbname !== "qcl-negf" || connect?.connect_args?.port !== 5432;
 }
 
 export function bootstrapPlan(
@@ -50,37 +54,10 @@ export function bootstrapPlan(
     throw new Error("Provide a stable installed Code label; use a new label for a new solver.");
   }
   return [{
-    executable: "verdi",
+    executable: "/nix/var/nix/profiles/qcl-negf-application/bin/python",
     args: [
-      "profile",
-      "setup",
-      "core.psql_dos",
-      "--non-interactive",
-      "--profile-name",
-      "qcl-negf",
-      "--set-as-default",
-      "--email",
+      decodeURIComponent(new URL("./bootstrap_profile.py", import.meta.url).pathname),
       email,
-      "--first-name",
-      "Research",
-      "--last-name",
-      "Service",
-      "--institution",
-      "QCL-NEGF",
-      "--broker",
-      "core.zeromq",
-      "--database-hostname",
-      "/run/postgresql",
-      "--database-port",
-      "5432",
-      "--database-username",
-      "qcl-negf",
-      "--database-password",
-      "",
-      "--database-name",
-      "qcl-negf",
-      "--repository-uri",
-      "file:///var/lib/qcl-negf/aiida/repository",
     ],
   }, {
     executable: "verdi",
@@ -112,7 +89,7 @@ if (import.meta.main) {
         "Usage: bootstrap.ts EMAIL /nix/store/.../bin/qcl-negf [--label LABEL] [--apply]",
       );
     }
-    let plan = bootstrapPlan(email, solver, label);
+    const plan = bootstrapPlan(email, solver, label);
     if (apply) {
       const owner = (await Deno.stat("/var/lib/qcl-negf")).uid;
       if (Deno.uid() === 0 || Deno.uid() !== owner) {
@@ -120,7 +97,9 @@ if (import.meta.main) {
       }
       try {
         const existing = await readExistingConfiguration();
-        if (!profileSetupRequired(existing)) plan = plan.slice(1);
+        // Always validate supported overrides in Python, including warm profiles.
+        // That path never initialises existing storage or replaces its UUID.
+        profileSetupRequired(existing);
       } catch (error) {
         if (!(error instanceof Deno.errors.NotFound)) throw error;
       }
@@ -134,7 +113,7 @@ if (import.meta.main) {
           stdout: "inherit",
           stderr: "inherit",
         }).spawn().status;
-        if (!result.success) throw new Error(`verdi exited ${result.code}`);
+        if (!result.success) throw new Error(`${command.executable} exited ${result.code}`);
       }
     }
   } catch (error) {

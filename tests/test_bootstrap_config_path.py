@@ -42,7 +42,7 @@ def test_bootstrap_reads_aiida_configuration_directory_not_identity_root(tmp_pat
                             capture_output=True, text=True, timeout=30)
     if case == "matching":
         assert result.returncode == 0, result.stderr
-        assert json.loads(result.stdout) == {"setupRequired": False}
+        assert json.loads(result.stdout) == {"setupRequired": True}
     else:
         assert result.returncode != 0
         expected = {"missing": "NotFound", "invalid": "SyntaxError",
