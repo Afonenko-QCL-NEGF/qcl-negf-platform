@@ -52,11 +52,12 @@
         checkedMonitoring = import ./tests/infrastructure/monitoring.nix { nixpkgs = nixpkgs.outPath; };
       in builtins.deepSeq [ checked checkedProduction checkedMunge checkedBuilder checkedRunner checkedRunnerRouting checkedRelease checkedMonitoring checkedLocalLab checkedSlurmNetwork ] (pkgs.runCommand "qcl-negf-infrastructure-check" {} "touch $out");
       slurm-vm = import ./tests/slurm-vm.nix { inherit pkgs; module = self.nixosModules.default; };
-      operations = pkgs.runCommand "qcl-negf-operations-check" { nativeBuildInputs = [ pkgs.deno pkgs.ansible (pkgs.python314.withPackages (ps: [ ps.pytest ])) ]; } ''
+      operations = pkgs.runCommand "qcl-negf-operations-check" { nativeBuildInputs = [ pkgs.deno pkgs.ansible pkgs.nix (pkgs.python314.withPackages (ps: [ ps.pytest ])) ]; } ''
         cp -r ${./.} source
         chmod -R u+w source
         cd source
         export DENO_DIR="$TMPDIR/deno"
+        export QCL_TEST_NIXPKGS=${nixpkgs.outPath}
         deno task check
         touch "$out"
       '';

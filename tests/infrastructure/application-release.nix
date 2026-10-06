@@ -42,7 +42,8 @@ let
 in
 assert controller.qclNegf.release.enable;
 assert worker.qclNegf.release.enable;
-assert lib.hasPrefix "/nix/var/nix/profiles/qcl-negf-application/bin/verdi " controller.systemd.services.qcl-negf-aiida.serviceConfig.ExecStart;
+assert lib.hasPrefix "/nix/store/" controller.systemd.services.qcl-negf-aiida.serviceConfig.ExecStart;
+assert lib.hasSuffix "-qcl-negf-aiida-start" controller.systemd.services.qcl-negf-aiida.serviceConfig.ExecStart;
 assert controller.systemd.services.qcl-negf-aiida.serviceConfig.EnvironmentFile == "-/var/lib/qcl-negf/runtime/service.env";
 assert lib.hasInfix "qcl-negf-release node-check" worker.systemd.services.slurmd.serviceConfig.ExecStartPre;
 assert lib.hasInfix "ReturnToService=0" worker.services.slurm.extraConfig;

@@ -13,11 +13,16 @@ let cfg = config.qclNegf.application;
     '';
     apiStart = pkgs.writeShellScript "qcl-negf-api-start" ''
       set -eu
+      export PATH=${applicationProfile}/bin:$PATH
       ${lib.optionalString (cfg.api.allowedCodesFile != null) ''
         export QCL_NEGF_ALLOWED_CODES="$(cat ${lib.escapeShellArg cfg.api.allowedCodesFile})"
         test -n "$QCL_NEGF_ALLOWED_CODES"
       ''}
       exec ${applicationProfile}/bin/qcl-negf-api --host 127.0.0.1 --port ${toString cfg.api.port}
+    '';
+    daemonStart = pkgs.writeShellScript "qcl-negf-aiida-start" ''
+      export PATH=${applicationProfile}/bin:$PATH
+      exec ${applicationProfile}/bin/verdi -p ${lib.escapeShellArg cfg.profile} daemon start --foreground
     '';
 in {
   options.qclNegf.application = {
@@ -147,7 +152,7 @@ in {
         User = "qcl-negf"; Group = "qcl-negf";
         WorkingDirectory = "/var/lib/qcl-negf";
         EnvironmentFile = "-/var/lib/qcl-negf/runtime/service.env";
-        ExecStart = "${applicationProfile}/bin/verdi -p ${cfg.profile} daemon start --foreground";
+        ExecStart = daemonStart;
         Restart = "on-failure"; RestartSec = 5;
         NoNewPrivileges = true;
         ProtectSystem = "strict";
