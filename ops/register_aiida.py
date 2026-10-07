@@ -11,6 +11,9 @@ import sys
 import tempfile
 
 
+NIXOS_BATCH_SHEBANG = "#!/run/current-system/sw/bin/bash"
+
+
 def reconcile(orm, manager, email, executable, label):
     if not re.fullmatch(r"/nix/store/[A-Za-z0-9][A-Za-z0-9+._?-]*/bin/qcl-negf", executable):
         raise ValueError("InstalledCode requires an immutable /nix/store/.../bin/qcl-negf executable")
@@ -29,13 +32,14 @@ def reconcile(orm, manager, email, executable, label):
     if computers:
         computer = computers[0]
         actual = (computer.hostname, computer.transport_type, computer.scheduler_type,
-                  computer.get_workdir(), computer.get_default_mpiprocs_per_machine())
-        if actual != ("localhost", "core.local", "core.slurm", "/srv/qcl-negf/jobs", 1):
-            raise ValueError("Existing slurm computer differs from declared local transport/scheduler")
+                  computer.get_workdir(), computer.get_default_mpiprocs_per_machine(), computer.get_shebang())
+        if actual != ("localhost", "core.local", "core.slurm", "/srv/qcl-negf/jobs", 1, NIXOS_BATCH_SHEBANG):
+            raise ValueError("Existing slurm computer differs from declared local transport/scheduler/shebang")
     else:
         computer = orm.Computer(label="slurm", hostname="localhost", transport_type="core.local",
                                 scheduler_type="core.slurm", workdir="/srv/qcl-negf/jobs")
         computer.set_default_mpiprocs_per_machine(1)
+        computer.set_shebang(NIXOS_BATCH_SHEBANG)
         computer.store()
 
     codes = orm.QueryBuilder().append(orm.Code, filters={"label": label}).all(flat=True)

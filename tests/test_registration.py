@@ -44,6 +44,7 @@ def adapter():
             self.uuid = str(uuid.uuid4())
             self.mpiprocs = None
             self.configured = False
+            self.shebang = "#!/bin/bash"
 
         def get_workdir(self):
             return self.workdir
@@ -53,6 +54,12 @@ def adapter():
 
         def set_default_mpiprocs_per_machine(self, value):
             self.mpiprocs = value
+
+        def get_shebang(self):
+            return self.shebang
+
+        def set_shebang(self, value):
+            self.shebang = value
 
         def store(self):
             stored["computers"].append(self)
@@ -129,6 +136,43 @@ class RegistrationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "differs"):
             registration.reconcile(orm, manager, "research@example.org", "/nix/store/one/bin/qcl-negf", "qcl-negf")
         self.assertEqual(stored["computers"][0].workdir, "/different")
+
+    def test_new_computer_declares_nixos_batch_interpreter(self):
+        orm, manager, stored, _failure = adapter()
+        registration.reconcile(orm, manager, "research@example.org", "/nix/store/one/bin/qcl-negf", "qcl-negf")
+        self.assertEqual(stored["computers"][0].get_shebang(), "#!/run/current-system/sw/bin/bash")
+
+    def test_new_computer_renders_nixos_interpreter_in_slurm_script(self):
+        # Characterize the real AiiDA 2.9 scheduler boundary that rejected NEG2.
+        # No database, profile, transport, scheduler submission or solver is used.
+        import pytest
+        pytest.importorskip("aiida", reason="Real renderer requires the application test environment")
+        from aiida.common.datastructures import CodeRunMode
+        from aiida.schedulers.datastructures import JobTemplate
+        from aiida.schedulers.plugins.slurm import SlurmScheduler
+        orm, manager, stored, _failure = adapter()
+        registration.reconcile(orm, manager, "research@example.org", "/nix/store/one/bin/qcl-negf", "qcl-negf")
+        template = JobTemplate()
+        template.shebang = stored["computers"][0].get_shebang()
+        scheduler = SlurmScheduler()
+        template.job_resource = scheduler.create_job_resource(num_machines=1,
+            num_mpiprocs_per_machine=1, num_cores_per_mpiproc=1)
+        template.codes_info = []
+        template.codes_run_mode = CodeRunMode.SERIAL
+        script = scheduler.get_submit_script(template)
+        self.assertEqual(script.splitlines()[0], "#!/run/current-system/sw/bin/bash")
+
+    def test_existing_legacy_interpreter_fails_without_mutating_provenance(self):
+        orm, manager, stored, _failure = adapter()
+        original = registration.reconcile(orm, manager, "research@example.org", "/nix/store/one/bin/qcl-negf", "qcl-negf")
+        computer = stored["computers"][0]
+        computer.set_shebang("#!/bin/bash")
+        with self.assertRaisesRegex(ValueError, "shebang"):
+            registration.reconcile(orm, manager, "research@example.org", "/nix/store/one/bin/qcl-negf", "qcl-negf")
+        self.assertEqual(computer.get_shebang(), "#!/bin/bash")
+        self.assertEqual(computer.uuid, original["computer_uuid"])
+        self.assertEqual(stored["codes"][0].uuid, original["code_uuid"])
+        self.assertEqual((len(stored["computers"]), len(stored["codes"])), (1, 1))
 
     def test_identity_publication_replaces_complete_file_with_owner_only_mode(self):
         with tempfile.TemporaryDirectory() as directory:
