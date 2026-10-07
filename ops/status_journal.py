@@ -111,5 +111,7 @@ def cleanup_once(save, cleanup, *, primary_error=None):
             except BaseException as error: logging_errors.append(error)
     if primary_error is not None or logging_errors or cleanup_error is not None:
         failure = FinalizationError(primary_error, logging_errors, cleanup_error, result)
-        raise failure from (primary_error or cleanup_error or logging_errors[0])
+        cause = (primary_error if primary_error is not None else
+                 cleanup_error if cleanup_error is not None else logging_errors[0])
+        raise failure from cause
     return result

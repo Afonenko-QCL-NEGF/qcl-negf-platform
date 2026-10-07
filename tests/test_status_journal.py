@@ -69,6 +69,28 @@ class StatusJournalTests(unittest.TestCase):
         self.assertEqual(caught.exception.cleanup_result, 'caller-return-value')
         self.assertEqual(marker.read_text(), 'caller-owned-cleanup')
 
+    def test_falsey_primary_exception_is_preserved_as_cause_with_successful_logging_cleanup(self):
+        class FalseyError(RuntimeError):
+            def __bool__(self): return False
+        primary = FalseyError('original failure')
+        with self.assertRaises(self.ops.FinalizationError) as caught:
+            self.ops.cleanup_once(lambda: None, lambda: 'cleanup-returned', primary_error=primary)
+        self.assertIs(caught.exception.primary_error, primary)
+        self.assertIs(caught.exception.__cause__, primary)
+        self.assertEqual(caught.exception.logging_errors, ())
+        self.assertEqual(caught.exception.cleanup_result, 'cleanup-returned')
+
+    def test_falsey_cleanup_exception_is_preserved_as_cause_with_successful_logging(self):
+        class FalseyError(RuntimeError):
+            def __bool__(self): return False
+        failure = FalseyError('cleanup failed')
+        def cleanup(): raise failure
+        with self.assertRaises(self.ops.FinalizationError) as caught:
+            self.ops.cleanup_once(lambda: None, cleanup)
+        self.assertIs(caught.exception.cleanup_error, failure)
+        self.assertIs(caught.exception.__cause__, failure)
+        self.assertEqual(caught.exception.logging_errors, ())
+
     def test_cleanup_error_and_logging_errors_are_both_retained_without_success(self):
         log_error = OSError('log storage unavailable'); cleanup_error = ValueError('unknown terminal')
         def save(): raise log_error
