@@ -165,6 +165,39 @@ automatically change running scientific machines.
 
 ## Replacement and recovery
 
+### Read-only physical Slurm job evidence
+
+`ops/slurm_job_evidence.py` captures worker-local evidence without submitting,
+cancelling, requeueing or signalling a job. Use it as root on the worker. Bind
+the expected numeric job ID, machine ID, boot ID, UID3000, exact immutable
+`slurmstepd` executable and cgroup scope in a protected JSON file. The scope
+must be the measured Slurm scope, for example `/system.slice/slurmstepd.scope`.
+Arrays and heterogeneous job IDs are intentionally unsupported.
+
+Run `python3 ops/slurm_job_evidence.py --mode before --expected EXPECTED.json
+--expected-sha256 SHA --scontrol /nix/store/SLURM/bin/scontrol --out NEW_BEFORE`
+while the owned job is running. A new output directory is required. The command
+keeps raw `listpids`, PID stat/status/executable/cgroup and start-tick observations
+before classifying membership. UID3000 tasks must be in the exact job/step
+subtree. Root processes are accepted only as the exact bound `slurmstepd` in
+that step's `slurm` subgroup; an arbitrary root process is never accepted.
+
+After the owning cancellation or completion, use `--mode after` with the same
+expected file, `--before NEW_BEFORE/proof.json --before-sha256 SHA`, and a new
+`--out NEW_AFTER`. Acceptance requires the same machine/boot, disappearance or
+changed start ticks of every original PID, an absent or unpopulated whole job
+subtree, and a matching UID3000 scheduler terminal record. A partial or failed
+before capture cannot be replaced by an invented empty list or missing ticks.
+Scheduler terminal state alone is insufficient.
+
+Each invocation is limited to 20 seconds and 128 KiB of retained metadata and
+raw output. Files are created exclusively and fsynced. Timeout or overflow
+retains the original bounded prefix and unknown status. Only the collector's
+own readonly CLI child can be terminated on timeout. Failed directories remain
+for diagnosis; the tool never retries. This physical stop proof establishes
+neither Runner checkpoint integrity nor scientific acceptance, and does not
+replace `worker_lifecycle.py`'s scoped Runner `verify-stop` contract.
+
 Routine application updates follow [application CD and admission](application-cd.md).
 The [Windows lifecycle adapter](windows-workers.md) uses the same Linux worker
 role, release gate and permanent-node Runner verification. Optional
