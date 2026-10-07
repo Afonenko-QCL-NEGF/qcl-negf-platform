@@ -205,6 +205,11 @@ returns. Before reopening release admission, use the guarded one-shot
 successful OS switch is insufficient. Do not automatically resume other failure
 reasons or change the return-to-service policy.
 
+For a finite operator supervisor, use the [bounded status journal](status-journal.md)
+to retain large public metadata separately from compact control status.
+Caller-owned terminal cleanup must run even when status logging fails; logging
+status never substitutes for physical stop or scientific acceptance.
+
 Routine application updates follow [application CD and admission](application-cd.md).
 The [Windows lifecycle adapter](windows-workers.md) uses the same Linux worker
 role, release gate and permanent-node Runner verification. Optional
