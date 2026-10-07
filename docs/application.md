@@ -63,6 +63,17 @@ bootstrap only fills missing socket connection settings, preserving UUID,
 other engine options and provenance; conflicting settings fail closed. Computer
 and immutable InstalledCode registration follows the existing reconciliation.
 
+The local Slurm Computer declares `#!/run/current-system/sw/bin/bash` for batch
+scripts; the base module installs Bash on every QCL node. NixOS has no portable
+`/bin/bash` contract. Reconciliation checks the saved shebang as well as transport,
+scheduler and work directory, and refuses a legacy or conflicting Computer without
+changing its UUID, Code or provenance. For an existing installation, preserve the
+identity and history, verify the declared interpreter is executable on the worker,
+then deliberately migrate the existing Computer through AiiDA
+`Computer.set_shebang("#!/run/current-system/sw/bin/bash")`. This is a separate
+operator action, not automatic bootstrap recovery. A local Slurm
+`get_submit_script` render can check the new first line without submitting a job.
+
 An optional common proxy replaces site-local nginx boilerplate:
 
 ```nix

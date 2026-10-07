@@ -2,6 +2,8 @@
 import json
 import os
 from pathlib import Path
+import pwd
+import shutil
 import subprocess
 import sys
 
@@ -62,3 +64,26 @@ def test_nested_verdi_tracks_current_profile(starts, tmp_path, service, argument
         )
         assert result.returncode == 0, result.stderr
         assert json.loads(result.stdout) == {"parent": version, "child": version, "args": arguments}
+
+
+def test_daemon_path_supports_real_local_transport_whoami(starts, tmp_path, monkeypatch):
+    """AiiDA invokes bash by name even when no scheduler job is submitted."""
+    pytest.importorskip("aiida")
+    from aiida.transports.plugins.local import LocalTransport
+
+    bash = shutil.which("bash")
+    whoami = shutil.which("whoami")
+    assert bash and whoami, "the local regression fixture needs bash and whoami"
+    binaries = {}
+    for package in {"bash", "openssh", "slurm", "coreutils"}:
+        binaries[package] = tmp_path / package / "bin"
+        binaries[package].mkdir(parents=True)
+    (binaries["bash"] / "bash").symlink_to(bash)
+    (binaries["coreutils"] / "whoami").symlink_to(whoami)
+    # NixOS supplies coreutils by default; the extra packages come directly
+    # from the evaluated owning service. Do not inherit the host PATH.
+    service_path = [binaries[package] for package in starts["daemonPath"]]
+    monkeypatch.setenv("PATH", os.pathsep.join(map(str, service_path + [binaries["coreutils"]])))
+    monkeypatch.setenv("AIIDA_PATH", str(tmp_path / "aiida"))
+    with LocalTransport(use_login_shell=False) as transport:
+        assert transport.whoami() == pwd.getpwuid(os.getuid()).pw_name

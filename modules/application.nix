@@ -147,7 +147,7 @@ in {
         AIIDA_PATH = "/var/lib/qcl-negf/aiida";
         SLURM_CONF = "${config.services.slurm.etcSlurm}/slurm.conf";
       };
-      path = [ pkgs.openssh pkgs.slurm ];
+      path = [ pkgs.bash pkgs.openssh pkgs.slurm ];
       serviceConfig = {
         User = "qcl-negf"; Group = "qcl-negf";
         WorkingDirectory = "/var/lib/qcl-negf";

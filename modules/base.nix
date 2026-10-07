@@ -22,7 +22,7 @@ in {
     services.openssh.enable = true;
     services.openssh.settings = { PasswordAuthentication = false; KbdInteractiveAuthentication = false; };
     services.timesyncd.enable = lib.mkDefault true;
-    environment.systemPackages = with pkgs; [ git deno nix-output-monitor ];
+    environment.systemPackages = with pkgs; [ bashInteractive git deno nix-output-monitor ];
     systemd.tmpfiles.rules = [ "d /srv/qcl-negf 0750 qcl-negf qcl-negf -" ];
   };
 }
