@@ -5,7 +5,12 @@ let
   lib = import (nixpkgs + "/lib");
   module = import ../../modules/application.nix {
     inherit lib;
-    pkgs.writeShellScript = name: text: text;
+    pkgs = {
+      writeShellScript = name: text: text;
+      bash = "bash";
+      openssh = "openssh";
+      slurm = "slurm";
+    };
     config.qclNegf.application = {
       enable = true;
       profile = "qcl-negf";
@@ -14,5 +19,6 @@ let
   };
 in {
   daemon = module.config.content.systemd.services.qcl-negf-aiida.serviceConfig.ExecStart;
+  daemonPath = module.config.content.systemd.services.qcl-negf-aiida.path;
   api = module.config.content.systemd.services.qcl-negf-api.content.serviceConfig.ExecStart;
 }
