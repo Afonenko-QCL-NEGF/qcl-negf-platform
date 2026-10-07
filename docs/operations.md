@@ -198,6 +198,13 @@ for diagnosis; the tool never retries. This physical stop proof establishes
 neither Runner checkpoint integrity nor scientific acceptance, and does not
 replace `worker_lifecycle.py`'s scoped Runner `verify-stop` contract.
 
+Controlled service maintenance also requires an explicit scheduler readiness gate.
+With `ReturnToService=0`, a registered worker may remain DOWN after its daemon
+returns. Before reopening release admission, use the guarded one-shot
+[maintenance resume](slurm-maintenance.md) procedure; an active `slurmd` or a
+successful OS switch is insufficient. Do not automatically resume other failure
+reasons or change the return-to-service policy.
+
 Routine application updates follow [application CD and admission](application-cd.md).
 The [Windows lifecycle adapter](windows-workers.md) uses the same Linux worker
 role, release gate and permanent-node Runner verification. Optional
