@@ -138,11 +138,17 @@ def validate_response(body, *, issuer_time=None):
     if (not isinstance(token, str)
             or not re.fullmatch(r"[A-Za-z0-9_-]{20,512}", token, flags=re.ASCII)
             or not isinstance(expires_at, str)
-            or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z", expires_at)):
+            or not re.fullmatch(
+                r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?"
+                r"(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])", expires_at)
+            or expires_at.endswith("-00:00")):
         raise RegistrationError("GitHub response has an invalid token or expiry")
     try:
-        expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00")).replace(microsecond=0)
-    except ValueError:
+        # Preserve the instant across explicit offsets; second floor can only
+        # shorten token lifetime. RFC3339 -00:00 means unknown offset, not UTC.
+        expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00")).astimezone(
+            timezone.utc).replace(microsecond=0)
+    except (ValueError, OverflowError):
         raise RegistrationError("GitHub response has an invalid expiry") from None
     now = utc_now()
     # HTTP Date is received over verified TLS. Permit only a measured small
