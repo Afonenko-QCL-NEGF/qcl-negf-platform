@@ -126,6 +126,55 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(self.output.read_bytes(), TOKEN.encode("ascii"))
         self.assertEqual(opener.open.call_count, 1)
 
+    def test_numeric_offset_expiry_returns_the_same_utc_instant_without_extension(self):
+        for value in ["2026-10-02T13:00:00+00:00", "2026-10-02T16:00:00+03:00",
+                      "2026-10-02T08:00:00-05:00", "2026-10-02T13:00:00.987654321+00:00"]:
+            with self.subTest(expiry=value):
+                self.output.unlink(missing_ok=True)
+                response = Response(body=json.dumps({"token": TOKEN, "expires_at": value}).encode())
+                result, out, err, opener, _ = self.invoke(response=response)
+                self.assertEqual(result, 0, err)
+                self.assertEqual(json.loads(out)["expires_at"], EXPIRY)
+                self.assertEqual(self.output.read_bytes(), TOKEN.encode("ascii"))
+                self.assertEqual(opener.open.call_count, 1)
+                self.assertNotIn(TOKEN, out + err)
+
+    def test_unknown_or_malformed_numeric_offset_never_publishes_a_token(self):
+        for value in ["2026-10-02T13:00:00-00:00", "2026-10-02T13:00:00+00:60",
+                      "2026-10-02T13:00:00+24:00", "2026-10-02T13:00:00+01:99",
+                      "2026-10-02T13:00:00+0000", "2026-10-02T13:00:00+00"]:
+            with self.subTest(expiry=value):
+                response = Response(body=json.dumps({"token": TOKEN, "expires_at": value}).encode())
+                result, out, err, opener, _ = self.invoke(response=response)
+                self.assert_safe_failure(result, out, err)
+                self.assertEqual(opener.open.call_count, 1)
+
+    def test_numeric_offsets_preserve_future_and_one_hour_ttl_rules(self):
+        for value in ["2026-10-02T16:00:01+03:00", "2026-10-02T15:00:00+03:00",
+                      "2026-10-02T14:59:59.999999+03:00"]:
+            with self.subTest(expiry=value):
+                response = Response(body=json.dumps({"token": TOKEN, "expires_at": value}).encode())
+                result, out, err, opener, _ = self.invoke(response=response)
+                self.assert_safe_failure(result, out, err)
+                self.assertEqual(opener.open.call_count, 1)
+
+    def test_numeric_offset_does_not_bypass_local_issuer_clock_admission(self):
+        response = Response(body=json.dumps({
+            "token": TOKEN, "expires_at": "2026-10-02T15:30:00+03:00"
+        }).encode())
+        response.headers["Date"] = "Fri, 02 Oct 2026 12:00:06 GMT"
+        result, out, err, opener, _ = self.invoke(response=response)
+        self.assert_safe_failure(result, out, err)
+        self.assertEqual(opener.open.call_count, 1)
+
+    def test_numeric_offset_duplicate_expiry_key_is_rejected(self):
+        response = Response(body=json.dumps({
+            "token": TOKEN, "expires_at": "2026-10-02T16:00:00+03:00"
+        }).encode()[:-1] + b',"expires_at":"2026-10-02T13:00:00Z"}')
+        result, out, err, opener, _ = self.invoke(response=response)
+        self.assert_safe_failure(result, out, err)
+        self.assertEqual(opener.open.call_count, 1)
+
     def test_verified_http_issuer_clock_bounds_one_hour_ttl(self):
         response = Response(body=json.dumps({
             "token": TOKEN, "expires_at": "2026-10-02T13:00:01.123Z"

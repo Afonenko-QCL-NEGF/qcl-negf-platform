@@ -27,6 +27,15 @@ body is capped at 64 KiB. The CLI accepts only HTTP `201`, a valid token, and an
 expiry in the future within one hour. Earlier successful PAT reads or HTTP `200`
 responses do not prove permission to create a registration token.
 
+Expiry accepts RFC3339 with `Z` or an explicit numeric offset such as `+00:00` or
+`+03:00`, including up to nine fractional digits. The validator converts the same
+instant to UTC and floors to whole seconds, so normalization never extends token
+lifetime. Unknown-offset `-00:00`, missing zones and malformed numeric offsets
+are rejected. The HTTP issuer Date must remain within five seconds of local UTC;
+canonical expiry must be strictly in the local future and at most one hour after
+that verified issuer Date. Numeric offsets change representation, not these clock
+or lifetime rules. JSON duplicates and the 64 KiB response bound remain rejected.
+
 After validating the response, the CLI writes and fsyncs a mode `0600` regular file,
 then publishes it atomically using exclusive hard-link creation. It never replaces
 an existing path, including a symlink or a path created during the HTTP request.
