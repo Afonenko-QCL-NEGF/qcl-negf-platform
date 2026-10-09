@@ -1,0 +1,58 @@
+# Private native-host admission; never historical capture or runtime authorization.
+qcl_host_storage:
+  apply: false
+  attempt_id: null
+  original_receipt: null
+  host_id: null
+  boot_id: null
+  admission:
+    fresh: false
+    exclusive: false
+    receipt: null
+    expires_at_epoch: null
+  tools:
+    lvs: null
+    vgs: null
+    pvs: null
+    blkid: null
+    wipefs: null
+    dumpe2fs: null
+    resize2fs: null
+    blockdev: null
+  root:
+    enabled: false
+    device: null
+    vg: null
+    lv: null
+    pv_uuid: null
+    vg_uuid: null
+    lv_uuid: null
+    fs_uuid: null
+    target_mib: null
+    authorized_cap_mib: null
+    reserve_vg_mib: null
+    supported_ext4_features: []
+  stage:
+    enabled: false
+    vg: null
+    pool: null
+    pool_uuid: null
+    vg_uuid: null
+    lv: null
+    lv_uuid: null
+    fs_uuid: null
+    target_mib: null
+    authorized_cap_mib: null
+    path: null
+    unit: null
+    source: /var/lib/vz
+    preparation_data_mib: null
+    preparation_metadata_mib: null
+    protected_data_mib: null
+    protected_metadata_mib: null
+    consumers_complete: false
+    namespace_complete: false
+    lifetime: protected-host-infrastructure
+    references_complete: false
+    reference_receipt: null
+    volume_references: []

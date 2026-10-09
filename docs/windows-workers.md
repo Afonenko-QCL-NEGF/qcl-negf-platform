@@ -34,10 +34,11 @@ completion raced pause. The adapter also waits for that job to leave RUNNING/COM
 disappearance, telemetry and an unverified JSON flag are not durable proof. Nonconverged terminal
 work can be safe to stop without scientific acceptance. Requests are attempt-scoped/idempotent.
 
-Idle shutdown returns immediately after drain. Busy shutdown waits for **every** captured job,
-including other owners, and does not wait for a successor allocation or free worker.
-Storage/controller/network errors retain the wait with a reason. Force shutdown/power loss/crash
-bypass the hook and use periodic recovery.
+Idle shutdown returns after durable intent/capture/finalize and drain. The v2 intent remains
+inhibiting delivery after the safe response and after client death. Busy shutdown waits for
+**every** captured job, including other owners, and does not wait for a successor allocation or free
+worker. Storage/controller/network errors retain the wait with a reason. Force shutdown/power
+loss/crash bypass the hook and use periodic recovery.
 
 ## Candidate policy and hardware status
 
@@ -72,11 +73,46 @@ authorized. Startup freezes protected known_hosts and uses that snapshot for eve
 call, verifies bound release checks, and rechecks before RESUME. Unknown delivery receipts remain
 blocking.
 
-Existing Windows wrappers which omit enrollment now fail closed. Provision the verified
-identity-capable guest tooling/role metadata through separately authorized bootstrap, enroll actual
-provider/guest/host-key evidence, and explicitly update site startup invocation to pass protected
-registry. This source change does not rewrite Windows/GPO wrappers or invent inventory/credentials.
-Unsupported identity probe/Slurm adapter receives no automatic preflight copy or permissive
-fallback. Normal shutdown's unlimited safe-stop polling is unchanged. CR02 shutdown intent, new-boot
-reconciliation and shared owner coordination are not implemented by CR03; production lifecycle
-readiness cannot be inferred from synthetic startup tests.
+The coordinated wrappers require `Enrollment`, `EnrollmentId` and `WorkerTarget` for both hooks.
+`Enrollment` is a protected absolute controller path, not registry content uploaded by Windows;
+`EnrollmentId` checks the scoped output. Legacy callers without those inputs fail closed. Provision
+actual identity-capable guest tooling, provider/guest/host-key evidence and scoped sudo policy
+separately. No inventory, credentials or machine trust are invented by these scripts.
+
+## Durable normal lifecycle (CR02)
+
+`shutdown --node N --target ROUTE --enrollment PATH` creates private mode-0600
+`runtime/shutdown/N.json` (`qcl-negf-shutdown-intent-v2`) before DRAIN. It retains captured
+owner/execution/attempt/solver/output descriptors until pinned Runner stop proof **and** actual
+allocation exit. `safe_to_shutdown:true` includes shutdown/enrollment ID, observed NodeName/boot and
+`phase:safe_to_power_off`; the record persists and delivery checks all shutdown records, including
+workers omitted from its active pool. Normal idle or completed shutdown does not close admission for
+independent healthy workers or cancel workflows.
+
+Capture/finalize use the existing common delivery lock for short regions. Runner waiting and
+unlimited outer polling release that lock; a separate per-node owner prevents duplicate shutdown. An
+orphan incomplete capture, v1 snapshot (exact original bytes retained in v2), malformed state,
+missing boot or unknown mutation requires explicit trusted reconciliation. Empty queues, elapsed
+wait or a new boot cannot erase unknown scope. Client death never clears inhibition.
+
+Normal return requires a controller-authenticated privileged operator invocation (actual root
+identity through reviewed scoped sudo), separately from guest health. No caller `trusted:true` or
+event UUID grants authority. It requires the same enrolled permanent machine/NodeName and a **new**
+boot after completed normal safe stop; all later observations must equal that new boot. First
+enrollment has no fabricated prior shutdown/boot proof. An identical resumed retry checks saved
+admitted boot and current full release health without another RESUME. State stays on disk as
+`resumed` evidence after success.
+
+Before RESUME, startup durably creates its own unique existing CR04 admission-intent-v1 marker. Only
+that newly created marker is removed after a durable resumed write, as the last fallible success
+action. Collision, terminal fsync/replace failure, unlink failure or an unknown outcome retains
+reconciliation inhibition. Existing CR04 receipts/markers are never overwritten or cleared; retries
+reject them before snapshot creation/SSH. Health or new boot cannot resolve them. Normal inhibit is
+node scoped; uncertain mutating startup retains the existing fail-closed gate recovery path. It does
+not implement a full-cluster update or automatic deployment.
+
+Windows/GPO actor mapping, actual enrollment/SSH trust, Hyper-V shutdown ordering and machine
+runtime acceptance remain **not_verified**. These coordinated source wrappers do not establish those
+facts. Running guest status is never an automatic clear. Whole-cluster I14 cancellation, complete
+worker inventory and VM-stop/start barrier adapters remain a separate unimplemented gate; any
+durable unknown update ownership blocks ordinary startup.

@@ -145,8 +145,9 @@ worker:
 sudo qcl-negf-worker-lifecycle startup --node day-worker --target deploy@day-worker --enrollment /operator-protected/enrollment.json
 ```
 
-The controller drains it, rejects active jobs/unresolved shutdown snapshots, delivers and verifies
-the current release, then resumes that worker. It launches no recovery attempt.
+The controller validates durable shutdown scope and authorized startup, drains it, rejects active
+jobs, delivers and verifies the current release, then resumes that worker. It launches no recovery
+attempt.
 
 ## Evidence boundary
 
@@ -198,7 +199,8 @@ summary provides no evidence of remote completion.
 Normal worker shutdown retains its unlimited outer safe-stop wait. Local child fixtures and fake
 transport failures do not establish production, service, scientific or whole-cluster acceptance.
 Scheduler starvation, uninterruptible kernel I/O and failed filesystem durability remain outside
-hard real-time bounds; unconfirmed cleanup fails closed. Competing lifecycle entrypoints need CR02.
+hard real-time bounds; unconfirmed cleanup fails closed. CR02 lifecycle entrypoints share the
+existing delivery owner; normal polls release it while awaiting scoped Runner stop proof.
 
 Before final gate opening, delivery writes a separate private durable admission intent. A failed
 gate replace/fsync or terminal receipt publication attempts one close and retains this blocker for
@@ -308,7 +310,33 @@ check without expected identity remains release-only. Privileged manual activate
 remains diagnostic and must satisfy old gate checks; it is not enrolled fleet evidence. Older
 installed tooling without identity or role metadata must be upgraded through separately authorized
 initial bootstrap; there is no permissive copy/install before preflight or auto enrollment fallback.
-Startup uses the same authority/trust/worker binding and rejects unresolved receipts; CR02 global
-lifecycle intent/owner coordination is still a separate blocker. Synthetic API tests establish none
-of real inventory completeness, provider/SSH trust, service/VM health, all-worker I14 gates, or
-scientific acceptance.
+Startup uses the same authority/trust/worker binding and rejects unresolved receipts; CR02 shared
+lifecycle intent/owner coordination is implemented below; full I14 remains a separate blocker.
+Synthetic API tests establish none of real inventory completeness, provider/SSH trust, service/VM
+health, all-worker I14 gates, or scientific acceptance.
+
+## Persistent normal-shutdown admission guard (CR02)
+
+Normal `qcl-negf-worker-lifecycle shutdown` now requires `--enrollment`, `--target` and `--node`. It
+persists private `shutdown/<node>.json` schema `qcl-negf-shutdown-intent-v2` before DRAIN, including
+observed permanent binding/boot and captured scoped Runner descriptors. A completed safe stop
+retains the inhibit. Common delivery ownership guards every shutdown record, even if an inhibited
+worker is absent from the selected active pool, before prefetch/mutation and again before
+RESUME/open. Readonly CR03 authority/identity validation does not grant admission.
+
+Startup consumes that same state under its existing internal owner. Only completed safe scope, a
+controller-authenticated privileged startup event, the same permanent enrollment and a stable new
+boot plus full current-release health permit RESUME and durable `resumed` evidence. Same boot,
+foreign guest, orphan/v1/malformed state, pending stop or unknown ownership cannot clear it. First
+enrollment records no invented old shutdown; resumed retry verifies the admitted generation. Normal
+shutdown leaves other healthy admission open. Unknown mutating startup uses the existing fail-closed
+recovery path; this is separate from full-cluster deployment.
+
+A unique owned CR04 admission-intent-v1 marker precedes final RESUME and is removed only after
+durable resumed publication, as the last fallible success action. Persistence/cleanup failure
+requires reconciliation, never trustworthy completion. All preexisting CR04 bytes remain untouched;
+retry blocks before further snapshot/SSH/copy/RESUME. The Windows wrappers coordinate protected
+registry route and scoped enrollment output; actual authenticated actor mapping, private inventory,
+SSH trust and Hyper-V/GPO event ordering remain deployment gates. See
+[Windows lifecycle](windows-workers.md). Whole-cluster I14 VM-stop/cancellation/complete-health
+adapters are not implemented here; durable unknown update ownership inhibits ordinary startup.

@@ -598,6 +598,96 @@ def unresolved_deliveries(runtime):
                 raise RuntimeError("Unresolved delivery requires trusted operator reconciliation")
 
 
+SHUTDOWN_SCHEMA = "qcl-negf-shutdown-intent-v2"
+SHUTDOWN_PHASES = {"requested", "capture_pending", "awaiting_jobs", "safe_to_power_off",
+                   "returning", "resumed", "reconciliation_required"}
+
+
+def validate_shutdown_intent(value, node):
+    if not isinstance(value, dict) or value.get("schema") != SHUTDOWN_SCHEMA or value.get("node") != node:
+        raise ValueError("Malformed/legacy normal shutdown intent requires reconciliation")
+    if not isinstance(node, str) or not IDENTIFIER.fullmatch(node) or value.get("node_name") != node:
+        raise ValueError("Shutdown intent canonical NodeName mismatch")
+    if value.get("phase") not in SHUTDOWN_PHASES or not isinstance(value.get("jobs"), dict):
+        raise ValueError("Malformed shutdown phase/captured jobs")
+    for key in ("inventory_id", "enrollment_id", "machine_uuid"):
+        normalized_uuid(value.get(key))
+    if not isinstance(value.get("machine_id"), str) or not re.fullmatch(r"[0-9a-f]{32}", value["machine_id"]) or int(value["machine_id"], 16) == 0:
+        raise ValueError("Shutdown intent missing permanent machine-id")
+    if value.get("role") != "worker" or not isinstance(value.get("hostname"), str) or not TARGET.fullmatch(value["hostname"]):
+        raise ValueError("Shutdown intent missing observed worker binding")
+    if not isinstance(value.get("target"), str) or not TARGET.fullmatch(value["target"]):
+        raise ValueError("Shutdown intent missing enrolled route")
+    origin = value.get("origin", "normal_shutdown")
+    if origin == "normal_shutdown":
+        normalized_uuid(value.get("shutdown_id"))
+        normalized_uuid(value.get("boot_id"))
+        if type(value.get("capture_complete")) is not bool:
+            raise ValueError("Shutdown capture status is unknown")
+    elif origin == "legacy_v1":
+        if value.get("phase") != "reconciliation_required" or value.get("capture_complete") is not False or not value.get("requires_reconciliation") or not isinstance(value.get("legacy_evidence_base64"), str):
+            raise ValueError("Legacy intent cannot imply stop/boot proof")
+        normalized_uuid(value.get("shutdown_id"))
+        if value.get("boot_id") is not None:
+            raise ValueError("Legacy intent cannot invent previous boot")
+    elif origin == "initial_enrollment":
+        if value.get("shutdown_id") is not None or value.get("boot_id") is not None or value.get("capture_complete") is not None:
+            raise ValueError("Initial enrollment cannot invent previous shutdown proof")
+    else:
+        raise ValueError("Unknown shutdown intent origin")
+    if value["phase"] == "safe_to_power_off" and (origin != "normal_shutdown" or value.get("capture_complete") is not True or value["jobs"] or value.get("requires_reconciliation") or value.get("pending_action")):
+        raise ValueError("Safe power-off lacks completed scoped capture/stop proof")
+    if value["phase"] == "resumed":
+        event = value.get("startup_event")
+        if (value.get("requires_reconciliation") or value.get("pending_action") or value["jobs"]
+                or not isinstance(event, dict) or event.get("schema") != "qcl-negf-startup-event-v1"
+                or event.get("node") != node or event.get("enrollment_id") != value["enrollment_id"]
+                or event.get("inventory_id") != value["inventory_id"]
+                or type(event.get("actor_uid")) is not int or event.get("actor_uid") != 0 or event.get("entrypoint") != "privileged-controller-operator") :
+            raise ValueError("Resumed intent lacks authorized startup/current binding evidence")
+        normalized_uuid(event.get("event_id"))
+        normalized_uuid(event.get("controller_machine_uuid"))
+        returned = normalized_uuid(value.get("return_boot_id"))
+        if origin == "normal_shutdown" and (value.get("capture_complete") is not True or returned == normalized_uuid(value["boot_id"])):
+            raise ValueError("Resumed normal intent lacks a new generation")
+    return value
+
+
+def read_shutdown_intent(path, node):
+    with Path(path).open("rb") as handle:
+        raw = handle.read(1048577)
+    value = unique_json(raw, 1048576)
+    return validate_shutdown_intent(value, node)
+
+
+def lifecycle_guard(runtime, *, normal_intents=True):
+    """No write/clear: unrelated CR04 outcomes retain independent authority."""
+    runtime = Path(runtime)
+    unresolved_deliveries(runtime)
+    # No I14 adapter exists here: any durable update ownership marker is unknown.
+    if os.path.lexists(runtime / "cluster-update.json"):
+        raise RuntimeError("Cluster update ownership requires trusted reconciliation")
+    if normal_intents:
+        state = runtime / "shutdown"
+        if state.exists():
+            for path in state.glob("*.json"):
+                try:
+                    value = read_shutdown_intent(path, path.stem)
+                except (ValueError, OSError, TypeError) as error:
+                    raise RuntimeError("Unresolved normal shutdown state requires reconciliation") from error
+                if value["phase"] != "resumed" or value.get("requires_reconciliation"):
+                    raise RuntimeError("Normal shutdown intent inhibits delivery until authorized new-boot startup")
+
+
+@contextmanager
+def lifecycle_owner(runtime):
+    runtime = Path(runtime)
+    runtime.mkdir(parents=True, exist_ok=True)
+    with (runtime / "delivery.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+
+
 def manifest(value):
     if not isinstance(value, dict) or value.get("schema") != "qcl-negf-release-v1":
         raise ValueError("Expected qcl-negf-release-v1 manifest")
@@ -942,7 +1032,22 @@ def node_check(runtime=RUNTIME / "release.json", gate=GATE, profile=PROFILE, *, 
 
 
 def deliver_pool(manifest_value, nodes, gate=GATE, *, deliver, quiesce, admit=lambda: None,
-                 deadline=None, checkpoint=None, bindings=None, authority=None, authority_run=command):
+                 deadline=None, checkpoint=None, bindings=None, authority=None, authority_run=command,
+                 runtime=RUNTIME):
+    recheck_controller_authority(authority, run=authority_run)
+    lifecycle_guard(runtime)
+    deadline_check(deadline)
+    with lifecycle_owner(runtime):
+        recheck_controller_authority(authority, run=authority_run)
+        lifecycle_guard(runtime)
+        return _deliver_pool_owned(manifest_value, nodes, gate, deliver=deliver, quiesce=quiesce,
+            admit=admit, deadline=deadline, checkpoint=checkpoint, bindings=bindings,
+            authority=authority, authority_run=authority_run, runtime=runtime)
+
+
+def _deliver_pool_owned(manifest_value, nodes, gate=GATE, *, deliver, quiesce, admit=lambda: None,
+                        deadline=None, checkpoint=None, bindings=None, authority=None,
+                        authority_run=command, runtime=RUNTIME):
     expected = manifest(manifest_value)
     if not isinstance(bindings, dict) or set(bindings) != set(nodes):
         raise ValueError("Required full selected node bindings")
@@ -953,6 +1058,7 @@ def deliver_pool(manifest_value, nodes, gate=GATE, *, deliver, quiesce, admit=la
         if len({identity[key] for identity in observed}) != len(nodes):
             raise ValueError("Duplicate actual selected machine")
     recheck_controller_authority(authority, run=authority_run)
+    lifecycle_guard(runtime)
     if not nodes or len(set(nodes)) != len(nodes):
         raise ValueError("Select a nonempty pool of unique active nodes")
     report = {"release_id": expected["release_id"], "open": False, "status": "running",
@@ -994,12 +1100,16 @@ def deliver_pool(manifest_value, nodes, gate=GATE, *, deliver, quiesce, admit=la
             save("admit")
             deadline_check(deadline)
             recheck_controller_authority(authority, run=authority_run)
+            lifecycle_guard(runtime)
             admit()
             deadline_check(deadline)
             report["admission_pending"] = True
             save("open_admission")
             deadline_check(deadline)
             recheck_controller_authority(authority, run=authority_run)
+            # The final preexisting-state guard above preceded creation of this
+            # operation's CR04 admission marker under the SAME owner. That own
+            # marker now inhibits retries; do not classify it as a competing attempt.
             publish_admission(gate, {"open": True, "release_id": expected["release_id"]})
             report.update(open=True, status="completed")
             save("finished")
@@ -1050,14 +1160,14 @@ def deliver_cli(expected, pool, run=command, *, enrollment, runtime=RUNTIME, gat
     prefetch_controller_closures(expected, validate_only=True)
     authority = preflight_controller_authority(enrollment, pool, run=run, deadline=deadline,
         command_timeout_seconds=command_timeout_seconds, command_output_bytes=command_output_bytes,
-        delivery_output_bytes=delivery_output_bytes, before_remote=lambda: unresolved_deliveries(runtime))
+        delivery_output_bytes=delivery_output_bytes, before_remote=lambda: lifecycle_guard(runtime))
     deadline_check(deadline)
     runtime = Path(runtime)
     runtime.mkdir(parents=True, exist_ok=True)
     with (runtime / "delivery.lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         recheck_controller_authority(authority, run=run)
-        unresolved_deliveries(runtime)
+        lifecycle_guard(runtime)
         return _deliver_cli_locked(expected, pool, run, runtime=runtime, gate=gate, authority=authority,
             start=start, deadline=deadline, command_timeout_seconds=command_timeout_seconds,
             command_output_bytes=command_output_bytes, delivery_output_bytes=delivery_output_bytes)
@@ -1241,6 +1351,7 @@ def _deliver_cli_locked(expected, pool, run, *, runtime, gate, authority, start,
                 raise
 
         def admit():
+            lifecycle_guard(runtime)
             for name in selected:
                 probe(name, prior_boot=bindings[name]["identity"]["boot_id"])
             recheck_controller_authority(authority, run=run)
@@ -1248,8 +1359,8 @@ def _deliver_cli_locked(expected, pool, run, *, runtime, gate, authority, start,
             for worker in workers:
                 run(["scontrol", "update", "NodeName=" + worker, "State=RESUME"])
 
-        report = deliver_pool(expected, list(by_name), gate, deliver=deliver, quiesce=quiesce, admit=admit,
-                              deadline=deadline, checkpoint=checkpoint, bindings=bindings, authority=authority, authority_run=run)
+        report = _deliver_pool_owned(expected, list(by_name), gate, deliver=deliver, quiesce=quiesce, admit=admit,
+                              deadline=deadline, checkpoint=checkpoint, bindings=bindings, authority=authority, authority_run=run, runtime=runtime)
         if report.get("status") == "completed" and intent_path.exists():
             try:
                 # Last fallible success action. Crash may restore an unsynced deletion,
