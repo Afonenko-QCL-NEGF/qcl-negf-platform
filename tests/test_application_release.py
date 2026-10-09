@@ -507,6 +507,82 @@ class ApplicationReleaseTests(unittest.TestCase):
                                   role="worker", run=commands)
             self.assertIsNot(json.loads((root / "runtime/release.json").read_text()).get("ready"), True)
 
+    def test_identical_retry_repairs_only_the_damaged_profile_and_preserves_identity(self):
+        for role in ("worker", "controller"):
+            for damaged in ("profile", "profile-solver"):
+                for target in (None, "/nix/store/other"):
+                    with self.subTest(role=role, damaged=damaged, target=target), tempfile.TemporaryDirectory() as temporary:
+                        root, commands = Path(temporary), Commands()
+                        arguments = dict(profile=root / "profile", runtime=root / "runtime", role=role,
+                                         run=commands, email="test@example.invalid",
+                                         allowed_codes_file=root / "code-uuid")
+                        first = self.ops.activate(release(), **arguments)
+                        self.assertEqual(first["release_id"], "release-a")
+                        self.assertEqual(first["solver_executable"], "/nix/store/solver/bin/qcl-negf")
+                        if role == "controller":
+                            self.assertEqual(first["code_uuid"], "12345678-1234-1234-1234-123456789abc")
+                        (root / damaged).unlink()
+                        if target is not None:
+                            (root / damaged).symlink_to(target)
+                        commands.calls.clear()
+                        self.assertEqual(self.ops.activate(release(), **arguments), first)
+                        selected = "/nix/store/application" if damaged == "profile" else "/nix/store/solver"
+                        self.assertEqual((root / damaged).resolve(), Path(selected))
+                        self.assertEqual([call for call in commands.calls if call[0] == "nix-env"],
+                                         [["nix-env", "--profile", str(root / damaged), "--set", selected]])
+                        if role == "controller":
+                            self.assertEqual((root / "code-uuid").read_text().strip(), first["code_uuid"])
+                            registration = next(call for call in commands.calls if call[0] == "runuser")
+                            self.assertEqual(registration[-2:],
+                                             ["/nix/store/solver/bin/qcl-negf", "qcl-negf-release-a"])
+                        self.assertEqual(self.ops.check(release(), profile=root / "profile",
+                            runtime=root / "runtime", role=role, run=commands), first)
+
+    def test_check_rejects_missing_or_wrong_solver_profile_before_health(self):
+        for role in ("worker", "controller"):
+            for target in (None, "/nix/store/other"):
+                with self.subTest(role=role, target=target), tempfile.TemporaryDirectory() as temporary:
+                    root, commands = Path(temporary), Commands()
+                    (root / "release.json").write_text(json.dumps({**release(), "ready": True}))
+                    (root / "profile").symlink_to("/nix/store/application")
+                    if target is not None:
+                        (root / "profile-solver").symlink_to(target)
+                    with self.assertRaisesRegex(ValueError, "solver profile"):
+                        self.ops.check(release(), profile=root / "profile", runtime=root, role=role, run=commands)
+                    self.assertEqual(commands.calls, [])
+
+    def test_profile_setter_failure_or_wrong_result_cannot_publish_ready(self):
+        class SetterCommands(Commands):
+            broken_profile = None
+            mode = None
+
+            def __call__(self, args):
+                if args[0] == "nix-env" and args[args.index("--profile") + 1] == str(self.broken_profile):
+                    if self.mode == "failure":
+                        raise RuntimeError("profile setter failed")
+                    super().__call__([*args[:-1], "/nix/store/other"])
+                    return ""
+                return super().__call__(args)
+
+        for role in ("worker", "controller"):
+            for damaged in ("profile", "profile-solver"):
+                for mode in ("failure", "wrong-result"):
+                    with self.subTest(role=role, damaged=damaged, mode=mode), tempfile.TemporaryDirectory() as temporary:
+                        root, commands = Path(temporary), SetterCommands()
+                        arguments = dict(profile=root / "profile", runtime=root / "runtime", role=role,
+                                         run=commands, email="test@example.invalid",
+                                         allowed_codes_file=root / "code-uuid")
+                        self.ops.activate(release(), **arguments)
+                        commands.broken_profile, commands.mode = root / damaged, mode
+                        commands.broken_profile.unlink()
+                        commands.calls.clear()
+                        error = RuntimeError if mode == "failure" else ValueError
+                        with self.assertRaisesRegex(error, "profile"):
+                            self.ops.activate(release(), **arguments)
+                        record = root / "runtime/release.json"
+                        self.assertFalse(record.exists() and json.loads(record.read_text()).get("ready") is True)
+                        self.assertFalse(any(call[0] == "systemctl" or "self-check" in call for call in commands.calls))
+
     def test_partial_fleet_delivery_closes_admission_until_every_selected_node_verifies(self):
         with tempfile.TemporaryDirectory() as temporary:
             gate = Path(temporary) / "admission.json"
@@ -673,8 +749,9 @@ class ApplicationReleaseTests(unittest.TestCase):
     def test_check_rejects_profile_path_that_mismatches_runtime_identity(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            (root / "release.json").write_text(json.dumps(release()))
+            (root / "release.json").write_text(json.dumps({**release(), "ready": True}))
             (root / "profile").symlink_to("/nix/store/old-application")
+            (root / "profile-solver").symlink_to("/nix/store/solver")
             with self.assertRaisesRegex(ValueError, "profile"):
                 self.ops.check(release(), profile=root / "profile", runtime=root, run=Commands())
 

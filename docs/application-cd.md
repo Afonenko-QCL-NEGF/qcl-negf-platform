@@ -90,12 +90,22 @@ does admission open. Partial failure leaves it closed and publishes node statuse
 in `/var/lib/qcl-negf/runtime/delivery-report.json`; fix the cause and repeat the
 same idempotent command. A repeated successful activation retains profile/Code
 identity and repeats checks.
+Application and solver profiles are reconciled independently. An identical retry
+repairs a missing or wrong solver GC root without changing the selected release,
+immutable solver executable or InstalledCode identity. Healthy profiles receive no
+extra `nix-env --set`; each setter is followed by a resolved closure identity check.
+Setter failure or a mismatched result leaves no ready record. The `check` command
+rejects a missing or wrong solver profile before checking services or running the
+solver self-check.
 Each required unit is checked separately. Activation also runs the pinned
 solver `self-check` as `qcl-negf`, with one Julia/BLAS thread and a 300-second
 limit, before readiness. This small analytic PV/HDF5 execution check verifies
 the installed runtime, not stationary convergence or scientific acceptance.
-An identical retry starts any services stopped by maintenance without
-replacing the immutable profile or Code.
+An identical retry starts any services stopped by maintenance while retaining
+the selected immutable closure and Code identity.
+Targeted activation/check regressions use injected stdlib command fakes for Nix,
+systemd and Code registration, with real temporary profile links and runtime
+records. They do not establish real Nix, service or AiiDA reconciliation behavior.
 After reboot, bootstrap derives solver/Code selection from the current runtime
 release instead of publishing the original image's seed Code UUID again.
 
