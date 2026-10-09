@@ -243,7 +243,7 @@ References prerequisite is protected root-owned0600 post-D04 schema `qcl.storage
 
 Completed `new_final` and `restored_original` paths inspect current fixed identities and original disable/is_mountpoint presence+semantics, allow legitimate current-tree readers/new writes, and never rehash historical content or declare/rewrite helpers/unit/receipt. Unexpected aliases/fixed-state mismatch returns readonly reconciliation. Incomplete records remain readonly refusal, not automatic resume. Final absence is separately frozen and rechecked immediately before declaration; stage observations cannot overwrite it. Exact existing declaration is not rewritten. Directory FD/cwd/root/maps, canonical directory binds/deleted references/loop footprint and unknown overlapping backing are refusal boundaries.
 
-Source slot inventory (83 max; 17 probe / 12 guard / 6 snapshot / 3 reference / 1 copy within90 ceiling):
+Source slot inventory (84 max; 17 probe / 12 guard / 6 snapshot / 3 reference / 1 copy within90 ceiling):
 
 | Slot | Source action | Kind |
 | --- | --- | --- |
@@ -315,6 +315,7 @@ Source slot inventory (83 max; 17 probe / 12 guard / 6 snapshot / 3 reference / 
 | guard-65 | guard-65 | mount_guard |
 | action-66 | Durable receipt rollback_intent | receipt_io |
 | action-67 | Ordinary verified final stop before original restoration | native_argv |
+| action-67-disable | Explicit final boot disable before verified original restoration | native_argv |
 | action-68 | Observe exact own empty mountpoint after ordinary final stop | probe |
 | action-69 | Restore exact retained original once | restore_original |
 | action-70 | Read durable historical manifest for pre-marker original only | receipt_io |
@@ -330,3 +331,14 @@ Source slot inventory (83 max; 17 probe / 12 guard / 6 snapshot / 3 reference / 
 | action-80 | Observe restored original reopening fixed state only | probe |
 | action-81 | Durable receipt reopened | receipt_io |
 | action-82 | Durable receipt complete | receipt_io |
+
+
+### NB native boundary enforcement
+
+Recovery first selects an immutable eligible pre-marker candidate from freshly inspected host receipt; action64 measures complete actual consumers before rollback intent or stop. Skipped observations carry `consumers_measured=false` and `refs=null`; they are never quiescence evidence. Native stop changes activation only. Separate action-67-disable changes boot policy; existing probes68/75 read back inactive/disabled, exact fragment and no reload before restoration/reopening. Unknown disable/readback blocks subsequent mutations.
+
+Each invocation partitions R into owner R//4, cleanup R//4 and child remainder; the maxima sum to exactly R. One source-local bounded metadata accessor covers no-follow stable files, stat projections, names, links, Linux xattr maxima, ioctl flags, native output and input/helper/source loading; count units and deadlines precede every accessor/iteration. Pure helpers remain unchanged. Receipt prepayment includes inspect B, transition4B, persist2B, read B, sync3B plus input/load/output, path-component/stat/chunk/native-tempfile collision bounds and8192 fixed accessor headroom before any mutating helper. Manifest content reads retain H; external backing reads retain E; metadata remains in R. Explicit telemetry is owner+child+cleanup; absent child telemetry is null/unknown, not0. Logical accessor/serialized payload accounting is not physical kernel/SSD IO proof.
+
+Normal EOF permits bounded natural exit within remaining work time before own-group cleanup. Cleanup itself uses the same reserved cleanup budget and deadline for every process generation record and repetition; uncertain group identity/cap/expiry stays unknown. Per-invocation Linux subreaper support is checked before mutation and never installed as a global service.
+
+Retained graph volume/absolute/backing relatives share one canonical validator: primitive canonical nonabsolute names, no dot-dot/NUL/normalization, special directory root only, every entry and parent covered by current independent manifest with correct type and no symlink escape. Reference slots21/57/77 receive existing before/final/restored manifests; no new snapshots or graph discovery fallback. Native support, whole graph/header discovery, mapped-process accessibility, installed copy multiplicity, capacity and boot admission remain separate operator gates.

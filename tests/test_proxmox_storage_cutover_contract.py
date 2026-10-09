@@ -467,7 +467,7 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                         "device": "/dev/dm-0", "rdev": 254 if scenario == "wrong-rdev-unit" else 253, "mountpoint_dev": source.stat().st_dev, "mountpoint_ino": source.stat().st_ino, "Where": "/wrong" if scenario == "wrong-where-unit" else observation_request.get("path", str(source)), "Type": "xfs" if scenario == "wrong-type-unit" else "ext4", "ActiveState": "active" if (s["stage_active"] if observation_request.get("stage", False) else s["final_active"]) else "inactive", "UnitFileState": "static" if observation_request.get("stage", False) else "enabled" if s["unit_enabled"] else "disabled", "stage_policy": "static", "source_renamed": s["renamed"],
                         "ForceUnmount": "yes" if scenario == "force-unit" else "no", "LazyUnmount": "yes" if scenario == "lazy-unit" else "no", "DropInPaths": "foreign.conf" if scenario == "dropin-unit" else "", "NeedDaemonReload": "yes" if scenario == "reload-unit" else "no",
                         "Options": "nosuid,rw,relatime,nodev,data=ordered" + (",ro" if scenario == "ro-unit" else ",unknown-option" if scenario == "unknown-options" else ""), "fragment_exact": scenario != "unsafe-unit",
-                        "seed_sha256": hashlib.sha256(b"AAAA").hexdigest(), "is_mountpoint_raw": s["offline_raw"], "mountpoint_guard": "/wrong" if scenario.startswith("nb-restore") and name=="Observe native offline policy and disabled gate before reopen" else native_mountpoint(s["offline_raw"],str(source)), "storage_disabled": s["disabled"], "original_disabled": cfg["cutover"]["storage"]["stanza"].get("disable") in (1,"1","yes",True),
+                        "seed_sha256": hashlib.sha256(b"AAAA").hexdigest(), "is_mountpoint_raw": s["offline_raw"], "mountpoint_guard": "/wrong" if scenario.startswith(("nb-restore","nb-disable")) and name=="Observe native offline policy and disabled gate before reopen" else native_mountpoint(s["offline_raw"],str(source)), "storage_disabled": s["disabled"], "original_disabled": cfg["cutover"]["storage"]["stanza"].get("disable") in (1,"1","yes",True),
                         "absent": bool(observation_request.get("allow_absent",False) and not s["unit_declared"])})
                     if name == "Verify exact loaded mount policy":
                         loaded=json.loads(out["stdout"])
@@ -484,6 +484,7 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                             observed.update(consumers_measured=not mode,refs=None if mode else observed["refs"])
                         if observation_request.get("final_policy_readback"):
                             observed["final_policy"]={"ActiveState":"active" if s["final_active"] else "inactive","UnitFileState":"enabled" if s["unit_enabled"] else "disabled","FragmentPath":"/etc/systemd/system/fixture-source.mount","NeedDaemonReload":"no"}
+                            if scenario=="nb-disable-readback-enabled":observed["final_policy"]["UnitFileState"]="enabled"
                         if name=="Reconcile actual fixed config mount units and callers read-only":
                             s["recovery_measurement"]=not mode
                             if not mode:
@@ -510,7 +511,8 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                 if args["name"]=="fixture-source.mount":assert s["unit_declared"], "absent final unit reached systemd before declaration"
                 record("systemd:"+{"start":"started","stop":"stopped","disable":"disable","enable":"enable","daemon-reload":"reload"}[verb])
                 if args["name"]=="fixture-source.mount":
-                    if verb in ("enable","disable"):s["unit_enabled"]=verb=="enable"
+                    if verb=="disable" and scenario=="nb-disable-unknown":out.update(failed=True,rc=1,stderr="unknown own disable outcome",boundary_status="native_outcome_unknown")
+                    elif verb in ("enable","disable"):s["unit_enabled"]=verb=="enable"
                     if verb in ("start","stop"):s["final_active"]=verb=="start"
                 if args["name"]=="fixture-stage.mount" and verb=="stop":s["stage_active"]=False
             elif effective_action in ("ansible.builtin.template","ansible.builtin.copy"):
@@ -737,6 +739,7 @@ def review_body(name):
     variables = yaml.safe_load((BASE / "ansible/proxmox-storage-cutover.yml").read_text())[0]["vars"]
     if name not in variables: raise AssertionError("missing owning review primitive: " + name)
     scope = {"__name__": "fixture"}
+    if name == "cutover_consumer_scan":exec(compile(variables["cutover_command_boundary"], "cutover_command_boundary", "exec"), scope)
     exec(compile(variables[name], name, "exec"), scope)
     return scope
 
@@ -812,16 +815,18 @@ def test_review_actual_directory_consumer(tmp_path,target,monkeypatch):
 def test_review_reference_semantic_context(tmp_path):
     api=review_body('cutover_reference_check')
     node=tmp_path/'external';node.write_bytes(b'known')
+    (tmp_path/'disk').write_bytes(b'known retained bytes')
+    manifest={'schema':1,'entries':{'.':{'type':'directory'},'disk':{'type':'file'}}}
     st=node.stat()
     graph={'schema':'qcl.storage-cutover.references.v1','accepted':True,'complete':True,'identity':{'host':'h'},'d04_receipt_sha256':'d'*64,'window_receipt_sha256':'w'*64,'retained_manifest_sha256':'m'*64,'excluded_old_qcl_set_sha256':'e'*64,
         'volume_bindings':[{'id':'dir:disk','relative':'disk','storage_id':'dir'}], 'absolute_bindings':[], 'backing_nodes':[{'id':'ext','ownership':'external','path':str(node),'format':'raw','dev':st.st_dev,'ino':st.st_ino,'size':5,'mtime_ns':st.st_mtime_ns,'sha256':hashlib.sha256(b'known').hexdigest()}], 'backing_edges':[], 'tool_evidence':[{'executable':'/usr/bin/qemu-img','source':'installed','sha256':'a'*64,'version':'fixture','argv':[],'result_artifact':'fixture'}]}
     expected={'identity':{'host':'h'},'d04_receipt_sha256':'d'*64,'window_receipt_sha256':'w'*64,'retained_manifest_sha256':'m'*64,'excluded_old_qcl_set_sha256':'e'*64}
-    assert api['verify_graph'](graph,expected,str(tmp_path),10,100,lambda vol:str(tmp_path/'disk'))
-    with pytest.raises(ValueError):api['verify_graph'](graph,expected,str(tmp_path),10,100,lambda vol:str(tmp_path/'wrong'))
+    assert api['verify_graph'](graph,expected,str(tmp_path),10,100,lambda vol:str(tmp_path/'disk'),retained_manifest=manifest)
+    with pytest.raises(ValueError):api['verify_graph'](graph,expected,str(tmp_path),10,100,lambda vol:str(tmp_path/'wrong'),retained_manifest=manifest)
     node.write_bytes(b'other')
-    with pytest.raises(ValueError):api['verify_graph'](graph,expected,str(tmp_path),10,100,lambda vol:str(tmp_path/'disk'))
+    with pytest.raises(ValueError):api['verify_graph'](graph,expected,str(tmp_path),10,100,lambda vol:str(tmp_path/'disk'),retained_manifest=manifest)
     graph['complete']=False
-    with pytest.raises(ValueError):api['verify_graph'](graph,expected,str(tmp_path),10,100,lambda vol:str(tmp_path/'disk'))
+    with pytest.raises(ValueError):api['verify_graph'](graph,expected,str(tmp_path),10,100,lambda vol:str(tmp_path/'disk'),retained_manifest=manifest)
 
 
 def test_review_finite_slot_reservations():
@@ -875,8 +880,8 @@ def test_review_source_slot_and_category_invariant():
             if 'ansible.builtin.include_tasks' in task:found.append(task['vars']['guard_slot']);kinds.append('mount_guard')
             for key in ('block','rescue','always'):
                 if key in task:walk(task[key])
-    walk(play['tasks']);assert found==play['vars']['cutover_slots'];assert len(found)==len(set(found))<=90
-    c=collections.Counter(kinds);assert c['probe']<=17 and c['mount_guard']<=12 and c['manifest']<=6 and c['reference_check']==3 and len(copies)==1
+    walk(play['tasks']);assert found==play['vars']['cutover_slots'];assert len(found)==len(set(found))==84
+    c=collections.Counter(kinds);assert c['probe']<=17 and c['mount_guard']<=12 and c['manifest']<=6 and c['reference_check']==3 and len(copies)==1 and c['native_argv']==14
     for argv in copies:assert '--whole-file' in argv and '--delete' not in argv and '--inplace' not in argv and '/usr/bin/timeout' not in argv
 
 
@@ -1112,7 +1117,10 @@ subprocess.Popen=fixture_popen
     context_bytes=len(json.dumps(context).encode('utf-8'))
     path_bytes=[len((path+'\n').encode('utf-8')) for path in resolution.values()]
     headroom=sum(path_bytes[:2])+8192
-    target=child_allowance-context_bytes-headroom
+    request['operation'].update(kind='reference_check',argv=['/usr/bin/python','-c',prefix+body],stdin=json.dumps(context))
+    load_api=review_body('cutover_command_boundary')
+    prepaid_context=load_api['child_metadata_load_bound'](request)
+    target=child_allowance-prepaid_context-headroom
     base_graph_bytes=len(json.dumps(graph).encode('utf-8'))
     assert target>base_graph_bytes and all(n<child_allowance for n in path_bytes)
     graph['tool_evidence'][0]['source']='installed:'+('p'*(target-base_graph_bytes-len('installed:')+len('installed')))
@@ -1121,10 +1129,10 @@ subprocess.Popen=fixture_popen
     context['h']['cutover']['preconditions']['references_receipt']['sha256']=hashlib.sha256(raw).hexdigest()
     serialized=json.dumps(context)
     assert len(serialized.encode('utf-8'))==context_bytes
-    assert context_bytes+len(raw)<child_allowance<context_bytes+len(raw)+sum(path_bytes)
+    assert prepaid_context+len(raw)<child_allowance<prepaid_context+len(raw)+sum(path_bytes)
     request['operation'].update(kind='reference_check',argv=['/usr/bin/python','-c',prefix+body],stdin=serialized)
     assert len(json.dumps(request).encode('utf-8'))<=request['bounds']['request_bytes']
-    (tmp_path/'reference-cap-plan.json').write_text(json.dumps({'child_allowance':child_allowance,'full_context_bytes':context_bytes,'graph_bytes':len(raw),'path_result_bytes':path_bytes,'headroom':headroom}))
+    (tmp_path/'reference-cap-plan.json').write_text(json.dumps({'child_allowance':child_allowance,'full_context_bytes':context_bytes,'source_defined_prepaid_context_bytes':prepaid_context,'graph_bytes':len(raw),'path_result_bytes':path_bytes,'headroom':headroom}))
     result=review_boundary(request)
     (tmp_path/'reference-cap-result.json').write_text(json.dumps(result))
     assert result['status']=='refused' and 'metadata' in result['stderr'],result
@@ -1188,3 +1196,44 @@ def test_fixture_pvesm_literal_mountpoint_path_preserves_native_value():
     path='/fixture/source'
     parsed=fixture_pvesm_policy(['/usr/sbin/pvesm','set','fixture-dir','--is_mountpoint',path,'--digest','a'*40],'fixture-dir','a'*40)
     assert fixture_pvesm_effect({'type':'dir'},*parsed)=={'type':'dir','is_mountpoint':path}
+
+
+@pytest.mark.parametrize('scenario',['nb-disable-unknown','nb-disable-readback-enabled'])
+def test_native_recovery_disable_unknown_or_bad_readback_blocks_reopening(tmp_path,monkeypatch,scenario):
+    rc,state,receipt,source,stage=run_playbook(tmp_path,monkeypatch,scenario)
+    assert rc!=0
+    trace=state['trace'];assert 'systemd:enable' in trace and 'systemd:disable' in trace,trace
+    assert 'restore' not in trace and 'CAS:reopen-original' not in trace and 'receipt:complete' not in trace
+    assert state['renamed'] and (tmp_path/'original'/'disk.raw').read_bytes()==b'AAAA'
+    assert json.loads(receipt.read_text())['reopening'] is None
+
+
+@pytest.mark.parametrize('case',['relevant','unrelated','inaccessible'])
+def test_real_directory_refs_with_independent_maps_boundary(tmp_path,monkeypatch,case):
+    api=review_body('cutover_consumer_scan');root=tmp_path/'tree';root.mkdir()
+    retained=root/'mapped';retained.write_bytes(b'actual retained inode')
+    other=tmp_path/'unrelated';other.write_bytes(b'ordinary external inode')
+    independent_maps(monkeypatch,retained if case=='relevant' else other,inaccessible=case=='inaccessible')
+    # Only map_files stat/link metadata is adapted; real FD/cwd/root walk remains.
+    if case=='inaccessible':
+        with pytest.raises(PermissionError):api['consumer_refs']([root],100,8388608,5,pids=[os.getpid()])
+    else:
+        refs=api['consumer_refs']([root],100,8388608,5,pids=[os.getpid()])
+        assert bool(refs)==(case=='relevant')
+        if case=='relevant':assert any(row.get('ino')==retained.stat().st_ino and row['target']==str(retained) for row in refs)
+
+
+@pytest.mark.parametrize('case',['valid','wrong-association','cycle'])
+def test_retained_backing_edges_inside_manifest(tmp_path,case):
+    api=review_body('cutover_reference_check');root,manifest,graph,expected=nb_graph(tmp_path)
+    (root/'upper').write_bytes(b'finite fixture qcow metadata')
+    manifest['entries']['upper']={'type':'file'}
+    graph['absolute_bindings']=[]
+    graph['backing_nodes']=[{'id':'base','ownership':'retained','relative':'disk','format':'qcow2'},{'id':'upper','ownership':'retained','relative':'upper','format':'qcow2'}]
+    graph['backing_edges']=[{'id':'edge','from':'upper','to':'base','association':'disk'}]
+    if case=='wrong-association':graph['backing_edges'][0]['association']='../disk'
+    if case=='cycle':graph['backing_edges'].append({'id':'reverse','from':'base','to':'upper','association':'upper'})
+    def invoke():return api['verify_graph'](graph,expected,str(root),20,100,lambda vol:(_ for _ in ()).throw(AssertionError('no volume lookup expected')),retained_manifest=manifest)
+    if case=='valid':assert invoke()
+    else:
+        with pytest.raises(ValueError):invoke()
