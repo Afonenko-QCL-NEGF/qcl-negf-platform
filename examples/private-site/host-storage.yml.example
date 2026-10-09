@@ -19,6 +19,11 @@ qcl_host_storage:
     dumpe2fs: null
     resize2fs: null
     blockdev: null
+    python: null
+    rsync: null
+    pvesm: null
+    pvenode: null
+    pvesh: null
   root:
     enabled: false
     device: null
@@ -56,3 +61,77 @@ qcl_host_storage:
     references_complete: false
     reference_receipt: null
     volume_references: []
+    # Underlying empty stage mountpoint identity from accepted R2 receipt.
+    path_dev: null
+    path_ino: null
+    # Optional exact R2-created empty ext4 directory: dev/ino/uid/gid/mode.
+    lost_found: null
+  cutover:
+    enabled: false
+    source_ref: null
+    window:
+      owner: null
+      receipt: null
+      expires_at_epoch: null
+      node: null
+      scope: [file-content, cached-workers, direct-paths, hooks, vm-transitions, automation]
+      reference: {path: null, sha256: null}
+    preconditions:
+      d04_receipt: {path: null, sha256: null}
+      r1r2_receipt: {path: null, sha256: null}
+      seed_receipt: {path: null, sha256: null}
+      seed_path: null
+      seed_sha256: null
+      old_installer_unit: null
+      old_installer_backing: null
+    storage:
+      id: null
+      type: dir
+      path: null
+      digest: null
+      stanza: null
+      foreign: null
+    source:
+      path: null
+      dev: null
+      ino: null
+      parent_dev: null
+      parent_ino: null
+    rollback: {path: null}
+    final:
+      path: null
+      unit: null
+      device: null
+      rdev: null
+      fs_uuid: null
+      options: rw,nodev,nosuid
+      allowed_defaults: [relatime, data=ordered]
+      install_target: local-fs.target
+    receipt:
+      path: null
+      max_bytes: null
+      receipt_helper: null
+      manifest_helper: null
+      manifest_path: null
+    limits:
+      entries: null
+      hash_bytes: null
+      logical_bytes: null
+      allocated_bytes: null
+      output_bytes: null
+      seconds: null
+      copy_bytes: null
+      aggregate_bytes: null
+      action_seconds: null
+    capacity:
+      receipt: null
+      pool_uuid: null
+      data_bytes: null
+      metadata_bytes: null
+      data_reserve_bytes: null
+      metadata_reserve_bytes: null
+      growth_bytes: null
+      metadata_growth_bytes: null
+      image_envelope_bytes: null
+      lv_projection: null
+      foreign_vm_projection: null

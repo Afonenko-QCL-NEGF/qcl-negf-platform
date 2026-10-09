@@ -116,3 +116,116 @@ bounded host-storage source packet.
 Primary contracts: [lvol 13.4.0](https://github.com/ansible-collections/community.general/blob/13.4.0/plugins/modules/lvol.py),
 [filesystem 13.4.0](https://github.com/ansible-collections/community.general/blob/13.4.0/plugins/modules/filesystem.py),
 [resize2fs](https://github.com/tytso/e2fsprogs/blob/master/resize/resize2fs.8.in).
+
+
+## Отдельный opt-in retained image cutover
+
+`ansible/proxmox-storage-cutover.yml` продолжает тот же private `qcl_host_storage`:
+`apply=false`, `cutover.enabled=false`, root/stage convergence отключены. Это
+отдельная source операция; она не создаёт LV/FS, не меняет root/pool, не удаляет
+VM/данные, не создаёт swap и не запускает bootstrap. Действующие чужие block VM
+сохраняются. Native admission, source fixtures, boot/persistence и SCI — разные
+gates. Synthetic boundary никогда не исполняет native PVE/LVM/systemd/rsync.
+
+До apply coordinator принимает exact D04 receipt о завершённом старом QCL wipe,
+accepted native R1/R2 receipt и protected verified new seed. Старый installer
+должен быть нормально retired без live loop backing; префикс, tag и пустой FD
+list не заменяют ownership/backing evidence. Public example содержит null,
+private input содержит observed UUID/rdev, source/parent dev+inode, escaped unit,
+полные selected/foreign storage stanzas и статические LV/VM disk projections.
+Проценты thin usage не входят в static mapping equality: они повторно измеряются
+и сравниваются с отдельными конечными data/metadata/growth/reserve bounds.
+
+Held cooperative window — существующее доверенное соглашение одного owner,
+не global lock/service. Protected referenced JSON0600 фиксирует `held=true`,
+`host_id`, `boot_id`, `attempt_id`, `owner`, `expires_at_epoch`, полный `scope`
+(file-content, cached-workers, direct-paths, hooks, vm-transitions, automation)
+и exact allowed `foreign_upids`. Metadata lookup не объявляется content reader.
+Новые relevant content opens/reads/writes, hooks, VM transitions и automation
+исключены до controlled reopening. Relevant workers естественно drain;
+foreign jobs не kill/cancel. Window expiry не включает storage автоматически.
+Referenced prerequisite JSON имеет `accepted=true`; SHA-256 и root-owned regular
+file identity проверяются вновь. Отсутствие, error, stale/unknown data — refusal.
+
+Перед selected native CAS mandatory config digest фиксируется в durable
+`gate_disable_intent`. После disable readback проверяются исходные fixed stanza
+и остальные stanzas. Complete FD/cwd/root/maps, kernel loop backing и один
+readable representative каждого mount namespace защищают original/stage
+physical footprint. Unrelated PrivateTmp/baseline views допустимы; неполный
+scan/alias/reader блокирует copy. Stage UUID/LV/rdev идентифицируются независимо
+от `/dev/mapper` spelling. Inactive stage запускается только с exact owned empty
+underlying mountpoint; active stage не restart. R2-created `lost+found` может
+исключаться только по explicitly admitted dev/ino/uid/gid/mode и пустому содержимому.
+
+`ops/host_storage_manifest.py` — независимый read-only stdlib oracle:
+SHA-256, logical length/type, numeric UID/GID/mode, mtime_ns, no-follow symlinks,
+xattrs (включая default/access POSIX ACL), canonical internal hardlink groups,
+inode flags и topology/fstat stability. Empty successful xattr probe допускает
+mode-only ACL без getfacl; probe error не означает отсутствие. Unsupported
+semantic flags/special files/external hardlinks дают refusal. Source/partial
+extras не удаляются. Sparse bytes сохраняются; destination allocation ограничена,
+равенство extents/inodes не обещается. Entry/hash/logical/allocation/output/time
+bounds действуют при чтении. JSON helper requests имеют hard cap1MiB: private
+manifest limits выбираются так, чтобы пары source/destination/request помещались
+в этот предел; capped request останавливает attempt, не запускает fallback.
+
+Copy — один deadline-bounded штатный rsync с fixed
+`-aHAXS --numeric-ids --one-file-system --ignore-times --modify-window=-1 --whole-file`.
+Equal size/mtime seconds не пропускают owned partial bad bytes. No inplace,
+delete/remove-source или hidden archive execution. Aggregate worksheet включает
+полные дополнительные hash/copy passes; unknown sizes не unlimited. До switch
+source-before/source-after/destination SHA/ns/metadata должны совпасть, data
+synced, thin health/capacity повторно приняты. Полный bounded manifest сохраняется
+atomic file+directory fsync в protected receipt directory; receipt содержит
+path/hash/summary. Exit0 producer не является приёмкой.
+
+`ops/host_storage_receipt.py` выполняет только bounded JSON IO, immutable identity,
+finite phase transitions и atomic exclusive same-parent temporary0600 -> file
+fsync -> os.replace -> parent directory fsync -> readback. Existing root-owned
+parent0700 должен уже быть admitted на stable rootFS вне source/stage/rollback,
+pmxcfs и wipe scope. Нет native/resource decisions, subprocess, DB или service.
+Manifest и helper paths находятся в этом же protected directory и отличаются от
+receipt. Original failed logs и старые receipts сохраняются вне wipe/copy.
+
+Durable `rename_intent` предшествует одному exact same-FS rename в absent sibling;
+parent fsync и observed original inode предшествуют `source_renamed`. Own empty
+mountpoint identity сохраняется отдельно. Loaded mount include перед inspection,
+start и каждым ordinary stop проверяет exact root-owned fragment, canonical
+block identity+UUID, What/Where/Type, no drop-ins/reload, ForceUnmount=no и
+LazyUnmount=no. Parsed effective Options требуют rw/nodev/nosuid; ro/dev/suid и
+unknown tokens запрещены, конечные installed harmless defaults relatime и
+data=ordered допускаются независимо от порядка. Чужой unit не переписывается.
+
+Stage нормально retired; `final_activation_intent` записывается до final start.
+Final unit persistent UUID ext4 Before=pve-guests.service, local-fs.target,
+без nofail/automount. Actual final UUID/rdev+manifest/seed/foreign mapping проверены
+до boot enable и native is_mountpoint policy CAS/readback. Original rollback tree
+никогда не удаляется этим ticket. Host image LV сохраняет
+protected-host-infrastructure lifetime даже при пустом/failed partial.
+
+**Durable reopening_intent предшествует любому CAS, снимающему restriction**,
+включая restored-original и originally-disabled случаи. Sticky marker содержит
+intended_tree=new_final/restored_original и не может исчезнуть/понизиться.
+Successful CAS с failed completion write, unknown CAS, corrupt/missing mutated
+receipt или дальнейшие новые writes требуют reconciliation. Rescue читает
+host receipt заново: после marker нет automatic rollback/CAS retry/copy/rename/
+restart/remount/reformat/delete. Historical content oracle после возможных новых
+writes не применяется. При ambiguous outcome закрытое состояние не обещается.
+
+До marker только fresh held disabled gate, полные пустые refs и safe loaded policy
+допускают guarded original restoration: ordinary stop, rmdir exact own empty
+point, exact retained inode rename обратно, fsync и независимая проверка manifest.
+Original offline semantics возвращаются под closed gate, потом durable
+restored_original reopening marker и один original disable semantics CAS.
+Unknown/busy/unsafe policy сохраняет original/gate/partial без forced/lazy unmount.
+Incomplete receipt на входе сам по себе не разрешает replay: текущая реализация
+возвращает reconcile_required без restart/rename/CAS. Complete fixed final resume
+наблюдается без сравнения исторического content oracle. Продолжение interrupted
+rename/activation требует отдельного bounded coordinator recovery на fresh state.
+
+Native apply остаётся отдельным одним admitted attempt с private deadlines,
+capacity/bytes/entry/log bounds и owner window. Synthetic GREEN не проверяет
+installed native probe enforcement, hardware FS support, PVE freshness, native
+copy/mount, reboot/persistence, swap или SCI. Optional host swap после accepted
+final FS требует собственного support/capacity/budget ticket; существующий active
+swap не resize/swapoff, guest memory/Slurm/physics contracts не меняются.
