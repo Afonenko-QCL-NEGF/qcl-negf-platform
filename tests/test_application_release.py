@@ -10,6 +10,9 @@ from types import SimpleNamespace
 import tempfile
 import unittest
 import sys
+import os
+import signal
+import time
 from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location(
@@ -110,6 +113,324 @@ class ApplicationReleaseTests(unittest.TestCase):
     def setUpClass(cls):
         cls.ops = importlib.util.module_from_spec(SPEC)
         SPEC.loader.exec_module(cls.ops)
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.runtime = Path(temporary.name) / "runtime"
+        self.gate = Path(temporary.name) / "gate"
+
+
+    def test_native_bounded_prefix_and_retained_descendant_pipe(self):
+        for parent_exits in (False, True):
+            with self.subTest(parent_exits=parent_exits):
+                pidfile = self.runtime.parent / "pid"
+                code = ("import os,time; p=os.fork(); "
+                        "open(" + repr(str(pidfile)) + ", 'w').write(str(os.getpid())) if p==0 else None; "
+                        "print('prefix',flush=True); " +
+                        ("os._exit(0) if p else time.sleep(10)" if parent_exits else "time.sleep(10)"))
+                start = time.monotonic()
+                try:
+                    with self.assertRaises(self.ops.CommandFailure) as caught:
+                        self.ops.command([sys.executable, "-c", code], timeout_seconds=.8,
+                                         cleanup_seconds=.2, output_bytes=4096)
+                    self.assertLess(time.monotonic() - start, 1.5)
+                    record = caught.exception.record
+                    self.assertIn("prefix", record["stdout"])
+                    self.assertTrue(record["cleanup_confirmed"])
+                    if pidfile.exists():
+                        pid = int(pidfile.read_text())
+                        stat = Path("/proc") / str(pid) / "stat"
+                        acknowledged = time.monotonic() + .2
+                        while stat.exists() and stat.read_text().split()[2] not in ("Z", "X") and time.monotonic() < acknowledged:
+                            time.sleep(.005)
+                        self.assertTrue(not stat.exists() or stat.read_text().split()[2] in ("Z", "X"))
+                finally:
+                    if pidfile.exists():
+                        try:
+                            os.kill(int(pidfile.read_text()), signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        pidfile.unlink()
+
+    def test_native_combined_cap_nonzero_and_finite_validation(self):
+        with self.assertRaises(self.ops.CommandFailure) as caught:
+            self.ops.command([sys.executable, "-c",
+                "import os,time; os.write(1,b'x'*3000); os.write(2,b'y'*3000); time.sleep(10)"],
+                timeout_seconds=1, cleanup_seconds=.2, output_bytes=4096)
+        record = caught.exception.record
+        self.assertEqual(record["failure"], "output_limit")
+        self.assertLessEqual(len(record["stdout"].encode()) + len(record["stderr"].encode()), 4096)
+        with self.assertRaises(self.ops.CommandFailure) as caught:
+            self.ops.command([sys.executable, "-c", "import sys; print('bad',file=sys.stderr); sys.exit(7)"],
+                             timeout_seconds=1, cleanup_seconds=.2)
+        self.assertEqual(caught.exception.record["returncode"], 7)
+        self.assertIn("bad", caught.exception.record["stderr"])
+        for value in (True, float('nan'), float('inf'), 0):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.ops.command([sys.executable], timeout_seconds=value)
+
+    def test_uncertain_activation_receipt_blocks_retry(self):
+        self.gate.write_text(json.dumps({"open": True, "release_id": "old"}))
+        run = DeliveryCommands(self.gate)
+        def loss(args):
+            result = run(args)
+            if args[0] == "ssh" and " activate " in args[-1]:
+                raise self.ops.CommandFailure({"failure": "nonzero", "returncode": 255,
+                    "stdout": "partial", "stderr": "lost", "child_started": True,
+                    "cleanup_confirmed": True, "elapsed_seconds": .1, "output_truncated": False})
+            return result
+        result = self.ops.deliver_cli(delivery_manifest(), POOL, run=loss,
+                                     runtime=self.runtime, gate=self.gate)
+        self.assertTrue(result["requires_reconciliation"])
+        self.assertFalse(json.loads(self.gate.read_text())["open"])
+        self.assertEqual(result["nodes"]["worker"]["status"], "not_attempted")
+        receipt = json.loads(Path(result["receipt"]).read_text())
+        self.assertEqual(receipt["status"], "failed")
+        self.assertEqual(receipt["manifest"]["closures"], delivery_manifest()["closures"])
+        self.assertIn("partial", json.dumps(receipt))
+        before = list(run.calls)
+        with self.assertRaisesRegex(RuntimeError, "reconciliation"):
+            self.ops.deliver_cli(delivery_manifest(), POOL, run=loss,
+                                 runtime=self.runtime, gate=self.gate)
+        self.assertEqual(before, run.calls)
+        self.assertFalse(any(" check " in args[-1] or "State=RESUME" in args for args in run.calls))
+
+    def test_aggregate_deadline_and_output_do_not_reset(self):
+        for output_limit in (False, True):
+            with self.subTest(output_limit=output_limit):
+                self.gate.write_text(json.dumps({"open": True, "release_id": "old"}))
+                run = DeliveryCommands(self.gate)
+                clock = [100.0]
+                def measured(args):
+                    result = run(args)
+                    clock[0] += 1.0
+                    return result
+                with patch.object(self.ops.time, "monotonic", lambda: clock[0]):
+                    with self.assertRaises(self.ops.CommandFailure):
+                        self.ops.deliver_cli(delivery_manifest(), POOL, run=measured,
+                            runtime=self.runtime, gate=self.gate, delivery_timeout_seconds=3,
+                            delivery_output_bytes=20 if output_limit else 8388608)
+                self.assertLessEqual(len(run.calls), 3)
+                self.assertFalse(any(args[0] == "ssh" for args in run.calls))
+                receipt = json.loads(next((self.runtime / "delivery-attempts").glob("*.json")).read_text())
+                self.assertEqual(receipt["status"], "failed")
+                self.assertEqual(receipt["gate_changed"], not output_limit)
+                if not output_limit:
+                    self.assertFalse(json.loads(self.gate.read_text())["open"])
+                # Different subtest must not share receipts.
+                for path in (self.runtime / "delivery-attempts").glob("*.json"):
+                    path.unlink()
+
+    def test_malformed_remote_check_is_unknown_and_stops_pool(self):
+        self.gate.write_text(json.dumps({"open": True, "release_id": "old"}))
+        run = DeliveryCommands(self.gate)
+        def incomplete(args):
+            result = run(args)
+            return '{"ready":' if args[0] == "ssh" and " check " in args[-1] else result
+        result = self.ops.deliver_cli(delivery_manifest(), POOL, run=incomplete,
+                                     runtime=self.runtime, gate=self.gate)
+        self.assertTrue(result["requires_reconciliation"])
+        self.assertEqual(result["nodes"]["worker"]["status"], "not_attempted")
+        self.assertFalse(any("State=RESUME" in args for args in run.calls))
+        self.assertEqual(next((self.runtime / "delivery-attempts").glob("*.json")).stat().st_mode & 0o777, 0o600)
+
+    def test_native_ssh_options_and_nix_environment_are_isolated(self):
+        calls = []
+        self.ops.ssh("admin@worker", ["echo", "hello world"], run=lambda args: calls.append(args) or "")
+        self.assertIn("-oControlMaster=no", calls[0])
+        self.assertIn("-oConnectionAttempts=1", calls[0])
+        self.assertEqual(calls[0][-1], "echo 'hello world'")
+        # Popen sees the isolated environment without executing Nix or SSH.
+        observed = []
+        popen = self.ops.subprocess.Popen
+        def fake_popen(args, **kwargs):
+            observed.append((args, kwargs.get("env")))
+            return popen([sys.executable, "-c", "print('{}')"], **kwargs)
+        self.gate.write_text(json.dumps({"open": True, "release_id": "old"}))
+        with patch.dict(os.environ, {"NIX_SSHOPTS": "-i /tmp/site-key"}), \
+             patch.object(self.ops.subprocess, "Popen", fake_popen):
+            with self.assertRaises(ValueError):
+                self.ops.deliver_cli(delivery_manifest(), POOL, runtime=self.runtime, gate=self.gate)
+            self.assertEqual(os.environ["NIX_SSHOPTS"], "-i /tmp/site-key")
+        self.assertIn("-oConnectTimeout=10", observed[0][1]["NIX_SSHOPTS"])
+        self.assertIn("/tmp/site-key", observed[0][1]["NIX_SSHOPTS"])
+
+    def test_deadline_after_returned_mutation_retains_started_unknown(self):
+        self.gate.write_text(json.dumps({"open": True, "release_id": "old"}))
+        run = DeliveryCommands(self.gate)
+        clock = [100.0]
+        def completed_after_deadline(args):
+            result = run(args)
+            if args[0] == "ssh" and " activate " in args[-1]:
+                clock[0] = 104.0
+            return result
+        with patch.object(self.ops.time, "monotonic", lambda: clock[0]):
+            result = self.ops.deliver_cli(delivery_manifest(), POOL, run=completed_after_deadline,
+                runtime=self.runtime, gate=self.gate, delivery_timeout_seconds=3)
+        self.assertTrue(result["requires_reconciliation"])
+        self.assertEqual(result["remote_outcome"], "unknown")
+        self.assertTrue(result["command_failure"]["child_started"])
+        self.assertEqual(result["command_failure"]["failure"], "deadline")
+        self.assertEqual(result["nodes"]["worker"]["status"], "not_attempted")
+        self.assertFalse(any(" check " in args[-1] or "State=RESUME" in args for args in run.calls))
+        self.assertFalse(json.loads(self.gate.read_text())["open"])
+
+    def test_review_gate_open_fsync_and_terminal_receipt_failure_keep_blocker(self):
+        for failure in ("gate_fsync", "terminal_after_replace", "terminal_persistent", "close_failure"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                gate, runtime = root / "gate", root / "runtime"
+                gate.write_text(json.dumps({"open": True, "release_id": "old"}))
+                run = DeliveryCommands(gate)
+                publish = self.ops.publish_json
+                admission = self.ops.publish_admission
+                fired = [False]
+                def fail_receipt(path, value, **kwargs):
+                    if Path(path).parent.name == "delivery-attempts" and value.get("phase") == "finished":
+                        if failure == "terminal_persistent":
+                            raise OSError("persistent terminal receipt failure")
+                        if failure == "terminal_after_replace" and not fired[0]:
+                            publish(path, value, **kwargs)
+                            fired[0] = True
+                            raise OSError("terminal directory fsync failed after replace")
+                    return publish(path, value, **kwargs)
+                def fail_admission(path, value):
+                    if value["open"] and failure in ("gate_fsync", "close_failure"):
+                        admission(path, value)
+                        fired[0] = True
+                        raise OSError("gate directory fsync failed after replace")
+                    if not value["open"] and failure == "close_failure" and fired[0]:
+                        raise OSError("cannot confirm closed gate")
+                    return admission(path, value)
+                with patch.object(self.ops, "publish_json", fail_receipt), \
+                     patch.object(self.ops, "publish_admission", fail_admission):
+                    if failure == "terminal_persistent":
+                        with self.assertRaises(OSError):
+                            self.ops.deliver_cli(delivery_manifest(), POOL, run=run, runtime=runtime, gate=gate)
+                        result = None
+                    else:
+                        result = self.ops.deliver_cli(delivery_manifest(), POOL, run=run, runtime=runtime, gate=gate)
+                self.assertEqual(json.loads(gate.read_text())["open"], failure == "close_failure")
+                self.assertTrue(list((runtime / "delivery-attempts").glob("*.admission-intent.json")))
+                if result:
+                    self.assertEqual(result["status"], "failed")
+                    self.assertTrue(result["requires_reconciliation"])
+                    if failure == "close_failure":
+                        self.assertIsNone(result["open"])
+                        self.assertTrue(result["critical_admission_failure"])
+                before = list(run.calls)
+                with self.assertRaisesRegex(RuntimeError, "reconciliation"):
+                    self.ops.deliver_cli(delivery_manifest(), POOL, run=run, runtime=runtime, gate=gate)
+                self.assertEqual(before, run.calls)
+
+    def test_review_native_environment_error_is_before_child(self):
+        self.gate.write_text(json.dumps({"open": True, "release_id": "old"}))
+        run = DeliveryCommands(self.gate)
+        def fake_command(args, **kwargs):
+            return run(args)
+        original_split = self.ops.shlex.split
+        def malformed_options(value):
+            if "bad-site" in value:
+                raise ValueError("malformed native options")
+            return original_split(value)
+        with patch.object(self.ops, "command", fake_command), \
+             patch.object(self.ops.shlex, "split", malformed_options), \
+             patch.dict(os.environ, {"NIX_SSHOPTS": "bad-site'"}):
+            with self.assertRaises(ValueError):
+                self.ops.deliver_cli(delivery_manifest(), POOL, run=fake_command,
+                                     runtime=self.runtime, gate=self.gate)
+        self.assertEqual(run.calls, [])
+        receipt = json.loads(next((self.runtime / "delivery-attempts").glob("*.json")).read_text())
+        self.assertFalse(receipt["commands"][-1]["record"]["child_started"])
+        self.assertFalse(receipt.get("requires_reconciliation", False))
+        # The same preparation failure during remote-copy stage is also known;
+        # local prefetch verification/quiesce may run, but native copy never enters.
+        other_runtime = self.runtime.parent / "remote-runtime"
+        with patch.object(self.ops, "command", fake_command), \
+             patch.object(self.ops.shlex, "split", malformed_options), \
+             patch.dict(os.environ, {"NIX_SSHOPTS": "bad-site'"}):
+            result = self.ops.deliver_cli(delivery_manifest(False), POOL, run=fake_command,
+                                         runtime=other_runtime, gate=self.gate)
+        self.assertFalse(result["requires_reconciliation"])
+        self.assertFalse(any(args[:2] == ["nix", "copy"] or args[0] == "ssh" for args in run.calls))
+        remote_receipt = json.loads(next((other_runtime / "delivery-attempts").glob("*.json")).read_text())
+        failures = [item for item in remote_receipt["commands"] if item["status"] == "failed"]
+        self.assertTrue(failures)
+        self.assertTrue(all(not item["record"]["child_started"] for item in failures))
+
+    def test_review_all_native_cli_actions_receive_selected_command_flags(self):
+        for action in ("node-check", "prepare-initial"):
+            observed = []
+            def check_action(*args, **kwargs):
+                kwargs["run"](["fake-verification"])
+                return {}
+            def adapter(args, **kwargs):
+                observed.append(kwargs)
+                return ""
+            source = self.runtime.parent / "manifest.json"
+            source.write_text(json.dumps(release()))
+            args = ["release", action, "--runtime", str(self.runtime), "--gate", str(self.gate),
+                    "--command-timeout-seconds", "7", "--command-output-bytes", "123"]
+            if action == "prepare-initial":
+                args += ["--manifest", str(source)]
+            with patch.object(sys, "argv", args), patch.object(self.ops, "command", adapter), \
+                 patch.object(self.ops, "node_check" if action == "node-check" else "prepare_initial", check_action), \
+                 patch("builtins.print"):
+                self.ops.main()
+            self.assertEqual(observed, [{"timeout_seconds": 7, "output_bytes": 123}])
+
+    def test_final_combined_cli_failure_prints_current_unknown_and_blocks_retry(self):
+        self.gate.write_text(json.dumps({"open": True, "release_id": "old"}))
+        source, pool = self.runtime.parent / "manifest.json", self.runtime.parent / "pool.json"
+        source.write_text(json.dumps(delivery_manifest()))
+        pool.write_text(json.dumps(POOL))
+        run = DeliveryCommands(self.gate)
+        original_deliver = self.ops.deliver_cli
+        publish = self.ops.publish_json
+        admission = self.ops.publish_admission
+        opened = [False]
+        def injected_delivery(value, selected, **kwargs):
+            return original_deliver(value, selected, run=run, **kwargs)
+        def persistent_terminal(path, value, **kwargs):
+            if Path(path).parent.name == "delivery-attempts" and value.get("phase") == "finished":
+                raise OSError("persistent terminal failure")
+            return publish(path, value, **kwargs)
+        def failed_close(path, value):
+            if not value["open"] and opened[0]:
+                raise OSError("failed recovery close")
+            result = admission(path, value)
+            if value["open"]:
+                opened[0] = True
+            return result
+        args = ["release", "deliver", "--manifest", str(source), "--pool", str(pool),
+                "--runtime", str(self.runtime), "--gate", str(self.gate)]
+        with patch.object(sys, "argv", args), patch.object(self.ops, "deliver_cli", injected_delivery), \
+             patch.object(self.ops, "publish_json", persistent_terminal), \
+             patch.object(self.ops, "publish_admission", failed_close), patch("builtins.print") as printed:
+            with self.assertRaises(SystemExit) as caught:
+                self.ops.main()
+        self.assertEqual(caught.exception.code, 1)
+        payload = json.loads(printed.call_args.args[0])
+        self.assertIsNone(payload["open"])
+        self.assertEqual(payload["admission_state"], "unknown")
+        self.assertTrue(payload["critical_admission_failure"])
+        self.assertTrue(payload["requires_reconciliation"])
+        self.assertTrue(json.loads(self.gate.read_text())["open"])
+        self.assertFalse(json.loads((self.runtime / "delivery-report.json").read_text())["open"])
+        self.assertNotIn("manifest", payload)
+        self.assertNotIn("commands", payload)
+        before = list(run.calls)
+        with patch.object(sys, "argv", args), patch.object(self.ops, "deliver_cli", injected_delivery), \
+             patch("builtins.print") as retry_printed:
+            with self.assertRaises(SystemExit) as retry:
+                self.ops.main()
+        self.assertEqual(retry.exception.code, 1)
+        self.assertEqual(before, run.calls)
+        retry_payload = json.loads(retry_printed.call_args.args[0])
+        self.assertIsNone(retry_payload["open"])
+        self.assertTrue(retry_payload["requires_reconciliation"])
+        self.assertTrue(list((self.runtime / "delivery-attempts").glob("*.admission-intent.json")))
 
     def test_root_squashed_shared_gate_is_read_as_scientific_owner_without_relaxing_guards(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -369,7 +690,8 @@ class ApplicationReleaseTests(unittest.TestCase):
                 with (root / "runtime/activation.lock").open("w") as competing:
                     with self.assertRaises(BlockingIOError):
                         fcntl.flock(competing, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return prepare(value, profile=root / "profile", run=run, **kwargs)
+                kwargs["run"] = run
+                return prepare(value, profile=root / "profile", **kwargs)
             args = ["qcl-negf-release", "prepare-initial", "--manifest", str(source),
                     "--role", "controller", "--runtime", str(root / "runtime"), "--gate", str(root / "gate")]
             with patch.object(sys, "argv", args), patch.object(self.ops, "prepare_initial", initial), patch("builtins.print"):
@@ -384,7 +706,7 @@ class ApplicationReleaseTests(unittest.TestCase):
             original = gate.read_bytes()
             run = DeliveryCommands(gate)
             with patch.object(self.ops, "publish_admission", lambda _path, value: self.ops.publish_json(gate, value)):
-                report = self.ops.deliver_cli(delivery_manifest(), POOL, run=run)
+                report = self.ops.deliver_cli(delivery_manifest(), POOL, runtime=self.runtime, gate=self.gate, run=run)
             self.assertTrue(report["open"])
             self.assertEqual(run.calls[:2], [
                 ["nix", "copy", "--from", "https://cache.example.invalid", "/nix/store/application", "/nix/store/solver"],
@@ -400,7 +722,7 @@ class ApplicationReleaseTests(unittest.TestCase):
             run.failure = True
             with patch.object(self.ops, "publish_admission", lambda _path, value: self.ops.publish_json(gate, value)):
                 with self.assertRaisesRegex(RuntimeError, "cache fetch"):
-                    self.ops.deliver_cli(delivery_manifest(), POOL, run=run)
+                    self.ops.deliver_cli(delivery_manifest(), POOL, runtime=self.runtime, gate=self.gate, run=run)
             self.assertEqual(gate.read_bytes(), original)
             self.assertFalse(any(args[0] in ("systemctl", "scontrol", "ssh") for args in run.calls))
 
@@ -418,7 +740,7 @@ class ApplicationReleaseTests(unittest.TestCase):
                 run.evidence = value
                 with patch.object(self.ops, "publish_admission", lambda _path, value: self.ops.publish_json(gate, value)):
                     with self.assertRaisesRegex(ValueError, "closure|hash|evidence"):
-                        self.ops.deliver_cli(delivery_manifest(), POOL, run=run)
+                        self.ops.deliver_cli(delivery_manifest(), POOL, runtime=self.runtime, gate=self.gate, run=run)
                 self.assertEqual(gate.read_bytes(), original)
                 self.assertFalse(any(args[0] in ("systemctl", "scontrol", "ssh") for args in run.calls))
 
@@ -429,7 +751,7 @@ class ApplicationReleaseTests(unittest.TestCase):
             original, run = gate.read_bytes(), DeliveryCommands(gate)
             run.evidence = [{"path": path, **value} for path, value in run.evidence.items()]
             with patch.object(self.ops, "publish_admission", lambda _path, value: self.ops.publish_json(gate, value)):
-                self.ops.deliver_cli(delivery_manifest(False), POOL, run=run)
+                self.ops.deliver_cli(delivery_manifest(False), POOL, runtime=self.runtime, gate=self.gate, run=run)
             self.assertEqual(run.calls[0][:3], ["nix", "path-info", "--json"])
             self.assertFalse(any(args[:3] == ["nix", "copy", "--from"] for args in run.calls))
             self.assertEqual(run.prefetch_gate_snapshots, [original])
@@ -445,12 +767,12 @@ class ApplicationReleaseTests(unittest.TestCase):
                 run = DeliveryCommands(gate)
                 with patch.object(self.ops, "publish_admission", lambda _path, value: self.ops.publish_json(gate, value)):
                     with self.assertRaisesRegex(ValueError, "cache"):
-                        self.ops.deliver_cli(value, POOL, run=run)
+                        self.ops.deliver_cli(value, POOL, runtime=self.runtime, gate=self.gate, run=run)
                 self.assertEqual(gate.read_text(), "unchanged")
                 self.assertEqual(run.calls, [])
         calls = []
         with self.assertRaisesRegex(ValueError, "closure"):
-            self.ops.deliver_cli(release(), POOL, run=lambda args: calls.append(args))
+            self.ops.deliver_cli(release(), POOL, runtime=self.runtime, gate=self.gate, run=lambda args: calls.append(args))
         self.assertEqual(calls, [])
 
     def test_malformed_manifest_closure_inventory_refuses_before_commands(self):
@@ -463,7 +785,7 @@ class ApplicationReleaseTests(unittest.TestCase):
                 value["closures"] = inventory
                 calls = []
                 with self.assertRaisesRegex(ValueError, "closure"):
-                    self.ops.deliver_cli(value, POOL, run=lambda args: calls.append(args))
+                    self.ops.deliver_cli(value, POOL, runtime=self.runtime, gate=self.gate, run=lambda args: calls.append(args))
                 self.assertEqual(calls, [])
 
     def test_cli_keeps_operational_cache_and_closure_fields_for_controller_prefetch(self):
@@ -473,9 +795,9 @@ class ApplicationReleaseTests(unittest.TestCase):
             source.write_text(json.dumps(delivery_manifest()))
             pool.write_text(json.dumps(POOL))
             observed = []
-            def deliver(value, selected_pool):
+            def deliver(value, selected_pool, **kwargs):
                 observed.append((value, selected_pool))
-                return {"open": True}
+                return {"open": True, "status": "completed"}
             args = ["qcl-negf-release", "deliver", "--manifest", str(source), "--pool", str(pool),
                     "--runtime", str(root / "runtime")]
             with patch.object(sys, "argv", args), patch.object(self.ops, "deliver_cli", deliver), patch("builtins.print"):
