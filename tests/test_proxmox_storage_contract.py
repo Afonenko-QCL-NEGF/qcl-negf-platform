@@ -186,7 +186,7 @@ def test_actual_ansible_action_contract(name, want, refused, tmp_path, monkeypat
                 trace("format"); s["stage_fs"] = "stage-fs"; out["changed"] = True
             elif action == "ansible.builtin.template":
                 from ansible._internal._datatag._tags import TrustedAsTemplate
-                text = self._templar.template(TrustedAsTemplate.tag((BASE/"ansible"/args["src"]).read_text()))
+                text = self._templar.template(TrustedAsTemplate().tag((BASE/"ansible"/args["src"]).read_text()))
                 assert "WantedBy" not in text and "What=UUID=stage-fs" in text
                 trace("unit"); out["changed"] = True
             elif action == "ansible.builtin.systemd_service":
