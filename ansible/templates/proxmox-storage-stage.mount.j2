@@ -1,0 +1,8 @@
+# Protected host infrastructure; temporary inspection only; no boot target.
+[Unit]
+Description=Protected host image preparation stage
+[Mount]
+What=UUID={{ h.stage.fs_uuid }}
+Where={{ h.stage.path }}
+Type=ext4
+Options=rw,nodev,nosuid

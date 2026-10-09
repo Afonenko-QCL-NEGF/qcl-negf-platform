@@ -1,0 +1,955 @@
+# No copy/cutover/final mount/swap/storage-disable or QCL teardown actions.
+- name: Converge native Proxmox root and protected temporary image stage only
+  hosts: proxmox_hypervisors
+  gather_facts: false
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    h: '{{ {''apply'': false, ''root'': {''enabled'': false}, ''stage'': {''enabled'': false}} | combine(qcl_host_storage
+      | default({}), recursive=true) }}'
+  tasks:
+  - name: Strict disabled-by-default host intent
+    ansible.builtin.assert:
+      that:
+      - h.apply is boolean
+      - h.root.enabled is boolean
+      - h.stage.enabled is boolean
+      - not (h.root.enabled or h.stage.enabled) or h.apply
+      - not (h.root.enabled or h.stage.enabled) or not ansible_check_mode
+      fail_msg: 'Host storage refusal: missing, stale, ambiguous or out-of-envelope evidence; preserve original
+        receipt and partial state.'
+  - name: Require fresh owning admission and distinct retained recovery receipts
+    ansible.builtin.assert:
+      that:
+      - h.admission.fresh is sameas true
+      - h.admission.exclusive is sameas true
+      - h.admission.receipt | length > 0
+      - h.attempt_id | length > 0
+      - h.original_receipt | length > 0
+      - h.attempt_id != h.original_receipt
+      fail_msg: 'Host storage refusal: missing, stale, ambiguous or out-of-envelope evidence; preserve original
+        receipt and partial state.'
+    when: h.root.enabled or h.stage.enabled
+  - name: Constrain measured executable paths
+    ansible.builtin.assert:
+      that:
+      - h.tools.lvs is match("^/(usr/)?sbin/lvs$")
+      - h.tools.vgs is match("^/(usr/)?sbin/vgs$")
+      - h.tools.pvs is match("^/(usr/)?sbin/pvs$")
+      - h.tools.blkid is match("^/(usr/)?sbin/blkid$")
+      - h.tools.wipefs is match("^/(usr/)?sbin/wipefs$")
+      - h.tools.dumpe2fs is match("^/(usr/)?sbin/dumpe2fs$")
+      - h.tools.resize2fs is match("^/(usr/)?sbin/resize2fs$")
+      - h.tools.blockdev is match("^/(usr/)?(sbin|bin)/blockdev$")
+      fail_msg: 'Host storage refusal: missing, stale, ambiguous or out-of-envelope evidence; preserve original
+        receipt and partial state.'
+    when: h.root.enabled or h.stage.enabled
+  - name: Read native time for admission expiry
+    ansible.builtin.command:
+      argv:
+      - /usr/bin/date
+      - +%s
+    register: admission_clock
+    changed_when: false
+    check_mode: false
+    when: h.root.enabled or h.stage.enabled
+  - name: Refuse expired private admission
+    ansible.builtin.assert:
+      that:
+      - h.admission.expires_at_epoch is integer
+      - h.admission.expires_at_epoch is not boolean
+      - h.admission.expires_at_epoch > (admission_clock.stdout | trim | int)
+    when: h.root.enabled or h.stage.enabled
+  - name: Fresh host identity
+    ansible.builtin.command:
+      argv:
+      - /usr/bin/cat
+      - /etc/machine-id
+    register: host_probe
+    changed_when: false
+    check_mode: false
+    when: h.root.enabled or h.stage.enabled
+  - name: Fresh boot identity
+    ansible.builtin.command:
+      argv:
+      - /usr/bin/cat
+      - /proc/sys/kernel/random/boot_id
+    register: boot_probe
+    changed_when: false
+    check_mode: false
+    when: h.root.enabled or h.stage.enabled
+  - name: Match exact admitted host and boot
+    ansible.builtin.assert:
+      that:
+      - host_probe.stdout | trim == h.host_id
+      - boot_probe.stdout | trim == h.boot_id
+      fail_msg: 'Host storage refusal: missing, stale, ambiguous or out-of-envelope evidence; preserve original
+        receipt and partial state.'
+    when: h.root.enabled or h.stage.enabled
+  - name: Capture all existing LV identities
+    ansible.builtin.command:
+      argv:
+      - '{{ h.tools.lvs }}'
+      - --reportformat
+      - json
+      - --units
+      - b
+      - --nosuffix
+      - --options
+      - lv_name,vg_name,lv_uuid,vg_uuid,lv_size,segtype,pool_lv,lv_path,data_percent,metadata_percent,lv_metadata_size,devices,lv_attr,lv_health_status
+    register: lv_probe
+    changed_when: false
+    check_mode: false
+    when: h.root.enabled or h.stage.enabled
+  - name: Capture actual mount topology
+    ansible.builtin.command:
+      argv:
+      - /usr/bin/findmnt
+      - --json
+      - --list
+      - --output
+      - TARGET,SOURCE,UUID,FSTYPE,FSROOT
+    register: mount_probe
+    changed_when: false
+    check_mode: false
+    when: h.root.enabled or h.stage.enabled
+  - name: Decode native LV and mount reports
+    ansible.builtin.set_fact:
+      initial_lvs: '{{ (lv_probe.stdout | from_json).report[0].lv }}'
+      mounts: '{{ (mount_probe.stdout | from_json).filesystems }}'
+    when: h.root.enabled or h.stage.enabled
+  - name: Fresh outside-pool VG ledger
+    ansible.builtin.command:
+      argv:
+      - '{{ h.tools.vgs }}'
+      - --reportformat
+      - json
+      - --units
+      - b
+      - --nosuffix
+      - --options
+      - vg_name,vg_uuid,vg_free,vg_extent_size
+    register: vg_probe
+    changed_when: false
+    check_mode: false
+    when: h.root.enabled
+  - name: Fresh PV membership
+    ansible.builtin.command:
+      argv:
+      - '{{ h.tools.pvs }}'
+      - --reportformat
+      - json
+      - --options
+      - pv_name,pv_uuid,vg_uuid
+    register: pv_probe
+    changed_when: false
+    check_mode: false
+    when: h.root.enabled
+  - name: Select exact root LV VG and mounted root
+    ansible.builtin.set_fact:
+      root_rows: '{{ initial_lvs | selectattr("lv_name", "equalto", h.root.lv) | selectattr("vg_name", "equalto",
+        h.root.vg) | list }}'
+      root_vgs: '{{ (vg_probe.stdout | from_json).report[0].vg | selectattr("vg_name", "equalto", h.root.vg) | list
+        }}'
+      root_mounts: '{{ mounts | selectattr("target", "equalto", "/") | list }}'
+      root_pvs: '{{ (pv_probe.stdout | from_json).report[0].pv | selectattr("pv_uuid", "equalto", h.root.pv_uuid)
+        | list }}'
+    when: h.root.enabled
+  - name: Existing root must resolve to exactly one PV VG LV and mount
+    ansible.builtin.assert:
+      that:
+      - root_rows | length == 1
+      - root_vgs | length == 1
+      - root_mounts | length == 1
+      - root_pvs | length == 1
+      fail_msg: 'Host storage refusal: missing, stale, ambiguous or out-of-envelope evidence; preserve original
+        receipt and partial state.'
+    when: h.root.enabled
+  - name: Resolve expected existing root device
+    ansible.builtin.command:
+      argv:
+      - /usr/bin/realpath
+      - -e
+      - '{{ h.root.device }}'
+    register: root_device_real
+    changed_when: false
+    check_mode: false
+    when: h.root.enabled
+  - name: Resolve actual mounted root block device
+    ansible.builtin.command:
+      argv:
+      - /usr/bin/realpath
+      - -e
+      - '{{ root_mounts[0].source }}'
+    register: root_mount_real
+    changed_when: false
+    check_mode: false
+    when: h.root.enabled
+  - name: Match existing root identities and resolved device
+    ansible.builtin.assert:
+      that:
+      - root_rows[0].lv_uuid == h.root.lv_uuid
+      - root_rows[0].vg_uuid == h.root.vg_uuid
+      - root_vgs[0].vg_uuid == h.root.vg_uuid
+      - root_pvs[0].vg_uuid == h.root.vg_uuid
+      - root_rows[0].segtype == "linear"
+      - root_rows[0].lv_path == h.root.device
+      - root_rows[0].devices is match("^" ~ (root_pvs[0].pv_name | regex_escape) ~ "\\([0-9]+\\)$")
+      - root_mounts[0].uuid == h.root.fs_uuid
+      - root_mounts[0].fstype == "ext4"
+      - root_mounts[0].fsroot == "/"
+      - root_device_real.stdout | trim == root_mount_real.stdout | trim
+    when: h.root.enabled
+  - name: Read existing ext4 superblock
+    ansible.builtin.command:
+      argv:
+      - '{{ h.tools.dumpe2fs }}'
+      - -h
+      - '{{ h.root.device }}'
+    register: fs_probe
+    changed_when: false
+    check_mode: false
+    when: h.root.enabled
+  - name: Decode independent existing ext4 geometry
+    ansible.builtin.set_fact:
+      fs_blocks: '{{ (fs_probe.stdout | regex_findall("(?m)^Block count: +([0-9]+)$"))[0] | int }}'
+      fs_block_size: '{{ (fs_probe.stdout | regex_findall("(?m)^Block size: +([0-9]+)$"))[0] | int }}'
+      root_lv_bytes: '{{ root_rows[0].lv_size | trim | int }}'
+      root_extent: '{{ root_vgs[0].vg_extent_size | trim | int }}'
+    when: h.root.enabled
+  - name: Finite monotonic extent-aligned root target and outside-pool reserve
+    ansible.builtin.assert:
+      that:
+      - h.root.target_mib is integer
+      - h.root.target_mib is not boolean
+      - h.root.authorized_cap_mib is integer
+      - h.root.authorized_cap_mib is not boolean
+      - h.root.reserve_vg_mib is integer
+      - h.root.reserve_vg_mib is not boolean
+      - h.root.target_mib > 0
+      - h.root.target_mib <= h.root.authorized_cap_mib
+      - h.root.reserve_vg_mib > 0
+      - root_extent > 0
+      - (h.root.target_mib * 1048576) % root_extent == 0
+      - (h.root.authorized_cap_mib * 1048576) % root_extent == 0
+      - root_lv_bytes > 0
+      - root_lv_bytes <= h.root.target_mib * 1048576
+      - fs_blocks > 0
+      - fs_block_size > 0
+      - fs_blocks * fs_block_size <= h.root.target_mib * 1048576
+      - (h.root.target_mib * 1048576) % fs_block_size == 0
+      - (h.root.target_mib * 1048576 - root_lv_bytes + h.root.reserve_vg_mib * 1048576) <= (root_vgs[0].vg_free
+        | trim | int)
+      - '(fs_probe.stdout | regex_findall("(?m)^Filesystem UUID: +(.+)$")) == [h.root.fs_uuid]'
+      - '(fs_probe.stdout | regex_findall("(?m)^Filesystem features: +(.+)$"))[0].split() | difference(h.root.supported_ext4_features)
+        | length == 0'
+      - h.root.supported_ext4_features | length > 0
+      fail_msg: 'Host storage refusal: missing, stale, ambiguous or out-of-envelope evidence; preserve original
+        receipt and partial state.'
+    when: h.root.enabled
+  - name: Grow only existing admitted root LV
+    community.general.lvol:
+      vg: '{{ h.root.vg }}'
+      lv: '{{ h.root.lv }}'
+      size: '{{ h.root.target_mib }}m'
+      state: present
+      shrink: false
+      force: false
+      resizefs: false
+    when: h.root.enabled and root_lv_bytes < h.root.target_mib * 1048576
+  - name: Reread root LV and protected pool after LV convergence
+    ansible.builtin.command:
+      argv:
+      - '{{ h.tools.lvs }}'
+      - --reportformat
+      - json
+      - --units
+      - b
+      - --nosuffix
+      - --options
+      - lv_name,vg_name,lv_uuid,vg_uuid,lv_size,segtype,pool_lv,lv_path,data_percent,metadata_percent,lv_metadata_size,devices,lv_attr,lv_health_status
+    register: grown_lv_probe
+    changed_when: false
+    check_mode: false
+    when: h.root.enabled
+  - name: Reread root mount before filesystem convergence
+    ansible.builtin.command:
+      argv:
+      - /usr/bin/findmnt
+      - --json
+      - --list
+      - --output
+      - TARGET,SOURCE,UUID,FSTYPE,FSROOT
+    register: grown_mount_probe
+    changed_when: false
+    check_mode: false
+    when: h.root.enabled
+  - name: Reread actual root block device bytes
+    ansible.builtin.command:
+      argv:
+      - '{{ h.tools.blockdev }}'
+      - --getsize64
+      - '{{ h.root.device }}'
+    register: device_probe
+    changed_when: false
+    check_mode: false
+    when: h.root.enabled
+  - name: Reread existing ext4 after LV convergence
+    ansible.builtin.command:
+      argv:
+      - '{{ h.tools.dumpe2fs }}'
+      - -h
+      - '{{ h.root.device }}'
+    register: grown_fs_probe
+    changed_when: false
+    check_mode: false
+    when: h.root.enabled
+  - name: Decode fresh root convergence state
+    ansible.builtin.set_fact:
+      grown_root: '{{ (grown_lv_probe.stdout | from_json).report[0].lv | selectattr("lv_uuid", "equalto", h.root.lv_uuid)
+        | list }}'
+      grown_mount: '{{ (grown_mount_probe.stdout | from_json).filesystems | selectattr("target", "equalto", "/")
+        | list }}'
+      grown_blocks: '{{ (grown_fs_probe.stdout | regex_findall("(?m)^Block count: +([0-9]+)$"))[0] | int }}'
+      goal_blocks: '{{ (h.root.target_mib * 1048576) // fs_block_size }}'
+    when: h.root.enabled
+  - name: Revalidate mounted identity and geometry before native ext4-only grow
+    ansible.builtin.assert:
+      that:
+      - grown_root | length == 1
+      - grown_root[0].lv_path == h.root.device
+      - grown_root[0].vg_uuid == h.root.vg_uuid
+      - grown_root[0].lv_size | trim | int == h.root.target_mib * 1048576
+      - device_probe.stdout | trim | int == h.root.target_mib * 1048576
+      - grown_mount | length == 1
+      - grown_mount[0] == root_mounts[0]
+      - '(grown_fs_probe.stdout | regex_findall("(?m)^Filesystem UUID: +(.+)$")) == [h.root.fs_uuid]'
+      - '(grown_fs_probe.stdout | regex_findall("(?m)^Block size: +([0-9]+)$"))[0] | int == fs_block_size'
+      - '(grown_fs_probe.stdout | regex_findall("(?m)^Filesystem features: +(.+)$"))[0].split() | difference(h.root.supported_ext4_features)
+        | length == 0'
+      - grown_blocks >= fs_blocks
+      - grown_blocks <= goal_blocks
+      - (grown_lv_probe.stdout | from_json).report[0].lv | rejectattr("lv_uuid", "equalto", h.root.lv_uuid) | list
+        == initial_lvs | rejectattr("lv_uuid", "equalto", h.root.lv_uuid) | list
+      fail_msg: 'Host storage refusal: missing, stale, ambiguous or out-of-envelope evidence; preserve original
+        receipt and partial state.'
+    when: h.root.enabled
+  - name: Converge existing ext4 independently including equal-LV retry
+    ansible.builtin.command:
+      argv:
+      - '{{ h.tools.resize2fs }}'
+      - '{{ h.root.device }}'
+      - '{{ goal_blocks | string }}'
+    when: h.root.enabled and grown_blocks < goal_blocks
+    changed_when: true
+  - name: Verify ext4 postcondition independently
+    ansible.builtin.command:
+      argv:
+      - '{{ h.tools.dumpe2fs }}'
+      - -h
+      - '{{ h.root.device }}'
+    register: root_final_fs
+    changed_when: false
+    check_mode: false
+    when: h.root.enabled
+  - name: Verify final root mount
+    ansible.builtin.command:
+      argv:
+      - /usr/bin/findmnt
+      - --json
+      - --list
+      - --output
+      - TARGET,SOURCE,UUID,FSTYPE,FSROOT
+    register: root_final_mount
+    changed_when: false
+    check_mode: false
+    when: h.root.enabled
+  - name: Verify final outside-pool reserve
+    ansible.builtin.command:
+      argv:
+      - '{{ h.tools.vgs }}'
+      - --reportformat
+      - json
+      - --units
+      - b
+      - --nosuffix
+      - --options
+      - vg_name,vg_uuid,vg_free,vg_extent_size
+    register: root_final_vg
+    changed_when: false
+    check_mode: false
+    when: h.root.enabled
+  - name: Verify final protected LV identities
+    ansible.builtin.command:
+      argv:
+      - '{{ h.tools.lvs }}'
+      - --reportformat
+      - json
+      - --units
+      - b
+      - --nosuffix
+      - --options
+      - lv_name,vg_name,lv_uuid,vg_uuid,lv_size,segtype,pool_lv,lv_path,data_percent,metadata_percent,lv_metadata_size,devices,lv_attr,lv_health_status
+    register: root_final_lv
+    changed_when: false
+    check_mode: false
+    when: h.root.enabled
+  - name: Capture final root df evidence
+    ansible.builtin.command:
+      argv:
+      - /usr/bin/df
+      - -B1
+      - /
+    register: root_df
+    changed_when: false
+    check_mode: false
+    when: h.root.enabled
+  - name: Root completion requires postconditions rather than exit status
+    ansible.builtin.assert:
+      that:
+      - '(root_final_fs.stdout | regex_findall("(?m)^Filesystem UUID: +(.+)$")) == [h.root.fs_uuid]'
+      - '(root_final_fs.stdout | regex_findall("(?m)^Block count: +([0-9]+)$"))[0] | int == goal_blocks'
+      - (root_final_mount.stdout | from_json).filesystems | selectattr("target", "equalto", "/") | list == root_mounts
+      - (root_final_vg.stdout | from_json).report[0].vg | selectattr("vg_uuid", "equalto", h.root.vg_uuid) | map(attribute="vg_free")
+        | map("int") | min >= h.root.reserve_vg_mib * 1048576
+      - (root_final_lv.stdout | from_json).report[0].lv == (grown_lv_probe.stdout | from_json).report[0].lv
+      fail_msg: 'Host storage refusal: missing, stale, ambiguous or out-of-envelope evidence; preserve original
+        receipt and partial state.'
+    when: h.root.enabled
+  - name: Identify existing final handoff before stage mutation
+    ansible.builtin.set_fact:
+      final_mounts: '{{ mounts | selectattr("target", "equalto", h.stage.source) | list }}'
+      stage_rows: '{{ initial_lvs | selectattr("vg_name", "equalto", h.stage.vg) | selectattr("lv_name", "equalto",
+        h.stage.lv) | list }}'
+      pool_rows: '{{ initial_lvs | selectattr("vg_name", "equalto", h.stage.vg) | selectattr("lv_name", "equalto",
+        h.stage.pool) | list }}'
+    when: h.stage.enabled
+  - name: Detect exact final handoff no-action branch
+    ansible.builtin.set_fact:
+      final_handoff: '{{ final_mounts | length == 1 and final_mounts[0].uuid == h.stage.fs_uuid and final_mounts[0].fstype
+        == "ext4" and final_mounts[0].fsroot == "/" and stage_rows | length == 1 and stage_rows[0].lv_uuid == h.stage.lv_uuid
+        and stage_rows[0].vg_uuid == h.stage.vg_uuid and stage_rows[0].pool_lv == h.stage.pool and stage_rows[0].segtype
+        == "thin" and stage_rows[0].lv_size | trim | int == h.stage.target_mib * 1048576 and final_mounts[0].source
+        == stage_rows[0].lv_path }}'
+    when: h.stage.enabled
+  - name: Report existing final handoff without remount or readiness claim
+    ansible.builtin.debug:
+      msg: Existing exact final handoff; no R2 action. Requires owning review; not whole-host readiness.
+    when: h.stage.enabled and final_handoff
+  - name: Admit only absent new stage or exact protected resume and shared pool
+    ansible.builtin.assert:
+      that:
+      - h.stage.target_mib is integer
+      - h.stage.target_mib is not boolean
+      - h.stage.authorized_cap_mib is integer
+      - h.stage.authorized_cap_mib is not boolean
+      - h.stage.target_mib > 0
+      - h.stage.target_mib <= h.stage.authorized_cap_mib
+      - h.stage.lv is match("^[a-zA-Z0-9][a-zA-Z0-9_-]+$")
+      - h.stage.lv != h.stage.pool
+      - h.stage.lifetime == "protected-host-infrastructure"
+      - pool_rows | length == 1
+      - pool_rows[0].lv_uuid == h.stage.pool_uuid
+      - pool_rows[0].vg_uuid == h.stage.vg_uuid
+      - pool_rows[0].segtype == "thin-pool"
+      - stage_rows | length <= 1
+      - (stage_rows | length == 0 and h.stage.lv_uuid is none) or (stage_rows | length == 1 and stage_rows[0].lv_uuid
+        == h.stage.lv_uuid and stage_rows[0].pool_lv == h.stage.pool and stage_rows[0].segtype == "thin" and stage_rows[0].vg_uuid
+        == h.stage.vg_uuid and stage_rows[0].lv_size | trim | int == h.stage.target_mib * 1048576)
+      - h.stage.consumers_complete is sameas true
+      - h.stage.namespace_complete is sameas true
+      - pool_rows[0].lv_attr is match("^t...a.*$")
+      - pool_rows[0].lv_health_status | trim == ""
+      - h.stage.references_complete is sameas true
+      - h.stage.reference_receipt | length > 0
+      - h.stage.volume_references | length == 0
+      fail_msg: 'Host storage refusal: missing, stale, ambiguous or out-of-envelope evidence; preserve original
+        receipt and partial state.'
+    when: h.stage.enabled and not final_handoff
+  - name: Require positive finite admitted preparation_data_mib
+    ansible.builtin.assert:
+      that:
+      - h.stage.preparation_data_mib is integer
+      - h.stage.preparation_data_mib is not boolean
+      - h.stage.preparation_data_mib > 0
+      fail_msg: 'Host storage refusal: missing, stale, ambiguous or out-of-envelope evidence; preserve original
+        receipt and partial state.'
+    when: h.stage.enabled and not final_handoff
+  - name: Require positive finite admitted preparation_metadata_mib
+    ansible.builtin.assert:
+      that:
+      - h.stage.preparation_metadata_mib is integer
+      - h.stage.preparation_metadata_mib is not boolean
+      - h.stage.preparation_metadata_mib > 0
+      fail_msg: 'Host storage refusal: missing, stale, ambiguous or out-of-envelope evidence; preserve original
+        receipt and partial state.'
+    when: h.stage.enabled and not final_handoff
+  - name: Require positive finite admitted protected_data_mib
+    ansible.builtin.assert:
+      that:
+      - h.stage.protected_data_mib is integer
+      - h.stage.protected_data_mib is not boolean
+      - h.stage.protected_data_mib > 0
+      fail_msg: 'Host storage refusal: missing, stale, ambiguous or out-of-envelope evidence; preserve original
+        receipt and partial state.'
+    when: h.stage.enabled and not final_handoff
+  - name: Require positive finite admitted protected_metadata_mib
+    ansible.builtin.assert:
+      that:
+      - h.stage.protected_metadata_mib is integer
+      - h.stage.protected_metadata_mib is not boolean
+      - h.stage.protected_metadata_mib > 0
+      fail_msg: 'Host storage refusal: missing, stale, ambiguous or out-of-envelope evidence; preserve original
+        receipt and partial state.'
+    when: h.stage.enabled and not final_handoff
+  - name: Admit preparation peak and protected shared data metadata reserves
+    ansible.builtin.assert:
+      that:
+      - pool_rows[0].data_percent | trim is match("^[0-9]+(\\.[0-9]+)?$")
+      - pool_rows[0].metadata_percent | trim is match("^[0-9]+(\\.[0-9]+)?$")
+      - pool_rows[0].data_percent | float >= 0
+      - pool_rows[0].data_percent | float < 100
+      - pool_rows[0].metadata_percent | float >= 0
+      - pool_rows[0].metadata_percent | float < 100
+      - (h.stage.preparation_data_mib + h.stage.protected_data_mib) * 1048576 <= (pool_rows[0].lv_size | trim |
+        int) * (100 - (pool_rows[0].data_percent | float)) / 100
+      - (h.stage.preparation_metadata_mib + h.stage.protected_metadata_mib) * 1048576 <= (pool_rows[0].lv_metadata_size
+        | trim | int) * (100 - (pool_rows[0].metadata_percent | float)) / 100
+      fail_msg: 'Host storage refusal: missing, stale, ambiguous or out-of-envelope evidence; preserve original
+        receipt and partial state.'
+    when: h.stage.enabled and not final_handoff
+  - name: Resolve real stage path
+    ansible.builtin.command:
+      argv:
+      - /usr/bin/realpath
+      - -e
+      - '{{ h.stage.path }}'
+    register: stage_real
+    changed_when: false
+    check_mode: false
+    when: h.stage.enabled and not final_handoff
+  - name: Resolve real source path
+    ansible.builtin.command:
+      argv:
+      - /usr/bin/realpath
+      - -e
+      - '{{ h.stage.source }}'
+    register: source_real
+    changed_when: false
+    check_mode: false
+    when: h.stage.enabled and not final_handoff
+  - name: Read stage directory identity
+    ansible.builtin.command:
+      argv:
+      - /usr/bin/stat
+      - -c
+      - '%d:%i'
+      - '{{ h.stage.path }}'
+    register: stage_stat
+    changed_when: false
+    check_mode: false
+    when: h.stage.enabled and not final_handoff
+  - name: Read source directory identity
+    ansible.builtin.command:
+      argv:
+      - /usr/bin/stat
+      - -c
+      - '%d:%i'
+      - '{{ h.stage.source }}'
+    register: source_stat
+    changed_when: false
+    check_mode: false
+    when: h.stage.enabled and not final_handoff
+  - name: Read stage path type without following symlinks
+    ansible.builtin.command:
+      argv:
+      - /usr/bin/stat
+      - -c
+      - '%F'
+      - '{{ h.stage.path }}'
+    register: stage_type
+    changed_when: false
+    check_mode: false
+    when: h.stage.enabled and not final_handoff
+  - name: Read mount namespace inventory
+    ansible.builtin.command:
+      argv:
+      - /usr/bin/lsns
+      - --json
+      - --type
+      - mnt
+      - --output
+      - NS,PID
+    register: namespaces
+    changed_when: false
+    check_mode: false
+    when: h.stage.enabled and not final_handoff
+  - name: Decode complete namespace representatives
+    ansible.builtin.set_fact:
+      namespace_rows: '{{ (namespaces.stdout | from_json).namespaces }}'
+    when: h.stage.enabled and not final_handoff
+  - name: Require complete readable namespace representatives
+    ansible.builtin.assert:
+      that:
+      - namespace_rows | length > 0
+      - namespace_rows | map(attribute="ns") | unique | length == namespace_rows | length
+      - item.ns is integer
+      - item.ns > 0
+      - item.pid is integer
+      - item.pid > 0
+    loop: '{{ namespace_rows }}'
+    when: h.stage.enabled and not final_handoff
+  - name: Read topology through each representative namespace
+    ansible.builtin.command:
+      argv:
+      - /usr/bin/nsenter
+      - --mount=/proc/{{ item.pid }}/ns/mnt
+      - --
+      - /usr/bin/findmnt
+      - --json
+      - --list
+      - --output
+      - TARGET,SOURCE,UUID,FSTYPE,FSROOT
+    register: namespace_views
+    loop: '{{ namespace_rows }}'
+    changed_when: false
+    check_mode: false
+    timeout: 30
+    when: h.stage.enabled and not final_handoff
+  - name: Decode independently observed namespace mount mappings
+    ansible.builtin.set_fact:
+      namespace_mounts: '{{ namespace_views.results | map(attribute="stdout") | map("from_json") | map(attribute="filesystems")
+        | flatten }}'
+    when: h.stage.enabled and not final_handoff
+  - name: Disjoint real directory in both directions without mount or namespace alias
+    ansible.builtin.assert:
+      that:
+      - h.stage.source == "/var/lib/vz"
+      - h.stage.path is match("^/[a-zA-Z0-9/_-]+$")
+      - h.stage.path != "/"
+      - stage_real.stdout | trim == h.stage.path
+      - source_real.stdout | trim == h.stage.source
+      - stage_type.stdout | trim == "directory"
+      - stage_stat.stdout | trim != source_stat.stdout | trim
+      - not h.stage.path.startswith(h.stage.source ~ "/")
+      - not h.stage.source.startswith(h.stage.path ~ "/")
+      - h.stage.path != h.stage.source
+      - mounts | selectattr("target", "equalto", h.stage.path) | rejectattr("uuid", "equalto", h.stage.fs_uuid)
+        | list | length == 0
+      - mounts | selectattr("target", "match", "^" ~ (h.stage.path | regex_escape) ~ "/") | list | length == 0
+      - mounts | selectattr("target", "match", "^" ~ (h.stage.source | regex_escape) ~ "/") | list | length == 0
+      - h.stage.unit == ((h.stage.path[1:] | replace("/", "-")) ~ ".mount")
+      - namespace_views.results | length == namespace_rows | length
+      - namespace_views.results | selectattr("rc", "equalto", 0) | list | length == namespace_rows | length
+      - namespace_mounts | rejectattr("fsroot", "equalto", "/") | list | length == 0
+      - namespace_mounts | selectattr("target", "equalto", h.stage.path) | rejectattr("uuid", "equalto", h.stage.fs_uuid)
+        | list | length == 0
+      - namespace_mounts | selectattr("uuid", "equalto", h.stage.fs_uuid) | rejectattr("target", "equalto", h.stage.path)
+        | list | length == 0
+      - namespace_mounts | selectattr("target", "match", "^" ~ (h.stage.path | regex_escape) ~ "/") | list | length
+        == 0
+      - namespace_mounts | selectattr("target", "match", "^" ~ (h.stage.source | regex_escape) ~ "/") | list | length
+        == 0
+      - namespace_mounts | selectattr("source", "equalto", (mounts | selectattr("target", "equalto", "/") | list)[0].source)
+        | rejectattr("target", "equalto", "/") | list | length == 0
+      fail_msg: 'Host storage refusal: missing, stale, ambiguous or out-of-envelope evidence; preserve original
+        receipt and partial state.'
+    when: h.stage.enabled and not final_handoff
+  - name: Record stage new-versus-resume and active state
+    ansible.builtin.set_fact:
+      stage_new: '{{ stage_rows | length == 0 }}'
+      stage_active: '{{ mounts | selectattr("target", "equalto", h.stage.path) | list | length == 1 }}'
+    when: h.stage.enabled and not final_handoff
+  - name: Require disabled temporary unit on active resume
+    ansible.builtin.command:
+      argv:
+      - /usr/bin/systemctl
+      - is-enabled
+      - '{{ h.stage.unit }}'
+    register: stage_disabled
+    changed_when: false
+    check_mode: false
+    when: h.stage.enabled and not final_handoff and stage_active
+    failed_when: stage_disabled.rc not in [0, 1]
+  - name: Active resume has exact source type and disabled policy
+    ansible.builtin.assert:
+      that:
+      - stage_disabled.stdout | trim == "disabled"
+      - (mounts | selectattr("target", "equalto", h.stage.path) | list)[0].source == stage_rows[0].lv_path
+      - (mounts | selectattr("target", "equalto", h.stage.path) | list)[0].fstype == "ext4"
+      fail_msg: 'Host storage refusal: missing, stale, ambiguous or out-of-envelope evidence; preserve original
+        receipt and partial state.'
+    when: h.stage.enabled and not final_handoff and stage_active
+  - name: Check stage consumers before any preparation action
+    ansible.builtin.command:
+      argv: '{{ ["/usr/bin/fuser", "-m", h.stage.path] if stage_active else ["/usr/bin/fuser", h.stage.path] }}'
+    register: initial_consumers
+    changed_when: false
+    check_mode: false
+    when: h.stage.enabled and not final_handoff
+    failed_when: initial_consumers.rc not in [0, 1]
+  - name: New or inactive stage has no existing consumers
+    ansible.builtin.assert:
+      that:
+      - initial_consumers.rc == 1
+      - initial_consumers.stdout | trim == ""
+      fail_msg: 'Host storage refusal: missing, stale, ambiguous or out-of-envelope evidence; preserve original
+        receipt and partial state.'
+    when: h.stage.enabled and not final_handoff and not stage_active
+  - name: Prove inactive stage directory empty before activation
+    ansible.builtin.command:
+      argv:
+      - /usr/bin/find
+      - '{{ h.stage.path }}'
+      - -mindepth
+      - '1'
+      - -maxdepth
+      - '1'
+      - -print
+      - -quit
+    register: stage_empty
+    changed_when: false
+    check_mode: false
+    when: h.stage.enabled and not final_handoff and not stage_active
+  - name: Never hide existing inactive stage contents
+    ansible.builtin.assert:
+      that:
+      - stage_empty.stdout | trim == ""
+    when: h.stage.enabled and not final_handoff and not stage_active
+  - name: Create only unique absent thin stage in exact existing pool
+    community.general.lvol:
+      vg: '{{ h.stage.vg }}'
+      thinpool: '{{ h.stage.pool }}'
+      lv: '{{ h.stage.lv }}'
+      size: '{{ h.stage.target_mib }}m'
+      state: present
+      shrink: false
+      force: false
+      resizefs: false
+    when: h.stage.enabled and not final_handoff and stage_new
+  - name: Fresh stage LV identity after creation
+    ansible.builtin.command:
+      argv:
+      - '{{ h.tools.lvs }}'
+      - --reportformat
+      - json
+      - --units
+      - b
+      - --nosuffix
+      - --options
+      - lv_name,vg_name,lv_uuid,vg_uuid,lv_size,segtype,pool_lv,lv_path,data_percent,metadata_percent,lv_metadata_size,devices,lv_attr,lv_health_status
+    register: stage_lv_probe
+    changed_when: false
+    check_mode: false
+    when: h.stage.enabled and not final_handoff
+  - name: Select observed stage LV
+    ansible.builtin.set_fact:
+      stage_observed: '{{ (stage_lv_probe.stdout | from_json).report[0].lv | selectattr("vg_name", "equalto", h.stage.vg)
+        | selectattr("lv_name", "equalto", h.stage.lv) | list }}'
+    when: h.stage.enabled and not final_handoff
+  - name: New or resumed stage retains exact pool geometry and foreign mappings
+    ansible.builtin.assert:
+      that:
+      - stage_observed | length == 1
+      - stage_observed[0].pool_lv == h.stage.pool
+      - stage_observed[0].vg_uuid == h.stage.vg_uuid
+      - stage_observed[0].segtype == "thin"
+      - stage_observed[0].lv_size | trim | int == h.stage.target_mib * 1048576
+      - stage_new or stage_observed[0].lv_uuid == h.stage.lv_uuid
+      - (stage_lv_probe.stdout | from_json).report[0].lv | rejectattr("lv_name", "equalto", h.stage.lv) | list ==
+        initial_lvs | rejectattr("lv_name", "equalto", h.stage.lv) | list
+      fail_msg: 'Host storage refusal: missing, stale, ambiguous or out-of-envelope evidence; preserve original
+        receipt and partial state.'
+    when: h.stage.enabled and not final_handoff
+  - name: Read stage signatures independently
+    ansible.builtin.command:
+      argv:
+      - '{{ h.tools.wipefs }}'
+      - --json
+      - --no-act
+      - '{{ stage_observed[0].lv_path }}'
+    register: signatures
+    changed_when: false
+    check_mode: false
+    when: h.stage.enabled and not final_handoff
+  - name: Read stage filesystem without create fallback
+    ansible.builtin.command:
+      argv:
+      - '{{ h.tools.blkid }}'
+      - -p
+      - -o
+      - export
+      - '{{ stage_observed[0].lv_path }}'
+    register: stage_blkid
+    changed_when: false
+    check_mode: false
+    when: h.stage.enabled and not final_handoff
+    failed_when: stage_blkid.rc not in [0, 2]
+  - name: Format permitted only for proven newly created blank LV; resume exact UUID type
+    ansible.builtin.assert:
+      that:
+      - (stage_new and stage_blkid.rc == 2 and stage_blkid.stdout | trim == "" and (signatures.stdout | from_json).signatures
+        | length == 0) or (not stage_new and stage_blkid.rc == 0 and (stage_blkid.stdout | regex_findall("(?m)^UUID=(.+)$"))
+        == [h.stage.fs_uuid] and (stage_blkid.stdout | regex_findall("(?m)^TYPE=(.+)$")) == ["ext4"])
+      - h.stage.fs_uuid is match("^[a-zA-Z0-9-]+$")
+      fail_msg: 'Host storage refusal: missing, stale, ambiguous or out-of-envelope evidence; preserve original
+        receipt and partial state.'
+    when: h.stage.enabled and not final_handoff
+  - name: First ext4 format only on observed new blank stage LV
+    community.general.filesystem:
+      dev: '{{ stage_observed[0].lv_path }}'
+      fstype: ext4
+      force: false
+      uuid: '{{ h.stage.fs_uuid }}'
+    when: h.stage.enabled and not final_handoff and stage_new
+  - name: Verify stage filesystem before mounting
+    ansible.builtin.command:
+      argv:
+      - '{{ h.tools.blkid }}'
+      - -p
+      - -o
+      - export
+      - '{{ stage_observed[0].lv_path }}'
+    register: stage_verified
+    changed_when: false
+    check_mode: false
+    when: h.stage.enabled and not final_handoff
+  - name: Stage filesystem postconditions
+    ansible.builtin.assert:
+      that:
+      - stage_verified.rc == 0
+      - (stage_verified.stdout | regex_findall("(?m)^UUID=(.+)$")) == [h.stage.fs_uuid]
+      - (stage_verified.stdout | regex_findall("(?m)^TYPE=(.+)$")) == ["ext4"]
+      fail_msg: 'Host storage refusal: missing, stale, ambiguous or out-of-envelope evidence; preserve original
+        receipt and partial state.'
+    when: h.stage.enabled and not final_handoff
+  - name: Declare temporary disabled stage mount without boot install
+    ansible.builtin.template:
+      src: templates/proxmox-storage-stage.mount.j2
+      dest: /etc/systemd/system/{{ h.stage.unit }}
+      owner: root
+      group: root
+      mode: '0644'
+    when: h.stage.enabled and not final_handoff and not stage_active
+  - name: Keep temporary stage unit disabled
+    ansible.builtin.systemd_service:
+      name: '{{ h.stage.unit }}'
+      enabled: false
+      daemon_reload: true
+    when: h.stage.enabled and not final_handoff and not stage_active
+  - name: Start temporary stage only when absent never restart active resume
+    ansible.builtin.systemd_service:
+      name: '{{ h.stage.unit }}'
+      enabled: false
+      state: started
+    when: h.stage.enabled and not final_handoff and not stage_active
+  - name: Read mounted stage topology before inspection
+    ansible.builtin.command:
+      argv:
+      - /usr/bin/findmnt
+      - --json
+      - --list
+      - --output
+      - TARGET,SOURCE,UUID,FSTYPE,FSROOT
+    register: inspection_mount
+    changed_when: false
+    check_mode: false
+    when: h.stage.enabled and not final_handoff
+  - name: Inspection mounted exact stage only
+    ansible.builtin.assert:
+      that:
+      - (inspection_mount.stdout | from_json).filesystems | selectattr("target", "equalto", h.stage.path) | map(attribute="uuid")
+        | list == [h.stage.fs_uuid]
+      - (inspection_mount.stdout | from_json).filesystems | selectattr("target", "equalto", h.stage.path) | map(attribute="source")
+        | list == [stage_observed[0].lv_path]
+      fail_msg: 'Host storage refusal: missing, stale, ambiguous or out-of-envelope evidence; preserve original
+        receipt and partial state.'
+    when: h.stage.enabled and not final_handoff
+  - name: Inspect prepared stage without copying or cutover
+    ansible.builtin.command:
+      argv:
+      - /usr/bin/ls
+      - -A
+      - --
+      - '{{ h.stage.path }}'
+    register: stage_inspection
+    changed_when: false
+    check_mode: false
+    when: h.stage.enabled and not final_handoff
+  - name: Fresh complete stage consumer retirement guard
+    ansible.builtin.command:
+      argv:
+      - /usr/bin/fuser
+      - -m
+      - '{{ h.stage.path }}'
+    register: retirement_consumers
+    changed_when: false
+    check_mode: false
+    when: h.stage.enabled and not final_handoff
+    failed_when: retirement_consumers.rc not in [0, 1]
+  - name: Busy or unknown stage preserves mount and failed attempt
+    ansible.builtin.assert:
+      that:
+      - h.stage.consumers_complete is sameas true
+      - retirement_consumers.rc == 1
+      - retirement_consumers.stdout | trim == ""
+      fail_msg: 'Host storage refusal: missing, stale, ambiguous or out-of-envelope evidence; preserve original
+        receipt and partial state.'
+    when: h.stage.enabled and not final_handoff
+  - name: Retire temporary mount normally without force lazy or delete
+    ansible.builtin.systemd_service:
+      name: '{{ h.stage.unit }}'
+      enabled: false
+      state: stopped
+    when: h.stage.enabled and not final_handoff
+  - name: Verify stage retired and final untouched
+    ansible.builtin.command:
+      argv:
+      - /usr/bin/findmnt
+      - --json
+      - --list
+      - --output
+      - TARGET,SOURCE,UUID,FSTYPE,FSROOT
+    register: retired_mount
+    changed_when: false
+    check_mode: false
+    when: h.stage.enabled and not final_handoff
+  - name: Verify boot policy remains disabled
+    ansible.builtin.command:
+      argv:
+      - /usr/bin/systemctl
+      - is-enabled
+      - '{{ h.stage.unit }}'
+    register: retired_disabled
+    changed_when: false
+    check_mode: false
+    when: h.stage.enabled and not final_handoff
+    failed_when: retired_disabled.rc not in [0, 1]
+  - name: Verify protected stage LV survives retirement
+    ansible.builtin.command:
+      argv:
+      - '{{ h.tools.lvs }}'
+      - --reportformat
+      - json
+      - --units
+      - b
+      - --nosuffix
+      - --options
+      - lv_name,vg_name,lv_uuid,vg_uuid,lv_size,segtype,pool_lv,lv_path,data_percent,metadata_percent,lv_metadata_size,devices,lv_attr,lv_health_status
+    register: retired_lv
+    changed_when: false
+    check_mode: false
+    when: h.stage.enabled and not final_handoff
+  - name: Prepared means retired disabled and protected; never whole-host ready
+    ansible.builtin.assert:
+      that:
+      - (retired_mount.stdout | from_json).filesystems | selectattr("target", "equalto", h.stage.path) | list |
+        length == 0
+      - (retired_mount.stdout | from_json).filesystems | selectattr("target", "equalto", h.stage.source) | list
+        == final_mounts
+      - retired_disabled.stdout | trim == "disabled"
+      - (retired_lv.stdout | from_json).report[0].lv == (stage_lv_probe.stdout | from_json).report[0].lv
+      fail_msg: 'Host storage refusal: missing, stale, ambiguous or out-of-envelope evidence; preserve original
+        receipt and partial state.'
+    when: h.stage.enabled and not final_handoff
