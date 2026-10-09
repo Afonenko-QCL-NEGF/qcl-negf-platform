@@ -67,6 +67,7 @@ qcl_host_storage:
     # Optional exact R2-created empty ext4 directory: dev/ino/uid/gid/mode.
     lost_found: null
   cutover:
+    contract_version: null # enabled native path requires exact integer 3
     enabled: false
     source_ref: null
     window:
@@ -80,6 +81,9 @@ qcl_host_storage:
       d04_receipt: {path: null, sha256: null}
       r1r2_receipt: {path: null, sha256: null}
       seed_receipt: {path: null, sha256: null}
+      references_receipt: {path: null, sha256: null}
+      excluded_old_qcl_set_sha256: null
+      seed_bytes: null
       seed_path: null
       seed_sha256: null
       old_installer_unit: null
@@ -123,6 +127,16 @@ qcl_host_storage:
       copy_bytes: null
       aggregate_bytes: null
       action_seconds: null
+      attempt_seconds: null
+      cleanup_seconds: null
+      aggregate_output_bytes: null
+      aggregate_read_bytes: null
+      aggregate_write_bytes: null
+      metadata_read_bytes: null
+      request_bytes: null
+      native_commands: null
+      reference_entries: null
+      reference_hash_bytes: null
     capacity:
       receipt: null
       pool_uuid: null

@@ -229,3 +229,104 @@ installed native probe enforcement, hardware FS support, PVE freshness, native
 copy/mount, reboot/persistence, swap или SCI. Optional host swap после accepted
 final FS требует собственного support/capacity/budget ticket; существующий active
 swap не resize/swapoff, guest memory/Slurm/physics contracts не меняются.
+
+
+### Cutover operational contract v3 (source review repair)
+
+Enabled native input requires exact primitive integer `contract_version: 3`; null/missing/unknown refuses before host mutation. Receipt and manifest schemas remain1, with no migration. Off/check remains no-op. New positive integer limits are `attempt_seconds`, `cleanup_seconds`, `aggregate_output_bytes`, `aggregate_read_bytes`, `aggregate_write_bytes`, `metadata_read_bytes`, `request_bytes`, `native_commands`, `reference_entries`, `reference_hash_bytes`; exact seed length is `preconditions.seed_bytes`. Request≤1MiB, cleanup<action/attempt, reference entries≤entries. Site inputs stay private.
+
+Child-free bootstrap freezes host monotonic deadline bounded by attempt and admission/held-window expiry before probe/helper/declaration. Every remaining action uses the same clock, current host/boot/wall expiry and a fixed unique source slot. Reservation charged before invocation, including failures/rescue, with no refunds/retries. One source-owned command adapter owns one `start_new_session` PGID; nested commands inherit it. Cumulative stdout/stderr and metadata/command counters are per whole invocation. Cleanup TERM→KILL/reap/group absence covers exited leaders; uncertain native daemon mutation is not accepted by rc0 or own child cleanup. Kernel D-state/fsync stalls remain unknown outcomes, not zero IO.
+
+Conservative fixed-flow reservations: `read >= 6H+17S+3E+4C+90R`, `write >= 2C+90J`, `output >=90*output_bytes`, `aggregate_bytes >= aggregate_read_bytes+aggregate_write_bytes`; H=hash_bytes, S=seed_bytes, E=reference_hash_bytes, C=copy_bytes, R=metadata_read_bytes, J=max(request_bytes,output_bytes,receipt.max_bytes). Copy stays one fixed local whole-file argv; 4C reads/2C writes are prepaid logical multiplicity, not a retry or physical SSD amplification claim. Native owner must independently prove installed support and this copy bound; version alone does not prove it.
+
+References prerequisite is protected root-owned0600 post-D04 schema `qcl.storage-cutover.references.v1`: same exact host/boot/attempt/held-window/source-parent/storage/LV/FS context, trusted receipt hashes, full sorted finite volume/absolute/backing projection and installed tool evidence. Three fresh applicability checks bind manifest context, actual `pvesm path` associations and bounded no-follow external fingerprints. Incomplete/unresolved/changed graph refuses before reopening. Frozen graph is a stated held-context prerequisite; a manifest SHA alone does not discover daemon/parser/backing dependencies. Missing actual native reference/tool proof blocks apply.
+
+Completed `new_final` and `restored_original` paths inspect current fixed identities and original disable/is_mountpoint presence+semantics, allow legitimate current-tree readers/new writes, and never rehash historical content or declare/rewrite helpers/unit/receipt. Unexpected aliases/fixed-state mismatch returns readonly reconciliation. Incomplete records remain readonly refusal, not automatic resume. Final absence is separately frozen and rechecked immediately before declaration; stage observations cannot overwrite it. Exact existing declaration is not rewritten. Directory FD/cwd/root/maps, canonical directory binds/deleted references/loop footprint and unknown overlapping backing are refusal boundaries.
+
+Source slot inventory (83 max; 17 probe / 12 guard / 6 snapshot / 3 reference / 1 copy within90 ceiling):
+
+| Slot | Source action | Kind |
+| --- | --- | --- |
+| clock-bootstrap | Freeze child-free host attempt clock | clock_bootstrap |
+| action-1 | Observe initial native admission and held caller window | probe |
+| action-2 | Declare bounded receipt IO helper | declare_file |
+| action-3 | Declare bounded read-only manifest helper | declare_file |
+| action-4 | Read authoritative host receipt | receipt_io |
+| guard-5 | guard-5 | mount_guard |
+| guard-6 | guard-6 | mount_guard |
+| action-7 | Reconcile fixed completed final identity only | probe |
+| guard-8 | guard-8 | mount_guard |
+| guard-9 | guard-9 | mount_guard |
+| action-10 | Durable receipt admitted | receipt_io |
+| action-11 | Durable receipt gate_disable_intent | receipt_io |
+| action-12 | CAS selected gate disable once | native_argv |
+| action-13 | Observe selected disabled gate and naturally drained callers | probe |
+| action-14 | Durable receipt gate_disabled | receipt_io |
+| guard-15 | guard-15 | mount_guard |
+| action-16 | Activate exact inactive empty stage only | native_argv |
+| action-17 | Observe stage active UUID after guarded activation | probe |
+| action-18 | Read independent before retained manifest | manifest |
+| action-19 | Read independent partial retained manifest | manifest |
+| action-20 | Verify independent manifest subset | receipt_io |
+| action-21 | Semantic references before copy | reference_check |
+| action-22 | Durable receipt copy_started | receipt_io |
+| action-23 | Copy retained files once | native_argv |
+| action-24 | Sync completed stage data | native_argv |
+| action-25 | Read independent after retained manifest | manifest |
+| action-26 | Read independent destination retained manifest | manifest |
+| action-27 | Verify independent manifest equal | receipt_io |
+| action-28 | Verify independent manifest equal | receipt_io |
+| action-29 | Persist verified bounded retained manifest | receipt_io |
+| action-30 | Observe postcopy pool health and empty reader scope | probe |
+| action-31 | Durable receipt copy_verified | receipt_io |
+| guard-32 | guard-32 | mount_guard |
+| action-33 | Declare exact initially disabled persistent final unit | declare_file |
+| action-34 | Load final declaration without starting or enabling | native_argv |
+| guard-35 | guard-35 | mount_guard |
+| action-36 | Observe fresh exact rename admission | probe |
+| action-37 | Durable receipt rename_intent | receipt_io |
+| action-38 | Rename exact original once | rename_original |
+| action-39 | Observe retained original after rename | probe |
+| action-40 | Durable receipt source_renamed | receipt_io |
+| guard-41 | guard-41 | mount_guard |
+| action-42 | Observe complete empty stage consumers before ordinary stop | probe |
+| action-43 | Ordinary stage retirement only | native_argv |
+| guard-44 | guard-44 | mount_guard |
+| action-45 | Observe stage retired before final activation | probe |
+| action-46 | Durable receipt final_activation_intent | receipt_io |
+| action-47 | Start exact UUID final once | native_argv |
+| guard-48 | guard-48 | mount_guard |
+| action-49 | Observe active final UUID retained seed and foreign bindings | probe |
+| action-50 | Read independent final retained manifest | manifest |
+| action-51 | Verify independent manifest equal | receipt_io |
+| action-52 | Durable receipt final_verified | receipt_io |
+| action-53 | Enable verified final boot policy only | native_argv |
+| guard-54 | guard-54 | mount_guard |
+| action-55 | CAS selected offline mount policy once | native_argv |
+| action-56 | Observe native offline policy and disabled gate before reopen | probe |
+| action-57 | Semantic references before final reopening | reference_check |
+| action-58 | Durable receipt reopening_intent | receipt_io |
+| action-59 | CAS selected gate reopen original semantics once | native_argv |
+| action-60 | Observe reopened fixed state without historical content oracle | probe |
+| action-61 | Durable receipt reopened | receipt_io |
+| action-62 | Durable receipt complete | receipt_io |
+| action-63 | Read authoritative host receipt anew in rescue | receipt_io |
+| action-64 | Reconcile actual fixed config mount units and callers read-only | probe |
+| guard-65 | guard-65 | mount_guard |
+| action-66 | Durable receipt rollback_intent | receipt_io |
+| action-67 | Ordinary verified final stop before original restoration | native_argv |
+| action-68 | Observe exact own empty mountpoint after ordinary final stop | probe |
+| action-69 | Restore exact retained original once | restore_original |
+| action-70 | Read durable historical manifest for pre-marker original only | receipt_io |
+| action-71 | Read independent restored retained manifest | manifest |
+| action-72 | Verify independent manifest equal | receipt_io |
+| action-73 | Observe restored original fixed identity before config restoration | probe |
+| action-74 | CAS original offline semantics while gate remains closed | native_argv |
+| action-75 | Observe restored original offline semantics and held disabled gate | probe |
+| action-76 | Durable receipt rolled_back | receipt_io |
+| action-77 | Semantic references before restored reopening | reference_check |
+| action-78 | Durable receipt reopening_intent | receipt_io |
+| action-79 | CAS restored original gate reopen semantics once | native_argv |
+| action-80 | Observe restored original reopening fixed state only | probe |
+| action-81 | Durable receipt reopened | receipt_io |
+| action-82 | Durable receipt complete | receipt_io |

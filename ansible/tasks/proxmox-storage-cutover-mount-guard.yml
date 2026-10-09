@@ -1,49 +1,91 @@
-- name: Verify exact loaded mount policy
-  ansible.builtin.command:
-    argv:
-    - /usr/bin/timeout
-    - '{{ c.limits.action_seconds | string }}'
-    - '{{ h.tools.python }}'
-    - -c
-    - "import json,os,stat,subprocess,sys\nr=json.load(sys.stdin)\ndef run(argv):\n import selectors,time\n process=subprocess.Popen(argv,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=dict(os.environ,LC_ALL='C'))\n\
-      \ selector=selectors.DefaultSelector();buffers={};total=0;deadline=time.monotonic()+r['seconds']\n for pipe\
-      \ in (process.stdout,process.stderr):selector.register(pipe,selectors.EVENT_READ);buffers[pipe.fileno()]=bytearray()\n\
-      \ try:\n  while selector.get_map():\n   remaining=deadline-time.monotonic()\n   if remaining<=0:raise ValueError('mount\
-      \ guard deadline')\n   for key,mask in selector.select(min(remaining,1)):\n    chunk=os.read(key.fd,65536)\n\
-      \    if not chunk:selector.unregister(key.fileobj);continue\n    total+=len(chunk)\n    if total>r['output_bytes']:raise\
-      \ ValueError('mount guard output cap')\n    buffers[key.fd].extend(chunk)\n  if process.wait(timeout=max(0.01,deadline-time.monotonic()))!=0:raise\
-      \ ValueError('mount guard native failure')\n  return buffers[process.stdout.fileno()].decode('utf-8')\n finally:\n\
-      \  selector.close()\n  if process.poll() is None:process.kill();process.wait()\n  process.stdout.close();process.stderr.close()\n\
-      unit=r['unit']; fragment='/etc/systemd/system/'+unit\nif not os.path.lexists(fragment):\n if not r['allow_absent']:\
-      \ raise ValueError('missing owned fragment')\n properties=run(['/usr/bin/systemctl','show',unit,'--property=LoadState,ActiveState,FragmentPath,DropInPaths']).splitlines()\n\
-      \ p=dict(x.split('=',1) for x in properties if '=' in x)\n if p.get('LoadState')!='not-found' or p.get('ActiveState')!='inactive'\
-      \ or p.get('FragmentPath') or p.get('DropInPaths'): raise ValueError('unknown preexisting unit')\n print(json.dumps({'absent':True,'fragment_exact':True}));sys.exit(0)\n\
-      s=os.lstat(fragment)\nif not stat.S_ISREG(s.st_mode) or s.st_uid!=0 or s.st_nlink!=1 or stat.S_IMODE(s.st_mode)!=0o644\
-      \ or s.st_size>r['output_bytes']: raise ValueError('unowned/ambiguous fragment')\nwith open(fragment) as handle:\n\
-      \ if handle.read(r['output_bytes']+1)!=r['expected_fragment']: raise ValueError('fragment differs')\nfields=['FragmentPath','What','Where','Type','Options','DropInPaths','NeedDaemonReload','ForceUnmount','LazyUnmount','ActiveState','UnitFileState']\n\
-      rows=run(['/usr/bin/systemctl','show',unit,'--property='+','.join(fields)]).splitlines()\nif len(rows)!=len(fields)\
-      \ or len(set(x.split('=',1)[0] for x in rows))!=len(fields): raise ValueError('incomplete loaded unit')\n\
-      p=dict(x.split('=',1) for x in rows)\nif p['FragmentPath']!=fragment or p['Where']!=r['path'] or p['Type']!='ext4'\
-      \ or p['DropInPaths'] or p['NeedDaemonReload']!='no' or p['ForceUnmount']!='no' or p['LazyUnmount']!='no':\
-      \ raise ValueError('unsafe loaded mount policy')\nopts=p['Options'].split(',')\nif not {'rw','nodev','nosuid'}<=set(opts)\
-      \ or set(opts)-{'rw','nodev','nosuid'}-set(r['allowed_defaults']) or {'ro','dev','suid'}&set(opts) or len(set(opts))!=len(opts):\
-      \ raise ValueError('unknown/conflicting loaded options')\nwhat=p['What']\nif what.startswith('UUID='): what='/dev/disk/by-uuid/'+what[5:]\n\
-      dev=os.stat(what); expected=os.stat(r['device'])\nif not stat.S_ISBLK(dev.st_mode) or not stat.S_ISBLK(expected.st_mode)\
-      \ or dev.st_rdev!=r['rdev'] or expected.st_rdev!=r['rdev'] or os.path.realpath(what)!=os.path.realpath(r['device']):\
-      \ raise ValueError('loaded device identity differs')\nif run(['/usr/sbin/blkid','-s','UUID','-o','value',what]).strip()!=r['fs_uuid']\
-      \ or run(['/usr/sbin/blkid','-s','TYPE','-o','value',what]).strip()!='ext4': raise ValueError('loaded filesystem\
-      \ identity differs')\nif r['stage']:\n if p['UnitFileState'] not in ('static','disabled') or '[Install]' in\
-      \ r['expected_fragment'] or 'WantedBy=' in r['expected_fragment']: raise ValueError('stage must remain nonboot')\n\
-      \ for root,dirs,files in os.walk('/etc/systemd/system',followlinks=False):\n  for name in files:\n   path=os.path.join(root,name)\n\
-      \   if name==unit and os.path.islink(path): raise ValueError('stage enable link')\np.update(absent=False,fragment_exact=True,fs_uuid=r['fs_uuid'],rdev=dev.st_rdev,device=os.path.realpath(what))\n\
-      print(json.dumps(p))"
-    stdin: '{{ {''unit'': guard_unit, ''path'': guard_path, ''device'': c.final.device, ''rdev'': c.final.rdev,
-      ''fs_uuid'': c.final.fs_uuid, ''allowed_defaults'': c.final.allowed_defaults, ''expected_fragment'': guard_fragment,
-      ''allow_absent'': guard_absent, ''stage'': guard_stage, ''seconds'': c.limits.action_seconds, ''output_bytes'':
-      c.limits.output_bytes} | to_json }}'
-  register: mount_guard
-  changed_when: false
-  check_mode: false
+- name: Bounded owning slot {{ guard_slot }}
+  vars:
+    cutover_operation:
+      kind: mount_guard
+      argv:
+      - '{{ h.tools.python }}'
+      - -c
+      - "import json,os,stat,subprocess,sys\nr=json.load(sys.stdin)\nscope={'__name__':'nested'};exec(r['boundary'],scope);runner=scope['NestedRunner'](json.loads(os.environ['QCL_CUTOVER_REQUEST']));metadata_total=0\n\
+        def run(argv):\n result=runner.run(argv)\n if metadata_total+runner.total>json.loads(os.environ['QCL_CUTOVER_REQUEST'])['bounds']['metadata_read_bytes']:raise\
+        \ ValueError('whole guard metadata cap')\n return result\nunit=r['unit']; fragment='/etc/systemd/system/'+unit\n\
+        if not os.path.lexists(fragment):\n if not r['allow_absent']: raise ValueError('missing owned fragment')\n\
+        \ properties=run(['/usr/bin/systemctl','show',unit,'--property=LoadState,ActiveState,FragmentPath,DropInPaths']).splitlines()\n\
+        \ p=dict(x.split('=',1) for x in properties if '=' in x)\n if p.get('LoadState')!='not-found' or p.get('ActiveState')!='inactive'\
+        \ or p.get('FragmentPath') or p.get('DropInPaths'): raise ValueError('unknown preexisting unit')\n print(json.dumps({'absent':True,'fragment_exact':True}));sys.exit(0)\n\
+        s=os.lstat(fragment)\nif not stat.S_ISREG(s.st_mode) or s.st_uid!=0 or s.st_nlink!=1 or stat.S_IMODE(s.st_mode)!=0o644\
+        \ or s.st_size>r['output_bytes']: raise ValueError('unowned/ambiguous fragment')\nwith open(fragment) as\
+        \ handle:\n data=handle.read(r['output_bytes']+1);metadata_total+=len(data.encode())\n if data!=r['expected_fragment']:\
+        \ raise ValueError('fragment differs')\nfields=['FragmentPath','What','Where','Type','Options','DropInPaths','NeedDaemonReload','ForceUnmount','LazyUnmount','ActiveState','UnitFileState']\n\
+        rows=run(['/usr/bin/systemctl','show',unit,'--property='+','.join(fields)]).splitlines()\nif len(rows)!=len(fields)\
+        \ or len(set(x.split('=',1)[0] for x in rows))!=len(fields): raise ValueError('incomplete loaded unit')\n\
+        p=dict(x.split('=',1) for x in rows)\nif p['FragmentPath']!=fragment or p['Where']!=r['path'] or p['Type']!='ext4'\
+        \ or p['DropInPaths'] or p['NeedDaemonReload']!='no' or p['ForceUnmount']!='no' or p['LazyUnmount']!='no':\
+        \ raise ValueError('unsafe loaded mount policy')\nopts=p['Options'].split(',')\nif not {'rw','nodev','nosuid'}<=set(opts)\
+        \ or set(opts)-{'rw','nodev','nosuid'}-set(r['allowed_defaults']) or {'ro','dev','suid'}&set(opts) or len(set(opts))!=len(opts):\
+        \ raise ValueError('unknown/conflicting loaded options')\nwhat=p['What']\nif what.startswith('UUID='): what='/dev/disk/by-uuid/'+what[5:]\n\
+        dev=os.stat(what); expected=os.stat(r['device'])\nif not stat.S_ISBLK(dev.st_mode) or not stat.S_ISBLK(expected.st_mode)\
+        \ or dev.st_rdev!=r['rdev'] or expected.st_rdev!=r['rdev'] or os.path.realpath(what)!=os.path.realpath(r['device']):\
+        \ raise ValueError('loaded device identity differs')\nif run(['/usr/sbin/blkid','-s','UUID','-o','value',what]).strip()!=r['fs_uuid']\
+        \ or run(['/usr/sbin/blkid','-s','TYPE','-o','value',what]).strip()!='ext4': raise ValueError('loaded filesystem\
+        \ identity differs')\nif r['stage']:\n if p['UnitFileState'] not in ('static','disabled') or '[Install]'\
+        \ in r['expected_fragment'] or 'WantedBy=' in r['expected_fragment']: raise ValueError('stage must remain\
+        \ nonboot')\n for root,dirs,files in os.walk('/etc/systemd/system',followlinks=False):\n  for name in files:\n\
+        \   path=os.path.join(root,name)\n   if name==unit and os.path.islink(path): raise ValueError('stage enable\
+        \ link')\np.update(absent=False,fragment_exact=True,fs_uuid=r['fs_uuid'],rdev=dev.st_rdev,device=os.path.realpath(what))\n\
+        print(json.dumps(p))"
+      stdin: '{{ {''boundary'':cutover_command_boundary,''unit'': guard_unit, ''path'': guard_path, ''device'':
+        c.final.device, ''rdev'': c.final.rdev, ''fs_uuid'': c.final.fs_uuid, ''allowed_defaults'': c.final.allowed_defaults,
+        ''expected_fragment'': guard_fragment, ''allow_absent'': guard_absent, ''stage'': guard_stage, ''seconds'':
+        c.limits.action_seconds, ''output_bytes'': c.limits.output_bytes} | to_json }}'
+      mutation: false
+  block:
+  - name: Admit unique fixed slot {{ guard_slot }}
+    ansible.builtin.assert:
+      that:
+      - guard_slot not in used_cutover_slots
+      - cutover_spent_read + (c.limits.metadata_read_bytes + (c.limits.hash_bytes if cutover_operation.kind == 'manifest'
+        else c.preconditions.seed_bytes if cutover_operation.kind == 'probe' else c.limits.reference_hash_bytes
+        if cutover_operation.kind == 'reference_check' else 0) + (4*c.limits.copy_bytes if cutover_operation.argv
+        | select('equalto',h.tools.rsync) | list | length else 0)) <= c.limits.aggregate_read_bytes
+      - cutover_spent_write + (([c.limits.request_bytes,c.limits.output_bytes,c.receipt.max_bytes] | max) + (2*c.limits.copy_bytes
+        if cutover_operation.argv | select('equalto',h.tools.rsync) | list | length else 0)) <= c.limits.aggregate_write_bytes
+      - cutover_spent_output + c.limits.output_bytes <= c.limits.aggregate_output_bytes
+  - name: Charge fixed slot before call {{ guard_slot }}
+    ansible.builtin.set_fact:
+      used_cutover_slots: '{{ used_cutover_slots + [guard_slot] }}'
+      cutover_spent_read: '{{ cutover_spent_read + (c.limits.metadata_read_bytes + (c.limits.hash_bytes if cutover_operation.kind
+        == ''manifest'' else c.preconditions.seed_bytes if cutover_operation.kind == ''probe'' else c.limits.reference_hash_bytes
+        if cutover_operation.kind == ''reference_check'' else 0) + (4*c.limits.copy_bytes if cutover_operation.argv
+        | select(''equalto'',h.tools.rsync) | list | length else 0)) }}'
+      cutover_spent_write: '{{ cutover_spent_write + (([c.limits.request_bytes,c.limits.output_bytes,c.receipt.max_bytes]
+        | max) + (2*c.limits.copy_bytes if cutover_operation.argv | select(''equalto'',h.tools.rsync) | list | length
+        else 0)) }}'
+      cutover_spent_output: '{{ cutover_spent_output + c.limits.output_bytes }}'
+  - name: Verify exact loaded mount policy
+    ansible.builtin.command:
+      argv:
+      - '{{ h.tools.python }}'
+      - -c
+      - '{{ cutover_command_boundary }}'
+      stdin: '{{ {''schema'':''qcl.storage-cutover.command.v1'',''identity'':{''host_id'':h.host_id,''boot_id'':h.boot_id,''attempt_id'':h.attempt_id},''slot_id'':guard_slot,''clock'':cutover_clock,''bounds'':{''request_bytes'':c.limits.request_bytes,''output_bytes'':c.limits.output_bytes,''metadata_read_bytes'':c.limits.metadata_read_bytes,''native_commands'':c.limits.native_commands,''hash_read_bytes'':(c.limits.hash_bytes
+        if cutover_operation.kind == ''manifest'' else c.preconditions.seed_bytes if cutover_operation.kind == ''probe''
+        else c.limits.reference_hash_bytes if cutover_operation.kind == ''reference_check'' else 0),''copy_read_bytes'':(4*c.limits.copy_bytes
+        if cutover_operation.argv | select(''equalto'',h.tools.rsync) | list | length else 0),''copy_write_bytes'':(2*c.limits.copy_bytes
+        if cutover_operation.argv | select(''equalto'',h.tools.rsync) | list | length else 0)},''operation'':cutover_operation}
+        | to_json }}'
+    register: guard_boundary
+    changed_when: false
+    check_mode: false
+  - name: Require complete own cleanup {{ guard_slot }}
+    ansible.builtin.assert:
+      that:
+      - (guard_boundary.stdout | from_json).status == 'ok'
+      - (guard_boundary.stdout | from_json).cleanup.group_absent is sameas true
+      - (guard_boundary.stdout | from_json).cleanup.reaped is sameas true
+      - (guard_boundary.stdout | from_json).clock == cutover_clock
+  - name: Decode primitive native result {{ guard_slot }}
+    ansible.builtin.set_fact:
+      mount_guard: '{{ guard_boundary | combine({"stdout":(guard_boundary.stdout | from_json).stdout}) }}'
 - name: Accept only complete safe loaded policy observation
   ansible.builtin.assert:
     that:
