@@ -77,7 +77,11 @@ has no install/boot target; the unit is explicitly disabled. Exact active resume
 is inspected without rewriting, restarting or reloading its unit. Its loaded
 What/Where/type/options/fragment, empty drop-ins, no pending reload and exact
 root-owned regular fragment must match the rendered non-boot template. Loaded
-LazyUnmount/ForceUnmount must both be no, checked again before stop. Proven
+LazyUnmount/ForceUnmount must both be no, checked again before stop.
+Loaded Options must have one nonempty record: comma-separated semantic tokens
+require rw/nodev/nosuid and reject ro/dev/suid, while ordering and ordinary kernel
+defaults (relatime/data=ordered) are allowed. The declared fragment still matches
+its exact rendered text; semantic loaded options do not relax fragment ownership. Proven
 non-boot static and disabled states are accepted; enabled/indirect/unknown refuse.
 Canonical device and rdev checks accept normal mapper/UUID device aliases. Busy/unknown
 retirement preserves the mount and diagnostics. After a fresh complete no-consumer

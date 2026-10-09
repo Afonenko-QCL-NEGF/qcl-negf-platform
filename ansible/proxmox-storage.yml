@@ -1118,7 +1118,10 @@
       - unit_owner.stdout | trim == "root:root:644:regular file"
       - (loaded_unit.stdout | regex_findall("(?m)^Where=(.*)$")) == [h.stage.path]
       - (loaded_unit.stdout | regex_findall("(?m)^Type=(.*)$")) == ["ext4"]
-      - (loaded_unit.stdout | regex_findall("(?m)^Options=(.*)$")) == ["rw,nodev,nosuid"]
+      - (loaded_unit.stdout | regex_findall("(?m)^Options=(.*)$")) | length == 1
+      - (loaded_unit.stdout | regex_findall("(?m)^Options=(.*)$"))[0] | trim | length > 0
+      - (["rw", "nodev", "nosuid"] | difference((loaded_unit.stdout | regex_findall("(?m)^Options=(.*)$"))[0].split(",") | map("trim") | list)) | length == 0
+      - (["ro", "dev", "suid"] | intersect((loaded_unit.stdout | regex_findall("(?m)^Options=(.*)$"))[0].split(",") | map("trim") | list)) | length == 0
       - (loaded_unit.stdout | regex_findall("(?m)^FragmentPath=(.*)$")) == ["/etc/systemd/system/" ~ h.stage.unit]
       - (loaded_unit.stdout | regex_findall("(?m)^DropInPaths=(.*)$")) == [""]
       - (loaded_unit.stdout | regex_findall("(?m)^ForceUnmount=(.*)$")) == ["no"]
@@ -1231,7 +1234,10 @@
       - unit_owner.stdout | trim == "root:root:644:regular file"
       - (loaded_unit.stdout | regex_findall("(?m)^Where=(.*)$")) == [h.stage.path]
       - (loaded_unit.stdout | regex_findall("(?m)^Type=(.*)$")) == ["ext4"]
-      - (loaded_unit.stdout | regex_findall("(?m)^Options=(.*)$")) == ["rw,nodev,nosuid"]
+      - (loaded_unit.stdout | regex_findall("(?m)^Options=(.*)$")) | length == 1
+      - (loaded_unit.stdout | regex_findall("(?m)^Options=(.*)$"))[0] | trim | length > 0
+      - (["rw", "nodev", "nosuid"] | difference((loaded_unit.stdout | regex_findall("(?m)^Options=(.*)$"))[0].split(",") | map("trim") | list)) | length == 0
+      - (["ro", "dev", "suid"] | intersect((loaded_unit.stdout | regex_findall("(?m)^Options=(.*)$"))[0].split(",") | map("trim") | list)) | length == 0
       - (loaded_unit.stdout | regex_findall("(?m)^FragmentPath=(.*)$")) == ["/etc/systemd/system/" ~ h.stage.unit]
       - (loaded_unit.stdout | regex_findall("(?m)^DropInPaths=(.*)$")) == [""]
       - (loaded_unit.stdout | regex_findall("(?m)^ForceUnmount=(.*)$")) == ["no"]
@@ -1421,7 +1427,10 @@
       - unit_owner.stdout | trim == "root:root:644:regular file"
       - (loaded_unit.stdout | regex_findall("(?m)^Where=(.*)$")) == [h.stage.path]
       - (loaded_unit.stdout | regex_findall("(?m)^Type=(.*)$")) == ["ext4"]
-      - (loaded_unit.stdout | regex_findall("(?m)^Options=(.*)$")) == ["rw,nodev,nosuid"]
+      - (loaded_unit.stdout | regex_findall("(?m)^Options=(.*)$")) | length == 1
+      - (loaded_unit.stdout | regex_findall("(?m)^Options=(.*)$"))[0] | trim | length > 0
+      - (["rw", "nodev", "nosuid"] | difference((loaded_unit.stdout | regex_findall("(?m)^Options=(.*)$"))[0].split(",") | map("trim") | list)) | length == 0
+      - (["ro", "dev", "suid"] | intersect((loaded_unit.stdout | regex_findall("(?m)^Options=(.*)$"))[0].split(",") | map("trim") | list)) | length == 0
       - (loaded_unit.stdout | regex_findall("(?m)^FragmentPath=(.*)$")) == ["/etc/systemd/system/" ~ h.stage.unit]
       - (loaded_unit.stdout | regex_findall("(?m)^DropInPaths=(.*)$")) == [""]
       - (loaded_unit.stdout | regex_findall("(?m)^ForceUnmount=(.*)$")) == ["no"]

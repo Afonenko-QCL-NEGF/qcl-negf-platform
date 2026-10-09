@@ -33,7 +33,7 @@ def fixture():
         "alias": False, "busy": False, "metadata_percent": 10,
         "data_percent":10, "segments":False, "mapper":False, "usage_changes":False,
         "unrelated_bind":False, "relevant_bind":False, "unit_state":"disabled",
-        "post_usage_field":None, "post_usage_value":None, "lazy":False, "force_unmount":False, "dropins":False, "foreign_unit":False,
+        "unit_options":"rw,nodev,nosuid", "options_duplicate":False, "post_usage_field":None, "post_usage_value":None, "lazy":False, "force_unmount":False, "dropins":False, "foreign_unit":False,
         "foreign": {"foreign_vm": "immutable"}, "original_receipt": "failed-1",
     }
     return cfg, state
@@ -85,6 +85,16 @@ CASES = [
     ("post-data-not-measured", ["lv-create", "format", "unit", "disable", "start", "inspect", "stop"], True),
     ("post-metadata-blank", ["lv-create", "format", "unit", "disable", "start", "inspect", "stop"], True),
     ("post-metadata-not-measured", ["lv-create", "format", "unit", "disable", "start", "inspect", "stop"], True),
+    ("options-native-new", ["lv-create", "format", "unit", "disable", "start", "inspect", "stop"], False),
+    ("options-native-resume", ["inspect", "stop"], False),
+    ("options-ro", [], True),
+    ("options-dev", [], True),
+    ("options-suid", [], True),
+    ("options-missing-nodev", [], True),
+    ("options-missing-nosuid", [], True),
+    ("options-blank", [], True),
+    ("options-missing-record", [], True),
+    ("options-duplicate-record", [], True),
 ]
 
 
@@ -133,6 +143,18 @@ def configure(name, cfg, state):
     if name.startswith("post-"):
         state["post_usage_field"] = "data_percent" if name.startswith("post-data") else "metadata_percent"
         state["post_usage_value"] = "" if name.endswith("blank") else "not_measured"
+    if name.startswith("options-"):
+        state["unit_options"] = "rw,nosuid,nodev,relatime,data=ordered"
+        if name != "options-native-new":
+            cfg["stage"]["lv_uuid"] = "stage-id"
+            state.update(stage_exists=True, stage_fs="22222222-2222-4222-8222-222222222222", stage_active=True)
+        if name in ("options-ro", "options-dev", "options-suid"):
+            state["unit_options"] += "," + name[len("options-"):]
+        if name == "options-missing-nodev": state["unit_options"] = "rw,nosuid,relatime"
+        if name == "options-missing-nosuid": state["unit_options"] = "rw,nodev,relatime"
+        if name == "options-blank": state["unit_options"] = ""
+        if name == "options-missing-record": state["unit_options"] = None
+        if name == "options-duplicate-record": state["options_duplicate"] = True
     return cfg, state
 
 
@@ -240,7 +262,10 @@ def test_actual_ansible_action_contract(name, want, refused, tmp_path, monkeypat
                 elif cmd == "systemctl":
                     if argv[1] == "is-enabled": out["stdout"] = s["unit_state"]
                     else:
-                        out["stdout"] = "\n".join(["What=UUID=22222222-2222-4222-8222-222222222222", "Where=/srv/stage", "Type=ext4", "Options=rw,nodev,nosuid", "FragmentPath=/etc/systemd/system/srv-stage.mount", "DropInPaths=" + ("/etc/foreign.conf" if s["dropins"] else ""), "LazyUnmount=" + ("yes" if s["lazy"] else "no"), "ForceUnmount=" + ("yes" if s["force_unmount"] else "no"), "UnitFileState=" + s["unit_state"], "NeedDaemonReload=no"])
+                        out["stdout"] = "\n".join(["What=UUID=22222222-2222-4222-8222-222222222222", "Where=/srv/stage", "Type=ext4", "Options=" + (s["unit_options"] or ""), "FragmentPath=/etc/systemd/system/srv-stage.mount", "DropInPaths=" + ("/etc/foreign.conf" if s["dropins"] else ""), "LazyUnmount=" + ("yes" if s["lazy"] else "no"), "ForceUnmount=" + ("yes" if s["force_unmount"] else "no"), "UnitFileState=" + s["unit_state"], "NeedDaemonReload=no"])
+                        if s["unit_options"] is None:
+                            out["stdout"] = "\n".join(x for x in out["stdout"].splitlines() if not x.startswith("Options="))
+                        if s["options_duplicate"]: out["stdout"] += "\nOptions=" + s["unit_options"]
                 elif cmd == "df": out["stdout"] = "fixture root df"
                 else: raise AssertionError(f"Unexpected command {argv}")
             elif action == "community.general.lvol":
