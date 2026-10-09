@@ -342,10 +342,10 @@ class EnrollmentTests(unittest.TestCase):
             gate = Path(temporary) / "gate"
             gate.write_text("original")
             with self.assertRaises(ValueError):
-                ops.deliver_pool(expected, ["worker"], gate, bindings={"worker": binding},
+                ops.deliver_pool(expected, ["worker"], gate, runtime=Path(temporary), bindings={"worker": binding},
                                  deliver=lambda *a: {**expected, "ready": True}, quiesce=lambda: None)
             self.assertEqual(gate.read_text(), "original")
-            result = ops.deliver_pool(expected, ["worker"], gate, authority=selected_context(), bindings={"worker": binding},
+            result = ops.deliver_pool(expected, ["worker"], gate, runtime=Path(temporary), authority=selected_context(), bindings={"worker": binding},
                                      deliver=lambda *a: {**expected, "ready": True}, quiesce=lambda: None)
             self.assertFalse(result["open"])
             self.assertTrue(result["requires_reconciliation"])
@@ -432,6 +432,7 @@ class EnrollmentTests(unittest.TestCase):
 
     def test_startup_requires_local_authority_and_bound_worker_before_resume(self):
         import worker_lifecycle as worker
+        from test_worker_shutdown_intent import authorized_event
         for case in ("wrong_local", "wrong_worker", "success", "legacy"):
             run = SyntheticCommands(mismatch="legacy" if case == "legacy" else None)
             if case == "wrong_worker":
@@ -439,7 +440,8 @@ class EnrollmentTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as temporary, \
                  patch.object(ops, "load_enrollment", lambda _: {"registry": registry(), "registry_sha256": "e" * 64, "known_hosts_bytes": b"synthetic"}), \
                  patch.object(ops, "observe_node_identity", lambda **_: WORKER if case == "wrong_local" else CONTROLLER), \
-                 patch.object(ops, "freeze_ssh_trust", lambda *a, **k: TRUST):
+                 patch.object(ops, "freeze_ssh_trust", lambda *a, **k: TRUST), \
+                 patch.object(worker, "_authorized_startup_event", authorized_event):
                 runtime, gate = Path(temporary), Path(temporary) / "gate"
                 (runtime / "release.json").write_text(json.dumps({**ops.manifest(manifest_fixture()), "ready": True}))
                 gate.write_text(json.dumps({"open": True, "release_id": "release-a"}))

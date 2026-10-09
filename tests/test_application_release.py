@@ -139,6 +139,7 @@ class ApplicationReleaseTests(unittest.TestCase):
             kwargs.setdefault("enrollment", "/synthetic/enrollment.json")
             return original_delivery(*args, **kwargs)
         def bound_pool(value, nodes, *args, **kwargs):
+            kwargs.setdefault("runtime", self.runtime)
             if "bindings" not in kwargs:
                 observations = {"worker": WORKER, "worker-a": {**WORKER, "node_name": "worker-a"},
                                 "worker-b": {**SECOND, "node_name": "worker-b"}}
@@ -277,20 +278,50 @@ class ApplicationReleaseTests(unittest.TestCase):
         self.assertIn("-oControlMaster=no", calls[0])
         self.assertIn("-oConnectionAttempts=1", calls[0])
         self.assertEqual(calls[0][-1], "echo 'hello world'")
-        # Popen sees the isolated environment without executing Nix or SSH.
+        self.assertIn("-oStrictHostKeyChecking=yes", calls[0])
+        self.assertIn("-oUserKnownHostsFile=" + TRUST["path"], calls[0])
+        # CR03 selected-node identity precedes Nix. Literal trusted observations
+        # simulate SSH without consuming a native child or treating env=None as Nix.
+        probes = []
+        def identity(target, *, trust_snapshot, run):
+            probes.append((target, trust_snapshot))
+            observations = {"admin@controller.invalid": CONTROLLER,
+                            "admin@worker.invalid": WORKER}
+            return dict(observations[target])
         observed = []
         popen = self.ops.subprocess.Popen
         def fake_popen(args, **kwargs):
+            if args[:2] != ["nix", "copy"]:
+                raise ValueError("fixture stops after isolated native Nix copy before another child")
             observed.append((args, kwargs.get("env")))
+            # Only our finite Python fixture executes; argv remains observed Nix.
             return popen([sys.executable, "-c", "print('{}')"], **kwargs)
         self.gate.write_text(json.dumps({"open": True, "release_id": "old"}))
+        caller_environment = dict(os.environ)
         with patch.dict(os.environ, {"NIX_SSHOPTS": "-i /tmp/site-key"}), \
+             patch.object(self.ops, "identity_probe", identity), \
              patch.object(self.ops.subprocess, "Popen", fake_popen):
-            with self.assertRaises(ValueError):
-                self.ops.deliver_cli(delivery_manifest(), POOL, runtime=self.runtime, gate=self.gate)
-            self.assertEqual(os.environ["NIX_SSHOPTS"], "-i /tmp/site-key")
-        self.assertIn("-oConnectTimeout=10", observed[0][1]["NIX_SSHOPTS"])
-        self.assertIn("/tmp/site-key", observed[0][1]["NIX_SSHOPTS"])
+            site_environment = dict(os.environ)
+            with self.assertRaisesRegex(ValueError, "fixture stops"):
+                self.ops.deliver_cli(delivery_manifest(), POOL, runtime=self.runtime, gate=self.gate,
+                                     delivery_timeout_seconds=30, command_timeout_seconds=15)
+            self.assertEqual(dict(os.environ), site_environment)
+        self.assertEqual(dict(os.environ), caller_environment)
+        self.assertEqual([target for target, _ in probes], ["admin@controller.invalid", "admin@worker.invalid"])
+        self.assertTrue(all(snapshot == TRUST for _, snapshot in probes))
+        nix_calls = [(args, env) for args, env in observed if args[:2] == ["nix", "copy"]]
+        self.assertTrue(nix_calls, "actual CLI must reach native Nix Popen with isolated env")
+        self.assertEqual(len(nix_calls), 1)  # One owned native child; RED consumed the other.
+        for args, env in nix_calls:
+            self.assertEqual(args[2:4], ["--from", "https://cache.example.invalid"])
+            self.assertIsNotNone(env)
+            self.assertIsNot(env, os.environ)
+            for option in ("-oConnectTimeout=10", "-oControlMaster=no", "-oConnectionAttempts=1",
+                           "-oStrictHostKeyChecking=yes", "-oUserKnownHostsFile=" + TRUST["path"],
+                           "/tmp/site-key"):
+                self.assertIn(option, env["NIX_SSHOPTS"])
+            self.assertEqual({key: val for key, val in env.items() if key != "NIX_SSHOPTS"},
+                             {key: val for key, val in site_environment.items() if key != "NIX_SSHOPTS"})
 
     def test_deadline_after_returned_mutation_retains_started_unknown(self):
         self.gate.write_text(json.dumps({"open": True, "release_id": "old"}))
