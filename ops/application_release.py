@@ -203,6 +203,9 @@ def check(manifest_value, *, profile=PROFILE, runtime=RUNTIME, role="worker", ru
     current = load(Path(runtime) / "release.json")
     if current.get("ready") is not True or manifest(current) != expected or Path(profile).resolve() != Path(expected["application_path"]):
         raise ValueError("Installed application profile or runtime release identity differs")
+    solver_profile = Path(profile).with_name(Path(profile).name + "-solver")
+    if solver_profile.resolve() != Path(expected["solver_executable"]).parents[1]:
+        raise ValueError("Installed solver profile differs from the selected closure")
     run(["nix-store", "--verify-path", expected["application_path"],
          str(Path(expected["solver_executable"]).parents[1])])
     units = ["slurmd.service"] if role == "worker" else ["qcl-negf-aiida.service", "qcl-negf-api.service"]
@@ -292,10 +295,15 @@ def activate(manifest_value, *, profile=PROFILE, runtime=RUNTIME, role="worker",
     record.unlink(missing_ok=True)
     run(["nix-store", "--verify-path", expected["application_path"],
          str(Path(expected["solver_executable"]).parents[1])])
-    if not same:
-        run(["nix-env", "--profile", str(profile), "--set", expected["application_path"]])
-        run(["nix-env", "--profile", str(profile.with_name(profile.name + "-solver")), "--set",
-             str(Path(expected["solver_executable"]).parents[1])])
+    # Each profile is an independent GC root; an identical release can lose one.
+    profiles = [(profile, expected["application_path"]),
+                (profile.with_name(profile.name + "-solver"),
+                 str(Path(expected["solver_executable"]).parents[1]))]
+    for path, selected in profiles:
+        if path.resolve() != Path(selected):
+            run(["nix-env", "--profile", str(path), "--set", selected])
+        if path.resolve() != Path(selected):
+            raise ValueError("Installed application or solver profile differs from the selected closure")
     identity = dict(expected)
     if role == "controller":
         if not email:
