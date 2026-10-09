@@ -273,7 +273,7 @@ def run_playbook(tmp_path, monkeypatch, scenario):
     from ansible.plugins.loader import init_plugin_loader
     from ansible.plugins.connection.local import Connection
     from ansible.utils.collection_loader import AnsibleCollectionConfig
-    from ansible.template import Templar
+    from ansible.template import Templar, trust_as_template
     if AnsibleCollectionConfig.collection_finder is None: init_plugin_loader()
     assert json.loads(Path("/tmp/qcl-host-storage-ansible/ansible_collections/community/general/MANIFEST.json").read_text())["collection_info"]["version"] == "13.4.0"
     monkeypatch.setenv("ANSIBLE_LOCAL_TEMP", str(tmp_path / "ansible-local"))
@@ -422,7 +422,7 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                     s["disabled"]=native_boolean(s["storage_current"].get("disable","0"))
                     s["offline_raw"]=s["storage_current"].get("is_mountpoint")
                     if "reopen" in name:
-                        assert installed_helper("receipt",cfg).inspect(receipt, json.loads(self._templar.template(__import__("ansible.utils.tags", fromlist=["TrustedAsTemplate"]).TrustedAsTemplate().tag("{{ receipt_identity | to_json }}"))), 65536)["record"]["reopening"]["intended_tree"] == ("restored_original" if "restored original" in name else "new_final")
+                        assert installed_helper("receipt",cfg).inspect(receipt, json.loads(self._templar.template(trust_as_template("{{ receipt_identity | to_json }}"))), 65536)["record"]["reopening"]["intended_tree"] == ("restored_original" if "restored original" in name else "new_final")
                         record("CAS:reopen-original" if "restored original" in name else "CAS:reopen")
                         if scenario == "unknown-cas":out.update(failed=True,rc=1,stderr="unknown CAS outcome",boundary_status="native_outcome_unknown")
                     elif option=="--is_mountpoint":record("CAS:offline")
@@ -446,12 +446,12 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                 elif operation["kind"]=="rename_original":
                     rename_request=json.loads(args["stdin"]);assert set(rename_request)=={"source","rollback","dev","ino","parent_dev","parent_ino"}
                     assert rename_request["source"]==str(source) and rename_request["rollback"]==str(tmp_path/"original")
-                    assert installed_helper("receipt",cfg).inspect(receipt, json.loads(self._templar.template(__import__("ansible.utils.tags", fromlist=["TrustedAsTemplate"]).TrustedAsTemplate().tag("{{ receipt_identity | to_json }}"))), 65536)["record"]["phase"] == "rename_intent"
+                    assert installed_helper("receipt",cfg).inspect(receipt, json.loads(self._templar.template(trust_as_template("{{ receipt_identity | to_json }}"))), 65536)["record"]["phase"] == "rename_intent"
                     record("rename"); os.rename(source, tmp_path / "original"); source.mkdir(); s["renamed"] = True
                 elif operation["kind"]=="restore_original":
                     restore_request=json.loads(args["stdin"]);assert set(restore_request)=={"source","rollback","dev","ino","parent_dev","parent_ino","mountpoint_dev","mountpoint_ino"}
                     assert restore_request["source"]==str(source) and restore_request["rollback"]==str(tmp_path/"original")
-                    assert installed_helper("receipt",cfg).inspect(receipt, json.loads(self._templar.template(__import__("ansible.utils.tags", fromlist=["TrustedAsTemplate"]).TrustedAsTemplate().tag("{{ receipt_identity | to_json }}"))), 65536)["record"]["phase"] == "rollback_intent"
+                    assert installed_helper("receipt",cfg).inspect(receipt, json.loads(self._templar.template(trust_as_template("{{ receipt_identity | to_json }}"))), 65536)["record"]["phase"] == "rollback_intent"
                     record("restore"); source.rmdir(); os.rename(tmp_path / "original", source); s["renamed"] = False
                 elif operation["kind"]=="native_argv" and argv[0]=="/usr/bin/sync":
                     assert argv==["/usr/bin/sync","-f",str(stage)] and args["stdin"]=="" and operation["mutation"] is False
