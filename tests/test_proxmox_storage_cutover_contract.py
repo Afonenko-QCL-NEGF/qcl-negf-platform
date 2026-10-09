@@ -1010,7 +1010,24 @@ def test_reference_actual_body_graph_and_paths_whole_cap(tmp_path):
     raw=json.dumps(graph).encode();assert len(raw)<child_allowance
     graphpath=tmp_path/'graph.json';graphpath.write_bytes(raw);graphpath.chmod(0o600)
     witness=tmp_path/'native-path-events'
-    prefix="import os,subprocess,sys\n_original_lstat=os.lstat\nclass RootRecord:\n def __init__(self,value):self.value=value\n def __getattr__(self,key):return 0 if key=='st_uid' else getattr(self.value,key)\ndef fixture_lstat(path,*a,**kw):\n value=_original_lstat(path,*a,**kw);return RootRecord(value) if str(path)=="+repr(str(graphpath))+" else value\nos.lstat=fixture_lstat\n_original_popen=subprocess.Popen\n_resolutions="+repr(resolution)+"\ndef fixture_popen(argv,*a,**kw):\n if argv[0]=='/usr/sbin/pvesm':\n  assert argv[1]=='path' and len(argv)==3\n  with open("+repr(str(witness))+",'a') as trace:trace.write(argv[2]+'\\n')\n  argv=['/usr/bin/python','-c','print('+repr(_resolutions[argv[2]])+')']\n return _original_popen(argv,*a,**kw)\nsubprocess.Popen=fixture_popen\n"
+    prefix=f"""import os,subprocess,sys
+_original_lstat=os.lstat
+class RootRecord:
+ def __init__(self,value):self.value=value
+ def __getattr__(self,key):return 0 if key=='st_uid' else getattr(self.value,key)
+def fixture_lstat(path,*a,**kw):
+ value=_original_lstat(path,*a,**kw);return RootRecord(value) if str(path)=={str(graphpath)!r} else value
+os.lstat=fixture_lstat
+_original_popen=subprocess.Popen
+_resolutions={resolution!r}
+def fixture_popen(argv,*a,**kw):
+ if argv[0]=='/usr/sbin/pvesm':
+  assert argv[1]=='path' and len(argv)==3
+  with open({str(witness)!r},'a') as trace:trace.write(argv[2]+chr(10))
+  argv=['/usr/bin/python','-c','print('+repr(_resolutions[argv[2]])+')']
+ return _original_popen(argv,*a,**kw)
+subprocess.Popen=fixture_popen
+"""
     play=yaml.safe_load((BASE/'ansible/proxmox-storage-cutover.yml').read_text())[0]
     body=play['vars']['cutover_reference_check'];boundary=play['vars']['cutover_command_boundary']
     request=review_request(output=262144);request['bounds'].update(metadata_read_bytes=8388608,native_commands=16)
