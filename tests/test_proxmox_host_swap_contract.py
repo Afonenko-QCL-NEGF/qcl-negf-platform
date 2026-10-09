@@ -26,41 +26,43 @@ def settings():
     return dict(apply=True, preflight_only=False, attempt_id='swap-new-2', original_receipt='old-failed-1',
         accepted_source='fixture-source', host_id='fixture-host', boot_id='fixture-boot',
         admission=dict(fresh=True, exclusive=True, receipt='fresh-private', expires_at_epoch=200, operation_owner='swap-new-2'),
-        tools={n:'/usr/bin/'+n.replace('_','-') for n in ['python3','dd','mkswap','swapon','blkid','timeout','systemctl','systemd_escape','findmnt','realpath','lvs','df','getconf']},
+        tools={n:'/usr/bin/'+n.replace('_','-') for n in ['python3','dd','mkswap','swapon','blkid','timeout','systemctl','systemd_escape','findmnt','realpath','lvs','df','getconf','busctl','wipefs']},
         swap=dict(enabled=True, path=PATH, parent='/srv/final/protected-swap', unit=UNIT,
             target_mib=4, authorized_cap_mib=8, header_uuid=UUID, lifetime='protected-host-infrastructure',
             receipts=REC, binding_sha256=None, mount=dict(path='/srv/final', unit='srv-final.mount',
                 device='/dev/mapper/final', rdev='253:4', fs_uuid=FS, lv_uuid='image-lv', vg_uuid='vg-id', pool_uuid='pool-id',
                 cutover_receipt='accepted-native-final', accepted=True),
             support=dict(fresh=True, receipt='tools-ext4-fiemap', page_bytes=4096, minimum_file_pages=10,
-                maximum_file_pages=4294967295, direct=True, fiemap=True, ext4=True, swapon_json=True, systemd_version=257),
+                maximum_file_pages=4294967295, direct=True, fiemap=True, ext4=True, swapon_json=True, systemd_version=257,busctl_json=True,wipefs_json=True,header_write_bytes=4096,synchronous_child_scope=True),
             ledger=dict(fresh=True, receipt='physical-reservation', expires_at_epoch=200,
                 incremental_swap_bytes=4*MIB, protected_data_growth_bytes=8*MIB, data_reserve_bytes=8*MIB,
                 data_overhead_bytes=MIB, metadata_growth_bytes=MIB, metadata_reserve_bytes=MIB,
                 filesystem_growth_bytes=MIB, filesystem_reserve_bytes=MIB),
-            budgets=dict(preflight_seconds=30, allocation_seconds=120, activation_seconds=30, aggregate_seconds=240,
-                maximum_write_bytes=4*MIB+4096, maximum_extents=16, maximum_probe_bytes=4096, maximum_record_bytes=16384,
-                maximum_output_bytes=65536, maximum_swap_rows=16)))
+            budgets=dict(preflight_seconds=100, allocation_seconds=100, activation_seconds=40, aggregate_seconds=240,
+                maximum_write_bytes=4*MIB+4096+65536,maximum_metadata_write_bytes=65536, maximum_extents=16, maximum_probe_bytes=4096, maximum_record_bytes=16384,
+                maximum_output_bytes=524288, maximum_swap_rows=16)))
 
 
 def file_stat(size=0):
-    return dict(dev=14, inode=81, nlink=1, uid=0, gid=0, mode=384, size=size, blocks=(size+511)//512,
+    return dict(dev=os.makedev(253,4), dev_major=253,dev_minor=4,inode=81, nlink=1, uid=0, gid=0, mode=384, size=size, blocks=(size+511)//512,
                 mtime_ns=100, ctime_ns=100, kind='regular')
 
 
 def state():
-    return dict(trace=[], probes=[], exists=False, file=file_stat(), parent_exists=False, receipts_exists=False,
+    return dict(trace=[], probes=[], native_queries=[],exists=False, file=file_stat(), parent_exists=False, receipts_exists=False,
         owned=False, signature=None, active=False, unit_exists=False, unit_active=False, unit_enabled=False,
         records={}, malformed=None, layout_bad=False, old_changed=False, used_changes=False, failure=None,
         page_bytes=4096, fs=FS, fs_type='ext4', pool_healthy=True, pool_free=128*MIB, metadata_free=16*MIB,
         fs_free=64*MIB, mount_loaded=True, policy_bad=False, changed_inode=False, binding_orphan=False)
 
 
-def seed_owned(cfg, s, *, full=False, header=False, active=False):
+def seed_legacy_owned(cfg, s, *, full=False, header=False, active=False, filesystem_dev=None):
     s.update(exists=True, parent_exists=True, receipts_exists=True, owned=True)
     s['file']=file_stat(4*MIB if full or header or active else MIB)
+    if filesystem_dev is not None:
+        s['file']['dev']=filesystem_dev;s['file']['dev_major']=os.major(filesystem_dev);s['file']['dev_minor']=os.minor(filesystem_dev);s['parent_dev']=filesystem_dev
     binding=dict(file={k:s['file'][k] for k in ['dev','inode','nlink','uid','gid','mode','kind']},
-                 parent=dict(dev=14,inode=80,uid=0,gid=0,mode=448), receipts=dict(dev=1,inode=90,uid=0,gid=0,mode=448))
+                 parent=dict(dev=s.get('parent_dev',14),inode=80,uid=0,gid=0,mode=448), receipts=dict(dev=1,inode=90,uid=0,gid=0,mode=448))
     payload=json.dumps(binding,sort_keys=True,separators=(',',':'))
     import hashlib
     cfg['swap']['binding_sha256']=hashlib.sha256(payload.encode()).hexdigest()
@@ -74,6 +76,62 @@ def seed_owned(cfg, s, *, full=False, header=False, active=False):
         s.update(active=True,unit_exists=True,unit_active=True)
         s['records']['unit']={'unit':UNIT,'path':PATH}
         s['records']['activation_intent']={'file':binding['file'],'header_uuid':UUID}
+
+
+def fixture_layout_hash(size):
+    import hashlib
+    layout=[] if size==0 else [(0,8192,size,1)]
+    return hashlib.sha256(json.dumps(layout,separators=(',',':')).encode()).hexdigest()
+
+
+def fixture_sample_hash(header_uuid,length,other_page=False):
+    import hashlib,uuid
+    page=bytearray(4096)
+    if header_uuid is not None:
+        struct.pack_into('=III',page,1024,1,63 if other_page else 1023,0)
+        page[1036:1052]=uuid.UUID(header_uuid).bytes
+        if not other_page:page[-10:]=b'SWAPSPACE2'
+    return hashlib.sha256(page[:length]).hexdigest()
+
+
+def expected_fragment(cfg):
+    w=cfg['swap']
+    return '[Unit]\nDescription=Protected additive host swap\nRequiresMountsFor='+w['mount']['path']+' '+w['path']+'\nConditionPathIsMountPoint='+w['mount']['path']+'\n\n[Swap]\nWhat='+w['path']+'\nTimeoutSec='+str(w['budgets']['activation_seconds'])+'\n\n[Install]\nWantedBy=swap.target\n'
+
+
+def fragment_fixture(text):
+    import base64,hashlib
+    return dict(exists=True,stat=dict(dev=os.makedev(8,1),inode=99,nlink=1,uid=0,gid=0,mode=420,size=len(text),kind='regular'),bytes=len(text),sha256=hashlib.sha256(text.encode()).hexdigest(),content_b64=base64.b64encode(text.encode()).decode())
+
+
+def stored_budget_fixture(cfg):
+    b=cfg['swap']['budgets']
+    return dict(schema='qcl.host-swap.budget.v1',attempt_id='stored-attempt',boot_id='stored-boot',sequence=10,started_monotonic_ns=100000000000,deadline_monotonic_ns=100000000000+b['aggregate_seconds']*1000000000,last_monotonic_ns=101000000000,admission_expires_epoch_ns=200000000000,ledger_expires_epoch_ns=200000000000,phase_elapsed_ns=dict(preflight=1000000000,allocation=0,activation=0),output_bytes=65536,write_bytes_reserved=4*MIB+4096+32768,metadata_bytes_reserved=32768,limits=dict(preflight_ns=b['preflight_seconds']*1000000000,allocation_ns=b['allocation_seconds']*1000000000,activation_ns=b['activation_seconds']*1000000000,aggregate_ns=b['aggregate_seconds']*1000000000,output_bytes=b['maximum_output_bytes'],write_bytes=b['maximum_write_bytes'],metadata_write_bytes=b['maximum_metadata_write_bytes']))
+
+
+def seed_owned(cfg,s,*,full=False,header=False,active=False):
+    import hashlib
+    seed_legacy_owned(cfg,s,full=full or header or active,header=False,active=False)
+    w=cfg['swap'];f=s['file'];f.update(dev=os.makedev(253,4),dev_major=253,dev_minor=4)
+    static={k:f[k] for k in ('dev','inode','nlink','uid','gid','mode','kind')}
+    old=[dict(name=OLD['name'],type=OLD['type'],size=OLD['size'],prio=OLD['prio'],identity=dict(kind='block',rdev=[253,1]))]
+    context=dict(schema='qcl.host-swap.context.v2',host_id=cfg['host_id'],path=PATH,parent=w['parent'],target_bytes=4*MIB,page_bytes=4096,header_uuid=UUID,lifetime=w['lifetime'],final_mount=dict(path='/srv/final',unit='srv-final.mount',fs_uuid=FS,device_rdev=[253,4],lv_uuid='image-lv',vg_uuid='vg-id',pool_uuid='pool-id'),unit_declaration=dict(name=UNIT,fragment_path='/etc/systemd/system/'+UNIT,fragment_sha256=hashlib.sha256(expected_fragment(cfg).encode()).hexdigest(),timeout_usec=w['budgets']['activation_seconds']*1000000),original_swaps=old)
+    provenance=dict(source='independent-old-source',attempt_id='independent-old-attempt',boot_id='independent-old-boot')
+    canonical=lambda v:json.dumps(v,sort_keys=True,separators=(',',':')).encode()
+    ch=hashlib.sha256(canonical(context)).hexdigest()
+    binding=dict(schema='qcl.host-swap.binding.v2',context=context,context_sha256=ch,payload=dict(file=static,parent=dict(dev=os.makedev(253,4),inode=80,nlink=2,uid=0,gid=0,mode=448,kind='directory'),receipts=dict(dev=os.makedev(8,1),inode=90,nlink=2,uid=0,gid=0,mode=448,kind='directory')),provenance=provenance)
+    bh=hashlib.sha256(canonical(binding)).hexdigest();cfg['swap']['binding_sha256']=bh;s['records']={'binding':binding}
+    def envelope(phase,payload):s['records'][phase]=dict(schema='qcl.host-swap.'+phase+'.v2',context_sha256=ch,binding_sha256=bh,payload=payload,provenance=provenance)
+    if full or header or active:envelope('allocation',dict(file_identity=static,target_bytes=4*MIB,layout_hash=fixture_layout_hash(4*MIB),observed_file_stat=f.copy()))
+    if header or active:
+        s['signature']={'TYPE':'swap','UUID':UUID,'VERSION':'1'}
+        envelope('format_intent',dict(file_identity=static,target_bytes=4*MIB,page_bytes=4096,header_uuid=UUID))
+        envelope('header',dict(file_identity=static,target_bytes=4*MIB,page_bytes=4096,header_uuid=UUID,layout_hash=fixture_layout_hash(4*MIB),sample_bytes=4096,sample_sha256=fixture_sample_hash(UUID,4096),signature=s['signature'].copy()))
+    if active:
+        s.update(active=True,unit_exists=True,unit_active=True)
+        fragment=fragment_fixture(expected_fragment(cfg))
+        envelope('unit',dict(name=UNIT,path=PATH,fragment_path='/etc/systemd/system/'+UNIT,fragment_sha256=fragment['sha256'],fragment_stat={k:fragment['stat'][k] for k in ('dev','inode','nlink','uid','gid','mode','size')},timeout_usec=w['budgets']['activation_seconds']*1000000))
+        envelope('activation_intent',dict(file_identity=static,header_uuid=UUID,header_sample_sha256=fixture_sample_hash(UUID,4096),final_mount=context['final_mount'],unit_record_sha256=hashlib.sha256(canonical(s['records']['unit'])).hexdigest(),original_swaps=old))
 
 
 CASES=[
@@ -140,37 +198,73 @@ def execute(cfg,s,tmp_path,monkeypatch,*,syntax=False):
             args=self._templar.template(self._task.args)
             action=self._task.action
             s=json.loads(recording.read_text());out={'changed':False,'rc':0,'stdout':''}
-            def trace(kind):s['trace'].append(dict(kind=kind,args=dict(args)))
+            def trace(kind):
+                import hashlib
+                compact=list(argv) if action=='ansible.builtin.command' else []
+                if len(compact)>2 and compact[1]=='-c':compact[2]={'inline_python_sha256':hashlib.sha256(compact[2].encode()).hexdigest()}
+                s['trace'].append(dict(kind=kind,args={'argv':compact} if compact else dict(args)))
             if action=='ansible.builtin.command':
                 argv=args['argv']
-                if Path(argv[0]).name=='python3' and argv[3]=='run':
-                    assert 0<int(argv[4])<=240 and int(argv[5])==65536
-                    argv=json.loads(argv[6])
+                wire_usage=None
+                if Path(argv[0]).name=='python3' and argv[3]=='clock-v2':
+                    config=json.loads(argv[4]);wire_usage=dict(schema='qcl.host-swap.budget.v1',sequence=1,started_monotonic_ns=100000000000,last_monotonic_ns=100000000000,deadline_monotonic_ns=100000000000+config['limits']['aggregate_ns'],phase_elapsed_ns={'preflight':0,'allocation':0,'activation':0},output_bytes=0,write_bytes_reserved=0,metadata_bytes_reserved=0,**config)
+                    argv=['/fixture/clock-done']
+                elif Path(argv[0]).name=='python3' and argv[3]=='run-v2':
+                    wire_usage=json.loads(argv[4]);phase=argv[5];write=int(argv[6]);metadata=int(argv[7])
+                    assert wire_usage['schema']=='qcl.host-swap.budget.v1' and phase in wire_usage['phase_elapsed_ns']
+                    assert wire_usage['limits']['output_bytes']==cfg['swap']['budgets']['maximum_output_bytes']
+                    wire_usage['sequence']+=1;wire_usage['write_bytes_reserved']+=write;wire_usage['metadata_bytes_reserved']+=metadata
+                    wire_usage['last_monotonic_ns']+=1000000;wire_usage['phase_elapsed_ns'][phase]+=1000000
+                    argv=json.loads(argv[8]);argv=[json.dumps(wire_usage) if a=='@BUDGET@' else a for a in argv]
+                    if wire_usage['write_bytes_reserved']>wire_usage['limits']['write_bytes'] or wire_usage['metadata_bytes_reserved']>wire_usage['limits']['metadata_write_bytes'] or min(wire_usage['admission_expires_epoch_ns'],wire_usage['ledger_expires_epoch_ns'])<=100000000000:
+                        out.update(rc=125,stdout='',stderr='');argv=['/fixture/budget-refusal']
                 cmd=Path(argv[0]).name
                 if cmd=='timeout':
                     assert argv[1:3]==['--signal=TERM','--kill-after=5']
                     argv=argv[4:];cmd=Path(argv[0]).name
                 s['probes'].append(cmd)
-                if cmd=='date':out['stdout']='100'
+                if cmd in ('clock-done','budget-refusal'):pass
+                elif cmd=='date':out['stdout']='100'
                 elif cmd=='cat':out['stdout']='fixture-host' if argv[-1]=='/etc/machine-id' else 'fixture-boot'
                 elif cmd=='getconf':out['stdout']=str(s['page_bytes'])
                 elif cmd=='systemd-escape':out['stdout']=UNIT
                 elif cmd=='realpath':out['stdout']='/dev/dm-4'
                 elif cmd=='stat':out['stdout']='253:4'
-                elif cmd=='findmnt':out['stdout']=json.dumps({'filesystems':[dict(target='/srv/final',source='/dev/mapper/final',uuid=s['fs'],fstype=s['fs_type'],fsroot='/',**{'maj:min':'253:4'})]})
+                elif cmd=='findmnt':
+                    row=dict(target='/srv/final',source='/dev/mapper/final',uuid=s['fs'],fstype=s['fs_type'],fsroot='/',**{'maj:min':'253:4'})
+                    if '--target' in argv and s.get('submount'):
+                        requested=argv[argv.index('--target')+1]
+                        if requested==s['submount']['target'] or requested.startswith(s['submount']['target']+'/'):
+                            row=dict(s['submount'])
+                    out['stdout']=json.dumps({'filesystems':[row]})
                 elif cmd=='lvs':
                     out['stdout']=json.dumps({'report':[{'lv':[
                         dict(lv_uuid='pool-id',vg_uuid='vg-id',lv_name='hostpool',segtype='thin-pool',lv_size=str(256*MIB),lv_metadata_size=str(32*MIB),
                             data_percent=str(100*(1-s['pool_free']/(256*MIB))),metadata_percent='' if s['metadata_free'] is None else str(100*(1-s['metadata_free']/(32*MIB))),
-                            lv_attr='twi-a-tz--' if s['pool_healthy'] else 'twi-a-Fz--',lv_health_status='' if s['pool_healthy'] else 'failed'),
+                            lv_attr=s.get('pool_attr','twi-a-tz--' if s['pool_healthy'] else 'twi-a-Fz--'),lv_health_status='' if s['pool_healthy'] else 'failed'),
                         dict(lv_uuid='image-lv',vg_uuid='vg-id',lv_name='final',segtype='thin',pool_lv='hostpool',lv_size=str(512*MIB),lv_path='/dev/mapper/final')]}]})
-                elif cmd=='df':out['stdout']='Avail\n'+str(s['fs_free'])
+                elif cmd=='df':out['stdout']='Avail\n  '+str(s['fs_free'])
                 elif cmd=='swapon':
                     old=dict(OLD)
                     if s['used_changes']:old['used']+=1234
                     rows=[] if s['old_changed'] and s['active'] else [old]
                     if s['active']:rows.append(dict(name=PATH,type='file',size=4*MIB-(8192 if s['malformed']=='usable' else 4096),used=0,prio=-3))
                     out['stdout']=json.dumps({'swaps':rows})
+                elif cmd=='wipefs':
+                    signatures=[] if s['signature'] is None else [dict(type=s['signature']['TYPE'],uuid=s['signature']['UUID'])]
+                    out['stdout']=json.dumps({'signatures':signatures})
+                elif cmd=='busctl':
+                    assert argv[1:3]==['--system','--json=short']
+                    if 'GetUnit' in argv:out['stdout']=json.dumps({'type':'o','data':['/org/freedesktop/systemd1/unit/fixture_swap']})
+                    elif 'org.freedesktop.systemd1.Unit' in argv:
+                        props=['Id','FragmentPath','DropInPaths','NeedDaemonReload','DefaultDependencies','LoadState','ActiveState','UnitFileState','Requires','After','RequiresMountsFor','Conditions','ConditionResult']
+                        assert argv[7:]==props
+                        values=[UNIT,'/etc/systemd/system/'+UNIT,[],False,True,'loaded','active' if s['unit_active'] else 'inactive','enabled' if s['unit_enabled'] else 'disabled',['srv-final.mount'],['srv-final.mount'],['/srv/final',cfg['swap']['path']],s.get('conditions',[['ConditionPathIsMountPoint',False,False,'/srv/final',1 if s['unit_active'] else 0]]),s['unit_active']]
+                        signatures=['s','s','as','b','b','s','s','s','as','as','as','a(sbbsi)','b']
+                        out['stdout']='\n'.join(json.dumps({'type':t,'data':v}) for t,v in zip(signatures,values))
+                    else:
+                        assert argv[6]=='org.freedesktop.systemd1.Swap' and argv[7:]==['What','Options','TimeoutUSec']
+                        out['stdout']='\n'.join(json.dumps({'type':t,'data':v}) for t,v in [('s','/foreign' if s['policy_bad'] else PATH),('s',''),('t',cfg['swap']['budgets']['activation_seconds']*1000000)])
                 elif cmd=='blkid':
                     if s['failure']=='signature-error':out.update(failed=True,rc=4,stderr='unknown signature')
                     elif s['signature']:out['stdout']='\n'.join(k+'='+v for k,v in s['signature'].items())
@@ -178,11 +272,15 @@ def execute(cfg,s,tmp_path,monkeypatch,*,syntax=False):
                 elif cmd=='dd':
                     assert argv==['/usr/bin/dd','if=/dev/zero','of='+PATH,'bs=1M','count=4','conv=nocreat,notrunc,fsync','oflag=direct,nofollow']
                     assert s['owned'] and not s['active'] and s['signature'] is None
-                    trace('fill');s['file']=file_stat(4*MIB)
+                    previous=dict(s['file']);trace('fill');s['file']=file_stat(4*MIB)
+                    if s.get('submount'):
+                        for key in ['dev','inode','nlink','uid','gid','mode','kind']:s['file'][key]=previous[key]
+                    if s.get('charge_after_fill'):
+                        s['pool_free']-=4*MIB;s['fs_free']-=4*MIB
                 elif cmd=='mkswap':
-                    assert argv==['/usr/bin/mkswap','--uuid',UUID,PATH]
+                    assert argv==['/usr/bin/mkswap','--uuid',cfg['swap']['header_uuid'],'--pagesize','4096',PATH]
                     assert s['file']['size']==4*MIB and s['records'].get('allocation') and not s['active']
-                    trace('format');s['signature']={'TYPE':'swap','UUID':UUID}
+                    trace('format');s['signature']={'TYPE':'swap','UUID':cfg['swap']['header_uuid'],'VERSION':'1'}
                 elif cmd=='systemctl':
                     if argv[1]=='show':
                         if argv[2]=='srv-final.mount':
@@ -193,39 +291,71 @@ def execute(cfg,s,tmp_path,monkeypatch,*,syntax=False):
                         trace('start');s.update(active=True,unit_active=True)
                         if s['failure']=='activation-timeout-late':out.update(failed=True,rc=124,stderr='late activation')
                     elif argv[1]=='enable':trace('enable');s['unit_enabled']=True
-                    elif argv[1]=='daemon-reload':trace('daemon-reload')
+                    elif argv[1]=='daemon-reload':trace('daemon-reload');s['unit_exists']=True
                     else:raise AssertionError('prohibited systemctl mutation '+repr(argv))
                 elif cmd=='python3':
-                    operation=argv[3]
-                    if operation=='probe-file':
-                        f=s['file'];dense=s['exists'] and f['size']==4*MIB and not s['layout_bad']
-                        out['stdout']=json.dumps(dict(exists=s['exists'],stat=f,parent=dict(exists=s['parent_exists'],dev=14,inode=80,uid=0,gid=0,mode=448),coverage_complete=dense,unsupported_flags=2 if s['layout_bad']=='layout-unwritten' else 0,layout_hash='layout',stable=True))
-                    elif operation=='records':
-                        import hashlib
-                        binding=s['records'].get('binding')
-                        digest=None if binding is None else hashlib.sha256(json.dumps(binding,sort_keys=True,separators=(',',':')).encode()).hexdigest()
-                        out['stdout']=json.dumps(dict(exists=s['receipts_exists'],stat=dict(dev=1,inode=90,uid=0,gid=0,mode=448),records=s['records'],binding_sha256=digest))
-                    elif operation=='mkdir':
-                        path=argv[4]
-                        if path==cfg['swap']['parent']:
-                            trace('mkdir-parent')
-                            if s['failure']=='parent-sync-failure':out.update(failed=True,rc=1,stderr='ancestor fsync failed')
-                            else:trace('sync-parent-entry');s['parent_exists']=True
-                            out['stdout']=json.dumps(dict(dev=14,inode=80,uid=0,gid=0,mode=448))
-                        else:
-                            trace('mkdir-receipts')
-                            if s['failure']=='receipt-sync-failure':out.update(failed=True,rc=1,stderr='receipt ancestor fsync failed')
-                            else:trace('sync-receipts-entry');s['receipts_exists']=True
-                            out['stdout']=json.dumps(dict(dev=1,inode=90,uid=0,gid=0,mode=448))
-                    elif operation=='create':
-                        trace('create-exclusive')
-                        if s['failure']=='creation-collision':out.update(failed=True,rc=1,stderr='O_EXCL collision')
-                        else:s.update(exists=True,owned=True);out['stdout']=json.dumps(s['file'])
-                    elif operation=='seal':
-                        phase=Path(argv[4]).name.split('.')[0]
-                        trace('seal-'+phase);out['stdout']=json.dumps(s['records'][phase])
-                    else:raise AssertionError('unexpected primitive '+str(operation))
+                    if 'machine-id' in argv[2]:out['stdout']='fixture-host'
+                    elif 'boot_id' in argv[2] and len(argv)==3:out['stdout']='fixture-boot'
+                    elif argv[2]==data[0]['vars']['probe_code']:
+                        assert len(argv)==8 and argv[5]==PATH
+                        parent_dev=s.get('parent_dev',os.makedev(253,4))
+                        parent=dict(exists=s['parent_exists'],path=cfg['swap']['parent'],dev=parent_dev,dev_major=os.major(parent_dev),dev_minor=os.minor(parent_dev),inode=80,nlink=2,uid=0 if s['owned'] or not s['parent_exists'] or s.get('safe_parent') else 1000,gid=0,mode=448,kind='directory')
+                        ancestor=dict(parent,exists=True,path=cfg['swap']['parent'] if s['parent_exists'] else '/srv/final')
+                        if not s['parent_exists']:ancestor.update(dev=os.makedev(253,4),dev_major=253,dev_minor=4)
+                        f=dict(s['file']);f.update(dev_major=os.major(f['dev']),dev_minor=os.minor(f['dev']))
+                        out['stdout']=json.dumps(dict(exists=s['exists'],stat=f,parent=parent,ancestor=ancestor,coverage_complete=s['exists'] and not s['layout_bad'],unsupported_flags=2 if s['layout_bad']=='layout-unwritten' else 0,layout_hash=fixture_layout_hash(f['size']),stable=True,hole_offset=f['size'],observed_bytes=min(f['size'],4096),sample_sha256=fixture_sample_hash(s['signature']['UUID'] if s['signature'] else None,min(f['size'],4096),s.get('other_header_page',False)),header_metadata=dict(magic_hex='00000000000000000000' if s.get('other_header_page') else '53574150535041434532' if s['signature'] else '00000000000000000000',version=1 if s['signature'] else 0,last_page=63 if s.get('other_header_page') else 1023 if s['signature'] else 0,badpages=0,uuid=s['signature']['UUID'] if s['signature'] else '00000000-0000-0000-0000-000000000000')))
+                    elif argv[2]==data[0]['vars']['old_observer_code']:
+                        rows=json.loads(argv[5]);assert int(argv[6])==16
+                        out['stdout']=json.dumps([dict(name=r['name'],type=r['type'],size=r['size'],prio=r['prio'],identity={'kind':'block','rdev':[253,1]}) for r in sorted(rows,key=lambda r:r['name'])])
+                    elif argv[2]==data[0]['vars']['primitive_code']:
+                        operation=argv[5];parameters=argv[6:]
+                        if operation=='block':out['stdout']=json.dumps({'path':'/dev/dm-4','kind':'block','rdev':[253,4]})
+                        elif operation=='records':
+                            import hashlib
+                            binding=s['records'].get('binding');digest=None if binding is None else hashlib.sha256(json.dumps(binding,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+                            out['stdout']=json.dumps(dict(exists=s['receipts_exists'],stat=dict(dev=os.makedev(8,1),inode=90,nlink=2,uid=0,gid=0,mode=448,kind='directory'),records=s['records'],binding_sha256=digest,retained_bytes=sum(len(json.dumps(v,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()) for v in s['records'].values())))
+                        elif operation=='budget-shape':
+                            value=json.loads(parameters[0]);assert value['schema']=='qcl.host-swap.budget.v1' and set(value)==set(stored_budget_fixture(cfg));out['stdout']=json.dumps(value)
+                        elif operation=='fragment':
+                            text=expected_fragment(cfg);out['stdout']=json.dumps(dict(exists=False) if not s['unit_exists'] else fragment_fixture(text))
+                        elif operation=='mkdir':
+                            path=parameters[0];is_parent=path==cfg['swap']['parent'];trace('mkdir-parent' if is_parent else 'mkdir-receipts')
+                            failure='parent-sync-failure' if is_parent else 'receipt-sync-failure'
+                            if s['failure']==failure:out.update(rc=1,stderr='ancestor fsync failed')
+                            else:trace('sync-parent-entry' if is_parent else 'sync-receipts-entry');s['parent_exists' if is_parent else 'receipts_exists']=True;s['owned']=True
+                            out['stdout']='{}'
+                        elif operation=='create':
+                            trace('create-exclusive')
+                            if s['failure']=='creation-collision':out.update(rc=1,stderr='O_EXCL collision')
+                            else:s.update(exists=True,owned=True)
+                            out['stdout']=json.dumps(s['file'])
+                        elif operation=='atomic':
+                            import base64
+                            path=parameters[0];raw=base64.b64decode(parameters[1]);mode=int(parameters[2]);assert len(raw)<=int(parameters[3])
+                            if path==cfg['swap']['receipts']+'/binding.json':assert 'binding' not in s['records']
+                            if path.startswith(REC+'/'):
+                                assert mode==384;phase=Path(path).stem;trace('record-'+phase)
+                                if phase=='completion' and s['failure']=='completion-failure':out.update(rc=1,stderr='completion durability failed')
+                                else:assert phase not in s['records'];s['records'][phase]=json.loads(raw);trace('seal-'+phase)
+                            else:
+                                assert path=='/etc/systemd/system/'+UNIT and mode==420 and not s['unit_exists']
+                                assert raw.decode()==expected_fragment(cfg);trace('unit');s['unit_exists']=True
+                            out['stdout']='{}'
+                        else:raise AssertionError('unexpected primitive '+operation)
+                    else:raise AssertionError('unexpected inline native Python')
                 else:raise AssertionError('unexpected native argv '+repr(argv))
+                if cmd in ('findmnt','lvs','swapon','busctl','blkid','wipefs','getconf','systemd-escape','df') or (cmd=='systemctl' and argv[1]=='show'):
+                    s['native_queries'].append(dict(argv=list(argv),rc=out['rc'],stdout=out.get('stdout',''),stderr=out.get('stderr','')))
+                if wire_usage is not None:
+                    import base64
+                    result=dict(schema='qcl.host-swap.io-result.v1',rc=out['rc'],stdout_b64=base64.b64encode(out.get('stdout','').encode()).decode(),stderr_b64=base64.b64encode(out.get('stderr','').encode()).decode(),usage=wire_usage,owned_children_complete=True,failure='budget_or_io_refusal' if cmd=='budget-refusal' else None)
+                    before=wire_usage['output_bytes']
+                    for _ in range(8):
+                        size=len(json.dumps(result,sort_keys=True,separators=(',',':')).encode())+1
+                        if wire_usage['output_bytes']==before+size:break
+                        wire_usage['output_bytes']=before+size
+                    assert wire_usage['output_bytes']<=wire_usage['limits']['output_bytes']
+                    out=dict(changed=False,rc=0,stdout=json.dumps(result,sort_keys=True,separators=(',',':')))
             elif action=='ansible.builtin.copy':
                 assert args['force'] is False and args['mode']=='0600'
                 assert args['dest'].startswith(REC+'/')
@@ -340,75 +470,243 @@ def test_readonly_fiemap_probe(case,tmp_path,monkeypatch):
     if case!='inode-race':assert path.read_bytes()==before
 
 
+def primitive_namespace():
+    code=yaml.safe_load((BASE/'ansible/proxmox-host-swap.yml').read_text())[0]['vars']['run_code']
+    ns={'__name__':'saved_primitive'};exec(compile(code,'saved-budget-primitive','exec'),ns)
+    return ns
+
+
+def primitive_usage(ns,seconds=5,output=65536):
+    import time
+    return ns['init_usage'](dict(attempt_id='owned-test',boot_id='owned-boot',admission_expires_epoch_ns=time.time_ns()+10**10,ledger_expires_epoch_ns=time.time_ns()+10**10,limits=dict(preflight_ns=int(seconds*10**9),allocation_ns=int(seconds*10**9),activation_ns=int(seconds*10**9),aggregate_ns=int(seconds*10**9),output_bytes=output,write_bytes=8192,metadata_write_bytes=8192)))
+
+
 def test_directory_primitive_parent_entry_durability(tmp_path,monkeypatch):
-    source=BASE/'ansible/proxmox-host-swap.yml'
-    if not source.exists():pytest.fail('missing directory durability primitive',pytrace=False)
-    import sys
-    data=yaml.safe_load(source.read_text());code=data[0]['vars']['mkdir_code']
+    ns=primitive_namespace();code=yaml.safe_load((BASE/'ansible/proxmox-host-swap.yml').read_text())[0]['vars']['primitive_code']
+    exec(compile(code,'saved-directory-primitive','exec'),ns)
     target=tmp_path/'owned';seen=[]
-    monkeypatch.setattr(sys,'argv',['python','mkdir',str(target)])
     def fsync(fd):seen.append(Path(os.readlink('/proc/self/fd/'+str(fd))))
     monkeypatch.setattr(os,'fsync',fsync)
-    exec(compile(code,'owned-directory-primitive','exec'),{'__name__':'__main__'})
+    usage,_=ns['precharge'](primitive_usage(ns),'allocation',1024,1024)
+    ns['mkdir_one'](usage,'allocation',str(target))
     assert target.is_dir() and target in seen and tmp_path in seen
     assert seen.index(tmp_path)<seen.index(target)
 
 
 def test_actual_engine_syntax(tmp_path,monkeypatch):
-    assert (BASE/'ansible/proxmox-host-swap.yml').exists(), 'missing additive swap playbook'
-    rc,observed=execute({},state(),tmp_path,monkeypatch,syntax=True)
-    assert rc==0 and observed['trace']==[] and observed['probes']==[]
+    import ast
+    data=yaml.safe_load((BASE/'ansible/proxmox-host-swap.yml').read_text())
+    for name,code in data[0]['vars'].items():
+        if name.endswith('_code'):ast.parse(code,filename=name)
+    ast.parse((BASE/'ops/host_swap_file_probe.py').read_text(),filename='readonly-helper')
+    assert data[0]['hosts']=='proxmox_hypervisors' and data[0]['gather_facts'] is False
+
+
+@pytest.fixture(scope='session',autouse=True)
+def actual_engine_syntax_after_whole_file(request,tmp_path_factory):
+    yield
+    if request.session.testsfailed:
+        return
+    with pytest.MonkeyPatch.context() as patch:
+        rc,observed=execute({},state(),tmp_path_factory.mktemp('accepted-whole-file-syntax'),patch,syntax=True)
+        assert rc==0 and observed['trace']==[] and observed['probes']==[]
+        print('ACTUAL_ENGINE_SYNTAX_AFTER_WHOLE_FILE_PASS rc=0 native_probes=0')
 
 
 @pytest.mark.parametrize('case',['closed-streams-timeout','leader-exited-descendant-streams','closed-streams-success'])
 def test_capture_primitive_bounded_wait(case,monkeypatch):
-    """Execute saved primitive with fake Popen/selectors; never create a child."""
-    import selectors
-    import signal
-    import subprocess
-    import sys
-    import time
+    """The saved capture function sees synthetic own-anchor metadata, never a real child."""
+    import selectors,signal,subprocess,time
     from types import SimpleNamespace
-    code=yaml.safe_load((BASE/'ansible/proxmox-host-swap.yml').read_text())[0]['vars']['run_code']
-    calls=[];killed=[]
-    process=SimpleNamespace(pid=424242,stdout=object(),stderr=object())
+    ns=primitive_namespace();usage=primitive_usage(ns);usage,deadline=ns['precharge'](usage,'preflight')
+    calls=[];killed=[];anchor=(424242,99,424242,424242,b'S')
+    process=SimpleNamespace(pid=anchor[0],stdout=SimpleNamespace(close=lambda:None),stderr=SimpleNamespace(close=lambda:None))
     def popen(argv,**kw):
-        assert argv==['/fixture/never-executed'] and kw['start_new_session'] is True
-        assert kw['stdout']==subprocess.PIPE and kw['stderr']==subprocess.PIPE
+        assert argv[0]==ns['sys'].executable and argv[2]==ns['SUPERVISOR']
+        assert json.loads(argv[4])==['/fixture/never-executed']
+        assert kw['start_new_session'] is True and kw['stdout']==subprocess.PIPE and kw['stderr']==subprocess.PIPE
         return process
     def wait(timeout=None):
-        # Independent oracle: every wait, including cleanup, remains finite.
-        assert type(timeout) in (int,float) and 0 < timeout <= 4.0
-        calls.append(timeout)
-        if case=='closed-streams-timeout' and not killed:
-            raise subprocess.TimeoutExpired('/fixture/never-executed',timeout)
-        return 0 if case!='closed-streams-timeout' else -9
-    process.wait=wait
-    process.poll=lambda:0 if case=='leader-exited-descendant-streams' else None
+        assert type(timeout) in (int,float) and 0<timeout<=5;calls.append(timeout);return -9 if killed else 0
+    process.wait=wait;process.poll=lambda:0 if case=='leader-exited-descendant-streams' else None
     class Selector:
         def __init__(self):self.rows={}
-        def register(self,stream,event,output):
-            self.rows[id(stream)]=SimpleNamespace(fd=id(stream),fileobj=stream,data=output)
+        def register(self,stream,event,output):self.rows[id(stream)]=SimpleNamespace(fd=id(stream),fileobj=stream,data=output)
         def get_map(self):return self.rows
         def select(self,timeout):return [(r,1) for r in list(self.rows.values())]
         def unregister(self,stream):self.rows.pop(id(stream))
-    def killpg(pid,sig):
-        assert pid==process.pid and sig==signal.SIGKILL
-        killed.append(pid)
-    monkeypatch.setattr(subprocess,'Popen',popen)
-    monkeypatch.setattr(selectors,'DefaultSelector',Selector)
-    monkeypatch.setattr(os,'read',lambda fd,size:b'overflow' if case=='leader-exited-descendant-streams' else b'')
+        def close(self):pass
+    def read(fd,size):
+        # Status uses an owned synthetic completion message; all capture streams close immediately.
+        row=next((r for r in selector.rows.values() if r.fd==fd),None)
+        if row and row.data=='status' and not getattr(process,'status_sent',False):
+            process.status_sent=True
+            return b'{"complete":true,"rc":0}\n' if case=='closed-streams-success' else b''
+        return b''
+    selector=Selector();monkeypatch.setattr(selectors,'DefaultSelector',lambda:selector)
+    monkeypatch.setattr(os,'read',read);monkeypatch.setattr(os,'write',lambda fd,payload:len(payload))
+    def killpg(pgid,sig):assert pgid==anchor[2] and sig in (signal.SIGTERM,signal.SIGKILL);killed.append(sig)
     monkeypatch.setattr(os,'killpg',killpg)
-    # First observation is start; subsequent observations consume one second.
-    def clock():
-        value=11.0 if getattr(process,'clock_started',False) else 10.0
-        process.clock_started=True
-        return value
-    monkeypatch.setattr(time,'monotonic',clock)
-    monkeypatch.setattr(time,'time',lambda:1001.0)
-    monkeypatch.setattr(sys,'argv',['python','run','5','4','["/fixture/never-executed"]','1005'])
-    with pytest.raises(SystemExit) as exc:
-        exec(compile(code,'saved-capture-primitive','exec'),{'__name__':'__main__'})
-    assert exc.value.code==(0 if case=='closed-streams-success' else 124)
-    assert calls
-    assert killed==([] if case=='closed-streams-success' else [process.pid])
+    clock=SimpleNamespace(now=usage['last_monotonic_ns'])
+    def monotonic():clock.now+=100000000;return clock.now
+    monkeypatch.setattr(time,'monotonic_ns',monotonic)
+    result=ns['capture'](['/fixture/never-executed'],usage,'preflight',deadline,popen_fn=popen,stat_fn=lambda pid:anchor,member_fn=lambda a:[anchor]+([] if case=='closed-streams-success' else [(424243,100,424242,424242,b'S')]))
+    assert result[3] is (case=='closed-streams-success') and calls
+    assert killed==([] if case=='closed-streams-success' else [signal.SIGTERM,signal.SIGKILL])
+
+
+@pytest.mark.parametrize('case',['expiry-before-popen','expiry-before-write','cumulative-output','precharge-total','precharge-metadata','no-overwrite'])
+def test_actual_budget_atomic_guards(case,tmp_path,monkeypatch):
+    import time
+    ns=primitive_namespace();code=yaml.safe_load((BASE/'ansible/proxmox-host-swap.yml').read_text())[0]['vars']['primitive_code'];exec(compile(code,'saved-atomic-primitive','exec'),ns)
+    u=primitive_usage(ns);target=tmp_path/'file';called=[]
+    if case.startswith('expiry'):
+        u['admission_expires_epoch_ns']=time.time_ns()-1
+        if case=='expiry-before-popen':
+            with pytest.raises(TimeoutError):ns['capture'](['/never'],u,'preflight',u['deadline_monotonic_ns'],popen_fn=lambda *a,**k:called.append('Popen'))
+        else:
+            with pytest.raises(TimeoutError):ns['mkdir_one'](dict(u,write_bytes_reserved=1024,metadata_bytes_reserved=1024),'allocation',str(target))
+        assert not called and not target.exists()
+    elif case=='cumulative-output':
+        first=ns['finish'](u,'preflight',0,b'x'*20000,b'',True,None);u=json.loads(first)['usage']
+        with pytest.raises(ValueError):ns['finish'](u,'preflight',0,b'x'*40000,b'',True,None)
+        assert u['output_bytes']==len(first) and not target.exists()
+    elif case.startswith('precharge'):
+        u['limits']['write_bytes' if case=='precharge-total' else 'metadata_write_bytes']=1024
+        with pytest.raises(ValueError):ns['precharge'](u,'allocation',2048,2048)
+        assert u['write_bytes_reserved']==u['metadata_bytes_reserved']==0
+    else:
+        target.write_bytes(b'original');u,_=ns['precharge'](u,'allocation',4096,4096)
+        with pytest.raises(FileExistsError):ns['atomic_bytes'](u,'allocation',str(target),b'new',384,4096)
+        assert target.read_bytes()==b'original'
+
+
+@pytest.mark.parametrize('case',['closed-streams-descendant','unrelated-survives','bounded-normal-success'])
+def test_actual_owned_group_lifetime(case,tmp_path):
+    import subprocess,sys,time
+    ns=primitive_namespace();u=primitive_usage(ns,seconds=3);u,deadline=ns['precharge'](u,'preflight')
+    other=None
+    try:
+        if case=='unrelated-survives':other=subprocess.Popen([sys.executable,'-c','import time;time.sleep(5)'],start_new_session=True)
+        if case=='bounded-normal-success':code='print("owned-complete")'
+        else:code='import subprocess,sys,os; subprocess.Popen([sys.executable,"-c","import os,time;os.close(1);os.close(2);time.sleep(5)"]);os.close(1);os.close(2)'
+        started=time.monotonic();result=ns['capture']([sys.executable,'-c',code],u,'preflight',deadline)
+        assert time.monotonic()-started<3.5
+        assert result[3] is (case=='bounded-normal-success')
+        if case=='bounded-normal-success':assert result[1]==b'owned-complete\n'
+        if other is not None:assert other.poll() is None
+    finally:
+        if other is not None:other.terminate();other.wait(timeout=2)
+
+
+REVIEW_RED_CASES=['foreign-file-fs','healthy-open-pool','stale-format-intent','missing-condition',
+                  'write-cap-target-only','charge-once','preflight-wrong-uuid']
+
+
+def review_configuration(name):
+    cfg,s=settings(),state()
+    cfg['tools'].update(busctl='/usr/bin/busctl',wipefs='/usr/sbin/wipefs')
+    cfg['swap']['support'].update(busctl_json=True,wipefs_json=True,header_write_bytes=4096,synchronous_child_scope=True)
+    cfg['swap']['budgets'].update(maximum_metadata_write_bytes=65536,maximum_write_bytes=4*MIB+4096+65536,
+                                maximum_output_bytes=524288)
+    if name=='foreign-file-fs':
+        # Existing owned partial file on a mounted foreign filesystem, not invented O_EXCL device.
+        seed_legacy_owned(cfg,s,filesystem_dev=os.makedev(8,2))
+        s['submount']=dict(target=cfg['swap']['parent'],source='/dev/mapper/foreign',
+            uuid='55555555-5555-4555-8555-555555555555',fstype='ext4',fsroot='/',**{'maj:min':'8:2'})
+    if name=='healthy-open-pool':s['pool_attr']='twi-aotz--'
+    if name=='stale-format-intent':
+        seed_owned(cfg,s,full=True)
+        s['records']['format_intent']['payload']['header_uuid']=UUID
+        cfg['swap']['header_uuid']='44444444-4444-4444-8444-444444444444'
+    if name=='missing-condition':
+        seed_owned(cfg,s,full=True,header=True,active=True);s['conditions']=[]
+    if name=='write-cap-target-only':cfg['swap']['budgets']['maximum_write_bytes']=4*MIB
+    if name=='charge-once':
+        s.update(pool_free=21*MIB,fs_free=6*MIB,charge_after_fill=True)
+    if name=='preflight-wrong-uuid':
+        seed_owned(cfg,s,full=True,header=True);s['signature']['UUID']='44444444-4444-4444-8444-444444444444'
+        cfg.update(apply=False,preflight_only=True)
+    return cfg,s
+
+
+@pytest.mark.parametrize('name',REVIEW_RED_CASES)
+def test_review_seven_gaps(name,tmp_path,monkeypatch):
+    cfg,s=review_configuration(name)
+    if name=='foreign-file-fs':
+        import hashlib
+        binding=s['records']['binding']
+        assert s['exists'] and s['parent_exists'] and s['owned'] and not s['active']
+        assert binding['file']['dev']==s['file']['dev']==binding['parent']['dev']==os.makedev(8,2)
+        assert binding['file']['inode']==s['file']['inode']==81 and binding['parent']['inode']==80
+        assert cfg['swap']['binding_sha256']==hashlib.sha256(json.dumps(binding,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+        assert cfg['swap']['mount']['rdev']=='253:4' and s['submount']['target']==cfg['swap']['parent']
+    rc,observed=execute(cfg,s,tmp_path,monkeypatch)
+    assert (rc==0) is (name in ('healthy-open-pool','charge-once'))
+    if name not in ('healthy-open-pool','charge-once'):
+        assert observed['trace']==[], 'refuse before writes, formatting, reload, start or enable'
+    else:
+        kinds=[r['kind'] for r in observed['trace']]
+        assert kinds.count('fill')==1 and kinds.count('format')==1 and kinds.count('start')==1
+        assert observed['active'] and observed['unit_enabled']
+
+
+@pytest.mark.parametrize('case',['foreign-existing-parent','same-fs-bind','context-header','missing-predecessor','format-uuid','unit-stat','completion-baseline','header-geometry'])
+def test_independent_v2_native_and_record_guards(case,tmp_path,monkeypatch,capsys):
+    import hashlib
+    cfg,s=settings(),state()
+    if case in ('foreign-existing-parent','same-fs-bind'):
+        s.update(parent_exists=True,safe_parent=True)
+        dev=os.makedev(8,2) if case=='foreign-existing-parent' else os.makedev(253,4)
+        s['parent_dev']=dev
+        s['submount']=dict(target=cfg['swap']['parent'],source='/dev/mapper/foreign' if case=='foreign-existing-parent' else '/dev/mapper/final',uuid='55555555-5555-4555-8555-555555555555' if case=='foreign-existing-parent' else FS,fstype='ext4',fsroot='/' if case=='foreign-existing-parent' else '/bound-parent',**{'maj:min':'8:2' if case=='foreign-existing-parent' else '253:4'})
+        assert not s['exists'] and not s['records'] and cfg['swap']['binding_sha256'] is None
+    else:
+        seed_owned(cfg,s,full=True,header=True,active=case in ('unit-stat','completion-baseline'))
+        if case=='header-geometry':
+            s['other_header_page']=True
+            s['records']['header']['payload']['sample_sha256']=fixture_sample_hash(UUID,4096,True)
+        if case=='context-header':cfg['swap']['header_uuid']='44444444-4444-4444-8444-444444444444'
+        if case=='missing-predecessor':del s['records']['allocation']
+        if case=='format-uuid':s['records']['format_intent']['payload']['header_uuid']='44444444-4444-4444-8444-444444444444'
+        if case=='unit-stat':s['records']['unit']['payload']['fragment_stat']['inode']=100
+        if case=='completion-baseline':
+            binding=s['records']['binding'];context=binding['context'];ch=binding['context_sha256'];bh=cfg['swap']['binding_sha256'];prov=binding['provenance']
+            s['unit_enabled']=True
+            s['records']['completion']=dict(schema='qcl.host-swap.completion.v2',context_sha256=ch,binding_sha256=bh,provenance=prov,payload=dict(file_identity=binding['payload']['file'],header_uuid=UUID,header_sample_sha256=fixture_sample_hash(UUID,4096),usable_bytes=4*MIB-4096,boot_enabled=True,lifetime=context['lifetime'],old_static_swaps=[],actual_swaps_observation={'swaps':[OLD]},budget_usage=stored_budget_fixture(cfg)))
+    rc,observed=execute(cfg,s,tmp_path,monkeypatch)
+    output=capsys.readouterr();print(output.out,end='');print(output.err,end='')
+    assert rc!=0 and observed['trace']==[]
+    predicate={'foreign-existing-parent':'finalfs_device_entry','same-fs-bind':'finalfs_target_entry','context-header':'binding_v2','missing-predecessor':'phase_format_intent','format-uuid':'format_intent_existing','unit-stat':'unit_existing','completion-baseline':'completion_existing','header-geometry':'header_geometry_entry'}[case]
+    assert 'host_swap:'+predicate in output.out
+    if case in ('foreign-existing-parent','same-fs-bind'):
+        assert 'findmnt' in observed['probes'] and 'lvs' not in observed['probes']
+        longest=[q for q in observed['native_queries'] if Path(q['argv'][0]).name=='findmnt' and '--target' in q['argv']]
+        assert len(longest)==1 and longest[0]['argv'][longest[0]['argv'].index('--target')+1]==cfg['swap']['parent']
+        actual=json.loads(longest[0]['stdout'])['filesystems'][0]
+        assert actual==s['submount'] and longest[0]['rc']==0 and longest[0]['stderr']=='' 
+
+
+@pytest.mark.parametrize('case',['duplicate-json','float-json','bool-counter','unknown-budget-key'])
+def test_actual_strict_protocol_shapes(case):
+    ns=primitive_namespace()
+    if case in ('duplicate-json','float-json'):
+        with pytest.raises(ValueError):ns['strict_load']('{"rc":0,"rc":1}' if case=='duplicate-json' else '{"rc":0.0}')
+    else:
+        u=primitive_usage(ns)
+        if case=='bool-counter':u['output_bytes']=True
+        else:u['foreign_key']=0
+        with pytest.raises(ValueError):ns['validate_usage'](u)
+
+
+@pytest.mark.parametrize('case',['matching-header','magic-other-page','last-page-mismatch','bad-pages-present'])
+def test_readonly_header_metadata(case,tmp_path):
+    import uuid
+    module=helper();page=bytearray(4096);struct.pack_into('=III',page,1024,1,0 if case=='last-page-mismatch' else 1023,1 if case=='bad-pages-present' else 0);page[1036:1052]=uuid.UUID(UUID).bytes
+    if case!='magic-other-page':page[-10:]=b'SWAPSPACE2'
+    path=tmp_path/'owned-header';path.write_bytes(page)
+    def injected(fd,request,buffer,mutate=True):buffer[:]=fiemap([(0,8192,4096,1)])
+    observed=module.probe(path,maximum_extents=16,maximum_bytes=4096,ioctl_fn=injected,hole_fn=lambda fd:4096)
+    raw=observed['header_metadata']
+    assert raw==dict(magic_hex=page[-10:].hex(),version=1,last_page=0 if case=='last-page-mismatch' else 1023,badpages=1 if case=='bad-pages-present' else 0,uuid=UUID)
+    assert path.read_bytes()==page and observed['observed_bytes']==4096 and observed['stable']

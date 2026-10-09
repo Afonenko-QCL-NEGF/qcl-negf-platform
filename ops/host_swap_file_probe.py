@@ -6,6 +6,7 @@ import json
 import os
 import stat
 import struct
+import uuid
 
 FIEMAP = 0xC020660B
 EXTENT = struct.Struct("=QQQQQIIII")
@@ -13,7 +14,7 @@ HEADER = struct.Struct("=QQIIII")
 
 
 def identity(s):
-    return dict(dev=s.st_dev, inode=s.st_ino, nlink=s.st_nlink, uid=s.st_uid,
+    return dict(dev=s.st_dev, dev_major=os.major(s.st_dev), dev_minor=os.minor(s.st_dev), inode=s.st_ino, nlink=s.st_nlink, uid=s.st_uid,
                 gid=s.st_gid, mode=stat.S_IMODE(s.st_mode), size=s.st_size,
                 blocks=s.st_blocks, mtime_ns=s.st_mtime_ns, ctime_ns=s.st_ctime_ns,
                 kind="regular" if stat.S_ISREG(s.st_mode) else "other")
@@ -45,10 +46,10 @@ def probe(path, *, maximum_extents, maximum_bytes, ioctl_fn=fcntl.ioctl, hole_fn
         size=before.st_size
         buffer=bytearray(HEADER.size+EXTENT.size*maximum_extents)
         HEADER.pack_into(buffer,0,0,size,1,0,maximum_extents,0)
-        ioctl_fn(fd,FIEMAP,buffer,True)
+        if size:ioctl_fn(fd,FIEMAP,buffer,True)
         _,_,_,count,_,_=HEADER.unpack_from(buffer)
         if count>maximum_extents:raise ValueError("invalid FIEMAP count")
-        covered=0;unsupported=0;last=False;layout=[];aligned=True
+        covered=0;unsupported=0;last=(size==0);layout=[];aligned=True
         for i in range(count):
             logical,physical,length,_,_,flags,_,_,_=EXTENT.unpack_from(buffer,HEADER.size+i*EXTENT.size)
             if length<=0:raise ValueError("invalid FIEMAP length")
@@ -65,13 +66,17 @@ def probe(path, *, maximum_extents, maximum_bytes, ioctl_fn=fcntl.ioctl, hole_fn
             hole=hole_fn(fd) if hole_fn else os.lseek(fd,0,os.SEEK_HOLE)
         except OSError:hole=None
         observed=os.pread(fd,min(maximum_bytes,size),0)
+        header_metadata=None
+        if len(observed)>=1052:
+            version,last_page,badpages=struct.unpack_from("=III",observed,1024)
+            header_metadata=dict(magic_hex=observed[-10:].hex(),version=version,last_page=last_page,badpages=badpages,uuid=str(uuid.UUID(bytes=observed[1036:1052])))
         after=os.fstat(fd)
         try:named=os.lstat(path)
         except FileNotFoundError:named=None
         stable=identity(before)==identity(after) and named is not None and identity(named)==identity(after)
         return dict(exists=True,stat=identity(after),stable=stable,coverage_complete=covered==size and aligned and not capped and unsupported==0,
                     scan_capped=capped,unsupported_flags=unsupported,hole_offset=hole,
-                    observed_bytes=len(observed),sample_sha256=hashlib.sha256(observed).hexdigest(),
+                    observed_bytes=len(observed),header_metadata=header_metadata,sample_sha256=hashlib.sha256(observed).hexdigest(),
                     layout_hash=hashlib.sha256(json.dumps(layout,separators=(",",":")).encode()).hexdigest())
     finally:os.close(fd)
 

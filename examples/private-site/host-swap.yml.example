@@ -1,4 +1,4 @@
-# Private declaration; fill every null from accepted native evidence.
+# Private declaration; fill every null from accepted native evidence. No public hardware target.
 qcl_host_storage:
   apply: false
   preflight_only: false
@@ -27,6 +27,8 @@ qcl_host_storage:
     lvs: null
     df: null
     getconf: null
+    busctl: null
+    wipefs: null
   swap:
     enabled: false
     path: null
@@ -61,6 +63,10 @@ qcl_host_storage:
       ext4: false
       swapon_json: false
       systemd_version: null
+      busctl_json: false
+      wipefs_json: false
+      header_write_bytes: null
+      synchronous_child_scope: false
     ledger:
       fresh: false
       receipt: null
@@ -84,3 +90,4 @@ qcl_host_storage:
       maximum_record_bytes: null
       maximum_output_bytes: null
       maximum_swap_rows: null
+      maximum_metadata_write_bytes: null

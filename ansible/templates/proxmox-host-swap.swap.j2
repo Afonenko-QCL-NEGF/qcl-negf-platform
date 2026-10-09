@@ -1,6 +1,6 @@
 [Unit]
 Description=Protected additive host swap
-RequiresMountsFor={{ w.mount.path }}
+RequiresMountsFor={{ w.mount.path }} {{ w.path }}
 ConditionPathIsMountPoint={{ w.mount.path }}
 
 [Swap]
