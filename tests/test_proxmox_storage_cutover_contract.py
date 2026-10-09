@@ -318,7 +318,7 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                 elif name.startswith("CAS "):
                     assert "--digest" in argv
                     if "reopen" in name:
-                        assert helper("receipt").inspect(receipt, task_vars["receipt_identity"], 65536)["record"]["reopening"]["intended_tree"] == ("restored_original" if "restored original" in name else "new_final")
+                        assert helper("receipt").inspect(receipt, json.loads(self._templar.template("{{ receipt_identity | to_json }}")), 65536)["record"]["reopening"]["intended_tree"] == ("restored_original" if "restored original" in name else "new_final")
                         record("CAS:reopen-original" if "restored original" in name else "CAS:reopen")
                         s["disabled"] = cfg["cutover"]["storage"]["stanza"].get("disable") in (1,"1","yes",True)
                         if scenario == "unknown-cas": out.update(failed=True, rc=1, stderr="unknown CAS outcome")
@@ -341,10 +341,10 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                         (stage / "disk.raw").write_bytes(b"CCCC")
                         os.utime(stage / "disk.raw", ns=(1234567890123,1234567890123))
                 elif name == "Rename exact original once":
-                    assert helper("receipt").inspect(receipt, task_vars["receipt_identity"], 65536)["record"]["phase"] == "rename_intent"
+                    assert helper("receipt").inspect(receipt, json.loads(self._templar.template("{{ receipt_identity | to_json }}")), 65536)["record"]["phase"] == "rename_intent"
                     record("rename"); os.rename(source, tmp_path / "original"); source.mkdir(); s["renamed"] = True
                 elif name == "Restore exact retained original once":
-                    assert helper("receipt").inspect(receipt, task_vars["receipt_identity"], 65536)["record"]["phase"] == "rollback_intent"
+                    assert helper("receipt").inspect(receipt, json.loads(self._templar.template("{{ receipt_identity | to_json }}")), 65536)["record"]["phase"] == "rollback_intent"
                     record("restore"); source.rmdir(); os.rename(tmp_path / "original", source); s["renamed"] = False
                 elif name.startswith("Observe") or name.startswith("Read") or name.startswith("Verify") or name.startswith("Sync") or name.startswith("Reconcile"):
                     # Independent native-shaped observations, not a second phase machine.
