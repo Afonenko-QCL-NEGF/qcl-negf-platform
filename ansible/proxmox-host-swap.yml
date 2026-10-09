@@ -1,0 +1,2007 @@
+- name: Additive protected host swap only
+  hosts: proxmox_hypervisors
+  gather_facts: false
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    h: '{{ {''apply'': false, ''preflight_only'': false, ''swap'': {''enabled'': false}} | combine(qcl_host_storage
+      | default({}), recursive=true) }}'
+    w: '{{ h.swap }}'
+    mkdir_code: |
+      import json, os, stat, sys
+      p=sys.argv[2]
+      os.mkdir(p,0o700)
+      parent=os.open(os.path.dirname(p),os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+      try: os.fsync(parent)
+      finally: os.close(parent)
+      fd=os.open(p,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+      try:
+       os.fsync(fd);s=os.fstat(fd)
+       print(json.dumps(dict(dev=s.st_dev,inode=s.st_ino,uid=s.st_uid,gid=s.st_gid,mode=stat.S_IMODE(s.st_mode))))
+      finally: os.close(fd)
+    create_code: |
+      import json, os, stat, sys
+      p=sys.argv[2]
+      fd=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC,0o600)
+      try:
+       os.fsync(fd);s=os.fstat(fd)
+       print(json.dumps(dict(dev=s.st_dev,inode=s.st_ino,nlink=s.st_nlink,uid=s.st_uid,gid=s.st_gid,mode=stat.S_IMODE(s.st_mode),size=s.st_size,blocks=s.st_blocks,mtime_ns=s.st_mtime_ns,ctime_ns=s.st_ctime_ns,kind="regular" if stat.S_ISREG(s.st_mode) else "other")))
+      finally: os.close(fd)
+      pfd=os.open(os.path.dirname(p),os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+      try: os.fsync(pfd)
+      finally: os.close(pfd)
+    seal_code: |
+      import json, os, stat, sys
+      p=sys.argv[2];cap=int(sys.argv[3])
+      fd=os.open(p,os.O_RDONLY|os.O_NOFOLLOW)
+      try:
+       s=os.fstat(fd)
+       if not stat.S_ISREG(s.st_mode) or s.st_uid!=0 or s.st_gid!=0 or stat.S_IMODE(s.st_mode)!=0o600 or s.st_nlink!=1 or s.st_size>cap:raise ValueError("invalid record")
+       total=sum(os.lstat(os.path.join(os.path.dirname(p),n)).st_size for n in os.listdir(os.path.dirname(p)))
+       if total>cap:raise ValueError("aggregate record bound")
+       os.fsync(fd);raw=os.read(fd,cap+1)
+       if len(raw)>cap:raise ValueError("record bound")
+      finally:os.close(fd)
+      pfd=os.open(os.path.dirname(p),os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+      try:os.fsync(pfd)
+      finally:os.close(pfd)
+      print(json.dumps(json.loads(raw)))
+    records_code: |
+      import hashlib, json, os, stat, sys
+      p=sys.argv[2];cap=int(sys.argv[3]);out=dict(exists=False,records={},binding_sha256=None)
+      if os.path.lexists(p):
+       fd=os.open(p,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+       try:
+        s=os.fstat(fd);out.update(exists=True,stat=dict(dev=s.st_dev,inode=s.st_ino,uid=s.st_uid,gid=s.st_gid,mode=stat.S_IMODE(s.st_mode)))
+        entries=os.listdir(fd)
+        allowed={x+".json" for x in ("binding","allocation","format_intent","header","unit","activation_intent","completion")}
+        if len(entries)>7 or set(entries)-allowed:raise ValueError("unknown record entry")
+        total=0
+        for name in entries:
+         r=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=fd)
+         try:
+          rs=os.fstat(r)
+          if not stat.S_ISREG(rs.st_mode) or rs.st_nlink!=1 or rs.st_uid!=0 or rs.st_gid!=0 or stat.S_IMODE(rs.st_mode)!=0o600:raise ValueError("unowned record")
+          total+=rs.st_size
+          if total>cap:raise ValueError("record byte cap")
+          raw=os.read(r,cap+1)
+          out["records"][name[:-5]]=json.loads(raw)
+         finally:os.close(r)
+        b=out["records"].get("binding")
+        if b is not None:out["binding_sha256"]=hashlib.sha256(json.dumps(b,sort_keys=True,separators=(",",":")).encode()).hexdigest()
+       finally:os.close(fd)
+      print(json.dumps(out))
+    probe_code: |
+      import json, os, stat, sys
+      import fcntl
+      import hashlib
+      import json
+      import os
+      import stat
+      import struct
+
+      FIEMAP = 0xC020660B
+      EXTENT = struct.Struct("=QQQQQIIII")
+      HEADER = struct.Struct("=QQIIII")
+
+
+      def identity(s):
+          return dict(dev=s.st_dev, inode=s.st_ino, nlink=s.st_nlink, uid=s.st_uid,
+                      gid=s.st_gid, mode=stat.S_IMODE(s.st_mode), size=s.st_size,
+                      blocks=s.st_blocks, mtime_ns=s.st_mtime_ns, ctime_ns=s.st_ctime_ns,
+                      kind="regular" if stat.S_ISREG(s.st_mode) else "other")
+
+
+      def safe_components(path):
+          if not os.path.isabs(path) or os.path.normpath(path) != path:
+              raise ValueError("absolute canonical path required")
+          parts=path.split("/")[1:]
+          cursor="/"
+          for part in parts[:-1]:
+              cursor=os.path.join(cursor,part)
+              s=os.lstat(cursor)
+              if not stat.S_ISDIR(s.st_mode):
+                  raise ValueError("symlink or nondirectory component")
+
+
+      def probe(path, *, maximum_extents, maximum_bytes, ioctl_fn=fcntl.ioctl, hole_fn=None):
+          path=os.fspath(path)
+          if type(maximum_extents) is not int or not 0 < maximum_extents <= 65536:
+              raise ValueError("finite extent bound required")
+          if type(maximum_bytes) is not int or not 0 < maximum_bytes <= 1048576:
+              raise ValueError("finite byte bound required")
+          safe_components(path)
+          fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC)
+          try:
+              before=os.fstat(fd)
+              if not stat.S_ISREG(before.st_mode):raise ValueError("regular file required")
+              size=before.st_size
+              buffer=bytearray(HEADER.size+EXTENT.size*maximum_extents)
+              HEADER.pack_into(buffer,0,0,size,1,0,maximum_extents,0)
+              ioctl_fn(fd,FIEMAP,buffer,True)
+              _,_,_,count,_,_=HEADER.unpack_from(buffer)
+              if count>maximum_extents:raise ValueError("invalid FIEMAP count")
+              covered=0;unsupported=0;last=False;layout=[];aligned=True
+              for i in range(count):
+                  logical,physical,length,_,_,flags,_,_,_=EXTENT.unpack_from(buffer,HEADER.size+i*EXTENT.size)
+                  if length<=0:raise ValueError("invalid FIEMAP length")
+                  end=min(size,logical+length)
+                  if logical<size:
+                      unsupported|=flags & ~1
+                      aligned=aligned and logical%512==0 and physical%512==0 and length%512==0
+                      if logical!=covered:aligned=False
+                      covered=end
+                      layout.append((logical,physical,end-logical,flags))
+                  if flags&1:last=True
+              capped=not last and size>0
+              try:
+                  hole=hole_fn(fd) if hole_fn else os.lseek(fd,0,os.SEEK_HOLE)
+              except OSError:hole=None
+              observed=os.pread(fd,min(maximum_bytes,size),0)
+              after=os.fstat(fd)
+              try:named=os.lstat(path)
+              except FileNotFoundError:named=None
+              stable=identity(before)==identity(after) and named is not None and identity(named)==identity(after)
+              return dict(exists=True,stat=identity(after),stable=stable,coverage_complete=covered==size and aligned and not capped and unsupported==0,
+                          scan_capped=capped,unsupported_flags=unsupported,hole_offset=hole,
+                          observed_bytes=len(observed),sample_sha256=hashlib.sha256(observed).hexdigest(),
+                          layout_hash=hashlib.sha256(json.dumps(layout,separators=(",",":")).encode()).hexdigest())
+          finally:os.close(fd)
+
+
+
+      p=sys.argv[2];parent=os.path.dirname(p);out=dict(exists=False,parent=dict(exists=False))
+      # Check every existing ancestor with lstat; absence allowed only at immediate parent.
+      if os.path.lexists(parent):
+       safe_components(p)
+       s=os.lstat(parent)
+       if not stat.S_ISDIR(s.st_mode):raise ValueError("invalid parent")
+       out["parent"]=dict(exists=True,dev=s.st_dev,inode=s.st_ino,uid=s.st_uid,gid=s.st_gid,mode=stat.S_IMODE(s.st_mode))
+      else:safe_components(parent)
+      if os.path.lexists(p):
+       out.update(probe(p,maximum_extents=int(sys.argv[3]),maximum_bytes=int(sys.argv[4])))
+      print(json.dumps(out))
+    run_code: |
+      import json, os, selectors, signal, subprocess, sys, time
+      seconds=float(sys.argv[2]);cap=int(sys.argv[3]);argv=json.loads(sys.argv[4])
+      if not 0<seconds<=86400 or not 0<cap<=1048576:raise ValueError("finite capture bound")
+      p=subprocess.Popen(argv,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
+      s=selectors.DefaultSelector();s.register(p.stdout,1,sys.stdout.buffer);s.register(p.stderr,1,sys.stderr.buffer)
+      t=time.monotonic();deadline=float(sys.argv[5]);size=0;reason=None
+      while s.get_map():
+       for key,_ in s.select(0.05):
+        data=os.read(key.fd,16384)
+        if not data:s.unregister(key.fileobj);continue
+        size+=len(data)
+        if size>cap:reason="output cap";data=b""
+        key.data.write(data);key.data.flush()
+       if time.monotonic()-t>seconds or (deadline and time.time()>deadline):reason="time cap"
+       if reason:
+        try:os.killpg(p.pid,signal.SIGKILL)
+        except ProcessLookupError:pass
+        break
+      rc=p.wait()
+      if reason:sys.stderr.write(reason+"\n");sys.exit(124)
+      sys.exit(rc)
+  tasks:
+  - name: Strict opt in
+    ansible.builtin.assert:
+      that:
+      - h.apply is boolean
+      - h.preflight_only is boolean
+      - w.enabled is boolean
+      - not w.enabled or (h.preflight_only != h.apply)
+      - not w.enabled or not ansible_check_mode
+      fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+  - name: Exact enabled preflight
+    when: w.enabled
+    block:
+    - name: Accepted private operation
+      ansible.builtin.assert:
+        that:
+        - h.accepted_source is string
+        - h.accepted_source | length > 0
+        - h.attempt_id is string
+        - h.original_receipt is string
+        - h.attempt_id != h.original_receipt
+        - h.admission.fresh is sameas true
+        - h.admission.exclusive is sameas true
+        - h.admission.operation_owner == h.attempt_id
+        - h.admission.receipt | length > 0
+        - w.mount.accepted is sameas true
+        - w.mount.cutover_receipt | length > 0
+        - w.lifetime == "protected-host-infrastructure"
+        - w.support.fresh is sameas true
+        - w.support.receipt | length > 0
+        - w.ledger.fresh is sameas true
+        - w.ledger.receipt | length > 0
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Finite exact geometry
+      ansible.builtin.assert:
+        that:
+        - w.target_mib is integer
+        - w.target_mib is not boolean
+        - w.authorized_cap_mib is integer
+        - w.authorized_cap_mib is not boolean
+        - 0 < w.target_mib <= w.authorized_cap_mib
+        - w.header_uuid is match("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+        - w.header_uuid != "00000000-0000-0000-0000-000000000000"
+        - w.header_uuid != w.mount.fs_uuid
+        - w.path is match("^/[A-Za-z0-9_./-]+$")
+        - w.parent is match("^/[A-Za-z0-9_./-]+$")
+        - w.receipts is match("^/[A-Za-z0-9_./-]+$")
+        - '".." not in w.path.split("/")'
+        - '"." not in w.path.split("/")'
+        - w.path | dirname == w.parent
+        - w.parent.startswith(w.mount.path + "/")
+        - not w.path.startswith("/var/lib/vz/")
+        - not w.receipts.startswith(w.mount.path + "/")
+        - w.support.direct is sameas true
+        - w.support.fiemap is sameas true
+        - w.support.ext4 is sameas true
+        - w.support.swapon_json is sameas true
+        - w.support.systemd_version == 257
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Finite preflight_seconds
+      ansible.builtin.assert:
+        that:
+        - w.budgets.preflight_seconds is integer
+        - w.budgets.preflight_seconds is not boolean
+        - 0 < w.budgets.preflight_seconds <= 9223372036854775807
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Finite allocation_seconds
+      ansible.builtin.assert:
+        that:
+        - w.budgets.allocation_seconds is integer
+        - w.budgets.allocation_seconds is not boolean
+        - 0 < w.budgets.allocation_seconds <= 9223372036854775807
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Finite activation_seconds
+      ansible.builtin.assert:
+        that:
+        - w.budgets.activation_seconds is integer
+        - w.budgets.activation_seconds is not boolean
+        - 0 < w.budgets.activation_seconds <= 9223372036854775807
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Finite aggregate_seconds
+      ansible.builtin.assert:
+        that:
+        - w.budgets.aggregate_seconds is integer
+        - w.budgets.aggregate_seconds is not boolean
+        - 0 < w.budgets.aggregate_seconds <= 9223372036854775807
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Finite maximum_write_bytes
+      ansible.builtin.assert:
+        that:
+        - w.budgets.maximum_write_bytes is integer
+        - w.budgets.maximum_write_bytes is not boolean
+        - 0 < w.budgets.maximum_write_bytes <= 9223372036854775807
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Finite maximum_extents
+      ansible.builtin.assert:
+        that:
+        - w.budgets.maximum_extents is integer
+        - w.budgets.maximum_extents is not boolean
+        - 0 < w.budgets.maximum_extents <= 9223372036854775807
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Finite maximum_probe_bytes
+      ansible.builtin.assert:
+        that:
+        - w.budgets.maximum_probe_bytes is integer
+        - w.budgets.maximum_probe_bytes is not boolean
+        - 0 < w.budgets.maximum_probe_bytes <= 9223372036854775807
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Finite maximum_record_bytes
+      ansible.builtin.assert:
+        that:
+        - w.budgets.maximum_record_bytes is integer
+        - w.budgets.maximum_record_bytes is not boolean
+        - 0 < w.budgets.maximum_record_bytes <= 9223372036854775807
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Finite maximum_output_bytes
+      ansible.builtin.assert:
+        that:
+        - w.budgets.maximum_output_bytes is integer
+        - w.budgets.maximum_output_bytes is not boolean
+        - 0 < w.budgets.maximum_output_bytes <= 9223372036854775807
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Finite maximum_swap_rows
+      ansible.builtin.assert:
+        that:
+        - w.budgets.maximum_swap_rows is integer
+        - w.budgets.maximum_swap_rows is not boolean
+        - 0 < w.budgets.maximum_swap_rows <= 9223372036854775807
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Byte and extent caps
+      ansible.builtin.assert:
+        that:
+        - w.budgets.maximum_extents <= 65536
+        - w.budgets.maximum_record_bytes <= 1048576
+        - w.budgets.preflight_seconds <= 86400
+        - w.budgets.allocation_seconds <= 86400
+        - w.budgets.activation_seconds <= 86400
+        - w.budgets.maximum_probe_bytes <= 1048576
+        - w.budgets.maximum_output_bytes <= 1048576
+        - w.budgets.maximum_write_bytes >= w.target_mib * 1048576
+        - w.budgets.aggregate_seconds >= w.budgets.preflight_seconds + w.budgets.allocation_seconds + w.budgets.activation_seconds
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Typed physical incremental_swap_bytes
+      ansible.builtin.assert:
+        that:
+        - w.ledger.incremental_swap_bytes is integer
+        - w.ledger.incremental_swap_bytes is not boolean
+        - w.ledger.incremental_swap_bytes >= 0
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Typed physical protected_data_growth_bytes
+      ansible.builtin.assert:
+        that:
+        - w.ledger.protected_data_growth_bytes is integer
+        - w.ledger.protected_data_growth_bytes is not boolean
+        - w.ledger.protected_data_growth_bytes >= 0
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Typed physical data_reserve_bytes
+      ansible.builtin.assert:
+        that:
+        - w.ledger.data_reserve_bytes is integer
+        - w.ledger.data_reserve_bytes is not boolean
+        - w.ledger.data_reserve_bytes >= 0
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Typed physical data_overhead_bytes
+      ansible.builtin.assert:
+        that:
+        - w.ledger.data_overhead_bytes is integer
+        - w.ledger.data_overhead_bytes is not boolean
+        - w.ledger.data_overhead_bytes >= 0
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Typed physical metadata_growth_bytes
+      ansible.builtin.assert:
+        that:
+        - w.ledger.metadata_growth_bytes is integer
+        - w.ledger.metadata_growth_bytes is not boolean
+        - w.ledger.metadata_growth_bytes >= 0
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Typed physical metadata_reserve_bytes
+      ansible.builtin.assert:
+        that:
+        - w.ledger.metadata_reserve_bytes is integer
+        - w.ledger.metadata_reserve_bytes is not boolean
+        - w.ledger.metadata_reserve_bytes >= 0
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Typed physical filesystem_growth_bytes
+      ansible.builtin.assert:
+        that:
+        - w.ledger.filesystem_growth_bytes is integer
+        - w.ledger.filesystem_growth_bytes is not boolean
+        - w.ledger.filesystem_growth_bytes >= 0
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Typed physical filesystem_reserve_bytes
+      ansible.builtin.assert:
+        that:
+        - w.ledger.filesystem_reserve_bytes is integer
+        - w.ledger.filesystem_reserve_bytes is not boolean
+        - w.ledger.filesystem_reserve_bytes >= 0
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Constrain executable python3
+      ansible.builtin.assert:
+        that:
+        - h.tools.python3 is match("^/(usr/)?(sbin|bin)/python3$")
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Constrain executable dd
+      ansible.builtin.assert:
+        that:
+        - h.tools.dd is match("^/(usr/)?(sbin|bin)/dd$")
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Constrain executable mkswap
+      ansible.builtin.assert:
+        that:
+        - h.tools.mkswap is match("^/(usr/)?(sbin|bin)/mkswap$")
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Constrain executable swapon
+      ansible.builtin.assert:
+        that:
+        - h.tools.swapon is match("^/(usr/)?(sbin|bin)/swapon$")
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Constrain executable blkid
+      ansible.builtin.assert:
+        that:
+        - h.tools.blkid is match("^/(usr/)?(sbin|bin)/blkid$")
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Constrain executable timeout
+      ansible.builtin.assert:
+        that:
+        - h.tools.timeout is match("^/(usr/)?(sbin|bin)/timeout$")
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Constrain executable systemctl
+      ansible.builtin.assert:
+        that:
+        - h.tools.systemctl is match("^/(usr/)?(sbin|bin)/systemctl$")
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Constrain executable systemd-escape
+      ansible.builtin.assert:
+        that:
+        - h.tools.systemd_escape is match("^/(usr/)?(sbin|bin)/systemd-escape$")
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Constrain executable findmnt
+      ansible.builtin.assert:
+        that:
+        - h.tools.findmnt is match("^/(usr/)?(sbin|bin)/findmnt$")
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Constrain executable realpath
+      ansible.builtin.assert:
+        that:
+        - h.tools.realpath is match("^/(usr/)?(sbin|bin)/realpath$")
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Constrain executable lvs
+      ansible.builtin.assert:
+        that:
+        - h.tools.lvs is match("^/(usr/)?(sbin|bin)/lvs$")
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Constrain executable df
+      ansible.builtin.assert:
+        that:
+        - h.tools.df is match("^/(usr/)?(sbin|bin)/df$")
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Constrain executable getconf
+      ansible.builtin.assert:
+        that:
+        - h.tools.getconf is match("^/(usr/)?(sbin|bin)/getconf$")
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Initial native clock
+      ansible.builtin.command:
+        argv:
+        - '{{ h.tools.python3 }}'
+        - -c
+        - '{{ run_code }}'
+        - run
+        - '{{ w.budgets.preflight_seconds }}'
+        - '{{ w.budgets.maximum_output_bytes }}'
+        - '{{ [("/usr/bin/date") | string, ("+%s") | string] | to_json }}'
+        - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+      register: clock
+      changed_when: false
+      check_mode: false
+      environment:
+        LC_ALL: C
+    - name: Start observed deadline
+      ansible.builtin.set_fact:
+        started: '{{ clock.stdout | trim | int }}'
+    - name: Fresh expiry
+      ansible.builtin.assert:
+        that:
+        - h.admission.expires_at_epoch is integer
+        - h.admission.expires_at_epoch is not boolean
+        - h.admission.expires_at_epoch > started
+        - w.ledger.expires_at_epoch is integer
+        - w.ledger.expires_at_epoch > started
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Host identity
+      ansible.builtin.command:
+        argv:
+        - '{{ h.tools.python3 }}'
+        - -c
+        - '{{ run_code }}'
+        - run
+        - '{{ w.budgets.preflight_seconds }}'
+        - '{{ w.budgets.maximum_output_bytes }}'
+        - '{{ [("/usr/bin/cat") | string, ("/etc/machine-id") | string] | to_json }}'
+        - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+      register: host
+      changed_when: false
+      check_mode: false
+      environment:
+        LC_ALL: C
+    - name: Boot identity
+      ansible.builtin.command:
+        argv:
+        - '{{ h.tools.python3 }}'
+        - -c
+        - '{{ run_code }}'
+        - run
+        - '{{ w.budgets.preflight_seconds }}'
+        - '{{ w.budgets.maximum_output_bytes }}'
+        - '{{ [("/usr/bin/cat") | string, ("/proc/sys/kernel/random/boot_id") | string] | to_json }}'
+        - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+      register: boot
+      changed_when: false
+      check_mode: false
+      environment:
+        LC_ALL: C
+    - name: Match host and boot
+      ansible.builtin.assert:
+        that:
+        - host.stdout | trim == h.host_id
+        - boot.stdout | trim == h.boot_id
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Native header page
+      ansible.builtin.command:
+        argv:
+        - '{{ h.tools.python3 }}'
+        - -c
+        - '{{ run_code }}'
+        - run
+        - '{{ w.budgets.preflight_seconds }}'
+        - '{{ w.budgets.maximum_output_bytes }}'
+        - '{{ [(h.tools.getconf) | string, ("PAGESIZE") | string] | to_json }}'
+        - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+      register: page
+      changed_when: false
+      check_mode: false
+      environment:
+        LC_ALL: C
+    - name: Measured usable geometry
+      ansible.builtin.set_fact:
+        page_bytes: '{{ page.stdout | trim | int }}'
+        target_bytes: '{{ w.target_mib * 1048576 }}'
+    - name: Exact native header page
+      ansible.builtin.assert:
+        that:
+        - page_bytes == w.support.page_bytes
+        - page_bytes > 0
+        - target_bytes % page_bytes == 0
+        - w.support.minimum_file_pages <= target_bytes // page_bytes <= w.support.maximum_file_pages
+        - w.support.minimum_file_pages >= 10
+        - w.support.maximum_file_pages <= 4294967295
+        - w.header_uuid not in (w.known_header_uuids | default([]))
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Path derived unit
+      ansible.builtin.command:
+        argv:
+        - '{{ h.tools.python3 }}'
+        - -c
+        - '{{ run_code }}'
+        - run
+        - '{{ w.budgets.preflight_seconds }}'
+        - '{{ w.budgets.maximum_output_bytes }}'
+        - '{{ [(h.tools.systemd_escape) | string, ("--path") | string, ("--suffix=swap") | string, (w.path) | string]
+          | to_json }}'
+        - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+      register: escaped
+      changed_when: false
+      check_mode: false
+      environment:
+        LC_ALL: C
+    - name: Exact unit
+      ansible.builtin.assert:
+        that:
+        - escaped.stdout | trim == w.unit
+        - '"@" not in w.unit'
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Mounted filesystem before
+      ansible.builtin.command:
+        argv:
+        - '{{ h.tools.python3 }}'
+        - -c
+        - '{{ run_code }}'
+        - run
+        - '{{ w.budgets.preflight_seconds }}'
+        - '{{ w.budgets.maximum_output_bytes }}'
+        - '{{ [(h.tools.findmnt) | string, ("--json") | string, ("--mountpoint") | string, (w.mount.path) | string,
+          ("--output") | string, ("TARGET,SOURCE,UUID,FSTYPE,FSROOT,MAJ:MIN") | string] | to_json }}'
+        - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+      register: fs_before
+      changed_when: false
+      check_mode: false
+      environment:
+        LC_ALL: C
+    - name: Canonical device before
+      ansible.builtin.command:
+        argv:
+        - '{{ h.tools.python3 }}'
+        - -c
+        - '{{ run_code }}'
+        - run
+        - '{{ w.budgets.preflight_seconds }}'
+        - '{{ w.budgets.maximum_output_bytes }}'
+        - '{{ [(h.tools.realpath) | string, ("--canonicalize-existing") | string, (w.mount.device) | string] | to_json
+          }}'
+        - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+      register: dev_before
+      changed_when: false
+      check_mode: false
+      environment:
+        LC_ALL: C
+    - name: Device rdev before
+      ansible.builtin.command:
+        argv:
+        - '{{ h.tools.python3 }}'
+        - -c
+        - '{{ run_code }}'
+        - run
+        - '{{ w.budgets.preflight_seconds }}'
+        - '{{ w.budgets.maximum_output_bytes }}'
+        - '{{ [("/usr/bin/stat") | string, ("--dereference") | string, ("--format=%Hr:%Lr") | string, (dev_before.stdout
+          | trim) | string] | to_json }}'
+        - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+      register: rdev_before
+      changed_when: false
+      check_mode: false
+      environment:
+        LC_ALL: C
+    - name: Mount policy before
+      ansible.builtin.command:
+        argv:
+        - '{{ h.tools.python3 }}'
+        - -c
+        - '{{ run_code }}'
+        - run
+        - '{{ w.budgets.preflight_seconds }}'
+        - '{{ w.budgets.maximum_output_bytes }}'
+        - '{{ [(h.tools.systemctl) | string, ("show") | string, (w.mount.unit) | string, ("--property=LoadState,What,Where,Type,FragmentPath,DropInPaths,NeedDaemonReload,ForceUnmount,LazyUnmount,Options")
+          | string] | to_json }}'
+        - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+      register: mount_before
+      changed_when: false
+      check_mode: false
+      environment:
+        LC_ALL: C
+    - name: Parse mounted before
+      ansible.builtin.set_fact:
+        fsbefore: '{{ (fs_before.stdout | from_json).filesystems }}'
+        mountbefore: '{{ dict(mount_before.stdout.splitlines() | map(''split'', ''='', 1)) }}'
+    - name: Exact current mount before
+      ansible.builtin.assert:
+        that:
+        - fsbefore | length == 1
+        - fsbefore[0].target == w.mount.path
+        - fsbefore[0].source == w.mount.device
+        - fsbefore[0].uuid == w.mount.fs_uuid
+        - fsbefore[0].fstype == "ext4"
+        - fsbefore[0].fsroot == "/"
+        - fsbefore[0]["maj:min"] == w.mount.rdev
+        - rdev_before.stdout | trim == w.mount.rdev
+        - mountbefore.LoadState == "loaded"
+        - mountbefore.What == w.mount.device
+        - mountbefore.Where == w.mount.path
+        - mountbefore.Type == "ext4"
+        - mountbefore.FragmentPath == "/etc/systemd/system/" + w.mount.unit
+        - mountbefore.DropInPaths == ""
+        - mountbefore.NeedDaemonReload == "no"
+        - mountbefore.ForceUnmount == "no"
+        - mountbefore.LazyUnmount == "no"
+        - '"bind" not in mountbefore.Options.split(",")'
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Physical pool before
+      ansible.builtin.command:
+        argv:
+        - '{{ h.tools.python3 }}'
+        - -c
+        - '{{ run_code }}'
+        - run
+        - '{{ w.budgets.preflight_seconds }}'
+        - '{{ w.budgets.maximum_output_bytes }}'
+        - '{{ [(h.tools.lvs) | string, ("--reportformat") | string, ("json") | string, ("--units") | string, ("b")
+          | string, ("--nosuffix") | string, ("--options") | string, ("lv_uuid,vg_uuid,lv_name,segtype,lv_size,lv_metadata_size,data_percent,metadata_percent,lv_attr,lv_health_status,pool_lv,lv_path")
+          | string] | to_json }}'
+        - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+      register: pool_before
+      changed_when: false
+      check_mode: false
+      environment:
+        LC_ALL: C
+    - name: Filesystem bytes before
+      ansible.builtin.command:
+        argv:
+        - '{{ h.tools.python3 }}'
+        - -c
+        - '{{ run_code }}'
+        - run
+        - '{{ w.budgets.preflight_seconds }}'
+        - '{{ w.budgets.maximum_output_bytes }}'
+        - '{{ [(h.tools.df) | string, ("--block-size=1") | string, ("--output=avail") | string, (w.mount.path) |
+          string] | to_json }}'
+        - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+      register: df_before
+      changed_when: false
+      check_mode: false
+      environment:
+        LC_ALL: C
+    - name: Select physical identity before
+      ansible.builtin.set_fact:
+        poolsbefore: '{{ (pool_before.stdout | from_json).report | map(attribute="lv") | flatten }}'
+    - name: Select admitted geometry before
+      ansible.builtin.set_fact:
+        poolbefore: '{{ poolsbefore | selectattr("lv_uuid", "equalto", w.mount.pool_uuid) | list }}'
+        imagebefore: '{{ poolsbefore | selectattr("lv_uuid", "equalto", w.mount.lv_uuid) | list }}'
+    - name: Measured physical bounds before
+      ansible.builtin.assert:
+        that:
+        - poolbefore | length == 1
+        - imagebefore | length == 1
+        - poolbefore[0].vg_uuid == w.mount.vg_uuid
+        - imagebefore[0].vg_uuid == w.mount.vg_uuid
+        - imagebefore[0].pool_lv == poolbefore[0].lv_name
+        - imagebefore[0].lv_path == w.mount.device
+        - poolbefore[0].segtype == "thin-pool"
+        - poolbefore[0].lv_health_status | trim == ""
+        - poolbefore[0].lv_attr is match("^twi-a-tz")
+        - poolbefore[0].data_percent | trim is match("^[0-9]+([.][0-9]+)?$")
+        - poolbefore[0].metadata_percent | trim is match("^[0-9]+([.][0-9]+)?$")
+        - 0 <= (poolbefore[0].data_percent | float) <= 100
+        - 0 <= (poolbefore[0].metadata_percent | float) <= 100
+        - (poolbefore[0].lv_size | float) * (1 - (poolbefore[0].data_percent | float)/100) >= w.ledger.incremental_swap_bytes
+          + w.ledger.protected_data_growth_bytes + w.ledger.data_reserve_bytes + w.ledger.data_overhead_bytes
+        - (poolbefore[0].lv_metadata_size | float) * (1 - (poolbefore[0].metadata_percent | float)/100) >= w.ledger.metadata_growth_bytes
+          + w.ledger.metadata_reserve_bytes
+        - df_before.stdout.splitlines()[-1] is match("^[0-9]+$")
+        - (df_before.stdout.splitlines()[-1] | int) >= w.ledger.incremental_swap_bytes + w.ledger.filesystem_growth_bytes
+          + w.ledger.filesystem_reserve_bytes
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Actual swap table before
+      ansible.builtin.command:
+        argv:
+        - '{{ h.tools.python3 }}'
+        - -c
+        - '{{ run_code }}'
+        - run
+        - '{{ w.budgets.preflight_seconds }}'
+        - '{{ w.budgets.maximum_output_bytes }}'
+        - '{{ [(h.tools.swapon) | string, ("--show") | string, ("--json") | string, ("--bytes") | string, ("--output")
+          | string, ("NAME,TYPE,SIZE,USED,PRIO") | string] | to_json }}'
+        - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+      register: swaps_before
+      changed_when: false
+      check_mode: false
+      environment:
+        LC_ALL: C
+    - name: Parse kernel swaps before
+      ansible.builtin.set_fact:
+        swapsbefore: '{{ (swaps_before.stdout | from_json).swaps }}'
+    - name: Finite swap rows before
+      ansible.builtin.assert:
+        that:
+        - swapsbefore | length <= w.budgets.maximum_swap_rows
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Exact file activity before
+      ansible.builtin.set_fact:
+        newbefore: '{{ swapsbefore | selectattr("name", "equalto", w.path) | list }}'
+    - name: File layout before
+      ansible.builtin.command:
+        argv:
+        - '{{ h.tools.python3 }}'
+        - -c
+        - '{{ run_code }}'
+        - run
+        - '{{ w.budgets.preflight_seconds }}'
+        - '{{ w.budgets.maximum_output_bytes }}'
+        - '{{ [(h.tools.python3) | string, ("-c") | string, (probe_code) | string, ("probe-file") | string, (w.path)
+          | string, (w.budgets.maximum_extents) | string, (w.budgets.maximum_probe_bytes) | string] | to_json }}'
+        - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+      register: fp_before
+      changed_when: false
+      check_mode: false
+      environment:
+        LC_ALL: C
+    - name: Parse file before
+      ansible.builtin.set_fact:
+        filebefore: '{{ fp_before.stdout | from_json }}'
+    - name: Protected original records
+      ansible.builtin.command:
+        argv:
+        - '{{ h.tools.python3 }}'
+        - -c
+        - '{{ run_code }}'
+        - run
+        - '{{ w.budgets.preflight_seconds }}'
+        - '{{ w.budgets.maximum_output_bytes }}'
+        - '{{ [(h.tools.python3) | string, ("-c") | string, (records_code) | string, ("records") | string, (w.receipts)
+          | string, (w.budgets.maximum_record_bytes) | string] | to_json }}'
+        - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+      register: record_probe
+      changed_when: false
+      check_mode: false
+      environment:
+        LC_ALL: C
+    - name: Parse original binding
+      ansible.builtin.set_fact:
+        rec: '{{ record_probe.stdout | from_json }}'
+    - name: Exact original ownership
+      ansible.builtin.assert:
+        that:
+        - not filebefore.exists or rec.records.binding is defined
+        - not rec.exists or rec.records.binding is defined
+        - not filebefore.parent.exists or rec.records.binding is defined
+        - not rec.records.binding is defined or rec.binding_sha256 == w.binding_sha256
+        - not rec.records.binding is defined or (filebefore.stat.dev == rec.records.binding.file.dev and filebefore.stat.inode
+          == rec.records.binding.file.inode)
+        - not rec.records.binding is defined or (filebefore.stat.nlink == 1 and filebefore.stat.uid == 0 and filebefore.stat.gid
+          == 0 and filebefore.stat.mode == 384 and filebefore.stat.kind == "regular")
+        - not rec.records.binding is defined or (filebefore.parent.dev == rec.records.binding.parent.dev and filebefore.parent.inode
+          == rec.records.binding.parent.inode and filebefore.parent.uid == 0 and filebefore.parent.gid == 0 and
+          filebefore.parent.mode == 448)
+        - not rec.records.binding is defined or (rec.stat.dev == rec.records.binding.receipts.dev and rec.stat.inode
+          == rec.records.binding.receipts.inode and rec.stat.uid == 0 and rec.stat.gid == 0 and rec.stat.mode ==
+          448)
+        - newbefore | length <= 1
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Loaded swap unit before
+      ansible.builtin.command:
+        argv:
+        - '{{ h.tools.python3 }}'
+        - -c
+        - '{{ run_code }}'
+        - run
+        - '{{ w.budgets.preflight_seconds }}'
+        - '{{ w.budgets.maximum_output_bytes }}'
+        - '{{ [(h.tools.systemctl) | string, ("show") | string, (w.unit) | string, ("--property=LoadState,ActiveState,UnitFileState,What,FragmentPath,DropInPaths,NeedDaemonReload,Options,DefaultDependencies,Requires,After")
+          | string] | to_json }}'
+        - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+      register: unit_before
+      changed_when: false
+      check_mode: false
+      environment:
+        LC_ALL: C
+    - name: Parse unit before
+      ansible.builtin.set_fact:
+        unitbefore: '{{ dict(unit_before.stdout.splitlines() | map(''split'', ''='', 1)) }}'
+    - name: No unknown unit
+      ansible.builtin.assert:
+        that:
+        - unitbefore.LoadState == "not-found" or rec.records.unit is defined
+        - newbefore | length == 0 or unitbefore.ActiveState == "active"
+        - unitbefore.ActiveState != "active" or newbefore | length == 1
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Exact initial active policy
+      ansible.builtin.assert:
+        that:
+        - not (newbefore | length == 1) or unitbefore.ActiveState == "active"
+        - unitbefore.ActiveState != "active" or newbefore | length == 1
+        - unitbefore.LoadState == "not-found" or unitbefore.What == w.path
+        - unitbefore.LoadState == "not-found" or unitbefore.FragmentPath == "/etc/systemd/system/" + w.unit
+        - unitbefore.LoadState == "not-found" or unitbefore.DropInPaths == ""
+        - unitbefore.LoadState == "not-found" or unitbefore.NeedDaemonReload == "no"
+        - unitbefore.LoadState == "not-found" or unitbefore.Options == ""
+        - unitbefore.LoadState == "not-found" or unitbefore.DefaultDependencies == "yes"
+        - unitbefore.LoadState == "not-found" or w.mount.unit in unitbefore.Requires.split()
+        - unitbefore.LoadState == "not-found" or w.mount.unit in unitbefore.After.split()
+        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+    - name: Admitted apply only
+      when: h.apply and not h.preflight_only
+      block:
+      - name: Owned active policy context
+        ansible.builtin.assert:
+          that:
+          - newbefore | length == 0 or rec.records.activation_intent is defined
+          - not rec.records.activation_intent is defined or newbefore | length == 1
+          fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+      - name: Exclusive protected parent
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.python3) | string, ("-c") | string, (mkdir_code) | string, ("mkdir") | string, (w.parent)
+            | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: new_parent
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+        when: not filebefore.parent.exists
+      - name: Exclusive protected receipts
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.python3) | string, ("-c") | string, (mkdir_code) | string, ("mkdir") | string, (w.receipts)
+            | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: new_receipts
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+        when: not rec.exists
+      - name: Exclusive swap file
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.python3) | string, ("-c") | string, (create_code) | string, ("create") | string, (w.path)
+            | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: created_file
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+        when: not filebefore.exists
+      - name: Immutable creation binding
+        ansible.builtin.set_fact:
+          binding: '{{ rec.records.binding if rec.records.binding is defined else {"file": (created_file.stdout
+            | from_json) | dict2items | rejectattr("key", "in", ["size", "blocks", "mtime_ns", "ctime_ns"]) | items2dict,
+            "parent": new_parent.stdout | from_json, "receipts": new_receipts.stdout | from_json} }}'
+      - name: Write immutable binding
+        ansible.builtin.copy:
+          dest: '{{ w.receipts }}/binding.json'
+          content: '{{ binding | to_json }}'
+          force: false
+          owner: root
+          group: root
+          mode: '0600'
+        when: not rec.records.binding is defined
+      - name: Durably readback binding
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.python3) | string, ("-c") | string, (seal_code) | string, ("seal") | string, ("" ~ (w.receipts)
+            ~ "/binding.json") | string, (w.budgets.maximum_record_bytes) | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: sealed_binding
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+        when: not rec.records.binding is defined
+      - name: Match sealed binding
+        ansible.builtin.assert:
+          that:
+          - sealed_binding.stdout | from_json == binding
+          fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+        when: not rec.records.binding is defined
+      - name: File layout owned
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.python3) | string, ("-c") | string, (probe_code) | string, ("probe-file") | string, (w.path)
+            | string, (w.budgets.maximum_extents) | string, (w.budgets.maximum_probe_bytes) | string] | to_json
+            }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: fp_owned
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+      - name: Parse file owned
+        ansible.builtin.set_fact:
+          fileowned: '{{ fp_owned.stdout | from_json }}'
+      - name: Actual swap table owned
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.swapon) | string, ("--show") | string, ("--json") | string, ("--bytes") | string, ("--output")
+            | string, ("NAME,TYPE,SIZE,USED,PRIO") | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: swaps_owned
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+      - name: Parse kernel swaps owned
+        ansible.builtin.set_fact:
+          swapsowned: '{{ (swaps_owned.stdout | from_json).swaps }}'
+      - name: Finite swap rows owned
+        ansible.builtin.assert:
+          that:
+          - swapsowned | length <= w.budgets.maximum_swap_rows
+          fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+      - name: Exact file activity owned
+        ansible.builtin.set_fact:
+          newowned: '{{ swapsowned | selectattr("name", "equalto", w.path) | list }}'
+      - name: Native signature before
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.blkid) | string, ("--probe") | string, ("--output") | string, ("export") | string, (w.path)
+            | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: sig_before
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+        failed_when: sig_before.rc not in [0, 2]
+      - name: Parse header before
+        ansible.builtin.set_fact:
+          sigbefore: '{{ dict(sig_before.stdout.splitlines() | map(''split'', ''='', 1)) }}'
+      - name: Exact inactive or known header
+        ansible.builtin.assert:
+          that:
+          - fileowned.stat.dev == binding.file.dev
+          - fileowned.stat.inode == binding.file.inode
+          - fileowned.stat.nlink == 1
+          - fileowned.stat.uid == 0
+          - fileowned.stat.gid == 0
+          - fileowned.stat.mode == 384
+          - fileowned.stat.kind == "regular"
+          - fileowned.stat.size <= target_bytes
+          - sigbefore == {} or (sigbefore.TYPE | default("") == "swap" and sigbefore.UUID | default("") == w.header_uuid
+            and rec.records.format_intent is defined)
+          - newowned | length == newbefore | length
+          fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+      - name: Decide single preparation
+        ansible.builtin.set_fact:
+          need_fill: '{{ sigbefore == {} and not rec.records.allocation is defined }}'
+          need_format: '{{ sigbefore == {} }}'
+          was_active: '{{ newbefore | length == 1 }}'
+      - name: No reuse of active blank or sticky attempt
+        ansible.builtin.assert:
+          that:
+          - not was_active or not need_format
+          - not rec.records.activation_intent is defined or was_active
+          fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+      - name: One admitted zero fill
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.allocation_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.dd) | string, ("if=/dev/zero") | string, ("of=" ~ (w.path) ~ "") | string, ("bs=1M") |
+            string, ("count=" ~ (w.target_mib) ~ "") | string, ("conv=nocreat,notrunc,fsync") | string, ("oflag=direct,nofollow")
+            | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: fill
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+        when: need_fill
+      - name: File layout allocated
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.python3) | string, ("-c") | string, (probe_code) | string, ("probe-file") | string, (w.path)
+            | string, (w.budgets.maximum_extents) | string, (w.budgets.maximum_probe_bytes) | string] | to_json
+            }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: fp_allocated
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+      - name: Parse file allocated
+        ansible.builtin.set_fact:
+          fileallocated: '{{ fp_allocated.stdout | from_json }}'
+      - name: Independent dense coverage
+        ansible.builtin.assert:
+          that:
+          - fileallocated.stat.dev == binding.file.dev
+          - fileallocated.stat.inode == binding.file.inode
+          - fileallocated.stat.nlink == 1
+          - fileallocated.stat.uid == 0
+          - fileallocated.stat.gid == 0
+          - fileallocated.stat.mode == 384
+          - fileallocated.stat.size == target_bytes
+          - fileallocated.stat.blocks * 512 >= target_bytes
+          - fileallocated.stable is sameas true
+          - fileallocated.coverage_complete is sameas true
+          - fileallocated.unsupported_flags == 0
+          fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+      - name: Current allocation observation
+        ansible.builtin.set_fact:
+          allocation: '{{ {"file": fileallocated.stat, "layout_hash": fileallocated.layout_hash, "attempt_id": h.attempt_id}
+            }}'
+      - name: Write immutable allocation
+        ansible.builtin.copy:
+          dest: '{{ w.receipts }}/allocation.json'
+          content: '{{ allocation | to_json }}'
+          force: false
+          owner: root
+          group: root
+          mode: '0600'
+        when: not rec.records.allocation is defined
+      - name: Durably readback allocation
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.python3) | string, ("-c") | string, (seal_code) | string, ("seal") | string, ("" ~ (w.receipts)
+            ~ "/allocation.json") | string, (w.budgets.maximum_record_bytes) | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: sealed_allocation
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+        when: not rec.records.allocation is defined
+      - name: Match sealed allocation
+        ansible.builtin.assert:
+          that:
+          - sealed_allocation.stdout | from_json == allocation
+          fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+        when: not rec.records.allocation is defined
+      - name: Expected immutable format intent
+        ansible.builtin.set_fact:
+          format_intent: '{{ {"header_uuid": w.header_uuid, "file": binding.file} }}'
+      - name: Write immutable format_intent
+        ansible.builtin.copy:
+          dest: '{{ w.receipts }}/format_intent.json'
+          content: '{{ format_intent | to_json }}'
+          force: false
+          owner: root
+          group: root
+          mode: '0600'
+        when: need_format and not rec.records.format_intent is defined
+      - name: Durably readback format_intent
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.python3) | string, ("-c") | string, (seal_code) | string, ("seal") | string, ("" ~ (w.receipts)
+            ~ "/format_intent.json") | string, (w.budgets.maximum_record_bytes) | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: sealed_format_intent
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+        when: need_format and not rec.records.format_intent is defined
+      - name: Match sealed format_intent
+        ansible.builtin.assert:
+          that:
+          - sealed_format_intent.stdout | from_json == format_intent
+          fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+        when: need_format and not rec.records.format_intent is defined
+      - name: Actual swap table format
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.swapon) | string, ("--show") | string, ("--json") | string, ("--bytes") | string, ("--output")
+            | string, ("NAME,TYPE,SIZE,USED,PRIO") | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: swaps_format
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+      - name: Parse kernel swaps format
+        ansible.builtin.set_fact:
+          swapsformat: '{{ (swaps_format.stdout | from_json).swaps }}'
+      - name: Finite swap rows format
+        ansible.builtin.assert:
+          that:
+          - swapsformat | length <= w.budgets.maximum_swap_rows
+          fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+      - name: Exact file activity format
+        ansible.builtin.set_fact:
+          newformat: '{{ swapsformat | selectattr("name", "equalto", w.path) | list }}'
+      - name: Native signature format
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.blkid) | string, ("--probe") | string, ("--output") | string, ("export") | string, (w.path)
+            | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: sig_format
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+        failed_when: sig_format.rc not in [0, 2]
+      - name: Parse header format
+        ansible.builtin.set_fact:
+          sigformat: '{{ dict(sig_format.stdout.splitlines() | map(''split'', ''='', 1)) }}'
+      - name: Guard possible prior format
+        ansible.builtin.assert:
+          that:
+          - not need_format or newformat | length == 0
+          - not need_format or sigformat == {}
+          fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+      - name: Native admitted header
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.allocation_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.mkswap) | string, ("--uuid") | string, (w.header_uuid) | string, (w.path) | string] |
+            to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: format
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+        when: need_format
+      - name: Native signature after
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.blkid) | string, ("--probe") | string, ("--output") | string, ("export") | string, (w.path)
+            | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: sig_after
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+        failed_when: sig_after.rc not in [0, 2]
+      - name: Parse header after
+        ansible.builtin.set_fact:
+          sigafter: '{{ dict(sig_after.stdout.splitlines() | map(''split'', ''='', 1)) }}'
+      - name: File layout header
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.python3) | string, ("-c") | string, (probe_code) | string, ("probe-file") | string, (w.path)
+            | string, (w.budgets.maximum_extents) | string, (w.budgets.maximum_probe_bytes) | string] | to_json
+            }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: fp_header
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+      - name: Parse file header
+        ansible.builtin.set_fact:
+          fileheader: '{{ fp_header.stdout | from_json }}'
+      - name: Exact observed header
+        ansible.builtin.assert:
+          that:
+          - sigafter.TYPE | default("") == "swap"
+          - sigafter.UUID | default("") == w.header_uuid
+          - fileheader.stat.dev == binding.file.dev
+          - fileheader.stat.inode == binding.file.inode
+          - fileheader.stat.size == target_bytes
+          - fileheader.coverage_complete is sameas true
+          - fileheader.stable is sameas true
+          fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+      - name: Write immutable header
+        ansible.builtin.copy:
+          dest: '{{ w.receipts }}/header.json'
+          content: '{{ format_intent | to_json }}'
+          force: false
+          owner: root
+          group: root
+          mode: '0600'
+        when: not rec.records.header is defined
+      - name: Durably readback header
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.python3) | string, ("-c") | string, (seal_code) | string, ("seal") | string, ("" ~ (w.receipts)
+            ~ "/header.json") | string, (w.budgets.maximum_record_bytes) | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: sealed_header
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+        when: not rec.records.header is defined
+      - name: Match sealed header
+        ansible.builtin.assert:
+          that:
+          - sealed_header.stdout | from_json == format_intent
+          fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+        when: not rec.records.header is defined
+      - name: Declare only new own unit
+        ansible.builtin.template:
+          src: templates/proxmox-host-swap.swap.j2
+          dest: /etc/systemd/system/{{ w.unit }}
+          force: false
+          owner: root
+          group: root
+          mode: '0644'
+        when: unitbefore.LoadState == "not-found"
+      - name: Unit binding
+        ansible.builtin.set_fact:
+          unit_binding: '{{ {"unit": w.unit, "path": w.path} }}'
+      - name: Write immutable unit
+        ansible.builtin.copy:
+          dest: '{{ w.receipts }}/unit.json'
+          content: '{{ unit_binding | to_json }}'
+          force: false
+          owner: root
+          group: root
+          mode: '0600'
+        when: not rec.records.unit is defined
+      - name: Durably readback unit
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.python3) | string, ("-c") | string, (seal_code) | string, ("seal") | string, ("" ~ (w.receipts)
+            ~ "/unit.json") | string, (w.budgets.maximum_record_bytes) | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: sealed_unit
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+        when: not rec.records.unit is defined
+      - name: Match sealed unit
+        ansible.builtin.assert:
+          that:
+          - sealed_unit.stdout | from_json == unit_binding
+          fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+        when: not rec.records.unit is defined
+      - name: Load only fresh declaration
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.systemctl) | string, ("daemon-reload") | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: reload
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+        when: unitbefore.LoadState == "not-found"
+      - name: Loaded swap unit ready
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.systemctl) | string, ("show") | string, (w.unit) | string, ("--property=LoadState,ActiveState,UnitFileState,What,FragmentPath,DropInPaths,NeedDaemonReload,Options,DefaultDependencies,Requires,After")
+            | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: unit_ready
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+      - name: Parse unit ready
+        ansible.builtin.set_fact:
+          unitready: '{{ dict(unit_ready.stdout.splitlines() | map(''split'', ''='', 1)) }}'
+      - name: Exact loaded swap declaration
+        ansible.builtin.assert:
+          that:
+          - unitready.LoadState == "loaded"
+          - unitready.What == w.path
+          - unitready.FragmentPath == "/etc/systemd/system/" + w.unit
+          - unitready.DropInPaths == ""
+          - unitready.NeedDaemonReload == "no"
+          - unitready.Options == ""
+          - unitready.DefaultDependencies == "yes"
+          - w.mount.unit in unitready.Requires.split()
+          - w.mount.unit in unitready.After.split()
+          fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+      - name: Mounted filesystem activation
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.findmnt) | string, ("--json") | string, ("--mountpoint") | string, (w.mount.path) | string,
+            ("--output") | string, ("TARGET,SOURCE,UUID,FSTYPE,FSROOT,MAJ:MIN") | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: fs_activation
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+      - name: Canonical device activation
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.realpath) | string, ("--canonicalize-existing") | string, (w.mount.device) | string] |
+            to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: dev_activation
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+      - name: Device rdev activation
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [("/usr/bin/stat") | string, ("--dereference") | string, ("--format=%Hr:%Lr") | string, (dev_activation.stdout
+            | trim) | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: rdev_activation
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+      - name: Mount policy activation
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.systemctl) | string, ("show") | string, (w.mount.unit) | string, ("--property=LoadState,What,Where,Type,FragmentPath,DropInPaths,NeedDaemonReload,ForceUnmount,LazyUnmount,Options")
+            | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: mount_activation
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+      - name: Parse mounted activation
+        ansible.builtin.set_fact:
+          fsactivation: '{{ (fs_activation.stdout | from_json).filesystems }}'
+          mountactivation: '{{ dict(mount_activation.stdout.splitlines() | map(''split'', ''='', 1)) }}'
+      - name: Exact current mount activation
+        ansible.builtin.assert:
+          that:
+          - fsactivation | length == 1
+          - fsactivation[0].target == w.mount.path
+          - fsactivation[0].source == w.mount.device
+          - fsactivation[0].uuid == w.mount.fs_uuid
+          - fsactivation[0].fstype == "ext4"
+          - fsactivation[0].fsroot == "/"
+          - fsactivation[0]["maj:min"] == w.mount.rdev
+          - rdev_activation.stdout | trim == w.mount.rdev
+          - mountactivation.LoadState == "loaded"
+          - mountactivation.What == w.mount.device
+          - mountactivation.Where == w.mount.path
+          - mountactivation.Type == "ext4"
+          - mountactivation.FragmentPath == "/etc/systemd/system/" + w.mount.unit
+          - mountactivation.DropInPaths == ""
+          - mountactivation.NeedDaemonReload == "no"
+          - mountactivation.ForceUnmount == "no"
+          - mountactivation.LazyUnmount == "no"
+          - '"bind" not in mountactivation.Options.split(",")'
+          fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+      - name: Physical pool activation
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.lvs) | string, ("--reportformat") | string, ("json") | string, ("--units") | string, ("b")
+            | string, ("--nosuffix") | string, ("--options") | string, ("lv_uuid,vg_uuid,lv_name,segtype,lv_size,lv_metadata_size,data_percent,metadata_percent,lv_attr,lv_health_status,pool_lv,lv_path")
+            | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: pool_activation
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+      - name: Filesystem bytes activation
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.df) | string, ("--block-size=1") | string, ("--output=avail") | string, (w.mount.path)
+            | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: df_activation
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+      - name: Select physical identity activation
+        ansible.builtin.set_fact:
+          poolsactivation: '{{ (pool_activation.stdout | from_json).report | map(attribute="lv") | flatten }}'
+      - name: Select admitted geometry activation
+        ansible.builtin.set_fact:
+          poolactivation: '{{ poolsactivation | selectattr("lv_uuid", "equalto", w.mount.pool_uuid) | list }}'
+          imageactivation: '{{ poolsactivation | selectattr("lv_uuid", "equalto", w.mount.lv_uuid) | list }}'
+      - name: Measured physical bounds activation
+        ansible.builtin.assert:
+          that:
+          - poolactivation | length == 1
+          - imageactivation | length == 1
+          - poolactivation[0].vg_uuid == w.mount.vg_uuid
+          - imageactivation[0].vg_uuid == w.mount.vg_uuid
+          - imageactivation[0].pool_lv == poolactivation[0].lv_name
+          - imageactivation[0].lv_path == w.mount.device
+          - poolactivation[0].segtype == "thin-pool"
+          - poolactivation[0].lv_health_status | trim == ""
+          - poolactivation[0].lv_attr is match("^twi-a-tz")
+          - poolactivation[0].data_percent | trim is match("^[0-9]+([.][0-9]+)?$")
+          - poolactivation[0].metadata_percent | trim is match("^[0-9]+([.][0-9]+)?$")
+          - 0 <= (poolactivation[0].data_percent | float) <= 100
+          - 0 <= (poolactivation[0].metadata_percent | float) <= 100
+          - (poolactivation[0].lv_size | float) * (1 - (poolactivation[0].data_percent | float)/100) >= w.ledger.incremental_swap_bytes
+            + w.ledger.protected_data_growth_bytes + w.ledger.data_reserve_bytes + w.ledger.data_overhead_bytes
+          - (poolactivation[0].lv_metadata_size | float) * (1 - (poolactivation[0].metadata_percent | float)/100)
+            >= w.ledger.metadata_growth_bytes + w.ledger.metadata_reserve_bytes
+          - df_activation.stdout.splitlines()[-1] is match("^[0-9]+$")
+          - (df_activation.stdout.splitlines()[-1] | int) >= w.ledger.incremental_swap_bytes + w.ledger.filesystem_growth_bytes
+            + w.ledger.filesystem_reserve_bytes
+          fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+      - name: Sticky activation evidence
+        ansible.builtin.set_fact:
+          activation_intent: '{{ {"file": binding.file, "header_uuid": w.header_uuid, "fs_uuid": w.mount.fs_uuid,
+            "mount": w.mount, "unit": unit_binding, "original_swaps": swapsbefore, "attempt_id": h.attempt_id} }}'
+      - name: Write immutable activation_intent
+        ansible.builtin.copy:
+          dest: '{{ w.receipts }}/activation_intent.json'
+          content: '{{ activation_intent | to_json }}'
+          force: false
+          owner: root
+          group: root
+          mode: '0600'
+        when: not rec.records.activation_intent is defined
+      - name: Durably readback activation_intent
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.python3) | string, ("-c") | string, (seal_code) | string, ("seal") | string, ("" ~ (w.receipts)
+            ~ "/activation_intent.json") | string, (w.budgets.maximum_record_bytes) | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: sealed_activation_intent
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+        when: not rec.records.activation_intent is defined
+      - name: Match sealed activation_intent
+        ansible.builtin.assert:
+          that:
+          - sealed_activation_intent.stdout | from_json == activation_intent
+          fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+        when: not rec.records.activation_intent is defined
+      - name: Start only exact new swap
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.activation_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.systemctl) | string, ("start") | string, (w.unit) | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: activation
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+        when: not was_active
+        failed_when: false
+      - name: Actual swap table after
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.swapon) | string, ("--show") | string, ("--json") | string, ("--bytes") | string, ("--output")
+            | string, ("NAME,TYPE,SIZE,USED,PRIO") | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: swaps_after
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+      - name: Parse kernel swaps after
+        ansible.builtin.set_fact:
+          swapsafter: '{{ (swaps_after.stdout | from_json).swaps }}'
+      - name: Finite swap rows after
+        ansible.builtin.assert:
+          that:
+          - swapsafter | length <= w.budgets.maximum_swap_rows
+          fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+      - name: Exact file activity after
+        ansible.builtin.set_fact:
+          newafter: '{{ swapsafter | selectattr("name", "equalto", w.path) | list }}'
+      - name: Loaded swap unit after
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.systemctl) | string, ("show") | string, (w.unit) | string, ("--property=LoadState,ActiveState,UnitFileState,What,FragmentPath,DropInPaths,NeedDaemonReload,Options,DefaultDependencies,Requires,After")
+            | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: unit_after
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+      - name: Parse unit after
+        ansible.builtin.set_fact:
+          unitafter: '{{ dict(unit_after.stdout.splitlines() | map(''split'', ''='', 1)) }}'
+      - name: File layout after
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.python3) | string, ("-c") | string, (probe_code) | string, ("probe-file") | string, (w.path)
+            | string, (w.budgets.maximum_extents) | string, (w.budgets.maximum_probe_bytes) | string] | to_json
+            }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: fp_after
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+      - name: Parse file after
+        ansible.builtin.set_fact:
+          fileafter: '{{ fp_after.stdout | from_json }}'
+      - name: Mounted filesystem after
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.findmnt) | string, ("--json") | string, ("--mountpoint") | string, (w.mount.path) | string,
+            ("--output") | string, ("TARGET,SOURCE,UUID,FSTYPE,FSROOT,MAJ:MIN") | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: fs_after
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+      - name: Canonical device after
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.realpath) | string, ("--canonicalize-existing") | string, (w.mount.device) | string] |
+            to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: dev_after
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+      - name: Device rdev after
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [("/usr/bin/stat") | string, ("--dereference") | string, ("--format=%Hr:%Lr") | string, (dev_after.stdout
+            | trim) | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: rdev_after
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+      - name: Mount policy after
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.systemctl) | string, ("show") | string, (w.mount.unit) | string, ("--property=LoadState,What,Where,Type,FragmentPath,DropInPaths,NeedDaemonReload,ForceUnmount,LazyUnmount,Options")
+            | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: mount_after
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+      - name: Parse mounted after
+        ansible.builtin.set_fact:
+          fsafter: '{{ (fs_after.stdout | from_json).filesystems }}'
+          mountafter: '{{ dict(mount_after.stdout.splitlines() | map(''split'', ''='', 1)) }}'
+      - name: Exact current mount after
+        ansible.builtin.assert:
+          that:
+          - fsafter | length == 1
+          - fsafter[0].target == w.mount.path
+          - fsafter[0].source == w.mount.device
+          - fsafter[0].uuid == w.mount.fs_uuid
+          - fsafter[0].fstype == "ext4"
+          - fsafter[0].fsroot == "/"
+          - fsafter[0]["maj:min"] == w.mount.rdev
+          - rdev_after.stdout | trim == w.mount.rdev
+          - mountafter.LoadState == "loaded"
+          - mountafter.What == w.mount.device
+          - mountafter.Where == w.mount.path
+          - mountafter.Type == "ext4"
+          - mountafter.FragmentPath == "/etc/systemd/system/" + w.mount.unit
+          - mountafter.DropInPaths == ""
+          - mountafter.NeedDaemonReload == "no"
+          - mountafter.ForceUnmount == "no"
+          - mountafter.LazyUnmount == "no"
+          - '"bind" not in mountafter.Options.split(",")'
+          fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+      - name: Physical pool after
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.lvs) | string, ("--reportformat") | string, ("json") | string, ("--units") | string, ("b")
+            | string, ("--nosuffix") | string, ("--options") | string, ("lv_uuid,vg_uuid,lv_name,segtype,lv_size,lv_metadata_size,data_percent,metadata_percent,lv_attr,lv_health_status,pool_lv,lv_path")
+            | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: pool_after
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+      - name: Filesystem bytes after
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.df) | string, ("--block-size=1") | string, ("--output=avail") | string, (w.mount.path)
+            | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: df_after
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+      - name: Select physical identity after
+        ansible.builtin.set_fact:
+          poolsafter: '{{ (pool_after.stdout | from_json).report | map(attribute="lv") | flatten }}'
+      - name: Select admitted geometry after
+        ansible.builtin.set_fact:
+          poolafter: '{{ poolsafter | selectattr("lv_uuid", "equalto", w.mount.pool_uuid) | list }}'
+          imageafter: '{{ poolsafter | selectattr("lv_uuid", "equalto", w.mount.lv_uuid) | list }}'
+      - name: Measured physical bounds after
+        ansible.builtin.assert:
+          that:
+          - poolafter | length == 1
+          - imageafter | length == 1
+          - poolafter[0].vg_uuid == w.mount.vg_uuid
+          - imageafter[0].vg_uuid == w.mount.vg_uuid
+          - imageafter[0].pool_lv == poolafter[0].lv_name
+          - imageafter[0].lv_path == w.mount.device
+          - poolafter[0].segtype == "thin-pool"
+          - poolafter[0].lv_health_status | trim == ""
+          - poolafter[0].lv_attr is match("^twi-a-tz")
+          - poolafter[0].data_percent | trim is match("^[0-9]+([.][0-9]+)?$")
+          - poolafter[0].metadata_percent | trim is match("^[0-9]+([.][0-9]+)?$")
+          - 0 <= (poolafter[0].data_percent | float) <= 100
+          - 0 <= (poolafter[0].metadata_percent | float) <= 100
+          - (poolafter[0].lv_size | float) * (1 - (poolafter[0].data_percent | float)/100) >= w.ledger.incremental_swap_bytes
+            + w.ledger.protected_data_growth_bytes + w.ledger.data_reserve_bytes + w.ledger.data_overhead_bytes
+          - (poolafter[0].lv_metadata_size | float) * (1 - (poolafter[0].metadata_percent | float)/100) >= w.ledger.metadata_growth_bytes
+            + w.ledger.metadata_reserve_bytes
+          - df_after.stdout.splitlines()[-1] is match("^[0-9]+$")
+          - (df_after.stdout.splitlines()[-1] | int) >= w.ledger.incremental_swap_bytes + w.ledger.filesystem_growth_bytes
+            + w.ledger.filesystem_reserve_bytes
+          fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+      - name: Observed usable capacity and stable old areas
+        ansible.builtin.assert:
+          that:
+          - newafter | length == 1
+          - newafter[0].type == "file"
+          - newafter[0].size == target_bytes - page_bytes
+          - unitafter.ActiveState == "active"
+          - unitafter.What == w.path
+          - unitafter.DropInPaths == ""
+          - unitafter.NeedDaemonReload == "no"
+          - fileafter.stat.dev == binding.file.dev
+          - fileafter.stat.inode == binding.file.inode
+          - fileafter.stat.nlink == 1
+          - fileafter.stat.size == target_bytes
+          - fileafter.stable is sameas true
+          - fileafter.coverage_complete is sameas true
+          - was_active or activation.rc == 0
+          fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+      - name: Preserve every old static swap area
+        ansible.builtin.assert:
+          that:
+          - item.name == w.path or (swapsafter | selectattr("name", "equalto", item.name) | list | length == 1)
+          - item.name == w.path or ((swapsafter | selectattr("name", "equalto", item.name) | first).type == item.type
+            and (swapsafter | selectattr("name", "equalto", item.name) | first).size == item.size and (swapsafter
+            | selectattr("name", "equalto", item.name) | first).prio == item.prio)
+        loop: '{{ swapsbefore }}'
+      - name: Enable exact boot declaration
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.systemctl) | string, ("enable") | string, (w.unit) | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: enabled
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+      - name: Loaded swap unit enabled
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.systemctl) | string, ("show") | string, (w.unit) | string, ("--property=LoadState,ActiveState,UnitFileState,What,FragmentPath,DropInPaths,NeedDaemonReload,Options,DefaultDependencies,Requires,After")
+            | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: unit_enabled
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+      - name: Parse unit enabled
+        ansible.builtin.set_fact:
+          unitenabled: '{{ dict(unit_enabled.stdout.splitlines() | map(''split'', ''='', 1)) }}'
+      - name: Boot policy observed
+        ansible.builtin.assert:
+          that:
+          - unitenabled.UnitFileState == "enabled"
+          - unitenabled.ActiveState == "active"
+          fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+      - name: Final native clock
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [("/usr/bin/date") | string, ("+%s") | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: end_clock
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+      - name: Aggregate native deadline
+        ansible.builtin.assert:
+          that:
+          - (end_clock.stdout | trim | int) - started < w.budgets.aggregate_seconds
+          fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+      - name: Completion observation
+        ansible.builtin.set_fact:
+          completion: '{{ {"attempt_id": h.attempt_id, "file": fileafter.stat, "header_uuid": w.header_uuid, "actual_swaps":
+            swapsafter, "usable_bytes": target_bytes - page_bytes, "boot_enabled": true, "lifetime": w.lifetime}
+            }}'
+      - name: Write immutable completion
+        ansible.builtin.copy:
+          dest: '{{ w.receipts }}/completion.json'
+          content: '{{ completion | to_json }}'
+          force: false
+          owner: root
+          group: root
+          mode: '0600'
+        when: not rec.records.completion is defined
+      - name: Durably readback completion
+        ansible.builtin.command:
+          argv:
+          - '{{ h.tools.python3 }}'
+          - -c
+          - '{{ run_code }}'
+          - run
+          - '{{ w.budgets.preflight_seconds }}'
+          - '{{ w.budgets.maximum_output_bytes }}'
+          - '{{ [(h.tools.python3) | string, ("-c") | string, (seal_code) | string, ("seal") | string, ("" ~ (w.receipts)
+            ~ "/completion.json") | string, (w.budgets.maximum_record_bytes) | string] | to_json }}'
+          - '{{ started + w.budgets.aggregate_seconds if started is defined else 0 }}'
+        register: sealed_completion
+        changed_when: false
+        check_mode: false
+        environment:
+          LC_ALL: C
+        when: not rec.records.completion is defined
+      - name: Match sealed completion
+        ansible.builtin.assert:
+          that:
+          - sealed_completion.stdout | from_json == completion
+          fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+        when: not rec.records.completion is defined

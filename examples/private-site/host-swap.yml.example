@@ -1,0 +1,86 @@
+# Private declaration; fill every null from accepted native evidence.
+qcl_host_storage:
+  apply: false
+  preflight_only: false
+  attempt_id: null
+  original_receipt: null
+  accepted_source: null
+  host_id: null
+  boot_id: null
+  admission:
+    fresh: false
+    exclusive: false
+    receipt: null
+    operation_owner: null
+    expires_at_epoch: null
+  tools:
+    python3: null
+    dd: null
+    mkswap: null
+    swapon: null
+    blkid: null
+    timeout: null
+    systemctl: null
+    systemd_escape: null
+    findmnt: null
+    realpath: null
+    lvs: null
+    df: null
+    getconf: null
+  swap:
+    enabled: false
+    path: null
+    parent: null
+    unit: null
+    target_mib: null
+    authorized_cap_mib: null
+    header_uuid: null
+    known_header_uuids: []
+    lifetime: protected-host-infrastructure
+    receipts: null
+    binding_sha256: null
+    mount:
+      accepted: false
+      cutover_receipt: null
+      path: null
+      unit: null
+      device: null
+      rdev: null
+      fs_uuid: null
+      lv_uuid: null
+      vg_uuid: null
+      pool_uuid: null
+    support:
+      fresh: false
+      receipt: null
+      page_bytes: null
+      minimum_file_pages: null
+      maximum_file_pages: null
+      direct: false
+      fiemap: false
+      ext4: false
+      swapon_json: false
+      systemd_version: null
+    ledger:
+      fresh: false
+      receipt: null
+      expires_at_epoch: null
+      incremental_swap_bytes: null
+      protected_data_growth_bytes: null
+      data_reserve_bytes: null
+      data_overhead_bytes: null
+      metadata_growth_bytes: null
+      metadata_reserve_bytes: null
+      filesystem_growth_bytes: null
+      filesystem_reserve_bytes: null
+    budgets:
+      preflight_seconds: null
+      allocation_seconds: null
+      activation_seconds: null
+      aggregate_seconds: null
+      maximum_write_bytes: null
+      maximum_extents: null
+      maximum_probe_bytes: null
+      maximum_record_bytes: null
+      maximum_output_bytes: null
+      maximum_swap_rows: null

@@ -1,0 +1,11 @@
+[Unit]
+Description=Protected additive host swap
+RequiresMountsFor={{ w.mount.path }}
+ConditionPathIsMountPoint={{ w.mount.path }}
+
+[Swap]
+What={{ w.path }}
+TimeoutSec={{ w.budgets.activation_seconds }}
+
+[Install]
+WantedBy=swap.target
