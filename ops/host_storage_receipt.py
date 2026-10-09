@@ -86,7 +86,7 @@ def inspect(path, identity, max_bytes):
 def atomic(path, value, maximum):
     path = owned_parent(path)
     raw = encode(value, maximum)
-    if path.exists(): read(path, maximum)  # never replace an unowned/symlink record
+    if os.path.lexists(path): read(path, maximum)  # never replace an unowned/symlink record
     directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     fd, temporary = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
     try:

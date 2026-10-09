@@ -252,6 +252,12 @@ def run_playbook(tmp_path, monkeypatch, scenario):
             saved = r.transition(receipt,rid,phase,{},65536,digest,intended_tree="new_final" if phase=="reopening_intent" else None)
             digest=saved["sha256"]
             if scenario=="active-incomplete-resume" and phase=="final_activation_intent": break
+    if scenario in ("active-incomplete-resume", "complete-resume"):
+        for name in ("receipt", "manifest"):
+            dest = receipt.parent / ("host_storage_"+name+".py")
+            dest.write_bytes((BASE/"ops"/dest.name).read_bytes()); dest.chmod(0o600)
+    helper_before = {str(p): (p.stat().st_ino, p.stat().st_mtime_ns, hashlib.sha256(p.read_bytes()).hexdigest()) for p in receipt.parent.glob("host_storage_*.py")}
+    state["helper_before"] = helper_before
     state_file = tmp_path / "recording.json"; state_file.write_text(json.dumps(state))
     original = TaskExecutor._get_action_handler_with_module_context
     def escaped(*a, **kw): raise AssertionError("Native command escaped cutover recording boundary")
@@ -325,7 +331,7 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                     argv = argv[2:] if argv[0] == "/usr/bin/timeout" else argv
                     assert argv[1:8] == ["-aHAXS", "--numeric-ids", "--one-file-system", "--ignore-times", "--modify-window=-1", "--whole-file", "--"]
                     assert "--delete" not in argv and "--inplace" not in argv
-                    record("copy")
+                    record("retained-copy")
                     if scenario == "copy-timeout":
                         out.update(failed=True, rc=124, stderr="own copy deadline")
                     shutil.copytree(source, stage, dirs_exist_ok=True, symlinks=True)
@@ -342,12 +348,13 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                     record("restore"); source.rmdir(); os.rename(tmp_path / "original", source); s["renamed"] = False
                 elif name.startswith("Observe") or name.startswith("Read") or name.startswith("Verify") or name.startswith("Sync") or name.startswith("Reconcile"):
                     # Independent native-shaped observations, not a second phase machine.
+                    observation_request = json.loads(args.get("stdin", "{}"))
                     out["stdout"] = json.dumps({"host_id": "fixture-host", "boot_id": "fixture-boot", "now": 100,
                         "digest": s["digest"], "storage": dict(cfg["cutover"]["storage"]["stanza"], **({"disable": "1"} if s["disabled"] else {}), **({"is_mountpoint":s["offline_raw"]} if s["offline_raw"] is not None else {})),
-                        "foreign": s["foreign"], "complete": True, "refs": [], "aliases": ["source-bind"] if scenario == "relevant-alias" else [], "old_loop": scenario == "old-loop",
+                        "foreign": s["foreign"], "receipt_present": receipt.exists(), "helpers_verified": True, "complete": True, "refs": [], "aliases": ["source-bind"] if scenario == "relevant-alias" else [], "old_loop": scenario == "old-loop",
                         "workers": [], "workers_relevant": ["cached-native-worker"] if scenario == "cached-worker" else [], "data_used_bytes": "not_measured" if scenario == "unknown-data" else 1048576, "metadata_used_bytes": 65536,
                         "healthy": True, "stage_active": s["stage_active"], "final_active": s["final_active"], "fs_uuid": "wrong" if scenario == "wrong-uuid-unit" else UUID,
-                        "device": "/dev/dm-0", "rdev": 254 if scenario == "wrong-rdev-unit" else 253, "mountpoint_dev": source.stat().st_dev, "mountpoint_ino": source.stat().st_ino, "Where": "/wrong" if scenario == "wrong-where-unit" else task_vars.get("guard_path", str(source)), "Type": "xfs" if scenario == "wrong-type-unit" else "ext4", "ActiveState": "active" if (s["stage_active"] if task_vars.get("guard_stage") else s["final_active"]) else "inactive", "UnitFileState": "static" if task_vars.get("guard_stage") else "enabled" if s["unit_enabled"] else "disabled", "stage_policy": "static", "source_renamed": s["renamed"],
+                        "device": "/dev/dm-0", "rdev": 254 if scenario == "wrong-rdev-unit" else 253, "mountpoint_dev": source.stat().st_dev, "mountpoint_ino": source.stat().st_ino, "Where": "/wrong" if scenario == "wrong-where-unit" else observation_request.get("path", str(source)), "Type": "xfs" if scenario == "wrong-type-unit" else "ext4", "ActiveState": "active" if (s["stage_active"] if observation_request.get("stage", False) else s["final_active"]) else "inactive", "UnitFileState": "static" if observation_request.get("stage", False) else "enabled" if s["unit_enabled"] else "disabled", "stage_policy": "static", "source_renamed": s["renamed"],
                         "ForceUnmount": "yes" if scenario == "force-unit" else "no", "LazyUnmount": "yes" if scenario == "lazy-unit" else "no", "DropInPaths": "foreign.conf" if scenario == "dropin-unit" else "", "NeedDaemonReload": "yes" if scenario == "reload-unit" else "no",
                         "Options": "nosuid,rw,relatime,nodev,data=ordered" + (",ro" if scenario == "ro-unit" else ",unknown-option" if scenario == "unknown-options" else ""), "fragment_exact": scenario != "unsafe-unit",
                         "seed_sha256": hashlib.sha256(b"AAAA").hexdigest(), "is_mountpoint_raw": s["offline_raw"], "mountpoint_guard": str(source) if s["offline_raw"] in ("1","yes",str(source)) else None, "storage_disabled": s["disabled"], "original_disabled": cfg["cutover"]["storage"]["stanza"].get("disable") in (1,"1","yes",True),
@@ -362,7 +369,13 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                 if args.get("name") == "fixture-source.mount" and args.get("state") == "started": s["final_active"] = True
                 if args.get("name") == "fixture-source.mount" and args.get("state") == "stopped": s["final_active"] = False
             elif self._task.action in ("ansible.builtin.template", "ansible.builtin.copy", "ansible.builtin.file"):
-                record(self._task.action.split(".")[-1])
+                if self._task.action == "ansible.builtin.copy" and "src" in args:
+                    record("helper-declare:" + Path(args["src"]).stem)
+                    destination = Path(args["dest"])
+                    content = (BASE/"ansible"/args["src"]).read_bytes()
+                    if not destination.exists() or destination.read_bytes() != content or stat.S_IMODE(destination.stat().st_mode) != 0o600:
+                        destination.write_bytes(content); destination.chmod(0o600); out["changed"] = True
+                else: record(self._task.action.split(".")[-1])
                 if self._task.action == "ansible.builtin.template":
                     from ansible.utils.tags import TrustedAsTemplate
                     text = self._templar.template(TrustedAsTemplate().tag((BASE / "ansible" / args["src"]).read_text()))
@@ -380,13 +393,16 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                           loader=executor._loader, templar=Templar._from_template_engine(templar), shared_loader_obj=executor._shared_loader_obj), None
     monkeypatch.setattr(TaskExecutor, "_get_action_handler_with_module_context", handler)
     context.CLIARGS = ImmutableDict(connection="local", forks=1, become=False, check=scenario == "check", diff=False, verbosity=0, syntax=False, start_at_task=None, tags=[], skip_tags=[])
+    # Actual core caches CLI magic vars globally: reset for this independent CLI simulation.
+    from ansible.utils.vars import load_options_vars
+    monkeypatch.setattr(load_options_vars, "options_vars", None, raising=False)
     loader = DataLoader(); loader.set_basedir(str(BASE / "ansible"))
     inventory = InventoryManager(loader=loader, sources="proxmox_hypervisors,")
     vm = VariableManager(loader=loader, inventory=inventory)
     path = BASE / "ansible/proxmox-storage-cutover.yml"
     data = yaml.safe_load(path.read_text()) if path.exists() else [{"hosts": "proxmox_hypervisors", "gather_facts": False, "tasks": []}]
     data[0]["become"] = False
-    data[0]["vars"] = dict(data[0].get("vars", {}), qcl_host_storage=cfg)
+    data[0]["vars"] = dict(data[0].get("vars", {}), qcl_host_storage=cfg, cutover_helper_sha256={kind:hashlib.sha256((BASE/"ops"/("host_storage_"+kind+".py")).read_bytes()).hexdigest() for kind in ("receipt","manifest")})
     play = tmp_path / "play.yml"; play.write_text(yaml.safe_dump(data, sort_keys=False))
     (tmp_path / "tasks").symlink_to(BASE / "ansible/tasks", target_is_directory=True)
     (tmp_path / "templates").symlink_to(BASE / "ansible/templates", target_is_directory=True)
@@ -399,13 +415,13 @@ def test_actual_cutover_yaml_and_sticky_cas_boundary(tmp_path, monkeypatch, scen
     rc, state, path, source, stage = run_playbook(tmp_path, monkeypatch, scenario)
     trace = state["trace"]
     if scenario not in ("success", "native-offline-yes", "native-offline-path", "completion-failure", "unknown-cas", "intent-fsync-failure", "intent-dir-fsync-failure", "copy-timeout", "copy-mismatch"):
-        assert "copy" not in trace and "rename" not in trace and "CAS:reopen" not in trace
+        assert "retained-copy" not in trace and "rename" not in trace and "CAS:reopen" not in trace
         assert (source / "disk.raw").read_bytes() == b"AAAA"
         assert ("CAS:disable" not in trace) if scenario in ("disabled", "check", "bad-input") else True
         assert (rc == 0) if scenario in ("disabled", "check") else rc != 0
         return
     if scenario in ("copy-timeout", "copy-mismatch"):
-        assert rc != 0 and "copy" in trace and "rename" not in trace and "CAS:reopen" not in trace
+        assert rc != 0 and "retained-copy" in trace and "rename" not in trace and "CAS:reopen" not in trace
         assert state["disabled"] and (source / "disk.raw").read_bytes() == b"AAAA"
         return
     if scenario in ("intent-fsync-failure", "intent-dir-fsync-failure"):
@@ -413,7 +429,7 @@ def test_actual_cutover_yaml_and_sticky_cas_boundary(tmp_path, monkeypatch, scen
         assert "rename" not in trace and "CAS:reopen" not in trace
         assert (source / "disk.raw").read_bytes() == b"AAAA" and state["disabled"]
         return
-    required = ["receipt:gate_disable_intent", "CAS:disable", "receipt:gate_disabled", "receipt:copy_started", "copy", "receipt:copy_verified", "receipt:rename_intent", "rename", "receipt:source_renamed", "receipt:final_activation_intent", "systemd:started", "receipt:final_verified", "CAS:offline", "receipt:reopening_intent", "CAS:reopen"]
+    required = ["receipt:gate_disable_intent", "CAS:disable", "receipt:gate_disabled", "receipt:copy_started", "retained-copy", "receipt:copy_verified", "receipt:rename_intent", "rename", "receipt:source_renamed", "receipt:final_activation_intent", "systemd:started", "receipt:final_verified", "CAS:offline", "receipt:reopening_intent", "CAS:reopen"]
     position = [trace.index(x) for x in required]
     assert position == sorted(position), "missing cutover durable intent/native/observed order"
     assert state["foreign"] == {"foreign-block": {"type": "lvmthin", "vgname": "fixture"}}
@@ -429,7 +445,7 @@ def test_actual_cutover_yaml_and_sticky_cas_boundary(tmp_path, monkeypatch, scen
         assert rc != 0 and state["receipt_reads"] >= 2
         assert record["phase"] in ("reopening_intent", "reconcile_required")
         after = trace[trace.index("CAS:reopen")+1:]
-        assert not any(x in after for x in ("copy", "rename", "CAS:disable", "CAS:reopen", "systemd:started", "systemd:stopped"))
+        assert not any(x in after for x in ("retained-copy", "rename", "CAS:disable", "CAS:reopen", "systemd:started", "systemd:stopped"))
 
 
 def test_all_embedded_native_python_and_playbook_are_parseable():
@@ -498,6 +514,40 @@ def test_actual_pre_marker_restore_has_its_own_sticky_boundary(tmp_path, monkeyp
 def test_existing_exact_final_is_never_restarted_or_stage_aliased(tmp_path, monkeypatch, scenario):
     rc, state, path, source, stage = run_playbook(tmp_path,monkeypatch,scenario)
     assert state["final_active"] and not state["stage_active"]
-    assert not any(item in state["trace"] for item in ("copy","rename","restore","CAS:disable","CAS:reopen","systemd:started","systemd:stopped","template"))
+    assert not any(item in state["trace"] for item in ("retained-copy","rename","restore","CAS:disable","CAS:reopen","systemd:started","systemd:stopped","template"))
     assert (source.parent / "original" / "disk.raw").read_bytes()==b"AAAA"
     assert rc==0 if scenario=="complete-resume" else rc!=0
+
+
+@pytest.mark.parametrize("operation", ["persist_manifest", "transition"])
+def test_repair_broken_symlink_record_is_never_replaced(tmp_path, operation):
+    r = helper("receipt")
+    path = receipt_dir(tmp_path)
+    missing = path.parent / "absent.json"
+    path.symlink_to(missing)
+    before = path.lstat()
+    with pytest.raises((ValueError,OSError)):
+        if operation == "persist_manifest": r.persist_manifest(path, {"fixture":True},65536)
+        else: r.transition(path,identity(),"admitted",{},65536)
+    assert path.is_symlink() and path.lstat().st_ino==before.st_ino
+    assert os.readlink(path)==str(missing) and not missing.exists()
+
+
+@pytest.mark.parametrize("scenario", ["active-incomplete-resume", "complete-resume"])
+def test_repair_existing_receipt_has_no_helper_declaration_or_write(tmp_path,monkeypatch,scenario):
+    rc,state,path,source,stage=run_playbook(tmp_path,monkeypatch,scenario)
+    assert not any(item.startswith("helper-declare:") for item in state["trace"])
+    after={str(p):(p.stat().st_ino,p.stat().st_mtime_ns,hashlib.sha256(p.read_bytes()).hexdigest()) for p in path.parent.glob("host_storage_*.py")}
+    assert after=={k:tuple(v) for k,v in state["helper_before"].items()}
+    assert not any(item in state["trace"] for item in ("retained-copy","rename","restore","CAS:disable","CAS:reopen","systemd:started","systemd:stopped","template"))
+    assert rc==0 if scenario=="complete-resume" else rc!=0
+
+
+def test_repair_check_after_warm_noncheck_cli_has_no_native_or_helper_write(tmp_path,monkeypatch):
+    warm=tmp_path/"warm";warm.mkdir()
+    run_playbook(warm,monkeypatch,"disabled")
+    cold=tmp_path/"check";cold.mkdir()
+    rc,state,path,source,stage=run_playbook(cold,monkeypatch,"check")
+    assert rc==0 and state["trace"]==[]
+    assert not path.exists() and list(path.parent.glob("host_storage_*.py"))==[]
+    assert (source/"disk.raw").read_bytes()==b"AAAA" and not state["renamed"]

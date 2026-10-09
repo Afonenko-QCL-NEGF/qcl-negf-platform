@@ -74,16 +74,23 @@
       \ and stat.S_IMODE(protected.st_mode)==0o700 and protected.st_dev==parent.st_dev and receipt.parent!=pathlib.Path('/etc/pve'),'stable\
       \ protected rootFS receipt directory')\nfor p in (source,rollback,stage):need(receipt.parent!=p and p not\
       \ in receipt.parent.parents and receipt.parent not in p.parents,'receipt overlaps copy/wipe footprint')\n\
-      # Independent per-namespace physical footprint observations; unrelated PrivateTmp passes.\nnamespaces={};refs=[];inodes=set();count=0\n\
-      pending=[original]\nwhile pending:\n p=pending.pop();info=p.lstat();inodes.add((info.st_dev,info.st_ino));count+=1;need(count<=c['limits']['entries'],'reference\
+      # Existing records are inspected through already trusted immutable helper bytes;\n# never redeclare/overwrite\
+      \ helpers on a completed or interrupted attempt.\nreceipt_present=os.path.lexists(receipt)\nif receipt_present:bounded_file(receipt,c['receipt']['max_bytes'])\n\
+      for kind in ('receipt','manifest'):\n helper=pathlib.Path(c['receipt'][kind+'_helper'])\n need(helper.parent==receipt.parent\
+      \ and helper not in (receipt,pathlib.Path(c['receipt']['manifest_path'])),'helper path identity')\n if os.path.lexists(helper):\n\
+      \  info=helper.lstat();need(stat.S_ISREG(info.st_mode) and info.st_uid==0 and info.st_nlink==1 and stat.S_IMODE(info.st_mode)==0o600,'unowned\
+      \ helper')\n  raw=bounded_file(helper,c['limits']['output_bytes'])\n  need(hashlib.sha256(raw).hexdigest()==r['helper_sha256'][kind],'helper\
+      \ bytes differ; no overwrite')\n else:need(not receipt_present,'missing helper for existing receipt; no deployment\
+      \ on resume')\n# Independent per-namespace physical footprint observations; unrelated PrivateTmp passes.\n\
+      namespaces={};refs=[];inodes=set();count=0\npending=[original]\nwhile pending:\n p=pending.pop();info=p.lstat();inodes.add((info.st_dev,info.st_ino));count+=1;need(count<=c['limits']['entries'],'reference\
       \ topology cap')\n if stat.S_ISDIR(info.st_mode):\n  with os.scandir(p) as children:\n   for child in children:\n\
       \    pending.append(pathlib.Path(child.path));need(count+len(pending)<=c['limits']['entries'],'reference enumeration\
       \ cap')\n need(time.monotonic()-start<c['limits']['action_seconds'],'reference deadline')\nsource_root='/'+str(original).lstrip('/')\n\
-      read_only_resume=r['observe_only'] or (r['initial'] and os.path.exists(receipt))\nif read_only_resume and\
-      \ os.path.exists(receipt):\n prior=json.loads(bounded_file(receipt,c['receipt']['max_bytes']))\n need(prior.get('identity',{}).get('attempt_id')==h['attempt_id']\
-      \ and prior.get('identity',{}).get('fs_uuid')==c['final']['fs_uuid'],'untrusted existing receipt identity')\n\
-      for pid in os.listdir('/proc'):\n if not pid.isdigit() or int(pid)==os.getpid():continue\n proc='/proc/'+pid\n\
-      \ try:\n  ns=os.stat(proc+'/ns/mnt').st_ino;namespaces.setdefault(ns,pid)\n  candidates=[proc+'/cwd',proc+'/root']+[proc+'/fd/'+f\
+      receipt_present=os.path.lexists(receipt)\nread_only_resume=r['observe_only'] or (r['initial'] and receipt_present)\n\
+      if read_only_resume and receipt_present:\n prior=json.loads(bounded_file(receipt,c['receipt']['max_bytes']))\n\
+      \ need(prior.get('identity',{}).get('attempt_id')==h['attempt_id'] and prior.get('identity',{}).get('fs_uuid')==c['final']['fs_uuid'],'untrusted\
+      \ existing receipt identity')\nfor pid in os.listdir('/proc'):\n if not pid.isdigit() or int(pid)==os.getpid():continue\n\
+      \ proc='/proc/'+pid\n try:\n  ns=os.stat(proc+'/ns/mnt').st_ino;namespaces.setdefault(ns,pid)\n  candidates=[proc+'/cwd',proc+'/root']+[proc+'/fd/'+f\
       \ for f in os.listdir(proc+'/fd')]+[proc+'/map_files/'+f for f in os.listdir(proc+'/map_files')]\n  for p\
       \ in candidates:\n   info=os.stat(p);target=os.readlink(p).removesuffix(' (deleted)')\n   if (info.st_dev,info.st_ino)\
       \ in inodes or target==str(original) or target.startswith(str(original)+'/') or (stat.S_ISREG(info.st_mode)\
@@ -121,9 +128,14 @@
       \ and s.st_size<=c['limits']['hash_bytes'],'seed hash cap')\n  digest=hashlib.sha256()\n  while True:\n  \
       \ chunk=os.read(fd,1048576)\n   if not chunk:break\n   digest.update(chunk)\n  need(os.fstat(fd).st_size==s.st_size\
       \ and os.fstat(fd).st_mtime_ns==s.st_mtime_ns,'seed changed')\n finally:os.close(fd)\n need(digest.hexdigest()==c['preconditions']['seed_sha256'],'protected\
-      \ new seed changed')\nresult={'host_id':host,'boot_id':boot,'now':now,'digest':storage['digest'],'storage':selected,'foreign':foreign,'complete':True,'refs':refs,'aliases':aliases,'workers':workers,'workers_relevant':[x\
+      \ new seed changed')\nresult={'receipt_present':receipt_present,'helpers_verified':True,'host_id':host,'boot_id':boot,'now':now,'digest':storage['digest'],'storage':selected,'foreign':foreign,'complete':True,'refs':refs,'aliases':aliases,'workers':workers,'workers_relevant':[x\
       \ for x in workers if x['upid'] not in window['foreign_upids']],'old_loop':False,'data_used_bytes':data_used,'metadata_used_bytes':meta_used,'healthy':True,'stage_active':stage_active,'final_active':final_active,'fs_uuid':c['final']['fs_uuid'],'device':os.path.realpath(c['final']['device']),'rdev':device.st_rdev,'mountpoint_dev':source.lstat().st_dev,'mountpoint_ino':source.lstat().st_ino,'source_renamed':renamed,'seed_sha256':c['preconditions']['seed_sha256'],'is_mountpoint_raw':selected.get('is_mountpoint'),'mountpoint_guard':storage['selected_mountpoint'],'storage_disabled':bool(storage['selected_disabled']),'original_disabled':bool(storage['original_disabled'])}\n\
       out=json.dumps(result);need(len(out.encode())<=cap,'observation output cap');print(out)"
+    cutover_helper_sha256:
+      receipt: '{{ lookup(''file'', playbook_dir ~ ''/../ops/host_storage_receipt.py'', rstrip=false) | hash(''sha256'')
+        }}'
+      manifest: '{{ lookup(''file'', playbook_dir ~ ''/../ops/host_storage_manifest.py'', rstrip=false) | hash(''sha256'')
+        }}'
   tasks:
   - name: Strict cutover defaults
     ansible.builtin.assert:
@@ -303,32 +315,35 @@
           - '{{ h.tools.python }}'
           - -c
           - '{{ cutover_native_probe }}'
-          stdin: '{{ {''h'': h, ''observe_only'':false, ''initial'':true} | to_json }}'
+          stdin: '{{ {''h'': h, ''helper_sha256'': cutover_helper_sha256, ''observe_only'':false, ''initial'':true}
+            | to_json }}'
         changed_when: false
         check_mode: false
-        register: live
+        register: admission_live
       - name: Match initial fixed native identity and selected digest
         ansible.builtin.assert:
           that:
-          - (live.stdout | from_json).host_id == h.host_id
-          - (live.stdout | from_json).boot_id == h.boot_id
-          - (live.stdout | from_json).complete is sameas true
-          - (live.stdout | from_json).refs | length == 0
-          - (live.stdout | from_json).aliases | length == 0
-          - (live.stdout | from_json).healthy is sameas true
-          - (live.stdout | from_json).workers_relevant | length == 0
-          - (live.stdout | from_json).data_used_bytes is integer
-          - (live.stdout | from_json).data_used_bytes is not boolean
-          - (live.stdout | from_json).metadata_used_bytes is integer
-          - (live.stdout | from_json).metadata_used_bytes is not boolean
-          - (live.stdout | from_json).data_used_bytes >= 0
-          - (live.stdout | from_json).metadata_used_bytes >= 0
-          - (live.stdout | from_json).data_used_bytes + c.capacity.growth_bytes + c.capacity.image_envelope_bytes
+          - (admission_live.stdout | from_json).host_id == h.host_id
+          - (admission_live.stdout | from_json).boot_id == h.boot_id
+          - (admission_live.stdout | from_json).complete is sameas true
+          - (admission_live.stdout | from_json).refs | length == 0
+          - (admission_live.stdout | from_json).aliases | length == 0
+          - (admission_live.stdout | from_json).healthy is sameas true
+          - (admission_live.stdout | from_json).workers_relevant | length == 0
+          - (admission_live.stdout | from_json).data_used_bytes is integer
+          - (admission_live.stdout | from_json).data_used_bytes is not boolean
+          - (admission_live.stdout | from_json).metadata_used_bytes is integer
+          - (admission_live.stdout | from_json).metadata_used_bytes is not boolean
+          - (admission_live.stdout | from_json).data_used_bytes >= 0
+          - (admission_live.stdout | from_json).metadata_used_bytes >= 0
+          - (admission_live.stdout | from_json).data_used_bytes + c.capacity.growth_bytes + c.capacity.image_envelope_bytes
             + c.capacity.data_reserve_bytes <= c.capacity.data_bytes
-          - (live.stdout | from_json).metadata_used_bytes + c.capacity.metadata_growth_bytes + c.capacity.metadata_reserve_bytes
+          - (admission_live.stdout | from_json).metadata_used_bytes + c.capacity.metadata_growth_bytes + c.capacity.metadata_reserve_bytes
             <= c.capacity.metadata_bytes
-          - not (live.stdout | from_json).old_loop
-          - (live.stdout | from_json).foreign == c.storage.foreign
+          - not (admission_live.stdout | from_json).old_loop
+          - (admission_live.stdout | from_json).foreign == c.storage.foreign
+          - (admission_live.stdout | from_json).receipt_present is boolean
+          - (admission_live.stdout | from_json).helpers_verified is sameas true
           fail_msg: 'Cutover refusal: incomplete/stale/ambiguous admission; preserve original, partial copy and
             host receipt.'
       - name: Declare bounded receipt IO helper
@@ -338,6 +353,7 @@
           owner: root
           group: root
           mode: '0600'
+        when: (admission_live.stdout | from_json).receipt_present is sameas false
       - name: Declare bounded read-only manifest helper
         ansible.builtin.copy:
           src: ../ops/host_storage_manifest.py
@@ -345,6 +361,7 @@
           owner: root
           group: root
           mode: '0600'
+        when: (admission_live.stdout | from_json).receipt_present is sameas false
       - name: Read authoritative host receipt
         ansible.builtin.command:
           argv:
@@ -358,6 +375,9 @@
       - name: Use newly inspected host phase
         ansible.builtin.set_fact:
           receipt_current: '{{ receipt_probe.stdout | from_json }}'
+      - name: Choose fresh or existing branch once from inspected host receipt
+        ansible.builtin.set_fact:
+          fresh_cutover_branch: '{{ receipt_current.record is none }}'
       - name: No blind restart of incomplete or reopened attempt
         ansible.builtin.assert:
           that:
@@ -382,16 +402,17 @@
             - '{{ h.tools.python }}'
             - -c
             - '{{ cutover_native_probe }}'
-            stdin: '{{ {''h'': h, ''observe_only'':true, ''initial'':false} | to_json }}'
+            stdin: '{{ {''h'': h, ''helper_sha256'': cutover_helper_sha256, ''observe_only'':true, ''initial'':false}
+              | to_json }}'
           changed_when: false
           check_mode: false
-          register: live
+          register: completed_live
         - name: Completed resume is fixed current state only
           ansible.builtin.assert:
             that:
-            - (live.stdout | from_json).final_active is sameas true
-            - not (live.stdout | from_json).stage_active
-            - (live.stdout | from_json).mountpoint_guard == c.storage.path
+            - (completed_live.stdout | from_json).final_active is sameas true
+            - not (completed_live.stdout | from_json).stage_active
+            - (completed_live.stdout | from_json).mountpoint_guard == c.storage.path
             - receipt_current.record.reopening.intended_tree == 'new_final'
             - (mount_guard.stdout | from_json).UnitFileState == 'enabled'
             fail_msg: 'Cutover refusal: incomplete/stale/ambiguous admission; preserve original, partial copy and
@@ -399,9 +420,9 @@
         - name: Completed retained original observation
           ansible.builtin.debug:
             msg: Already-complete host receipt; no CAS/copy/rename/restart/remount or historical manifest comparison.
-        when: receipt_current.record is not none
+        when: not fresh_cutover_branch
       - name: One fresh cutover attempt
-        when: receipt_current.record is none
+        when: fresh_cutover_branch
         block:
         - name: Mark one newly admitted fresh mutation attempt
           ansible.builtin.set_fact:
@@ -409,10 +430,10 @@
         - name: Initial source remains original and gate is exact
           ansible.builtin.assert:
             that:
-            - (live.stdout | from_json).digest == c.storage.digest
-            - (live.stdout | from_json).storage == c.storage.stanza
-            - not (live.stdout | from_json).source_renamed
-            - not (live.stdout | from_json).final_active
+            - (admission_live.stdout | from_json).digest == c.storage.digest
+            - (admission_live.stdout | from_json).storage == c.storage.stanza
+            - not (admission_live.stdout | from_json).source_renamed
+            - not (admission_live.stdout | from_json).final_active
             fail_msg: 'Cutover refusal: incomplete/stale/ambiguous admission; preserve original, partial copy and
               host receipt.'
         - name: Repeat exact stage loaded mount guard
@@ -487,7 +508,8 @@
             - '{{ h.tools.python }}'
             - -c
             - '{{ cutover_native_probe }}'
-            stdin: '{{ {''h'': h, ''observe_only'':false, ''initial'':false} | to_json }}'
+            stdin: '{{ {''h'': h, ''helper_sha256'': cutover_helper_sha256, ''observe_only'':false, ''initial'':false}
+              | to_json }}'
           changed_when: false
           check_mode: false
           register: live
@@ -537,7 +559,8 @@
             - '{{ h.tools.python }}'
             - -c
             - '{{ cutover_native_probe }}'
-            stdin: '{{ {''h'': h, ''observe_only'':false, ''initial'':false} | to_json }}'
+            stdin: '{{ {''h'': h, ''helper_sha256'': cutover_helper_sha256, ''observe_only'':false, ''initial'':false}
+              | to_json }}'
           changed_when: false
           check_mode: false
           register: live
@@ -712,7 +735,8 @@
             - '{{ h.tools.python }}'
             - -c
             - '{{ cutover_native_probe }}'
-            stdin: '{{ {''h'': h, ''observe_only'':false, ''initial'':false} | to_json }}'
+            stdin: '{{ {''h'': h, ''helper_sha256'': cutover_helper_sha256, ''observe_only'':false, ''initial'':false}
+              | to_json }}'
           changed_when: false
           check_mode: false
           register: live
@@ -760,7 +784,8 @@
             - '{{ h.tools.python }}'
             - -c
             - '{{ cutover_native_probe }}'
-            stdin: '{{ {''h'': h, ''observe_only'':false, ''initial'':false} | to_json }}'
+            stdin: '{{ {''h'': h, ''helper_sha256'': cutover_helper_sha256, ''observe_only'':false, ''initial'':false}
+              | to_json }}'
           changed_when: false
           check_mode: false
           register: live
@@ -832,7 +857,8 @@
             - '{{ h.tools.python }}'
             - -c
             - '{{ cutover_native_probe }}'
-            stdin: '{{ {''h'': h, ''observe_only'':false, ''initial'':false} | to_json }}'
+            stdin: '{{ {''h'': h, ''helper_sha256'': cutover_helper_sha256, ''observe_only'':false, ''initial'':false}
+              | to_json }}'
           changed_when: false
           check_mode: false
           register: live
@@ -873,7 +899,8 @@
             - '{{ h.tools.python }}'
             - -c
             - '{{ cutover_native_probe }}'
-            stdin: '{{ {''h'': h, ''observe_only'':false, ''initial'':false} | to_json }}'
+            stdin: '{{ {''h'': h, ''helper_sha256'': cutover_helper_sha256, ''observe_only'':false, ''initial'':false}
+              | to_json }}'
           changed_when: false
           check_mode: false
           register: live
@@ -898,7 +925,8 @@
             - '{{ h.tools.python }}'
             - -c
             - '{{ cutover_native_probe }}'
-            stdin: '{{ {''h'': h, ''observe_only'':false, ''initial'':false} | to_json }}'
+            stdin: '{{ {''h'': h, ''helper_sha256'': cutover_helper_sha256, ''observe_only'':false, ''initial'':false}
+              | to_json }}'
           changed_when: false
           check_mode: false
           register: live
@@ -943,7 +971,8 @@
             - '{{ h.tools.python }}'
             - -c
             - '{{ cutover_native_probe }}'
-            stdin: '{{ {''h'': h, ''observe_only'':false, ''initial'':false} | to_json }}'
+            stdin: '{{ {''h'': h, ''helper_sha256'': cutover_helper_sha256, ''observe_only'':false, ''initial'':false}
+              | to_json }}'
           changed_when: false
           check_mode: false
           register: live
@@ -1037,7 +1066,8 @@
             - '{{ h.tools.python }}'
             - -c
             - '{{ cutover_native_probe }}'
-            stdin: '{{ {''h'': h, ''observe_only'':false, ''initial'':false} | to_json }}'
+            stdin: '{{ {''h'': h, ''helper_sha256'': cutover_helper_sha256, ''observe_only'':false, ''initial'':false}
+              | to_json }}'
           changed_when: false
           check_mode: false
           register: live
@@ -1078,7 +1108,8 @@
             - '{{ h.tools.python }}'
             - -c
             - '{{ cutover_native_probe }}'
-            stdin: '{{ {''h'': h, ''observe_only'':true, ''initial'':false} | to_json }}'
+            stdin: '{{ {''h'': h, ''helper_sha256'': cutover_helper_sha256, ''observe_only'':true, ''initial'':false}
+              | to_json }}'
           changed_when: false
           check_mode: false
           register: live
@@ -1141,14 +1172,18 @@
           - '{{ h.tools.python }}'
           - -c
           - '{{ cutover_native_probe }}'
-          stdin: '{{ {''h'': h, ''observe_only'':true, ''initial'':false} | to_json }}'
+          stdin: '{{ {''h'': h, ''helper_sha256'': cutover_helper_sha256, ''observe_only'':true, ''initial'':false}
+            | to_json }}'
         changed_when: false
         check_mode: false
         register: live
+      - name: Choose pre-marker recovery once from newly reread host evidence
+        ansible.builtin.set_fact:
+          pre_marker_restore_permitted: '{{ fresh_attempt_started | default(false) and receipt_current.record is
+            not none and receipt_current.record.reopening is none and receipt_current.record.phase in [''source_renamed'',''final_activation_intent'',''final_verified'']
+            and (live.stdout | from_json).source_renamed }}'
       - name: Guarded original restoration only before sticky reopening boundary
-        when: fresh_attempt_started | default(false) and receipt_current.record is not none and receipt_current.record.reopening
-          is none and receipt_current.record.phase in ['source_renamed','final_activation_intent','final_verified']
-          and (live.stdout | from_json).source_renamed
+        when: pre_marker_restore_permitted
         block:
         - name: Independently held disabled gate allows pre-marker restoration only
           ansible.builtin.assert:
@@ -1196,7 +1231,8 @@
             - '{{ h.tools.python }}'
             - -c
             - '{{ cutover_native_probe }}'
-            stdin: '{{ {''h'': h, ''observe_only'':false, ''initial'':false} | to_json }}'
+            stdin: '{{ {''h'': h, ''helper_sha256'': cutover_helper_sha256, ''observe_only'':false, ''initial'':false}
+              | to_json }}'
           changed_when: false
           check_mode: false
           register: live
@@ -1285,7 +1321,8 @@
             - '{{ h.tools.python }}'
             - -c
             - '{{ cutover_native_probe }}'
-            stdin: '{{ {''h'': h, ''observe_only'':false, ''initial'':false} | to_json }}'
+            stdin: '{{ {''h'': h, ''helper_sha256'': cutover_helper_sha256, ''observe_only'':false, ''initial'':false}
+              | to_json }}'
           changed_when: false
           check_mode: false
           register: live
@@ -1303,7 +1340,8 @@
             - '{{ h.tools.python }}'
             - -c
             - '{{ cutover_native_probe }}'
-            stdin: '{{ {''h'': h, ''observe_only'':false, ''initial'':false} | to_json }}'
+            stdin: '{{ {''h'': h, ''helper_sha256'': cutover_helper_sha256, ''observe_only'':false, ''initial'':false}
+              | to_json }}'
           changed_when: false
           check_mode: false
           register: live
@@ -1359,7 +1397,8 @@
             - '{{ h.tools.python }}'
             - -c
             - '{{ cutover_native_probe }}'
-            stdin: '{{ {''h'': h, ''observe_only'':true, ''initial'':false} | to_json }}'
+            stdin: '{{ {''h'': h, ''helper_sha256'': cutover_helper_sha256, ''observe_only'':true, ''initial'':false}
+              | to_json }}'
           changed_when: false
           check_mode: false
           register: live
