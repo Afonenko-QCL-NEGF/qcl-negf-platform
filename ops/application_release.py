@@ -15,6 +15,12 @@ import pwd
 import re
 import shlex
 import subprocess
+import math
+import selectors
+import signal
+import time
+import uuid
+from datetime import datetime, timezone
 import tempfile
 from urllib.parse import urlsplit
 
@@ -28,9 +34,148 @@ TARGET = re.compile(r"(?:[a-z_][a-z0-9_-]*@)?[a-zA-Z0-9][a-zA-Z0-9.-]*\Z")
 NAR_HASH = re.compile(r"sha256-[A-Za-z0-9+/]{43}=\Z")
 
 
-def command(args):
-    """No shell for local commands; a failed command cannot publish readiness."""
-    return subprocess.run(args, check=True, text=True, capture_output=True).stdout
+class CommandOutput(str):
+    pass
+
+
+class CommandFailure(RuntimeError):
+    def __init__(self, record):
+        self.record = record
+        super().__init__("Command failed: " + record["failure"])
+
+
+def duration(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        raise ValueError(name + " must be finite and positive")
+    return value
+
+
+def output_bound(value):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("Output bound must be a positive integer")
+    return value
+
+
+def deadline_check(deadline):
+    if deadline is not None and time.monotonic() >= deadline:
+        raise CommandFailure({"failure": "deadline", "returncode": None, "elapsed_seconds": 0,
+                              "stdout": "", "stderr": "", "output_truncated": False,
+                              "cleanup_confirmed": True, "child_started": False})
+
+
+def group_cleanup_confirmed(group, end):
+    """Linux process evidence: zombies cannot execute or retain output pipes.
+
+    Signal submission alone is not confirmation. Unknown /proc visibility or a
+    live group member after the original cleanup reserve expires fails closed.
+    """
+    while time.monotonic() < end:
+        live = False
+        try:
+            for entry in Path("/proc").iterdir():
+                if time.monotonic() >= end:
+                    return False
+                if not entry.name.isdigit():
+                    continue
+                try:
+                    fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+                    if int(fields[2]) == group and fields[0] not in ("Z", "X"):
+                        live = True
+                        break
+                except (FileNotFoundError, ProcessLookupError):
+                    continue
+                except (PermissionError, ValueError, IndexError):
+                    return False
+        except OSError:
+            return False
+        if not live:
+            return True
+        time.sleep(min(.005, max(0, end - time.monotonic())))
+    return False
+
+
+def command(args, *, timeout_seconds=360.0, output_bytes=1048576,
+            deadline=None, cleanup_seconds=2.0, env=None):
+    """Bound only our local process group; killing SSH does not establish remote completion."""
+    duration(timeout_seconds, "Command timeout")
+    duration(cleanup_seconds, "Cleanup timeout")
+    output_bound(output_bytes)
+    if timeout_seconds <= cleanup_seconds:
+        raise ValueError("Command timeout must exceed cleanup reserve")
+    if deadline is not None:
+        duration(deadline, "Deadline")
+    start = time.monotonic()
+    end = min(start + timeout_seconds, deadline) if deadline is not None else start + timeout_seconds
+    record = {"failure": None, "returncode": None, "elapsed_seconds": 0,
+              "stdout": "", "stderr": "", "output_truncated": False,
+              "cleanup_confirmed": True, "child_started": False, "output_bytes": 0}
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    process = None
+    selector = selectors.DefaultSelector()
+    try:
+        if start >= end - cleanup_seconds:
+            record["failure"] = "deadline"
+        else:
+            try:
+                process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, shell=False, start_new_session=True, env=env)
+                record["child_started"] = True
+            except OSError:
+                record["failure"] = "spawn"
+        if process is not None:
+            for name in buffers:
+                pipe = getattr(process, name)
+                os.set_blocking(pipe.fileno(), False)
+                selector.register(pipe, selectors.EVENT_READ, name)
+            while selector.get_map() or process.poll() is None:
+                remaining = end - cleanup_seconds - time.monotonic()
+                if remaining <= 0:
+                    record["failure"] = "timeout"
+                    break
+                for key, _ in selector.select(min(.05, remaining)):
+                    chunk = os.read(key.fileobj.fileno(), min(4096, output_bytes - record["output_bytes"] + 1))
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    retained = min(len(chunk), output_bytes - record["output_bytes"])
+                    buffers[key.data].extend(chunk[:retained])
+                    record["output_bytes"] += retained
+                    if retained < len(chunk):
+                        record["failure"] = "output_limit"
+                        record["output_truncated"] = True
+                        break
+                if record["failure"]:
+                    break
+            record["returncode"] = process.poll()
+            if not record["failure"] and record["returncode"] != 0:
+                record["failure"] = "nonzero"
+    finally:
+        # Even a successful immediate parent may have left descendants behind.
+        if process is not None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=max(.001, end - time.monotonic()))
+                record["returncode"] = process.returncode
+                record["cleanup_confirmed"] = group_cleanup_confirmed(process.pid, end)
+                if not record["cleanup_confirmed"]:
+                    record["failure"] = "cleanup_unconfirmed"
+            except subprocess.TimeoutExpired:
+                record["cleanup_confirmed"] = False
+                record["failure"] = "cleanup_unconfirmed"
+            for name in buffers:
+                getattr(process, name).close()
+        selector.close()
+        record["elapsed_seconds"] = time.monotonic() - start
+        for name, data in buffers.items():
+            record[name] = data.decode(errors="ignore")
+    if record["failure"]:
+        raise CommandFailure(record)
+    output = CommandOutput(record["stdout"])
+    output.output_bytes = record["output_bytes"]
+    return output
 
 
 def manifest(value):
@@ -102,7 +247,7 @@ def prefetch_controller_closures(value, run=command):
     return hashes
 
 
-def publish(path, value):
+def publish(path, value, *, mode=0o644):
     """Publish complete public runtime configuration and fsync the directory."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -112,7 +257,7 @@ def publish(path, value):
             handle.write(value)
             handle.flush()
             os.fsync(handle.fileno())
-            os.fchmod(handle.fileno(), 0o644)
+            os.fchmod(handle.fileno(), mode)
             os.replace(temporary, path)
             directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
             try:
@@ -123,8 +268,8 @@ def publish(path, value):
             temporary.unlink(missing_ok=True)
 
 
-def publish_json(path, value):
-    publish(path, json.dumps(value, sort_keys=True) + "\n")
+def publish_json(path, value, *, mode=0o644):
+    publish(path, json.dumps(value, sort_keys=True) + "\n", mode=mode)
 
 
 def publish_admission(path, value):
@@ -363,80 +508,278 @@ def node_check(runtime=RUNTIME / "release.json", gate=GATE, profile=PROFILE, *, 
     return current
 
 
-def deliver_pool(manifest_value, nodes, gate=GATE, *, deliver, quiesce, admit=lambda: None):
+def deliver_pool(manifest_value, nodes, gate=GATE, *, deliver, quiesce, admit=lambda: None,
+                 deadline=None, checkpoint=None):
     expected = manifest(manifest_value)
     if not nodes or len(set(nodes)) != len(nodes):
         raise ValueError("Select a nonempty pool of unique active nodes")
+    report = {"release_id": expected["release_id"], "open": False, "status": "running",
+              "gate_changed": False, "nodes": {node: {"status": "not_attempted"} for node in nodes}}
+    def save(phase):
+        report["phase"] = phase
+        if checkpoint:
+            checkpoint(report)
+    save("close_admission")
+    deadline_check(deadline)
     publish_admission(gate, {"open": False, "release_id": expected["release_id"]})
+    report["gate_changed"] = True
+    save("quiesce")
+    deadline_check(deadline)
     quiesce()
-    report = {"release_id": expected["release_id"], "open": False, "nodes": {}}
+    save("quiesced")
     for node in nodes:
+        report["node"] = node
+        save("deliver")
         try:
+            deadline_check(deadline)
             identity = deliver(node, expected)
+            deadline_check(deadline)
             if not isinstance(identity, dict) or identity.get("ready") is not True or manifest(identity) != expected:
                 raise ValueError("Node verified a different release identity")
             report["nodes"][node] = {"status": "verified", "identity": identity}
         except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
             report["nodes"][node] = {"status": "failed", "reason": str(error)}
+            if isinstance(error, CommandFailure):
+                report["command_failure"] = error.record
+            if getattr(error, "uncertain", False):
+                report.update(requires_reconciliation=True, remote_outcome="unknown")
+            save("node_failed")
+            if isinstance(error, CommandFailure) or getattr(error, "uncertain", False):
+                break
+        save("node_finished")
     if all(item["status"] == "verified" for item in report["nodes"].values()):
         try:
+            save("admit")
+            deadline_check(deadline)
             admit()
+            deadline_check(deadline)
+            report["admission_pending"] = True
+            save("open_admission")
+            deadline_check(deadline)
             publish_admission(gate, {"open": True, "release_id": expected["release_id"]})
-            report["open"] = True
-        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+            report.update(open=True, status="completed")
+            save("finished")
+            return report
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
             report["admission_error"] = str(error)
+            if report.get("admission_pending"):
+                close_after_failure(report, expected, gate)
+            elif getattr(error, "uncertain", False):
+                report.update(requires_reconciliation=True, remote_outcome="unknown")
+    report["status"] = "failed"
+    save("finished")
     return report
 
+
+def close_after_failure(report, expected, gate):
+    """One recovery publication, never assume replace/fsync failure left old bytes."""
+    report.update(status="failed", requires_reconciliation=True, admission_outcome="unknown")
+    try:
+        publish_admission(gate, {"open": False, "release_id": expected["release_id"]})
+        report.update(open=False, admission_state="closed")
+    except (ValueError, RuntimeError, OSError) as error:
+        report.update(open=None, admission_state="unknown", critical_admission_failure=True,
+                      close_error=str(error))
+
+
+SSH_OPTIONS = ["-oBatchMode=yes", "-oConnectionAttempts=1", "-oConnectTimeout=10",
+               "-oServerAliveInterval=15", "-oServerAliveCountMax=2",
+               "-oControlMaster=no", "-oControlPath=none"]
 
 def ssh(target, args, run=command):
     if not TARGET.fullmatch(target):
         raise ValueError("Invalid SSH target")
-    return run(["ssh", "-oBatchMode=yes", target, shlex.join(args)])
+    return run(["ssh", *SSH_OPTIONS, target, shlex.join(args)])
 
 
-def deliver_cli(expected, pool, run=command):
+def deliver_cli(expected, pool, run=command, *, runtime=RUNTIME, gate=GATE,
+                delivery_timeout_seconds=1800.0, command_timeout_seconds=360.0,
+                command_output_bytes=1048576, delivery_output_bytes=8388608):
     """Controller-local orchestration; explicit active inventory, no discovery."""
-    nodes = pool.get("nodes", [])
-    if not nodes or not all(isinstance(node, dict) and IDENTIFIER.fullmatch(node.get("name", ""))
-                            and node.get("role") in ("controller", "worker")
-                            and TARGET.fullmatch(node.get("target", "")) for node in nodes):
-        raise ValueError("Pool requires named controller/worker nodes and SSH targets")
-    if len({node["name"] for node in nodes}) != len(nodes):
-        raise ValueError("Pool node names must be unique")
-    if sum(node["role"] == "controller" for node in nodes) != 1:
-        raise ValueError("Select exactly one controller in the active pool")
-    # The controller initially receives only the manifest, never CI's local store.
-    # A bad cache or hash must leave both admission and current services untouched.
-    prefetch_controller_closures(expected, run)
-    expected = manifest(expected)
-    workers = [node["name"] for node in nodes if node["role"] == "worker"]
-    by_name = {node["name"]: node for node in nodes}
-    encoded = base64.urlsafe_b64encode(json.dumps(expected).encode()).decode()
+    start = time.monotonic()
+    for value in (delivery_timeout_seconds, command_timeout_seconds):
+        if duration(value, "CLI timeout") <= 2:
+            raise ValueError("CLI timeout must exceed 2 seconds")
+    output_bound(command_output_bytes)
+    output_bound(delivery_output_bytes)
+    deadline = start + delivery_timeout_seconds
+    runtime = Path(runtime)
+    attempts = runtime / "delivery-attempts"
+    if attempts.exists():
+        for path in attempts.glob("*.json"):
+            previous = load(path)
+            if previous.get("schema") == "qcl-negf-admission-intent-v1" or previous.get("requires_reconciliation") or (previous.get("status") == "running"
+                    and previous.get("pending_command", {}).get("mutation")):
+                raise RuntimeError("Unresolved delivery requires trusted operator reconciliation")
+    attempts.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(attempts, 0o700)
+    attempt_id = str(uuid.uuid4())
+    receipt_path = attempts / (attempt_id + ".json")
+    intent_path = attempts / (attempt_id + ".admission-intent.json")
+    receipt = {"schema": "qcl-negf-delivery-attempt-v1", "attempt_id": attempt_id,
+               "manifest": expected, "identity": manifest(expected), "status": "running",
+               "started_utc": datetime.now(timezone.utc).isoformat(), "gate_changed": False,
+               "admission_before": None, "commands": [], "nodes": {}, "open": False}
+    raw_gate = read_admission(gate, missing=True)
+    if raw_gate is not None:
+        try:
+            receipt["admission_before"] = json.loads(raw_gate)
+        except ValueError:
+            receipt["admission_before"] = {"unparsed": True}
+    def safe_summary():
+        summary = {key: receipt[key] for key in ("attempt_id", "status", "open", "gate_changed",
+                   "release_id", "requires_reconciliation", "remote_outcome", "admission_state",
+                   "critical_admission_failure") if key in receipt}
+        summary["receipt"] = str(receipt_path)
+        return summary
+    def checkpoint(report=None):
+        if report:
+            receipt.update(report)
+        if receipt.get("admission_pending") and not intent_path.exists():
+            publish_json(intent_path, {"schema": "qcl-negf-admission-intent-v1",
+                "attempt_id": attempt_id, "identity": receipt["identity"]}, mode=0o600)
+        receipt["elapsed_seconds"] = time.monotonic() - start
+        if receipt["status"] != "running":
+            receipt["ended_utc"] = datetime.now(timezone.utc).isoformat()
+        publish_json(receipt_path, receipt, mode=0o600)
+        publish_json(runtime / "delivery-report.json", safe_summary())
+    checkpoint()
+    native = run is command
+    original_run = run
+    used_output = 0
+    stage = {"phase": "prefetch", "node": None, "remote": False, "mutation": False}
+    def dispatch(args):
+        nonlocal used_output
+        deadline_check(deadline)
+        available = min(command_output_bytes, delivery_output_bytes - used_output)
+        if available <= 0:
+            raise CommandFailure({"failure": "output_limit", "returncode": None,
+                "elapsed_seconds": 0, "stdout": "", "stderr": "", "output_truncated": True,
+                "cleanup_confirmed": True, "child_started": False})
+        pending = {**stage, "executable": Path(args[0]).name}
+        if args[0] in ("squeue",) or args[:2] == ["nix", "path-info"]:
+            pending["mutation"] = False
+        receipt.update(phase=stage["phase"], node=stage["node"], pending_command=pending)
+        checkpoint()
+        completed_dispatch = False
+        entered_callable = False
+        try:
+            env = None
+            if native and args[:2] == ["nix", "copy"]:
+                env = dict(os.environ)
+                env["NIX_SSHOPTS"] = shlex.join(SSH_OPTIONS + shlex.split(env.get("NIX_SSHOPTS", "")))
+            entered_callable = True
+            output = (original_run(args, timeout_seconds=command_timeout_seconds, output_bytes=available,
+                                   deadline=deadline, env=env) if native else original_run(args))
+            completed_dispatch = True
+            count = getattr(output, "output_bytes", len(output.encode()))
+            used_output += count
+            if count > available:
+                raise CommandFailure({"failure": "output_limit", "returncode": None,
+                    "elapsed_seconds": 0, "stdout": output.encode()[:available].decode(errors="replace"),
+                    "stderr": "", "output_truncated": True, "cleanup_confirmed": True,
+                    "child_started": True})
+            deadline_check(deadline)
+            receipt["commands"].append({**pending, "status": "completed", "output_bytes": count})
+            receipt.pop("pending_command", None)
+            checkpoint()
+            return output
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
+            record = error.record if isinstance(error, CommandFailure) else {"failure": type(error).__name__,
+                      "returncode": None, "stdout": "", "stderr": "", "child_started": entered_callable}
+            if completed_dispatch:
+                record["child_started"] = True
+            used_output += record.get("output_bytes", 0)
+            receipt["commands"].append({**pending, "status": "failed", "record": record})
+            started = record.get("child_started", True)
+            uncertain = (not record.get("cleanup_confirmed", True) or
+                         (started and pending["mutation"] and record["failure"] in ("timeout", "deadline", "output_limit")) or
+                         (stage["remote"] and started and
+                         (stage["mutation"] or record.get("returncode") == 255 or isinstance(error, RuntimeError))))
+            if uncertain:
+                error.uncertain = True
+                receipt.update(requires_reconciliation=True, remote_outcome="unknown")
+            receipt.pop("pending_command", None)
+            checkpoint()
+            raise
+    run = dispatch
+    try:
+        nodes = pool.get("nodes", [])
+        if not nodes or not all(isinstance(node, dict) and IDENTIFIER.fullmatch(node.get("name", ""))
+                                and node.get("role") in ("controller", "worker")
+                                and TARGET.fullmatch(node.get("target", "")) for node in nodes):
+            raise ValueError("Pool requires named controller/worker nodes and SSH targets")
+        if len({node["name"] for node in nodes}) != len(nodes):
+            raise ValueError("Pool node names must be unique")
+        if sum(node["role"] == "controller" for node in nodes) != 1:
+            raise ValueError("Select exactly one controller in the active pool")
+        # The controller initially receives only the manifest, never CI's local store.
+        # A bad cache or hash must leave both admission and current services untouched.
+        prefetch_controller_closures(expected, run)
+        expected = manifest(expected)
+        workers = [node["name"] for node in nodes if node["role"] == "worker"]
+        by_name = {node["name"]: node for node in nodes}
+        encoded = base64.urlsafe_b64encode(json.dumps(expected).encode()).decode()
 
-    def quiesce():
-        run(["systemctl", "stop", "qcl-negf-api.service", "qcl-negf-aiida.service"])
-        for worker in workers:
-            run(["scontrol", "update", "NodeName=" + worker, "State=DRAIN", "Reason=application-release"])
-        # All queued/running research must be resolved by the maintenance owner;
-        # never cancel, requeue, or silently accept an old workflow here.
-        if run(["squeue", "--all", "--noheader", "--format", "%i"]).strip():
-            raise RuntimeError("Slurm still has running or queued jobs; resolve the old research before delivery")
+        def quiesce():
+            stage.update(phase="quiesce", remote=False, mutation=True)
+            run(["systemctl", "stop", "qcl-negf-api.service", "qcl-negf-aiida.service"])
+            for worker in workers:
+                run(["scontrol", "update", "NodeName=" + worker, "State=DRAIN", "Reason=application-release"])
+            # All queued/running research must be resolved by the maintenance owner;
+            # never cancel, requeue, or silently accept an old workflow here.
+            if run(["squeue", "--all", "--noheader", "--format", "%i"]).strip():
+                raise RuntimeError("Slurm still has running or queued jobs; resolve the old research before delivery")
 
-    def deliver(name, value):
-        node = by_name[name]
-        run(["nix", "copy", "--to", "ssh-ng://" + node["target"], value["application_path"],
-             str(Path(value["solver_executable"]).parents[1])])
-        ssh(node["target"], ["sudo", "-n", "qcl-negf-release", "activate", "--manifest-base64", encoded,
-                            "--role", node["role"]], run)
-        result = ssh(node["target"], ["sudo", "-n", "qcl-negf-release", "check", "--manifest-base64", encoded,
-                                     "--role", node["role"]], run)
-        return json.loads(result)
+        def deliver(name, value):
+            node = by_name[name]
+            stage.update(phase="copy", node=name, remote=True, mutation=True)
+            run(["nix", "copy", "--to", "ssh-ng://" + node["target"], value["application_path"],
+                 str(Path(value["solver_executable"]).parents[1])])
+            stage.update(phase="activate", mutation=True)
+            ssh(node["target"], ["sudo", "-n", "qcl-negf-release", "activate", "--manifest-base64", encoded,
+                                "--role", node["role"], "--command-timeout-seconds", str(command_timeout_seconds),
+                                "--command-output-bytes", str(command_output_bytes)], run)
+            stage.update(phase="check", mutation=False)
+            result = ssh(node["target"], ["sudo", "-n", "qcl-negf-release", "check", "--manifest-base64", encoded,
+                                         "--role", node["role"], "--command-timeout-seconds", str(command_timeout_seconds),
+                                "--command-output-bytes", str(command_output_bytes)], run)
+            try:
+                return json.loads(result)
+            except ValueError as error:
+                error.uncertain = True
+                receipt.update(requires_reconciliation=True, remote_outcome="unknown",
+                               response_prefix=result[:command_output_bytes])
+                raise
 
-    def admit():
-        for worker in workers:
-            run(["scontrol", "update", "NodeName=" + worker, "State=RESUME"])
+        def admit():
+            stage.update(phase="admit", remote=False, mutation=True)
+            for worker in workers:
+                run(["scontrol", "update", "NodeName=" + worker, "State=RESUME"])
 
-    return deliver_pool(expected, list(by_name), deliver=deliver, quiesce=quiesce, admit=admit)
+        report = deliver_pool(expected, list(by_name), gate, deliver=deliver, quiesce=quiesce, admit=admit,
+                              deadline=deadline, checkpoint=checkpoint)
+        if report.get("status") == "completed" and intent_path.exists():
+            try:
+                # Last fallible success action. Crash may restore an unsynced deletion,
+                # conservatively blocking reconciliation, never erasing a pending failure.
+                intent_path.unlink()
+            except OSError as error:
+                close_after_failure(report, expected, gate)
+                report["admission_error"] = str(error)
+                checkpoint(report)
+        return {**report, "attempt_id": attempt_id, "receipt": str(receipt_path),
+                "requires_reconciliation": receipt.get("requires_reconciliation", False)}
+
+    except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
+        receipt.update(status="failed", reason=str(error))
+        try:
+            checkpoint()
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as write_error:
+            write_error.delivery_summary = safe_summary()
+            raise
+        error.delivery_summary = safe_summary()
+        raise
 
 
 def main():
@@ -452,13 +795,19 @@ def main():
     parser.add_argument("--gate", type=Path, default=GATE)
     parser.add_argument("--returning-worker", action="store_true")
     parser.add_argument("--initial-label")
+    parser.add_argument("--delivery-timeout-seconds", type=float, default=1800)
+    parser.add_argument("--command-timeout-seconds", type=float, default=360)
+    parser.add_argument("--command-output-bytes", type=int, default=1048576)
+    parser.add_argument("--delivery-output-bytes", type=int, default=8388608)
     args = parser.parse_args()
+    def native_run(argv):
+        return command(argv, timeout_seconds=args.command_timeout_seconds, output_bytes=args.command_output_bytes)
     if args.action == "bootstrap-identity":
         solver, label = bootstrap_selection(args.runtime / "release.json", args.solver_executable, args.initial_label)
         print(solver + "\n" + label)
         return
     if args.action == "node-check":
-        node_check(args.runtime / "release.json", args.gate)
+        node_check(args.runtime / "release.json", args.gate, run=native_run)
         return
     if args.action == "guard":
         guard(args.release_id, args.solver_executable, args.runtime / "release.json", args.gate)
@@ -468,7 +817,7 @@ def main():
     manifest_value = load(args.manifest) if args.manifest else json.loads(base64.urlsafe_b64decode(args.manifest_base64))
     expected = manifest(manifest_value)
     if args.action == "check":
-        result = check(expected, runtime=args.runtime, role=args.role)
+        result = check(expected, runtime=args.runtime, role=args.role, run=native_run)
     else:
         args.runtime.mkdir(parents=True, exist_ok=True)
         # One finite invocation at a time. This is a local flock, not a lease
@@ -479,10 +828,18 @@ def main():
             if args.action == "deliver":
                 if not args.pool:
                     parser.error("Delivery requires an explicit --pool")
-                result = deliver_cli(manifest_value, load(args.pool))
-                publish_json(args.runtime / "delivery-report.json", result)
+                try:
+                    result = deliver_cli(manifest_value, load(args.pool), runtime=args.runtime, gate=args.gate,
+                        delivery_timeout_seconds=args.delivery_timeout_seconds,
+                        command_timeout_seconds=args.command_timeout_seconds,
+                        command_output_bytes=args.command_output_bytes, delivery_output_bytes=args.delivery_output_bytes)
+                except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
+                    result = getattr(error, "delivery_summary", None)
+                    if result is None:
+                        result = {"open": None, "admission_state": "unknown", "requires_reconciliation": True}
+                    result = {**result, "status": "failed", "error": type(error).__name__}
             elif args.action == "prepare-initial":
-                result = prepare_initial(manifest_value, runtime=args.runtime, gate=args.gate, role=args.role)
+                result = prepare_initial(manifest_value, runtime=args.runtime, gate=args.gate, role=args.role, run=native_run)
             else:
                 admission = load_admission(args.gate)
                 if admission.get("release_id") != expected["release_id"] or (
@@ -491,9 +848,9 @@ def main():
                     raise ValueError("Close admission for the selected release before activation")
                 settings = load("/etc/qcl-negf/release-config.json")
                 result = activate(expected, runtime=args.runtime, role=args.role, email=settings.get("email"),
-                                  allowed_codes_file=Path(settings.get("allowed_codes_file") or "/var/lib/qcl-negf/aiida/code-uuid"))
+                                  run=native_run, allowed_codes_file=Path(settings.get("allowed_codes_file") or "/var/lib/qcl-negf/aiida/code-uuid"))
     print(json.dumps(result, sort_keys=True))
-    if args.action == "deliver" and not result["open"]:
+    if args.action == "deliver" and (result.get("status") != "completed" or not result.get("open")):
         raise SystemExit(1)
 
 
