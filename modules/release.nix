@@ -51,13 +51,19 @@ in {
       assertions = [
         { assertion = cfg.applicationPackage != null && cluster.solverPackage != null; message = "Release activation requires initial application and immutable solver closures."; }
         { assertion = cluster.controller || cluster.worker; message = "Release activation belongs on controller and Linux worker roles."; }
+        { assertion = !(cluster.controller && cluster.worker); message = "Enrolled node identity requires distinct controller and worker machines."; }
       ];
       environment.systemPackages = [ releaseCommand lifecycleCommand ];
       environment.etc."qcl-negf/release-config.json".text = builtins.toJSON {
         email = config.qclNegf.application.bootstrap.email;
         allowed_codes_file = config.qclNegf.application.api.allowedCodesFile;
+        role = if cluster.controller then "controller" else "worker";
+        slurm_conf = "${config.services.slurm.etcSlurm}/slurm.conf";
       };
-      systemd.tmpfiles.rules = [ "d /var/lib/qcl-negf/runtime 0755 root root -" ];
+      systemd.tmpfiles.rules = [
+        "d /var/lib/qcl-negf/runtime 0755 root root -"
+        "d /var/lib/qcl-negf/trust-snapshots 0700 root root -"
+      ];
       systemd.services.slurmd = lib.mkIf cluster.worker {
         requires = [ "qcl-negf-application-profile.service" ];
         after = [ "qcl-negf-application-profile.service" ];

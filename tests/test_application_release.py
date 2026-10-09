@@ -14,6 +14,7 @@ import os
 import signal
 import time
 from unittest.mock import patch
+from test_node_enrollment import CONTROLLER, WORKER, SECOND, TRUST, ENROLL_IDS, selected_context
 
 SPEC = importlib.util.spec_from_file_location(
     "application_release", Path(__file__).parents[1] / "ops" / "application_release.py"
@@ -80,8 +81,9 @@ def delivery_manifest(cache=True):
     return value
 
 
-POOL = {"nodes": [{"name": "controller", "target": "admin@controller", "role": "controller"},
-                  {"name": "worker", "target": "admin@worker", "role": "worker"}]}
+POOL = {"schema": "qcl-negf-active-pool-v2", "nodes": [
+    {"name": "controller", "target": "admin@controller.invalid", "role": "controller", "enrollment_id": ENROLL_IDS[0]},
+    {"name": "worker", "target": "admin@worker.invalid", "role": "worker", "enrollment_id": ENROLL_IDS[1]}]}
 
 
 class DeliveryCommands:
@@ -103,8 +105,13 @@ class DeliveryCommands:
         if args[:3] == ["nix", "path-info", "--json"]:
             self.prefetch_gate_snapshots.append(self.gate.read_bytes())
             return self.evidence if isinstance(self.evidence, str) else json.dumps(self.evidence)
-        if args[0] == "ssh" and " check " in args[-1]:
-            return json.dumps({**release(), "ready": True})
+        if args[0] == "ssh":
+            observed = CONTROLLER if "controller" in args[-2] else WORKER
+            if args[-1].endswith(" identity"):
+                return json.dumps(observed)
+            if " check " in args[-1]:
+                return json.dumps({"schema": "qcl-negf-node-release-check-v1", "node_identity": observed,
+                                   "release": {**release(), "ready": True}})
         return ""
 
 
@@ -119,6 +126,34 @@ class ApplicationReleaseTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.runtime = Path(temporary.name) / "runtime"
         self.gate = Path(temporary.name) / "gate"
+        # Existing CR04 regressions use handwritten enrollment/observation facts;
+        # CR03 tests exercise actual authority/protected helpers independently.
+        context = selected_context()
+        context["bindings"] = context["bindings"][:2]
+        original_delivery, original_pool = self.ops.deliver_cli, self.ops.deliver_pool
+        def preflight(*args, **kwargs):
+            if kwargs.get("before_remote"):
+                kwargs["before_remote"]()
+            return context
+        def delivery(*args, **kwargs):
+            kwargs.setdefault("enrollment", "/synthetic/enrollment.json")
+            return original_delivery(*args, **kwargs)
+        def bound_pool(value, nodes, *args, **kwargs):
+            if "bindings" not in kwargs:
+                observations = {"worker": WORKER, "worker-a": {**WORKER, "node_name": "worker-a"},
+                                "worker-b": {**SECOND, "node_name": "worker-b"}}
+                bindings = {node: {**observations[node], "identity": observations[node]} for node in nodes}
+                callback = kwargs["deliver"]
+                def envelope(node, expected):
+                    result = callback(node, expected)
+                    return {"schema": "qcl-negf-node-release-check-v1", "node_identity": observations[node], "release": result}
+                kwargs.update(bindings=bindings, authority=context, deliver=envelope)
+            return original_pool(value, nodes, *args, **kwargs)
+        for name, replacement in (("preflight_controller_authority", preflight), ("observe_node_identity", lambda **_: CONTROLLER),
+                                  ("deliver_cli", delivery), ("deliver_pool", bound_pool)):
+            mocker = patch.object(self.ops, name, replacement)
+            mocker.start()
+            self.addCleanup(mocker.stop)
 
 
     def test_native_bounded_prefix_and_retained_descendant_pipe(self):
@@ -204,15 +239,16 @@ class ApplicationReleaseTests(unittest.TestCase):
                 clock = [100.0]
                 def measured(args):
                     result = run(args)
-                    clock[0] += 1.0
+                    if not (args[0] == "ssh" and args[-1].endswith(" identity")):
+                        clock[0] += 1.0
                     return result
                 with patch.object(self.ops.time, "monotonic", lambda: clock[0]):
                     with self.assertRaises(self.ops.CommandFailure):
                         self.ops.deliver_cli(delivery_manifest(), POOL, run=measured,
                             runtime=self.runtime, gate=self.gate, delivery_timeout_seconds=3,
                             delivery_output_bytes=20 if output_limit else 8388608)
-                self.assertLessEqual(len(run.calls), 3)
-                self.assertFalse(any(args[0] == "ssh" for args in run.calls))
+                self.assertLessEqual(len([args for args in run.calls if args[0] != "ssh"]), 3)
+                self.assertFalse(any(" activate " in args[-1] for args in run.calls))
                 receipt = json.loads(next((self.runtime / "delivery-attempts").glob("*.json")).read_text())
                 self.assertEqual(receipt["status"], "failed")
                 self.assertEqual(receipt["gate_changed"], not output_limit)
@@ -237,7 +273,7 @@ class ApplicationReleaseTests(unittest.TestCase):
 
     def test_native_ssh_options_and_nix_environment_are_isolated(self):
         calls = []
-        self.ops.ssh("admin@worker", ["echo", "hello world"], run=lambda args: calls.append(args) or "")
+        self.ops.ssh("admin@worker", ["echo", "hello world"], run=lambda args: calls.append(args) or "", trust_snapshot=TRUST)
         self.assertIn("-oControlMaster=no", calls[0])
         self.assertIn("-oConnectionAttempts=1", calls[0])
         self.assertEqual(calls[0][-1], "echo 'hello world'")
@@ -340,7 +376,7 @@ class ApplicationReleaseTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.ops.deliver_cli(delivery_manifest(), POOL, run=fake_command,
                                      runtime=self.runtime, gate=self.gate)
-        self.assertEqual(run.calls, [])
+        self.assertTrue(all(args[0] == "ssh" and args[-1].endswith(" identity") for args in run.calls))
         receipt = json.loads(next((self.runtime / "delivery-attempts").glob("*.json")).read_text())
         self.assertFalse(receipt["commands"][-1]["record"]["child_started"])
         self.assertFalse(receipt.get("requires_reconciliation", False))
@@ -353,7 +389,9 @@ class ApplicationReleaseTests(unittest.TestCase):
             result = self.ops.deliver_cli(delivery_manifest(False), POOL, run=fake_command,
                                          runtime=other_runtime, gate=self.gate)
         self.assertFalse(result["requires_reconciliation"])
-        self.assertFalse(any(args[:2] == ["nix", "copy"] or args[0] == "ssh" for args in run.calls))
+        self.assertFalse(any(args[:2] == ["nix", "copy"] for args in run.calls))
+        self.assertTrue(all(args[0] != "ssh" or args[-1].endswith(" identity") for args in run.calls))
+        self.assertFalse(any("State=RESUME" in args for args in run.calls))
         remote_receipt = json.loads(next((other_runtime / "delivery-attempts").glob("*.json")).read_text())
         failures = [item for item in remote_receipt["commands"] if item["status"] == "failed"]
         self.assertTrue(failures)
@@ -403,7 +441,7 @@ class ApplicationReleaseTests(unittest.TestCase):
             if value["open"]:
                 opened[0] = True
             return result
-        args = ["release", "deliver", "--manifest", str(source), "--pool", str(pool),
+        args = ["release", "deliver", "--manifest", str(source), "--pool", str(pool), "--enrollment", "/synthetic/enrollment.json",
                 "--runtime", str(self.runtime), "--gate", str(self.gate)]
         with patch.object(sys, "argv", args), patch.object(self.ops, "deliver_cli", injected_delivery), \
              patch.object(self.ops, "publish_json", persistent_terminal), \
@@ -708,11 +746,11 @@ class ApplicationReleaseTests(unittest.TestCase):
             with patch.object(self.ops, "publish_admission", lambda _path, value: self.ops.publish_json(gate, value)):
                 report = self.ops.deliver_cli(delivery_manifest(), POOL, runtime=self.runtime, gate=self.gate, run=run)
             self.assertTrue(report["open"])
-            self.assertEqual(run.calls[:2], [
+            self.assertEqual([args for args in run.calls if args[0] != "ssh"][:2], [
                 ["nix", "copy", "--from", "https://cache.example.invalid", "/nix/store/application", "/nix/store/solver"],
                 ["nix", "path-info", "--json", "/nix/store/application", "/nix/store/solver"]])
             self.assertEqual(run.prefetch_gate_snapshots, [original, original])
-            self.assertEqual(run.calls[2][:2], ["systemctl", "stop"])
+            self.assertEqual([args for args in run.calls if args[0] != "ssh"][2][:2], ["systemctl", "stop"])
 
     def test_cache_fetch_failure_leaves_gate_and_services_unchanged(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -724,7 +762,8 @@ class ApplicationReleaseTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "cache fetch"):
                     self.ops.deliver_cli(delivery_manifest(), POOL, runtime=self.runtime, gate=self.gate, run=run)
             self.assertEqual(gate.read_bytes(), original)
-            self.assertFalse(any(args[0] in ("systemctl", "scontrol", "ssh") for args in run.calls))
+            self.assertFalse(any(args[0] in ("systemctl", "scontrol") or
+                                 (args[0] == "ssh" and not args[-1].endswith(" identity")) for args in run.calls))
 
     def test_hash_mismatch_missing_paths_or_malformed_evidence_does_not_quiesce(self):
         evidence = ["malformed", [], {}, {"/nix/store/application": {"narHash": HASH}},
@@ -742,7 +781,8 @@ class ApplicationReleaseTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "closure|hash|evidence"):
                         self.ops.deliver_cli(delivery_manifest(), POOL, runtime=self.runtime, gate=self.gate, run=run)
                 self.assertEqual(gate.read_bytes(), original)
-                self.assertFalse(any(args[0] in ("systemctl", "scontrol", "ssh") for args in run.calls))
+                self.assertFalse(any(args[0] in ("systemctl", "scontrol") or
+                                 (args[0] == "ssh" and not args[-1].endswith(" identity")) for args in run.calls))
 
     def test_manifest_without_cache_uri_verifies_local_closures_before_quiesce(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -752,7 +792,7 @@ class ApplicationReleaseTests(unittest.TestCase):
             run.evidence = [{"path": path, **value} for path, value in run.evidence.items()]
             with patch.object(self.ops, "publish_admission", lambda _path, value: self.ops.publish_json(gate, value)):
                 self.ops.deliver_cli(delivery_manifest(False), POOL, runtime=self.runtime, gate=self.gate, run=run)
-            self.assertEqual(run.calls[0][:3], ["nix", "path-info", "--json"])
+            self.assertEqual(next(args for args in run.calls if args[0] != "ssh")[:3], ["nix", "path-info", "--json"])
             self.assertFalse(any(args[:3] == ["nix", "copy", "--from"] for args in run.calls))
             self.assertEqual(run.prefetch_gate_snapshots, [original])
 
@@ -798,7 +838,7 @@ class ApplicationReleaseTests(unittest.TestCase):
             def deliver(value, selected_pool, **kwargs):
                 observed.append((value, selected_pool))
                 return {"open": True, "status": "completed"}
-            args = ["qcl-negf-release", "deliver", "--manifest", str(source), "--pool", str(pool),
+            args = ["qcl-negf-release", "deliver", "--manifest", str(source), "--pool", str(pool), "--enrollment", "/synthetic/enrollment.json",
                     "--runtime", str(root / "runtime")]
             with patch.object(sys, "argv", args), patch.object(self.ops, "deliver_cli", deliver), patch("builtins.print"):
                 self.ops.main()
