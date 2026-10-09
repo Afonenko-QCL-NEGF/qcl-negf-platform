@@ -233,7 +233,7 @@ def run_playbook(tmp_path, monkeypatch, scenario):
              "rollback": {"path": str(tmp_path / "original")},
              "final": {"path": str(source), "unit": "fixture-source.mount", "fs_uuid": UUID, "device": "/dev/mapper/fixture-images", "rdev": 253, "options": "rw,nodev,nosuid", "allowed_defaults": ["relatime", "data=ordered"], "install_target": "local-fs.target"},
              "receipt": {"path": str(receipt), "max_bytes": 65536, "receipt_helper": str(receipt.parent / "host_storage_receipt.py"), "manifest_helper": str(receipt.parent / "host_storage_manifest.py"), "manifest_path": str(receipt.parent / "manifest.json")},
-             "limits": dict(limits(), copy_bytes=1048576, aggregate_bytes=100000000, action_seconds=20, attempt_seconds=600, cleanup_seconds=1, aggregate_output_bytes=10000000, aggregate_read_bytes=70000000, aggregate_write_bytes=30000000, metadata_read_bytes=65536, request_bytes=262144, native_commands=100, reference_entries=100, reference_hash_bytes=1048576),
+             "limits": dict(limits(), copy_bytes=1048576, aggregate_bytes=794296388, action_seconds=20, attempt_seconds=900, cleanup_seconds=1, aggregate_output_bytes=23592960, aggregate_read_bytes=768606276, aggregate_write_bytes=25690112, metadata_read_bytes=8388608, request_bytes=262144, native_commands=100, reference_entries=100, reference_hash_bytes=1048576),
              "capacity": {"receipt": "fixture-capacity", "pool_uuid": "fixture-pool", "data_bytes": 16777216, "metadata_bytes": 1048576, "data_reserve_bytes": 1048576, "metadata_reserve_bytes": 65536, "growth_bytes": 1048576, "metadata_growth_bytes": 65536, "image_envelope_bytes": 1048576, "lv_projection": [{"lv_uuid":"fixture-lv"}], "foreign_vm_projection": {}}}}
     if scenario in ("complete-original-disabled","complete-missing-disable"): cfg["cutover"]["storage"]["stanza"]["disable"]="yes"
     if scenario == "disabled": cfg = {}
@@ -279,16 +279,20 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                     clock={"started_monotonic_ns":time.monotonic_ns(),"deadline_monotonic_ns":time.monotonic_ns()+600000000000,"expires_at_epoch":int(time.time())+600,"action_seconds":20,"cleanup_seconds":1}
                     s["trace"].append("clock-bootstrap");state_file.write_text(json.dumps(s))
                     return {"changed":False,"rc":0,"stdout":json.dumps({"clock":clock,"status":"ok"})}
-                operation=outer_request["operation"];args={"argv":operation["argv"],"stdin":operation["stdin"]}
+                assert outer_request["schema"]=="qcl.storage-cutover.command.v1" and set(outer_request)=={"schema","identity","slot_id","clock","bounds","operation"}
+                operation=outer_request["operation"];assert set(operation)=={"kind","argv","stdin","mutation"}
+                assert operation["argv"][0] in ("/usr/bin/python3","/usr/bin/systemctl","/usr/bin/rsync","/usr/sbin/pvesm","/usr/bin/sync")
+                s.setdefault("boundary_events",[]).append({"slot":outer_request["slot_id"],"kind":operation["kind"],"argv_sha256":hashlib.sha256(json.dumps(operation["argv"]).encode()).hexdigest()})
+                args={"argv":operation["argv"],"stdin":operation["stdin"]}
                 if operation["kind"] == "declare_file":
-                    args=json.loads(operation["stdin"]);effective_action="ansible.builtin.template" if "final unit" in name else "ansible.builtin.copy"
+                    args=json.loads(operation["stdin"]);assert set(args)-{"dest","content","mode"} <= {"src","owner","group"};args={key:args[key] for key in ("dest","content","mode")};effective_action="ansible.builtin.template" if "final unit" in name else "ansible.builtin.copy"
                 elif operation["argv"][0] == "/usr/bin/systemctl":
-                    args=json.loads(operation["stdin"]);effective_action="ansible.builtin.systemd_service"
+                    argv=operation["argv"];assert len(argv) in (2,3) and argv[0]=="/usr/bin/systemctl";verb=argv[1];args={"verb":verb,"name":argv[2] if len(argv)==3 else None};effective_action="ansible.builtin.systemd_service"
             def record(kind): s["trace"].append(kind)
             if effective_action == "ansible.builtin.command":
                 argv = args["argv"]
                 if "host_storage_receipt.py" in " ".join(map(str, argv)):
-                    r = helper("receipt")
+                    r = installed_helper("receipt", cfg)
                     request = json.loads(args.get("stdin", "{}"))
                     try:
                         if request["action"] == "inspect":
@@ -317,7 +321,7 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                         out["stdout"] = json.dumps(result)
                     except (ValueError, OSError) as exc: out.update(failed=True, rc=1, stderr=str(exc))
                 elif "host_storage_manifest.py" in " ".join(map(str, argv)):
-                    m = helper("manifest")
+                    m = installed_helper("manifest", cfg)
                     request = json.loads(args["stdin"])
                     try:
                         if request.get("action") in ("equal", "subset"):
@@ -336,7 +340,7 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                 elif name.startswith("CAS "):
                     assert "--digest" in argv
                     if "reopen" in name:
-                        assert helper("receipt").inspect(receipt, json.loads(self._templar.template(__import__("ansible.utils.tags", fromlist=["TrustedAsTemplate"]).TrustedAsTemplate().tag("{{ receipt_identity | to_json }}"))), 65536)["record"]["reopening"]["intended_tree"] == ("restored_original" if "restored original" in name else "new_final")
+                        assert installed_helper("receipt",cfg).inspect(receipt, json.loads(self._templar.template(__import__("ansible.utils.tags", fromlist=["TrustedAsTemplate"]).TrustedAsTemplate().tag("{{ receipt_identity | to_json }}"))), 65536)["record"]["reopening"]["intended_tree"] == ("restored_original" if "restored original" in name else "new_final")
                         record("CAS:reopen-original" if "restored original" in name else "CAS:reopen")
                         s["disabled"] = cfg["cutover"]["storage"]["stanza"].get("disable") in (1,"1","yes",True)
                         if scenario == "unknown-cas": out.update(failed=True, rc=1, stderr="unknown CAS outcome")
@@ -359,10 +363,10 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                         (stage / "disk.raw").write_bytes(b"CCCC")
                         os.utime(stage / "disk.raw", ns=(1234567890123,1234567890123))
                 elif name == "Rename exact original once":
-                    assert helper("receipt").inspect(receipt, json.loads(self._templar.template(__import__("ansible.utils.tags", fromlist=["TrustedAsTemplate"]).TrustedAsTemplate().tag("{{ receipt_identity | to_json }}"))), 65536)["record"]["phase"] == "rename_intent"
+                    assert installed_helper("receipt",cfg).inspect(receipt, json.loads(self._templar.template(__import__("ansible.utils.tags", fromlist=["TrustedAsTemplate"]).TrustedAsTemplate().tag("{{ receipt_identity | to_json }}"))), 65536)["record"]["phase"] == "rename_intent"
                     record("rename"); os.rename(source, tmp_path / "original"); source.mkdir(); s["renamed"] = True
                 elif name == "Restore exact retained original once":
-                    assert helper("receipt").inspect(receipt, json.loads(self._templar.template(__import__("ansible.utils.tags", fromlist=["TrustedAsTemplate"]).TrustedAsTemplate().tag("{{ receipt_identity | to_json }}"))), 65536)["record"]["phase"] == "rollback_intent"
+                    assert installed_helper("receipt",cfg).inspect(receipt, json.loads(self._templar.template(__import__("ansible.utils.tags", fromlist=["TrustedAsTemplate"]).TrustedAsTemplate().tag("{{ receipt_identity | to_json }}"))), 65536)["record"]["phase"] == "rollback_intent"
                     record("restore"); source.rmdir(); os.rename(tmp_path / "original", source); s["renamed"] = False
                 elif name.startswith("Observe") or name.startswith("Read") or name.startswith("Verify") or name.startswith("Sync") or name.startswith("Reconcile"):
                     # Independent native-shaped observations, not a second phase machine.
@@ -375,7 +379,7 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                         "device": "/dev/dm-0", "rdev": 254 if scenario == "wrong-rdev-unit" else 253, "mountpoint_dev": source.stat().st_dev, "mountpoint_ino": source.stat().st_ino, "Where": "/wrong" if scenario == "wrong-where-unit" else observation_request.get("path", str(source)), "Type": "xfs" if scenario == "wrong-type-unit" else "ext4", "ActiveState": "active" if (s["stage_active"] if observation_request.get("stage", False) else s["final_active"]) else "inactive", "UnitFileState": "static" if observation_request.get("stage", False) else "enabled" if s["unit_enabled"] else "disabled", "stage_policy": "static", "source_renamed": s["renamed"],
                         "ForceUnmount": "yes" if scenario == "force-unit" else "no", "LazyUnmount": "yes" if scenario == "lazy-unit" else "no", "DropInPaths": "foreign.conf" if scenario == "dropin-unit" else "", "NeedDaemonReload": "yes" if scenario == "reload-unit" else "no",
                         "Options": "nosuid,rw,relatime,nodev,data=ordered" + (",ro" if scenario == "ro-unit" else ",unknown-option" if scenario == "unknown-options" else ""), "fragment_exact": scenario != "unsafe-unit",
-                        "seed_sha256": hashlib.sha256(b"AAAA").hexdigest(), "is_mountpoint_raw": s["offline_raw"], "mountpoint_guard": str(source) if s["offline_raw"] in ("1","yes",str(source)) else None, "storage_disabled": s["disabled"], "original_disabled": cfg["cutover"]["storage"]["stanza"].get("disable") in (1,"1","yes",True),
+                        "seed_sha256": hashlib.sha256(b"AAAA").hexdigest(), "is_mountpoint_raw": s["offline_raw"], "mountpoint_guard": "/wrong" if scenario.startswith("nb-restore") and name=="Observe native offline policy and disabled gate before reopen" else str(source) if s["offline_raw"] in ("1","yes",str(source)) else None, "storage_disabled": s["disabled"], "original_disabled": cfg["cutover"]["storage"]["stanza"].get("disable") in (1,"1","yes",True),
                         "absent": bool(observation_request.get("allow_absent",False) and not s["unit_declared"])})
                     if name == "Verify exact loaded mount policy":
                         loaded=json.loads(out["stdout"])
@@ -385,32 +389,43 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                             loaded={key:loaded[key] for key in ("absent","fragment_exact","fs_uuid","rdev","device","Where","Type","Options","ForceUnmount","LazyUnmount","DropInPaths","NeedDaemonReload","ActiveState","UnitFileState")}
                             loaded.update(FragmentPath="/etc/systemd/system/"+observation_request["unit"],What=cfg["cutover"]["final"]["device"])
                         out["stdout"]=json.dumps(loaded)
+                    observed=json.loads(out["stdout"])
+                    if outer_request and outer_request["operation"]["kind"]=="probe":
+                        mode=observation_request.get("observe_only",False) or (observation_request.get("initial",False) and receipt.exists())
+                        if "consumers_measured" in task_vars["cutover_native_probe"]:
+                            observed.update(consumers_measured=not mode,refs=None if mode else observed["refs"])
+                        if observation_request.get("final_policy_readback"):
+                            observed["final_policy"]={"ActiveState":"active" if s["final_active"] else "inactive","UnitFileState":"enabled" if s["unit_enabled"] else "disabled","FragmentPath":"/etc/systemd/system/fixture-source.mount","NeedDaemonReload":"no"}
+                        if name=="Reconcile actual fixed config mount units and callers read-only":
+                            s["recovery_measurement"]=not mode
+                        out["stdout"]=json.dumps(observed)
                     record("observe:" + name)
                 else: raise AssertionError("Unrecognized native command " + name + " " + str(argv))
             elif effective_action == "ansible.builtin.systemd_service":
-                assert args.get("state") != "restarted"
-                if scenario == "review-final-absent" and args.get("name") == "fixture-source.mount":
-                    assert s["unit_declared"], "absent final unit reached systemd before declaration"
-                record("systemd:" + str(args.get("state", "enable")))
-                if args.get("name") == "fixture-source.mount" and "enabled" in args: s["unit_enabled"] = args["enabled"]
-                if args.get("name") == "fixture-stage.mount" and args.get("state") == "stopped": s["stage_active"] = False
-                if args.get("name") == "fixture-source.mount" and args.get("state") == "started": s["final_active"] = True
-                if args.get("name") == "fixture-source.mount" and args.get("state") == "stopped": s["final_active"] = False
-            elif effective_action in ("ansible.builtin.template", "ansible.builtin.copy", "ansible.builtin.file"):
-                if effective_action == "ansible.builtin.copy" and "src" in args:
-                    record("helper-declare:" + Path(args["src"]).stem)
-                    destination = Path(args["dest"])
-                    content = (BASE/"ansible"/args["src"]).read_bytes()
-                    if not destination.exists() or destination.read_bytes() != content or stat.S_IMODE(destination.stat().st_mode) != 0o600:
-                        destination.write_bytes(content); destination.chmod(0o600); out["changed"] = True
-                else: record(effective_action.split(".")[-1])
-                if effective_action == "ansible.builtin.template":
-                    from ansible.utils.tags import TrustedAsTemplate
-                    text = self._templar.template(TrustedAsTemplate().tag((BASE / "ansible" / args["src"]).read_text()))
-                    s["unit_declared"] = True
-                    assert "ForceUnmount=no" in text and "LazyUnmount=no" in text and "Before=pve-guests.service" in text
-                if effective_action == "ansible.builtin.copy" and "content" in args:
-                    helper("receipt").persist_manifest(Path(args["dest"]), json.loads(args["content"]), 262144)
+                verb=args["verb"];assert verb in ("start","stop","enable","disable","daemon-reload")
+                assert verb=="daemon-reload" or args["name"] in ("fixture-stage.mount","fixture-source.mount")
+                if args["name"]=="fixture-source.mount":assert s["unit_declared"], "absent final unit reached systemd before declaration"
+                record("systemd:"+{"start":"started","stop":"stopped","disable":"disable","enable":"enable","daemon-reload":"reload"}[verb])
+                if args["name"]=="fixture-source.mount":
+                    if verb in ("enable","disable"):s["unit_enabled"]=verb=="enable"
+                    if verb in ("start","stop"):s["final_active"]=verb=="start"
+                if args["name"]=="fixture-stage.mount" and verb=="stop":s["stage_active"]=False
+            elif effective_action in ("ansible.builtin.template","ansible.builtin.copy"):
+                assert set(args)=={"dest","content","mode"}
+                content=args["content"].encode();mode=int(args["mode"],8)
+                if effective_action=="ansible.builtin.template":
+                    destination=tmp_path/"unit";record("template");s["unit_declared"]=True
+                    assert "ForceUnmount=no" in args["content"] and "Before=pve-guests.service" in args["content"]
+                    assert mode==0o644
+                else:
+                    destination=Path(args["dest"]);kind="receipt" if destination.name=="host_storage_receipt.py" else "manifest"
+                    assert content==(BASE/"ops"/destination.name).read_bytes() and mode==0o600
+                    record("helper-declare:host_storage_"+kind)
+                if destination.exists():
+                    assert destination.read_bytes()==content and stat.S_IMODE(destination.stat().st_mode)==mode
+                else:
+                    destination.write_bytes(content);destination.chmod(mode)
+                assert destination.read_bytes()==content
             else: raise AssertionError(self._task.action)
             state_file.write_text(json.dumps(s))
             if outer_request is not None:
@@ -434,6 +449,15 @@ def run_playbook(tmp_path, monkeypatch, scenario):
     data = yaml.safe_load(path.read_text()) if path.exists() else [{"hosts": "proxmox_hypervisors", "gather_facts": False, "tasks": []}]
     data[0]["become"] = False
     data[0]["vars"] = dict(data[0].get("vars", {}), qcl_host_storage=cfg, cutover_helper_sha256={kind:hashlib.sha256((BASE/"ops"/("host_storage_"+kind+".py")).read_bytes()).hexdigest() for kind in ("receipt","manifest")})
+    def relocate_declaration(tasks):
+        for task in tasks:
+            declaration=task.get("vars",{}).get("cutover_declaration")
+            if declaration and declaration["mode"]=="0600":
+                kind="receipt" if "receipt_helper" in declaration["dest"] else "manifest"
+                declaration["content"]=(BASE/"ops"/("host_storage_"+kind+".py")).read_text()
+            for key in ("block","rescue","always"):
+                if key in task:relocate_declaration(task[key])
+    relocate_declaration(data[0]["tasks"])
     play = tmp_path / "play.yml"; play.write_text(yaml.safe_dump(data, sort_keys=False))
     (tmp_path / "tasks").symlink_to(BASE / "ansible/tasks", target_is_directory=True)
     (tmp_path / "templates").symlink_to(BASE / "ansible/templates", target_is_directory=True)
@@ -604,7 +628,7 @@ def review_request(argv=None, seconds=3, output=4096):
     now = time.monotonic_ns()
     return {"schema":"qcl.storage-cutover.command.v1", "identity":{"attempt_id":"fixture", "host_id":Path("/etc/machine-id").read_text().strip(), "boot_id":Path("/proc/sys/kernel/random/boot_id").read_text().strip()},
         "slot_id":"fixture-slot", "clock":{"started_monotonic_ns":now, "deadline_monotonic_ns":now+int(seconds*1e9), "expires_at_epoch":int(time.time())+60, "action_seconds":seconds, "cleanup_seconds":1},
-        "bounds":{"request_bytes":1048576,"output_bytes":output,"metadata_read_bytes":4096,"native_commands":3,"hash_read_bytes":0,"copy_read_bytes":0,"copy_write_bytes":0},
+        "bounds":{"request_bytes":1048576,"output_bytes":output,"metadata_read_bytes":8388608,"native_commands":3,"hash_read_bytes":0,"copy_read_bytes":0,"copy_write_bytes":0},
         "operation":{"kind":"native_argv", "argv":argv or ["/usr/bin/python", "-c", "print('ok')"], "stdin":"", "mutation":False}}
 
 
@@ -654,14 +678,15 @@ def test_review_nested_cumulative_output_and_expiry(tmp_path):
 
 
 @pytest.mark.parametrize("target", ["stage-root","stage-subdir","inactive-point","deleted-original","unrelated"])
-def test_review_actual_directory_consumer(tmp_path,target):
+def test_review_actual_directory_consumer(tmp_path,target,monkeypatch):
     api=review_body("cutover_consumer_scan")
     original=tmp_path/'source';original.mkdir(); stage=tmp_path/'stage';stage.mkdir(); sub=stage/'sub';sub.mkdir();other=tmp_path/'other';other.mkdir()
+    maps=tmp_path/'map-unrelated';maps.write_bytes(b'x');independent_maps(monkeypatch,maps)
     opened=stage if target in ('stage-root','inactive-point') else sub if target=='stage-subdir' else original if target=='deleted-original' else other
     fd=os.open(opened,os.O_RDONLY|os.O_DIRECTORY)
     if target=='deleted-original': original.rmdir()
     try:
-        result=api['consumer_refs']([original,stage],100,4096,5,pids=[os.getpid()])
+        result=api['consumer_refs']([original,stage],100,8388608,5,pids=[os.getpid()])
         assert bool(result)==(target!='unrelated')
     finally:os.close(fd)
 
@@ -735,3 +760,114 @@ def test_review_source_slot_and_category_invariant():
     walk(play['tasks']);assert found==play['vars']['cutover_slots'];assert len(found)==len(set(found))<=90
     c=collections.Counter(kinds);assert c['probe']<=17 and c['mount_guard']<=12 and c['manifest']<=6 and c['reference_check']==3 and len(copies)==1
     for argv in copies:assert '--whole-file' in argv and '--delete' not in argv and '--inplace' not in argv and '/usr/bin/timeout' not in argv
+
+
+def installed_helper(kind,cfg):
+    path=Path(cfg['cutover']['receipt'][kind+'_helper']);expected=(BASE/'ops'/path.name).read_bytes()
+    assert path.read_bytes()==expected and stat.S_IMODE(path.stat().st_mode)==0o600
+    spec=importlib.util.spec_from_file_location('declared_'+kind,path);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
+
+
+def independent_maps(monkeypatch,physical,inaccessible=False):
+    old_readlink,old_stat=os.readlink,os.stat
+    def maps(path):return '/map_files/' in str(path) and str(path).startswith('/proc/'+str(os.getpid())+'/')
+    def readlink(path,*a,**kw):
+        if maps(path):
+            if inaccessible:raise PermissionError('independent mapped metadata inaccessible')
+            return str(physical)
+        return old_readlink(path,*a,**kw)
+    def statmap(path,*a,**kw):
+        if maps(path):
+            if inaccessible:raise PermissionError('independent mapped metadata inaccessible')
+            return old_stat(physical)
+        return old_stat(path,*a,**kw)
+    monkeypatch.setattr(os,'readlink',readlink);monkeypatch.setattr(os,'stat',statmap)
+
+
+NB_RED_IDS = [
+    'test_native_recovery_stop_does_not_disable',
+    'test_recovery_real_consumer_scan_precedes_stop',
+    'test_whole_metadata_proc_enumeration_cap_and_deadline',
+    'test_whole_reference_metadata_sum_cap',
+    'test_receipt_read_multiplicity_is_prepaid',
+    'test_eof_waits_for_natural_epilogue',
+    'test_reference_relative_inside_manifest',
+]
+
+
+def nb_graph(tmp_path):
+    root=tmp_path/'tree';root.mkdir();(root/'disk').write_bytes(b'known')
+    manifest={'schema':1,'entries':{'.':{'type':'directory'},'disk':{'type':'file'}},'summary':{}}
+    graph={'schema':'qcl.storage-cutover.references.v1','accepted':True,'complete':True,'identity':{'host':'h'},'d04_receipt_sha256':'d'*64,'window_receipt_sha256':'w'*64,'retained_manifest_sha256':'m'*64,'excluded_old_qcl_set_sha256':'e'*64,'volume_bindings':[],'absolute_bindings':[{'id':'absolute','path':str(root/'disk'),'relative':'disk','type':'file','ownership':'retained'}],'backing_nodes':[],'backing_edges':[],'tool_evidence':[{'executable':'/usr/bin/qemu-img','source':'installed','sha256':'a'*64,'version':'fixture','argv':[],'result_artifact':'fixture'}]}
+    expected={k:graph[k] for k in ('identity','d04_receipt_sha256','window_receipt_sha256','retained_manifest_sha256','excluded_old_qcl_set_sha256')}
+    return root,manifest,graph,expected
+
+
+def test_native_recovery_stop_does_not_disable(tmp_path,monkeypatch):
+    rc,state,*_=run_playbook(tmp_path,monkeypatch,'nb-restore-after-enable')
+    assert 'systemd:enable' in state['trace'],state['trace']
+    assert 'CAS:reopen-original' in state['trace'],state['trace']
+    assert state['unit_enabled'] is False,'native stop does not disable enabled final unit'
+    assert 'systemd:disable' in state['trace']
+
+
+def test_recovery_real_consumer_scan_precedes_stop(tmp_path,monkeypatch):
+    rc,state,*_=run_playbook(tmp_path,monkeypatch,'nb-restore-after-enable')
+    assert 'systemd:enable' in state['trace'],state['trace']
+    assert state.get('recovery_measurement') is True,'pre-stop recovery action64 skipped consumer measurement'
+
+
+def test_whole_metadata_proc_enumeration_cap_and_deadline(tmp_path):
+    api=review_body('cutover_command_boundary')
+    if 'MetadataBudget' not in api:raise AssertionError('own cleanup/proc lacks shared bounded metadata accessor')
+    budget=api['MetadataBudget'](32,__import__('time').monotonic()+1)
+    path=tmp_path/'record';path.write_bytes(b'X'*20)
+    assert budget.read(path,20)==b'X'*20
+    with pytest.raises(ValueError,match='metadata'):budget.read(path,20)
+    expired=api['MetadataBudget'](100,0)
+    with pytest.raises(ValueError,match='deadline'):expired.names(tmp_path)
+
+
+def test_whole_reference_metadata_sum_cap(tmp_path):
+    api=review_body('cutover_command_boundary')
+    if 'MetadataBudget' not in api:raise AssertionError('reference graph/path outputs lack one shared child allowance')
+    budget=api['MetadataBudget'](300,__import__('time').monotonic()+1);budget.charge(200)
+    for _ in range(3):budget.charge(25)
+    with pytest.raises(ValueError,match='metadata'):budget.charge(26)
+
+
+@pytest.mark.parametrize('action,factor',[('inspect',1),('transition',4),('persist_manifest',2),('read_manifest',1),('sync_manifest',3)])
+def test_receipt_read_multiplicity_is_prepaid(action,factor):
+    api=review_body('cutover_command_boundary')
+    if 'helper_metadata_bound' not in api:raise AssertionError('receipt4B/2B/3B explicit IO not prepaid')
+    request={'action':action,'max_bytes':128}
+    assert api['helper_metadata_bound']('receipt',request,10,20)>=factor*128+30
+
+
+def test_eof_waits_for_natural_epilogue(tmp_path):
+    witness=tmp_path/'epilogue'
+    code="import os,time;os.close(1);os.close(2);time.sleep(.15);open("+repr(str(witness))+",'w').write('finished')"
+    result=review_boundary(review_request(['/usr/bin/python','-c',code],seconds=3))
+    assert result['status']=='ok',result
+    assert not result['cleanup']['term_sent'] and not result['cleanup']['kill_sent']
+    assert witness.read_text()=='finished'
+
+
+@pytest.mark.parametrize('case',['absolute','empty','parent','noncanonical','outside','missing','type','valid'])
+def test_reference_relative_inside_manifest(tmp_path,case):
+    api=review_body('cutover_reference_check');root,manifest,graph,expected=nb_graph(tmp_path)
+    binding=graph['absolute_bindings'][0]
+    if case=='absolute':binding.update(relative=str(root/'disk'),path=str(root/'disk'))
+    elif case=='empty':binding.update(relative='',path=str(root))
+    elif case=='parent':binding.update(relative='../disk',path=str(tmp_path/'disk'))
+    elif case=='noncanonical':binding.update(relative='./disk',path=str(root/'./disk'))
+    elif case=='outside':binding.update(path=str(tmp_path/'disk'))
+    elif case=='missing':manifest['entries'].pop('disk')
+    elif case=='type':manifest['entries']['disk']['type']='symlink'
+    parameters=__import__('inspect').signature(api['verify_graph']).parameters
+    def invoke():
+        args=(graph,expected,str(root),20,100,lambda vol:str(root/'disk'))
+        return api['verify_graph'](*args,retained_manifest=manifest) if 'retained_manifest' in parameters else api['verify_graph'](*args)
+    if case=='valid':assert invoke()
+    else:
+        with pytest.raises(ValueError):invoke()
