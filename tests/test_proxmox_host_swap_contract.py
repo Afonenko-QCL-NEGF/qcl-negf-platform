@@ -349,7 +349,7 @@ def execute(cfg,s,tmp_path,monkeypatch,*,syntax=False):
                 if Path(argv[0]).name=='python3' and argv[3]=='clock-v2':
                     config=json.loads(argv[4]);wire_usage=dict(schema='qcl.host-swap.budget.v1',sequence=1,started_monotonic_ns=100000000000,last_monotonic_ns=100000000000,deadline_monotonic_ns=100000000000+config['limits']['aggregate_ns'],phase_elapsed_ns={'preflight':0,'allocation':0,'activation':0},output_bytes=0,write_bytes_reserved=0,metadata_bytes_reserved=0,**config)
                     argv=['/fixture/clock-done']
-                    if min(wire_usage['admission_expires_epoch_ns'],wire_usage['ledger_expires_epoch_ns'])<=100000000000:out.update(rc=125);argv=['/fixture/budget-refusal']
+                    if min(wire_usage['admission_expires_epoch_ns'],wire_usage['ledger_expires_epoch_ns'])<=s.get('epoch_ns',100000000000):out.update(rc=125);argv=['/fixture/budget-refusal']
                 elif Path(argv[0]).name=='python3' and argv[3]=='run-v2':
                     wire_usage=json.loads(argv[4]);incoming=json.loads(argv[4]);phase=argv[5];write=int(argv[6]);metadata=int(argv[7]);event['phase']=phase
                     assert wire_usage['schema']=='qcl.host-swap.budget.v1' and phase in wire_usage['phase_elapsed_ns']
@@ -357,8 +357,8 @@ def execute(cfg,s,tmp_path,monkeypatch,*,syntax=False):
                     wire_usage['sequence']+=1;wire_usage['write_bytes_reserved']+=write;wire_usage['metadata_bytes_reserved']+=metadata
                     wire_usage['last_monotonic_ns']+=1000000;wire_usage['phase_elapsed_ns'][phase]+=1000000
                     argv=json.loads(argv[8]);argv=[json.dumps(wire_usage) if a=='@BUDGET@' else a for a in argv]
-                    if wire_usage['write_bytes_reserved']>wire_usage['limits']['write_bytes'] or wire_usage['metadata_bytes_reserved']>wire_usage['limits']['metadata_write_bytes'] or wire_usage['phase_elapsed_ns'][phase]>=wire_usage['limits'][phase+'_ns'] or wire_usage['last_monotonic_ns']>=wire_usage['deadline_monotonic_ns'] or min(wire_usage['admission_expires_epoch_ns'],wire_usage['ledger_expires_epoch_ns'])<=100000000000:
-                        out.update(rc=125,stdout='',stderr='');argv=['/fixture/budget-refusal']
+                    if wire_usage['write_bytes_reserved']>wire_usage['limits']['write_bytes'] or wire_usage['metadata_bytes_reserved']>wire_usage['limits']['metadata_write_bytes'] or wire_usage['phase_elapsed_ns'][phase]>=wire_usage['limits'][phase+'_ns'] or wire_usage['last_monotonic_ns']>=wire_usage['deadline_monotonic_ns'] or min(wire_usage['admission_expires_epoch_ns'],wire_usage['ledger_expires_epoch_ns'])<=s.get('epoch_ns',100000000000):
+                        out.update(rc=125,stdout='',stderr='');wire_usage=incoming;argv=['/fixture/budget-refusal']
                 cmd=Path(argv[0]).name
                 if cmd=='timeout':
                     assert argv[1:3]==['--signal=TERM','--kill-after=5']
@@ -501,7 +501,7 @@ def execute(cfg,s,tmp_path,monkeypatch,*,syntax=False):
                     result=dict(schema='qcl.host-swap.io-result.v1',rc=out['rc'],stdout_b64=base64.b64encode(out.get('stdout','').encode()).decode(),stderr_b64=base64.b64encode(out.get('stderr','').encode()).decode(),usage=wire_usage,owned_children_complete=True,failure='budget_or_io_refusal' if cmd=='budget-refusal' else None)
                     if cmd=='systemctl' and shape['operands'][0]=='start' and s['failure'] in ('start-cleanup-unknown','start-exhausted','start-malformed-usage'):
                         result.update(owned_children_complete=False,failure='cleanup_unknown')
-                        if s['failure']=='start-exhausted':wire_usage['admission_expires_epoch_ns']=100000000000
+                        if s['failure']=='start-exhausted':s['epoch_ns']=201000000000
                     before=wire_usage['output_bytes']
                     for _ in range(8):
                         size=len(json.dumps(result,sort_keys=True,separators=(',',':')).encode())+1
@@ -850,6 +850,7 @@ def test_review_seven_gaps(name,tmp_path,monkeypatch,capfd):
     if name not in ('healthy-open-pool','charge-once'):
         assert observed['trace']==[], 'refuse before writes, formatting, reload, start or enable'
     else:
+        assert_lifecycle_history(observed)
         kinds=[r['kind'] for r in observed['trace']]
         assert kinds.count('fill')==1 and kinds.count('format')==1 and kinds.count('start')==1
         assert observed['active'] and observed['unit_enabled']
@@ -936,7 +937,11 @@ def assert_lifecycle_history(observed):
         reads=[q for q in observed['native_queries'] if seal['index']<q['index']<starts[0]['index']]
         assert any(q['task']=='file_start_guard' for q in reads)
         assert any(Path(q['argv'][0]).name=='findmnt' for q in reads)
-        assert any(Path(q['argv'][0]).name=='blkid' for q in reads)
+        raw=next(q for q in reads if q['task']=='file_start_guard')
+        sample=json.loads(raw['stdout'])
+        assert sample['header_metadata']['uuid']==observed['records']['header']['payload']['header_uuid']
+        assert sample['sample_sha256']==observed['records']['header']['payload']['sample_sha256']
+        assert any(Path(q['argv'][0]).name=='blkid' and q['index']<seal['index'] for q in observed['native_queries'])
     if 'completion' in observed['records']:
         stored=observed['records']['completion']['payload']['budget_usage']
         publication=[h for h in history if h['task']=='write_completion']
@@ -979,7 +984,7 @@ def test_whole_repair_vectors(case,tmp_path,monkeypatch,capfd):
             kinds=[r['kind'] for r in observed['trace']];assert kinds.count('fill')==kinds.count('format')==kinds.count('start')==1
         else:assert observed['trace']==[]
     else:
-        predicate='capacity_entry' if case=='ledger-above-target' else 'capacity_allocated' if case.startswith('reserve-') else 'owned_existing' if case=='legacy-refusal' else 'format_intent_existing'
+        predicate='capacity_entry' if case=='ledger-above-target' else 'capacity_allocated' if case.startswith('reserve-') else 'binding_v2' if case=='legacy-refusal' else 'format_intent_existing'
         assert_boundary(rc,observed,output,predicate,forbidden=('format','start','enable','record-completion') if case.startswith('reserve-') else None)
         if case=='ledger-above-target':
             queries=[q for q in observed['native_queries'] if Path(q['argv'][0]).name=='lvs']
@@ -1071,5 +1076,7 @@ def test_minimal_response_unicode_counter_bound(failure,monkeypatch):
     monkeypatch.setattr(time,'monotonic_ns',lambda:u['last_monotonic_ns'])
     wire=ns['finish'](u,'preflight',125,b'',b'',failure is None,failure)
     result=json.loads(wire)
+    assert ns['MINIMAL_REFUSAL_BOUND']<=4096
+    assert ns['MINIMAL_REFUSAL_BOUND']>=len(wire)
     assert len(wire)<=4096 and result['usage']['output_bytes']==len(wire)
     assert result['owned_children_complete'] is (failure is None) and result['failure']==failure

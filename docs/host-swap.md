@@ -60,7 +60,10 @@ Loaded declaration использует What=file, RequiresMountsFor и mount co
 Explicit Priority/Options отсутствуют; kernel priority наблюдается, не задаётся.
 
 Перед start записывается durable sticky activation_intent. После unknown/timeout
-outcome actual kernel table и unit читаются до отказа. Late activation и failed
+outcome только trusted updated BudgetState допускает одну bounded read-only последовательность:
+actual kernel table и три scalar unit properties; затем обязательный отказ. Unknown,
+expired или exhausted usage не допускает native child; rejected wrapper не является
+выполненным native read. Observed active не отменяет исходную start failure. Late activation и failed
 completion не разрешают refill, format, delete, stop/restart или swapoff. Sticky
 intent при текущем inactive состоянии также требует отдельного reconciliation,
 не нового automatic start. Оригинальные failed receipts сохраняются.
@@ -131,3 +134,44 @@ resume, enable and poststate. A healthy open thin pool `twi-aotz--` is accepted 
 `twi-a-tz--`; all ten semantic attribute positions, health and finite geometry remain
 strict. No stop, swapoff, restart, swappiness, VM, Slurm or scientific model changes are
 part of this operation.
+
+
+## F1–F6: exact producer, entry decisions and authoritative ledger
+
+Declared fragment bytes contain exactly one final U+000A from the actual template lookup.
+Faulty old fragments/contexts refuse; this operation never rewrites or migrates them.
+The four creation decisions are plain booleans frozen after entry validation, before
+writes. Durable allocation and activation intent do not turn off later guards within
+that entry. A fresh successful allocation retains its exact dense/stable proof before
+remaining backing becomes zero; an existing full allocation needs the same current proof.
+Sticky inactive intent never permits an automatic start retry.
+
+Initial B_entry is the independently known `ledger.incremental_swap_bytes`, a non-boolean
+integer from0 through2^63−1. It may be explicitly admitted above or below file target size;
+unknown is never zero. Target bytes still determine the full DD/header/file geometry.
+Physical free-space checks include B_entry plus all protected growth/reserve/overhead;
+after proven full durable allocation, current free measurements already include backing
+and only B_entry becomes zero. No repeated target subtraction or inference from FIEMAP.
+
+Attempt and boot BudgetState identities are nonempty strings of at most128 UTF-8 bytes.
+A canonical worst-case minimal response uses maximum-width counters and maximally escaped
+identities to prove the4096-byte reserve. Serialization converges in at most8 steps or
+refuses. Before capture no-child certainty may be true; on entering capture it becomes
+false and only observed completion may replace it. Finish/fallback errors preserve false
+certainty and the primary failure. If a minimal truthful result cannot fit, outer125 has
+no serialized result and is unknown downstream; no cap bypass or fabricated completion.
+
+Failed start handling is local to the one start command. Its complete raw response is
+retained. Only structurally valid canonical updated usage with exact original identity,
+limits, clocks and cumulative counters can fund at most swapon table then minimal
+systemctl show of LoadState/ActiveState/UnitFileState. Every read uses the same current
+native guard; failure of the first excludes the second. No enable, completion, retry or
+other mutation follows either known or unknown failed outcome. The observations remain
+ephemeral facts; no eighth durable record is created. Unit typed policy and native support
+are still admission gates, independent of outcome diagnostics.
+
+`completion.payload.budget_usage` is the snapshot before its own publication. The final
+transported write-completion usage includes its precharges, bounded output and elapsed
+own capture/readback; immutable completion is not rewritten to contain itself. Final
+controller latency, physical journal I/O and concurrent tree RSS remain unmeasured.
+Local synthetic source tests do not grant native/boot/pressure/SCI acceptance.

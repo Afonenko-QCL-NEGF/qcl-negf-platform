@@ -53,7 +53,7 @@
 
       def validate_usage(u):
           if type(u) is not dict or set(u)!=BUDGET_KEYS or u['schema']!='qcl.host-swap.budget.v1':raise ValueError('budget schema')
-          if not all(type(u[k]) is str and u[k] for k in ('attempt_id','boot_id')):raise ValueError('budget identity')
+          if not all(type(u[k]) is str and u[k] and len(u[k].encode('utf-8'))<=128 for k in ('attempt_id','boot_id')):raise ValueError('budget identity')
           for key in BUDGET_KEYS-{'schema','attempt_id','boot_id','phase_elapsed_ns','limits'}:integer(u[key])
           if set(u['limits'])!=LIMIT_KEYS or set(u['phase_elapsed_ns'])!=PHASES:raise ValueError('budget keys')
           for key,v in u['limits'].items():integer(v,key not in ('write_bytes','metadata_write_bytes'))
@@ -72,6 +72,17 @@
                  deadline_monotonic_ns=now+integer(config['limits']['aggregate_ns'],True),phase_elapsed_ns={p:0 for p in PHASES},
                  output_bytes=0,write_bytes_reserved=0,metadata_bytes_reserved=0,**config)
           validate_usage(u);return u
+
+
+      FAILURE_REASONS={None,'capture_timeout','output_cap','children_incomplete','cleanup_unknown','post_budget_expired','budget_or_io_refusal'}
+      # Canonical worst-case identities are 128 one-byte control characters (six JSON bytes each).
+      # All counters/limits use the widest allowed integer, independent of current clock values.
+      _max_counter=9223372036854775807
+      _max_usage={key:_max_counter for key in BUDGET_KEYS}
+      _max_usage.update(schema='qcl.host-swap.budget.v1',attempt_id='\x00'*128,boot_id='\x00'*128,
+                        phase_elapsed_ns={p:_max_counter for p in PHASES},limits={k:_max_counter for k in LIMIT_KEYS})
+      MINIMAL_REFUSAL_BOUND=max(len(canonical(dict(schema='qcl.host-swap.io-result.v1',rc=125,stdout_b64='',stderr_b64='',usage=_max_usage,owned_children_complete=complete,failure=reason)))+1 for complete in (True,False) for reason in FAILURE_REASONS)
+      if MINIMAL_REFUSAL_BOUND>MIN_RESPONSE_BYTES:raise ValueError('minimal response reserve proof')
 
 
       def guard(u,phase,write=0,metadata=0):
@@ -244,6 +255,8 @@
 
 
       def finish(u,phase,rc,out,err,complete,failure):
+          validate_usage(u)
+          if type(complete) is not bool or (failure is not None and type(failure) is not str) or failure not in FAILURE_REASONS:raise ValueError('response certainty/reason')
           now=time.monotonic_ns();v=copy.deepcopy(u)
           v['phase_elapsed_ns'][phase]+=max(0,now-v['last_monotonic_ns']);v['last_monotonic_ns']=now
           if now>v['deadline_monotonic_ns'] or v['phase_elapsed_ns'][phase]>v['limits'][phase+'_ns'] or time.time_ns()>=min(v['admission_expires_epoch_ns'],v['ledger_expires_epoch_ns']):
@@ -253,14 +266,17 @@
           for _ in range(8):
               wire=canonical(result);count=previous+len(wire)+1
               if v['output_bytes']==count:break
+              if count>u['limits']['output_bytes']:raise ValueError('serialized response bound')
               v['output_bytes']=count
+          else:raise ValueError('output fixed point did not converge')
+          validate_usage(v)
           wire=canonical(result)+b'\n'
           if len(wire)+previous>u['limits']['output_bytes']:raise ValueError('serialized response bound')
           return wire
 
 
       def main_io():
-          mode=sys.argv[1];phase='preflight';u=None
+          mode=sys.argv[1];phase='preflight';u=None;complete=True;failure=None
           try:
               if mode=='clock-v2':
                   u=init_usage(strict_load(sys.argv[2]));u,_=precharge(u,phase);wire=finish(u,phase,0,b'',b'',True,None)
@@ -268,6 +284,7 @@
                   u=strict_load(sys.argv[2]);phase=sys.argv[3];write=int(sys.argv[4]);metadata=int(sys.argv[5]);argv=strict_load(sys.argv[6])
                   u,deadline=precharge(u,phase,write,metadata)
                   argv=[canonical(u).decode() if x=='@BUDGET@' else x for x in argv]
+                  complete=False
                   rc,out,err,complete,failure=capture(argv,u,phase,deadline)
                   if failure is None and rc==0:
                       if any(a in ('--json','--json=short') for a in argv) or '--reportformat' in argv:
@@ -283,7 +300,10 @@
               else:raise ValueError('IO mode')
           except (ValueError,TimeoutError,OSError):
               if u is None:sys.exit(125)
-              wire=finish(u,phase,125,b'',b'',True,'budget_or_io_refusal')
+              failure=failure or 'budget_or_io_refusal'
+              # At most one bounded minimal serialization, preserving observed child certainty.
+              try:wire=finish(u,phase,125,b'',b'',complete,failure)
+              except (ValueError,TimeoutError,OSError):sys.exit(125)
           sys.stdout.buffer.write(wire)
 
       if __name__=='__main__':main_io()
@@ -332,7 +352,7 @@
 
       def validate_usage(u):
           if type(u) is not dict or set(u)!=BUDGET_KEYS or u['schema']!='qcl.host-swap.budget.v1':raise ValueError('budget schema')
-          if not all(type(u[k]) is str and u[k] for k in ('attempt_id','boot_id')):raise ValueError('budget identity')
+          if not all(type(u[k]) is str and u[k] and len(u[k].encode('utf-8'))<=128 for k in ('attempt_id','boot_id')):raise ValueError('budget identity')
           for key in BUDGET_KEYS-{'schema','attempt_id','boot_id','phase_elapsed_ns','limits'}:integer(u[key])
           if set(u['limits'])!=LIMIT_KEYS or set(u['phase_elapsed_ns'])!=PHASES:raise ValueError('budget keys')
           for key,v in u['limits'].items():integer(v,key not in ('write_bytes','metadata_write_bytes'))
@@ -351,6 +371,17 @@
                  deadline_monotonic_ns=now+integer(config['limits']['aggregate_ns'],True),phase_elapsed_ns={p:0 for p in PHASES},
                  output_bytes=0,write_bytes_reserved=0,metadata_bytes_reserved=0,**config)
           validate_usage(u);return u
+
+
+      FAILURE_REASONS={None,'capture_timeout','output_cap','children_incomplete','cleanup_unknown','post_budget_expired','budget_or_io_refusal'}
+      # Canonical worst-case identities are 128 one-byte control characters (six JSON bytes each).
+      # All counters/limits use the widest allowed integer, independent of current clock values.
+      _max_counter=9223372036854775807
+      _max_usage={key:_max_counter for key in BUDGET_KEYS}
+      _max_usage.update(schema='qcl.host-swap.budget.v1',attempt_id='\x00'*128,boot_id='\x00'*128,
+                        phase_elapsed_ns={p:_max_counter for p in PHASES},limits={k:_max_counter for k in LIMIT_KEYS})
+      MINIMAL_REFUSAL_BOUND=max(len(canonical(dict(schema='qcl.host-swap.io-result.v1',rc=125,stdout_b64='',stderr_b64='',usage=_max_usage,owned_children_complete=complete,failure=reason)))+1 for complete in (True,False) for reason in FAILURE_REASONS)
+      if MINIMAL_REFUSAL_BOUND>MIN_RESPONSE_BYTES:raise ValueError('minimal response reserve proof')
 
 
       def guard(u,phase,write=0,metadata=0):
@@ -523,6 +554,8 @@
 
 
       def finish(u,phase,rc,out,err,complete,failure):
+          validate_usage(u)
+          if type(complete) is not bool or (failure is not None and type(failure) is not str) or failure not in FAILURE_REASONS:raise ValueError('response certainty/reason')
           now=time.monotonic_ns();v=copy.deepcopy(u)
           v['phase_elapsed_ns'][phase]+=max(0,now-v['last_monotonic_ns']);v['last_monotonic_ns']=now
           if now>v['deadline_monotonic_ns'] or v['phase_elapsed_ns'][phase]>v['limits'][phase+'_ns'] or time.time_ns()>=min(v['admission_expires_epoch_ns'],v['ledger_expires_epoch_ns']):
@@ -532,14 +565,17 @@
           for _ in range(8):
               wire=canonical(result);count=previous+len(wire)+1
               if v['output_bytes']==count:break
+              if count>u['limits']['output_bytes']:raise ValueError('serialized response bound')
               v['output_bytes']=count
+          else:raise ValueError('output fixed point did not converge')
+          validate_usage(v)
           wire=canonical(result)+b'\n'
           if len(wire)+previous>u['limits']['output_bytes']:raise ValueError('serialized response bound')
           return wire
 
 
       def main_io():
-          mode=sys.argv[1];phase='preflight';u=None
+          mode=sys.argv[1];phase='preflight';u=None;complete=True;failure=None
           try:
               if mode=='clock-v2':
                   u=init_usage(strict_load(sys.argv[2]));u,_=precharge(u,phase);wire=finish(u,phase,0,b'',b'',True,None)
@@ -547,6 +583,7 @@
                   u=strict_load(sys.argv[2]);phase=sys.argv[3];write=int(sys.argv[4]);metadata=int(sys.argv[5]);argv=strict_load(sys.argv[6])
                   u,deadline=precharge(u,phase,write,metadata)
                   argv=[canonical(u).decode() if x=='@BUDGET@' else x for x in argv]
+                  complete=False
                   rc,out,err,complete,failure=capture(argv,u,phase,deadline)
                   if failure is None and rc==0:
                       if any(a in ('--json','--json=short') for a in argv) or '--reportformat' in argv:
@@ -562,7 +599,10 @@
               else:raise ValueError('IO mode')
           except (ValueError,TimeoutError,OSError):
               if u is None:sys.exit(125)
-              wire=finish(u,phase,125,b'',b'',True,'budget_or_io_refusal')
+              failure=failure or 'budget_or_io_refusal'
+              # At most one bounded minimal serialization, preserving observed child certainty.
+              try:wire=finish(u,phase,125,b'',b'',complete,failure)
+              except (ValueError,TimeoutError,OSError):sys.exit(125)
           sys.stdout.buffer.write(wire)
 
       # Standard bounded one-object IO primitives; Ansible owns phase/target/capacity policy.
@@ -768,7 +808,7 @@
 
       def validate_usage(u):
           if type(u) is not dict or set(u)!=BUDGET_KEYS or u['schema']!='qcl.host-swap.budget.v1':raise ValueError('budget schema')
-          if not all(type(u[k]) is str and u[k] for k in ('attempt_id','boot_id')):raise ValueError('budget identity')
+          if not all(type(u[k]) is str and u[k] and len(u[k].encode('utf-8'))<=128 for k in ('attempt_id','boot_id')):raise ValueError('budget identity')
           for key in BUDGET_KEYS-{'schema','attempt_id','boot_id','phase_elapsed_ns','limits'}:integer(u[key])
           if set(u['limits'])!=LIMIT_KEYS or set(u['phase_elapsed_ns'])!=PHASES:raise ValueError('budget keys')
           for key,v in u['limits'].items():integer(v,key not in ('write_bytes','metadata_write_bytes'))
@@ -787,6 +827,17 @@
                  deadline_monotonic_ns=now+integer(config['limits']['aggregate_ns'],True),phase_elapsed_ns={p:0 for p in PHASES},
                  output_bytes=0,write_bytes_reserved=0,metadata_bytes_reserved=0,**config)
           validate_usage(u);return u
+
+
+      FAILURE_REASONS={None,'capture_timeout','output_cap','children_incomplete','cleanup_unknown','post_budget_expired','budget_or_io_refusal'}
+      # Canonical worst-case identities are 128 one-byte control characters (six JSON bytes each).
+      # All counters/limits use the widest allowed integer, independent of current clock values.
+      _max_counter=9223372036854775807
+      _max_usage={key:_max_counter for key in BUDGET_KEYS}
+      _max_usage.update(schema='qcl.host-swap.budget.v1',attempt_id='\x00'*128,boot_id='\x00'*128,
+                        phase_elapsed_ns={p:_max_counter for p in PHASES},limits={k:_max_counter for k in LIMIT_KEYS})
+      MINIMAL_REFUSAL_BOUND=max(len(canonical(dict(schema='qcl.host-swap.io-result.v1',rc=125,stdout_b64='',stderr_b64='',usage=_max_usage,owned_children_complete=complete,failure=reason)))+1 for complete in (True,False) for reason in FAILURE_REASONS)
+      if MINIMAL_REFUSAL_BOUND>MIN_RESPONSE_BYTES:raise ValueError('minimal response reserve proof')
 
 
       def guard(u,phase,write=0,metadata=0):
@@ -959,6 +1010,8 @@
 
 
       def finish(u,phase,rc,out,err,complete,failure):
+          validate_usage(u)
+          if type(complete) is not bool or (failure is not None and type(failure) is not str) or failure not in FAILURE_REASONS:raise ValueError('response certainty/reason')
           now=time.monotonic_ns();v=copy.deepcopy(u)
           v['phase_elapsed_ns'][phase]+=max(0,now-v['last_monotonic_ns']);v['last_monotonic_ns']=now
           if now>v['deadline_monotonic_ns'] or v['phase_elapsed_ns'][phase]>v['limits'][phase+'_ns'] or time.time_ns()>=min(v['admission_expires_epoch_ns'],v['ledger_expires_epoch_ns']):
@@ -968,14 +1021,17 @@
           for _ in range(8):
               wire=canonical(result);count=previous+len(wire)+1
               if v['output_bytes']==count:break
+              if count>u['limits']['output_bytes']:raise ValueError('serialized response bound')
               v['output_bytes']=count
+          else:raise ValueError('output fixed point did not converge')
+          validate_usage(v)
           wire=canonical(result)+b'\n'
           if len(wire)+previous>u['limits']['output_bytes']:raise ValueError('serialized response bound')
           return wire
 
 
       def main_io():
-          mode=sys.argv[1];phase='preflight';u=None
+          mode=sys.argv[1];phase='preflight';u=None;complete=True;failure=None
           try:
               if mode=='clock-v2':
                   u=init_usage(strict_load(sys.argv[2]));u,_=precharge(u,phase);wire=finish(u,phase,0,b'',b'',True,None)
@@ -983,6 +1039,7 @@
                   u=strict_load(sys.argv[2]);phase=sys.argv[3];write=int(sys.argv[4]);metadata=int(sys.argv[5]);argv=strict_load(sys.argv[6])
                   u,deadline=precharge(u,phase,write,metadata)
                   argv=[canonical(u).decode() if x=='@BUDGET@' else x for x in argv]
+                  complete=False
                   rc,out,err,complete,failure=capture(argv,u,phase,deadline)
                   if failure is None and rc==0:
                       if any(a in ('--json','--json=short') for a in argv) or '--reportformat' in argv:
@@ -998,7 +1055,10 @@
               else:raise ValueError('IO mode')
           except (ValueError,TimeoutError,OSError):
               if u is None:sys.exit(125)
-              wire=finish(u,phase,125,b'',b'',True,'budget_or_io_refusal')
+              failure=failure or 'budget_or_io_refusal'
+              # At most one bounded minimal serialization, preserving observed child certainty.
+              try:wire=finish(u,phase,125,b'',b'',complete,failure)
+              except (ValueError,TimeoutError,OSError):sys.exit(125)
           sys.stdout.buffer.write(wire)
 
       # Standard bounded one-object IO primitives; Ansible owns phase/target/capacity policy.
@@ -1297,7 +1357,7 @@
 
       def validate_usage(u):
           if type(u) is not dict or set(u)!=BUDGET_KEYS or u['schema']!='qcl.host-swap.budget.v1':raise ValueError('budget schema')
-          if not all(type(u[k]) is str and u[k] for k in ('attempt_id','boot_id')):raise ValueError('budget identity')
+          if not all(type(u[k]) is str and u[k] and len(u[k].encode('utf-8'))<=128 for k in ('attempt_id','boot_id')):raise ValueError('budget identity')
           for key in BUDGET_KEYS-{'schema','attempt_id','boot_id','phase_elapsed_ns','limits'}:integer(u[key])
           if set(u['limits'])!=LIMIT_KEYS or set(u['phase_elapsed_ns'])!=PHASES:raise ValueError('budget keys')
           for key,v in u['limits'].items():integer(v,key not in ('write_bytes','metadata_write_bytes'))
@@ -1316,6 +1376,17 @@
                  deadline_monotonic_ns=now+integer(config['limits']['aggregate_ns'],True),phase_elapsed_ns={p:0 for p in PHASES},
                  output_bytes=0,write_bytes_reserved=0,metadata_bytes_reserved=0,**config)
           validate_usage(u);return u
+
+
+      FAILURE_REASONS={None,'capture_timeout','output_cap','children_incomplete','cleanup_unknown','post_budget_expired','budget_or_io_refusal'}
+      # Canonical worst-case identities are 128 one-byte control characters (six JSON bytes each).
+      # All counters/limits use the widest allowed integer, independent of current clock values.
+      _max_counter=9223372036854775807
+      _max_usage={key:_max_counter for key in BUDGET_KEYS}
+      _max_usage.update(schema='qcl.host-swap.budget.v1',attempt_id='\x00'*128,boot_id='\x00'*128,
+                        phase_elapsed_ns={p:_max_counter for p in PHASES},limits={k:_max_counter for k in LIMIT_KEYS})
+      MINIMAL_REFUSAL_BOUND=max(len(canonical(dict(schema='qcl.host-swap.io-result.v1',rc=125,stdout_b64='',stderr_b64='',usage=_max_usage,owned_children_complete=complete,failure=reason)))+1 for complete in (True,False) for reason in FAILURE_REASONS)
+      if MINIMAL_REFUSAL_BOUND>MIN_RESPONSE_BYTES:raise ValueError('minimal response reserve proof')
 
 
       def guard(u,phase,write=0,metadata=0):
@@ -1488,6 +1559,8 @@
 
 
       def finish(u,phase,rc,out,err,complete,failure):
+          validate_usage(u)
+          if type(complete) is not bool or (failure is not None and type(failure) is not str) or failure not in FAILURE_REASONS:raise ValueError('response certainty/reason')
           now=time.monotonic_ns();v=copy.deepcopy(u)
           v['phase_elapsed_ns'][phase]+=max(0,now-v['last_monotonic_ns']);v['last_monotonic_ns']=now
           if now>v['deadline_monotonic_ns'] or v['phase_elapsed_ns'][phase]>v['limits'][phase+'_ns'] or time.time_ns()>=min(v['admission_expires_epoch_ns'],v['ledger_expires_epoch_ns']):
@@ -1497,14 +1570,17 @@
           for _ in range(8):
               wire=canonical(result);count=previous+len(wire)+1
               if v['output_bytes']==count:break
+              if count>u['limits']['output_bytes']:raise ValueError('serialized response bound')
               v['output_bytes']=count
+          else:raise ValueError('output fixed point did not converge')
+          validate_usage(v)
           wire=canonical(result)+b'\n'
           if len(wire)+previous>u['limits']['output_bytes']:raise ValueError('serialized response bound')
           return wire
 
 
       def main_io():
-          mode=sys.argv[1];phase='preflight';u=None
+          mode=sys.argv[1];phase='preflight';u=None;complete=True;failure=None
           try:
               if mode=='clock-v2':
                   u=init_usage(strict_load(sys.argv[2]));u,_=precharge(u,phase);wire=finish(u,phase,0,b'',b'',True,None)
@@ -1512,6 +1588,7 @@
                   u=strict_load(sys.argv[2]);phase=sys.argv[3];write=int(sys.argv[4]);metadata=int(sys.argv[5]);argv=strict_load(sys.argv[6])
                   u,deadline=precharge(u,phase,write,metadata)
                   argv=[canonical(u).decode() if x=='@BUDGET@' else x for x in argv]
+                  complete=False
                   rc,out,err,complete,failure=capture(argv,u,phase,deadline)
                   if failure is None and rc==0:
                       if any(a in ('--json','--json=short') for a in argv) or '--reportformat' in argv:
@@ -1527,7 +1604,10 @@
               else:raise ValueError('IO mode')
           except (ValueError,TimeoutError,OSError):
               if u is None:sys.exit(125)
-              wire=finish(u,phase,125,b'',b'',True,'budget_or_io_refusal')
+              failure=failure or 'budget_or_io_refusal'
+              # At most one bounded minimal serialization, preserving observed child certainty.
+              try:wire=finish(u,phase,125,b'',b'',complete,failure)
+              except (ValueError,TimeoutError,OSError):sys.exit(125)
           sys.stdout.buffer.write(wire)
 
       # Standard bounded one-object IO primitives; Ansible owns phase/target/capacity policy.
@@ -1838,13 +1918,14 @@
         - w.budgets.maximum_write_bytes >= w.target_mib * 1048576
         - w.budgets.aggregate_seconds >= w.budgets.preflight_seconds + w.budgets.allocation_seconds + w.budgets.activation_seconds
         fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
-    - name: Typed physical incremental_swap_bytes
+    - name: ledger_incremental
       ansible.builtin.assert:
         that:
+        - w.ledger.incremental_swap_bytes is defined
         - w.ledger.incremental_swap_bytes is integer
         - w.ledger.incremental_swap_bytes is not boolean
-        - w.ledger.incremental_swap_bytes >= 0
-        fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
+        - 0 <= w.ledger.incremental_swap_bytes <= 9223372036854775807
+        fail_msg: host_swap:ledger_incremental
     - name: Typed physical protected_data_growth_bytes
       ansible.builtin.assert:
         that:
@@ -1996,7 +2077,7 @@
         page_bytes: '{{ w.support.page_bytes }}'
         fs_pair: '{{ w.mount.rdev.split(":") | map("int") | list }}'
         fragment_path: '{{ "/etc/systemd/system/" + w.unit }}'
-        remaining_backing: '{{ w.target_mib * 1048576 }}'
+        remaining_backing: '{{ w.ledger.incremental_swap_bytes }}'
     - name: rdev_pair
       ansible.builtin.assert:
         that:
@@ -2005,11 +2086,29 @@
         fail_msg: host_swap:rdev_pair
     - name: render_expected
       ansible.builtin.set_fact:
-        fragment_text: '{{ lookup("ansible.builtin.template", "templates/proxmox-host-swap.swap.j2").rstrip("\n") ~ "\n" }}'
+        fragment_text: '{{ lookup("ansible.builtin.template", "templates/proxmox-host-swap.swap.j2") }}'
+    - name: fragment_exact_newline
+      ansible.builtin.assert:
+        that:
+        - fragment_text is string
+        - fragment_text.endswith("\n")
+        - not fragment_text.endswith("\n\n")
+        - not fragment_text.endswith("\\n")
+        fail_msg: host_swap:fragment_exact_newline
     - name: fragment_declaration
       ansible.builtin.set_fact:
         fragment_bytes: '{{ fragment_text | length }}'
         fragment_sha: '{{ fragment_text | hash("sha256") }}'
+    - name: budget_identity_bounds
+      ansible.builtin.assert:
+        that:
+        - h.attempt_id is string
+        - h.boot_id is string
+        - h.attempt_id | length > 0
+        - h.boot_id | length > 0
+        - ((h.attempt_id | b64encode) | length) // 4 * 3 - (2 if (h.attempt_id | b64encode).endswith("==") else 1 if (h.attempt_id | b64encode).endswith("=") else 0) <= 128
+        - ((h.boot_id | b64encode) | length) // 4 * 3 - (2 if (h.boot_id | b64encode).endswith("==") else 1 if (h.boot_id | b64encode).endswith("=") else 0) <= 128
+        fail_msg: host_swap:budget_identity_bounds
     - name: budget_config
       ansible.builtin.set_fact:
         budget_config: '{{ {"attempt_id": h.attempt_id,"boot_id":h.boot_id,"admission_expires_epoch_ns":h.admission.expires_at_epoch
@@ -3804,6 +3903,20 @@
         - new_entry | length == 0 or (new_entry[0].type == "file" and new_entry[0].size == target_bytes-page_bytes)
         - load_entry.LoadState != "loaded" or "unit" in records
         fail_msg: host_swap:new_activity
+    - name: freeze_entry_decisions
+      ansible.builtin.set_fact:
+        allocate_this_entry: '{{ ("allocation" not in records) | bool }}'
+        format_this_entry: '{{ ("header" not in records) | bool }}'
+        unit_this_entry: '{{ ("unit" not in records) | bool }}'
+        activate_this_entry: '{{ ("activation_intent" not in records and new_entry | length == 0) | bool }}'
+    - name: entry_decision_types
+      ansible.builtin.assert:
+        that:
+        - allocate_this_entry is boolean
+        - format_this_entry is boolean
+        - unit_this_entry is boolean
+        - activate_this_entry is boolean
+        fail_msg: host_swap:entry_decision_types
     - name: Admitted bounded writes
       block:
       - name: Write admission
@@ -4787,10 +4900,23 @@
             retained_record_bytes: '{{ retained_record_bytes + length_allocation }}'
             records: '{{ records | combine({"allocation": envelope_allocation}) }}'
           when: '"allocation" not in records'
+        - name: backing_charge_proven
+          ansible.builtin.assert:
+            that:
+            - allocate_this_entry is sameas true
+            - records.allocation == envelope_allocation
+            - records.allocation.binding_sha256 == binding_sha
+            - records.allocation.context_sha256 == context_sha
+            - file_allocated.coverage_complete is sameas true
+            - file_allocated.stable is sameas true
+            - file_allocated.stat.size == target_bytes
+            - file_allocated.layout_hash == records.allocation.payload.layout_hash
+            - records.allocation.payload.file_identity == file_identity
+            fail_msg: host_swap:backing_charge_proven
         - name: backing_charge_done
           ansible.builtin.set_fact:
             remaining_backing: 0
-        when: '"allocation" not in records'
+        when: allocate_this_entry
       - name: Observe allocation capacity
         block:
         - name: pool_allocated
@@ -5901,7 +6027,7 @@
             retained_record_bytes: '{{ retained_record_bytes + length_header }}'
             records: '{{ records | combine({"header": envelope_header}) }}'
           when: '"header" not in records'
-        when: '"header" not in records'
+        when: format_this_entry
       - name: Prepare and prove unit
         block:
         - name: publish_fragment
@@ -6461,7 +6587,7 @@
             retained_record_bytes: '{{ retained_record_bytes + length_unit }}'
             records: '{{ records | combine({"unit": envelope_unit}) }}'
           when: '"unit" not in records'
-        when: '"unit" not in records'
+        when: unit_this_entry
       - name: One activation intent and start
         block:
         - name: mount_activation
@@ -7908,50 +8034,167 @@
             - '{{ 0 }}'
             - '{{ [((h.tools.systemctl)) | string, ("start") | string, ((w.unit)) | string] | to_json }}'
           register: _io
+          failed_when: false
           changed_when: false
           check_mode: false
           environment:
             LC_ALL: C
-          when: new_entry | length == 0
-        - name: start_once_transport
-          ansible.builtin.assert:
-            that:
-            - _io.rc == 0
-            - io_result.schema == "qcl.host-swap.io-result.v1"
-            - io_result.usage.schema == "qcl.host-swap.budget.v1"
-            - io_result.usage.sequence == b.sequence + 1
-            - io_result.usage.attempt_id == b.attempt_id
-            - io_result.usage.boot_id == b.boot_id
-            - io_result.usage.limits == b.limits
-            - io_result.usage.started_monotonic_ns == b.started_monotonic_ns
-            - io_result.usage.deadline_monotonic_ns == b.deadline_monotonic_ns
-            - io_result.usage.last_monotonic_ns >= b.last_monotonic_ns
-            - io_result.usage.phase_elapsed_ns.preflight >= b.phase_elapsed_ns.preflight
-            - io_result.usage.phase_elapsed_ns.allocation >= b.phase_elapsed_ns.allocation
-            - io_result.usage.phase_elapsed_ns.activation >= b.phase_elapsed_ns.activation
-            - io_result.usage.output_bytes > b.output_bytes
-            - io_result.usage.output_bytes <= b.limits.output_bytes
-            - io_result.usage.write_bytes_reserved == b.write_bytes_reserved + (0)
-            - io_result.usage.metadata_bytes_reserved == b.metadata_bytes_reserved + (0)
-            - io_result.owned_children_complete is sameas true
-            - io_result.failure == none
-            fail_msg: host_swap:start_once_transport
-          vars:
-            io_result: '{{ _io.stdout | from_json }}'
-          when: new_entry | length == 0
+        - name: start_wire_bounds
+          ansible.builtin.set_fact:
+            start_wire_bounded: '{{ (_io.rc is integer and _io.rc is not boolean and _io.stdout is string and (_io.stdout | length) <= w.budgets.maximum_output_bytes) | bool }}'
+            start_raw: '{{ _io }}'
+        - name: start_failed_outcome_unknown
+          ansible.builtin.fail:
+            msg: host_swap:start_failed_outcome_unknown
+          when: not start_wire_bounded
+        - name: Preserve structural start result
+          block:
+          - name: start_wire_decode
+            ansible.builtin.set_fact:
+              start_wire: '{{ _io.stdout | from_json }}'
+          - name: start_usage_trust
+            ansible.builtin.set_fact:
+              start_trusted: '{{ (start_wire is mapping) and (start_wire.keys() | list | sort == ["failure","owned_children_complete","rc","schema","stderr_b64","stdout_b64","usage"]) and (start_wire.owned_children_complete is boolean) and (start_wire.failure in [none,"capture_timeout","output_cap","children_incomplete","cleanup_unknown","post_budget_expired","budget_or_io_refusal"]) and (start_wire.rc is integer and start_wire.rc is not boolean and -9223372036854775807 <= start_wire.rc <= 9223372036854775807) and (start_wire.stdout_b64 is string and start_wire.stdout_b64 is match("^[A-Za-z0-9+/]*={0,2}$")) and (start_wire.stderr_b64 is string and start_wire.stderr_b64 is match("^[A-Za-z0-9+/]*={0,2}$")) and (start_wire.usage is mapping) and (start_wire.usage.keys() | list | sort == ["admission_expires_epoch_ns","attempt_id","boot_id","deadline_monotonic_ns","last_monotonic_ns","ledger_expires_epoch_ns","limits","metadata_bytes_reserved","output_bytes","phase_elapsed_ns","schema","sequence","started_monotonic_ns","write_bytes_reserved"]) and (start_wire.usage.phase_elapsed_ns is mapping and start_wire.usage.phase_elapsed_ns.keys() | list | sort == ["activation","allocation","preflight"]) and (start_wire.usage.limits is mapping and start_wire.usage.limits == b.limits) and (start_wire.usage.admission_expires_epoch_ns == b.admission_expires_epoch_ns and start_wire.usage.ledger_expires_epoch_ns == b.ledger_expires_epoch_ns) and (start_wire.usage.phase_elapsed_ns.preflight is integer and start_wire.usage.phase_elapsed_ns.preflight is not boolean and 0 <= start_wire.usage.phase_elapsed_ns.preflight <= 9223372036854775807) and (start_wire.usage.phase_elapsed_ns.allocation is integer and start_wire.usage.phase_elapsed_ns.allocation is not boolean and 0 <= start_wire.usage.phase_elapsed_ns.allocation <= 9223372036854775807) and (start_wire.usage.phase_elapsed_ns.activation is integer and start_wire.usage.phase_elapsed_ns.activation is not boolean and 0 <= start_wire.usage.phase_elapsed_ns.activation <= 9223372036854775807) and (start_wire.usage.write_bytes_reserved is integer and start_wire.usage.write_bytes_reserved is not boolean and 0 <= start_wire.usage.write_bytes_reserved <= 9223372036854775807) and (start_wire.usage.started_monotonic_ns is integer and start_wire.usage.started_monotonic_ns is not boolean and 0 <= start_wire.usage.started_monotonic_ns <= 9223372036854775807) and (start_wire.usage.sequence is integer and start_wire.usage.sequence is not boolean and 0 <= start_wire.usage.sequence <= 9223372036854775807) and (start_wire.usage.output_bytes is integer and start_wire.usage.output_bytes is not boolean and 0 <= start_wire.usage.output_bytes <= 9223372036854775807) and (start_wire.usage.metadata_bytes_reserved is integer and start_wire.usage.metadata_bytes_reserved is not boolean and 0 <= start_wire.usage.metadata_bytes_reserved <= 9223372036854775807) and (start_wire.usage.ledger_expires_epoch_ns is integer and start_wire.usage.ledger_expires_epoch_ns is not boolean and 0 <= start_wire.usage.ledger_expires_epoch_ns <= 9223372036854775807) and (start_wire.usage.last_monotonic_ns is integer and start_wire.usage.last_monotonic_ns is not boolean and 0 <= start_wire.usage.last_monotonic_ns <= 9223372036854775807) and (start_wire.usage.deadline_monotonic_ns is integer and start_wire.usage.deadline_monotonic_ns is not boolean and 0 <= start_wire.usage.deadline_monotonic_ns <= 9223372036854775807) and (start_wire.usage.admission_expires_epoch_ns is integer and start_wire.usage.admission_expires_epoch_ns is not boolean and 0 <= start_wire.usage.admission_expires_epoch_ns <= 9223372036854775807) and (start_wire.usage.output_bytes == b.output_bytes + (((_io.stdout | trim | b64encode) | length) // 4 * 3 - (2 if (_io.stdout | trim | b64encode).endswith("==") else 1 if (_io.stdout | trim | b64encode).endswith("=") else 0) + 1)) and (start_wire.usage.last_monotonic_ns >= start_wire.usage.started_monotonic_ns) and (start_wire.usage.phase_elapsed_ns.values() | sum == start_wire.usage.last_monotonic_ns - start_wire.usage.started_monotonic_ns) and (_io.stdout | trim == start_wire | to_json(sort_keys=true,separators=(",",":"),ensure_ascii=false,allow_nan=false)) and (start_wire.schema == "qcl.host-swap.io-result.v1") and (start_wire.usage.schema == "qcl.host-swap.budget.v1") and (start_wire.usage.sequence == b.sequence + 1) and (start_wire.usage.attempt_id == b.attempt_id) and (start_wire.usage.boot_id == b.boot_id) and (start_wire.usage.limits == b.limits) and (start_wire.usage.started_monotonic_ns == b.started_monotonic_ns) and (start_wire.usage.deadline_monotonic_ns == b.deadline_monotonic_ns) and (start_wire.usage.last_monotonic_ns >= b.last_monotonic_ns) and (start_wire.usage.phase_elapsed_ns.preflight >= b.phase_elapsed_ns.preflight) and (start_wire.usage.phase_elapsed_ns.allocation >= b.phase_elapsed_ns.allocation) and (start_wire.usage.phase_elapsed_ns.activation >= b.phase_elapsed_ns.activation) and (start_wire.usage.output_bytes > b.output_bytes) and (start_wire.usage.output_bytes <= b.limits.output_bytes) and (start_wire.usage.write_bytes_reserved == b.write_bytes_reserved + (0)) and (start_wire.usage.metadata_bytes_reserved == b.metadata_bytes_reserved + (0)) | bool }}'
+          rescue:
+          - name: start_failed_outcome_unknown
+            ansible.builtin.fail:
+              msg: host_swap:start_failed_outcome_unknown
+        - name: start_failed_outcome_unknown
+          ansible.builtin.fail:
+            msg: host_swap:start_failed_outcome_unknown
+          when: not start_trusted
         - name: start_once_response
           ansible.builtin.set_fact:
-            _start: '{{ {"rc": (_io.stdout | from_json).rc, "stdout": (_io.stdout | from_json).stdout_b64 | b64decode, "stderr":
-              (_io.stdout | from_json).stderr_b64 | b64decode} }}'
-            b: '{{ (_io.stdout | from_json).usage }}'
-          when: new_entry | length == 0
+            b: '{{ start_wire.usage }}'
+            start_failed: '{{ (start_raw.rc != 0 or start_wire.rc != 0 or start_wire.failure != none or start_wire.owned_children_complete is not sameas true) | bool }}'
+            failed_start_outcome: '{{ {"start": start_wire,"table":none,"manager":none,"reason":"not_observed"} }}'
+        - name: Observe bounded failed start outcome
+          block:
+          - name: failed_start_swaps
+            ansible.builtin.command:
+              argv:
+              - '{{ h.tools.python3 }}'
+              - -c
+              - '{{ run_code }}'
+              - run-v2
+              - '{{ b | to_json }}'
+              - activation
+              - '{{ 0 }}'
+              - '{{ 0 }}'
+              - '{{ [h.tools.swapon,"--show","--json","--bytes","--output","NAME,TYPE,SIZE,USED,PRIO"] | to_json }}'
+            register: _io
+            changed_when: false
+            check_mode: false
+            environment:
+              LC_ALL: C
+          - name: failed_start_swaps_decode
+            ansible.builtin.set_fact:
+              start_wire: '{{ _io.stdout | from_json }}'
+          - name: failed_start_swaps_trust
+            ansible.builtin.set_fact:
+              outcome_trusted: '{{ (start_wire is mapping) and (start_wire.keys() | list | sort == ["failure","owned_children_complete","rc","schema","stderr_b64","stdout_b64","usage"]) and (start_wire.owned_children_complete is boolean) and (start_wire.failure in [none,"capture_timeout","output_cap","children_incomplete","cleanup_unknown","post_budget_expired","budget_or_io_refusal"]) and (start_wire.rc is integer and start_wire.rc is not boolean and -9223372036854775807 <= start_wire.rc <= 9223372036854775807) and (start_wire.stdout_b64 is string and start_wire.stdout_b64 is match("^[A-Za-z0-9+/]*={0,2}$")) and (start_wire.stderr_b64 is string and start_wire.stderr_b64 is match("^[A-Za-z0-9+/]*={0,2}$")) and (start_wire.usage is mapping) and (start_wire.usage.keys() | list | sort == ["admission_expires_epoch_ns","attempt_id","boot_id","deadline_monotonic_ns","last_monotonic_ns","ledger_expires_epoch_ns","limits","metadata_bytes_reserved","output_bytes","phase_elapsed_ns","schema","sequence","started_monotonic_ns","write_bytes_reserved"]) and (start_wire.usage.phase_elapsed_ns is mapping and start_wire.usage.phase_elapsed_ns.keys() | list | sort == ["activation","allocation","preflight"]) and (start_wire.usage.limits is mapping and start_wire.usage.limits == b.limits) and (start_wire.usage.admission_expires_epoch_ns == b.admission_expires_epoch_ns and start_wire.usage.ledger_expires_epoch_ns == b.ledger_expires_epoch_ns) and (start_wire.usage.phase_elapsed_ns.preflight is integer and start_wire.usage.phase_elapsed_ns.preflight is not boolean and 0 <= start_wire.usage.phase_elapsed_ns.preflight <= 9223372036854775807) and (start_wire.usage.phase_elapsed_ns.allocation is integer and start_wire.usage.phase_elapsed_ns.allocation is not boolean and 0 <= start_wire.usage.phase_elapsed_ns.allocation <= 9223372036854775807) and (start_wire.usage.phase_elapsed_ns.activation is integer and start_wire.usage.phase_elapsed_ns.activation is not boolean and 0 <= start_wire.usage.phase_elapsed_ns.activation <= 9223372036854775807) and (start_wire.usage.write_bytes_reserved is integer and start_wire.usage.write_bytes_reserved is not boolean and 0 <= start_wire.usage.write_bytes_reserved <= 9223372036854775807) and (start_wire.usage.started_monotonic_ns is integer and start_wire.usage.started_monotonic_ns is not boolean and 0 <= start_wire.usage.started_monotonic_ns <= 9223372036854775807) and (start_wire.usage.sequence is integer and start_wire.usage.sequence is not boolean and 0 <= start_wire.usage.sequence <= 9223372036854775807) and (start_wire.usage.output_bytes is integer and start_wire.usage.output_bytes is not boolean and 0 <= start_wire.usage.output_bytes <= 9223372036854775807) and (start_wire.usage.metadata_bytes_reserved is integer and start_wire.usage.metadata_bytes_reserved is not boolean and 0 <= start_wire.usage.metadata_bytes_reserved <= 9223372036854775807) and (start_wire.usage.ledger_expires_epoch_ns is integer and start_wire.usage.ledger_expires_epoch_ns is not boolean and 0 <= start_wire.usage.ledger_expires_epoch_ns <= 9223372036854775807) and (start_wire.usage.last_monotonic_ns is integer and start_wire.usage.last_monotonic_ns is not boolean and 0 <= start_wire.usage.last_monotonic_ns <= 9223372036854775807) and (start_wire.usage.deadline_monotonic_ns is integer and start_wire.usage.deadline_monotonic_ns is not boolean and 0 <= start_wire.usage.deadline_monotonic_ns <= 9223372036854775807) and (start_wire.usage.admission_expires_epoch_ns is integer and start_wire.usage.admission_expires_epoch_ns is not boolean and 0 <= start_wire.usage.admission_expires_epoch_ns <= 9223372036854775807) and (start_wire.usage.output_bytes == b.output_bytes + (((_io.stdout | trim | b64encode) | length) // 4 * 3 - (2 if (_io.stdout | trim | b64encode).endswith("==") else 1 if (_io.stdout | trim | b64encode).endswith("=") else 0) + 1)) and (start_wire.usage.last_monotonic_ns >= start_wire.usage.started_monotonic_ns) and (start_wire.usage.phase_elapsed_ns.values() | sum == start_wire.usage.last_monotonic_ns - start_wire.usage.started_monotonic_ns) and (_io.stdout | trim == start_wire | to_json(sort_keys=true,separators=(",",":"),ensure_ascii=false,allow_nan=false)) and (_io.rc == 0) and (start_wire.schema == "qcl.host-swap.io-result.v1") and (start_wire.usage.schema == "qcl.host-swap.budget.v1") and (start_wire.usage.sequence == b.sequence + 1) and (start_wire.usage.attempt_id == b.attempt_id) and (start_wire.usage.boot_id == b.boot_id) and (start_wire.usage.limits == b.limits) and (start_wire.usage.started_monotonic_ns == b.started_monotonic_ns) and (start_wire.usage.deadline_monotonic_ns == b.deadline_monotonic_ns) and (start_wire.usage.last_monotonic_ns >= b.last_monotonic_ns) and (start_wire.usage.phase_elapsed_ns.preflight >= b.phase_elapsed_ns.preflight) and (start_wire.usage.phase_elapsed_ns.allocation >= b.phase_elapsed_ns.allocation) and (start_wire.usage.phase_elapsed_ns.activation >= b.phase_elapsed_ns.activation) and (start_wire.usage.output_bytes > b.output_bytes) and (start_wire.usage.output_bytes <= b.limits.output_bytes) and (start_wire.usage.write_bytes_reserved == b.write_bytes_reserved + (0)) and (start_wire.usage.metadata_bytes_reserved == b.metadata_bytes_reserved + (0)) and start_wire.owned_children_complete is sameas true and start_wire.failure == none and start_wire.rc == 0 | bool }}'
+          - name: start_failed_outcome_unknown
+            ansible.builtin.fail:
+              msg: host_swap:start_failed_outcome_unknown
+            when: not outcome_trusted
+          - name: failed_start_swaps_response
+            ansible.builtin.set_fact:
+              b: '{{ start_wire.usage }}'
+              outcome_text: '{{ start_wire.stdout_b64 | b64decode }}'
+          - name: failed_start_swaps_value
+            ansible.builtin.set_fact:
+              outcome_table: '{{ outcome_text | from_json }}'
+          - name: failed_start_swaps_shape
+            ansible.builtin.set_fact:
+              outcome_shape: '{{ (outcome_table is mapping and outcome_table.keys() | list == ["swaps"] and outcome_table.swaps is sequence and outcome_table.swaps is not string and outcome_table.swaps | length <= w.budgets.maximum_swap_rows and outcome_table.swaps | map(attribute="name") | list | unique | length == outcome_table.swaps | length) | bool }}'
+          - name: start_failed_outcome_unknown
+            ansible.builtin.fail:
+              msg: host_swap:start_failed_outcome_unknown
+            when: not outcome_shape
+          - name: failed_start_row_shape
+            ansible.builtin.assert:
+              that:
+              - item is mapping
+              - item.keys() | list | sort == ["name","prio","size","type","used"]
+              - item.name is string
+              - item.type in ["file","partition"]
+              - item.size is integer and item.size is not boolean and 0 <= item.size <= 9223372036854775807
+              - item.used is integer and item.used is not boolean and 0 <= item.used <= item.size
+              - item.prio is integer and item.prio is not boolean and -9223372036854775807 <= item.prio <= 9223372036854775807
+              fail_msg: host_swap:start_failed_outcome_unknown
+            loop: '{{ outcome_table.swaps }}'
+          - name: retain_failed_start_table
+            ansible.builtin.set_fact:
+              failed_start_outcome: '{{ failed_start_outcome | combine({"table":outcome_table,"table_wire":start_wire}) }}'
+          - name: failed_start_manager
+            ansible.builtin.command:
+              argv:
+              - '{{ h.tools.python3 }}'
+              - -c
+              - '{{ run_code }}'
+              - run-v2
+              - '{{ b | to_json }}'
+              - activation
+              - '{{ 0 }}'
+              - '{{ 0 }}'
+              - '{{ [h.tools.systemctl,"show",w.unit,"--property=LoadState,ActiveState,UnitFileState"] | to_json }}'
+            register: _io
+            changed_when: false
+            check_mode: false
+            environment:
+              LC_ALL: C
+          - name: failed_start_manager_decode
+            ansible.builtin.set_fact:
+              start_wire: '{{ _io.stdout | from_json }}'
+          - name: failed_start_manager_trust
+            ansible.builtin.set_fact:
+              outcome_trusted: '{{ (start_wire is mapping) and (start_wire.keys() | list | sort == ["failure","owned_children_complete","rc","schema","stderr_b64","stdout_b64","usage"]) and (start_wire.owned_children_complete is boolean) and (start_wire.failure in [none,"capture_timeout","output_cap","children_incomplete","cleanup_unknown","post_budget_expired","budget_or_io_refusal"]) and (start_wire.rc is integer and start_wire.rc is not boolean and -9223372036854775807 <= start_wire.rc <= 9223372036854775807) and (start_wire.stdout_b64 is string and start_wire.stdout_b64 is match("^[A-Za-z0-9+/]*={0,2}$")) and (start_wire.stderr_b64 is string and start_wire.stderr_b64 is match("^[A-Za-z0-9+/]*={0,2}$")) and (start_wire.usage is mapping) and (start_wire.usage.keys() | list | sort == ["admission_expires_epoch_ns","attempt_id","boot_id","deadline_monotonic_ns","last_monotonic_ns","ledger_expires_epoch_ns","limits","metadata_bytes_reserved","output_bytes","phase_elapsed_ns","schema","sequence","started_monotonic_ns","write_bytes_reserved"]) and (start_wire.usage.phase_elapsed_ns is mapping and start_wire.usage.phase_elapsed_ns.keys() | list | sort == ["activation","allocation","preflight"]) and (start_wire.usage.limits is mapping and start_wire.usage.limits == b.limits) and (start_wire.usage.admission_expires_epoch_ns == b.admission_expires_epoch_ns and start_wire.usage.ledger_expires_epoch_ns == b.ledger_expires_epoch_ns) and (start_wire.usage.phase_elapsed_ns.preflight is integer and start_wire.usage.phase_elapsed_ns.preflight is not boolean and 0 <= start_wire.usage.phase_elapsed_ns.preflight <= 9223372036854775807) and (start_wire.usage.phase_elapsed_ns.allocation is integer and start_wire.usage.phase_elapsed_ns.allocation is not boolean and 0 <= start_wire.usage.phase_elapsed_ns.allocation <= 9223372036854775807) and (start_wire.usage.phase_elapsed_ns.activation is integer and start_wire.usage.phase_elapsed_ns.activation is not boolean and 0 <= start_wire.usage.phase_elapsed_ns.activation <= 9223372036854775807) and (start_wire.usage.write_bytes_reserved is integer and start_wire.usage.write_bytes_reserved is not boolean and 0 <= start_wire.usage.write_bytes_reserved <= 9223372036854775807) and (start_wire.usage.started_monotonic_ns is integer and start_wire.usage.started_monotonic_ns is not boolean and 0 <= start_wire.usage.started_monotonic_ns <= 9223372036854775807) and (start_wire.usage.sequence is integer and start_wire.usage.sequence is not boolean and 0 <= start_wire.usage.sequence <= 9223372036854775807) and (start_wire.usage.output_bytes is integer and start_wire.usage.output_bytes is not boolean and 0 <= start_wire.usage.output_bytes <= 9223372036854775807) and (start_wire.usage.metadata_bytes_reserved is integer and start_wire.usage.metadata_bytes_reserved is not boolean and 0 <= start_wire.usage.metadata_bytes_reserved <= 9223372036854775807) and (start_wire.usage.ledger_expires_epoch_ns is integer and start_wire.usage.ledger_expires_epoch_ns is not boolean and 0 <= start_wire.usage.ledger_expires_epoch_ns <= 9223372036854775807) and (start_wire.usage.last_monotonic_ns is integer and start_wire.usage.last_monotonic_ns is not boolean and 0 <= start_wire.usage.last_monotonic_ns <= 9223372036854775807) and (start_wire.usage.deadline_monotonic_ns is integer and start_wire.usage.deadline_monotonic_ns is not boolean and 0 <= start_wire.usage.deadline_monotonic_ns <= 9223372036854775807) and (start_wire.usage.admission_expires_epoch_ns is integer and start_wire.usage.admission_expires_epoch_ns is not boolean and 0 <= start_wire.usage.admission_expires_epoch_ns <= 9223372036854775807) and (start_wire.usage.output_bytes == b.output_bytes + (((_io.stdout | trim | b64encode) | length) // 4 * 3 - (2 if (_io.stdout | trim | b64encode).endswith("==") else 1 if (_io.stdout | trim | b64encode).endswith("=") else 0) + 1)) and (start_wire.usage.last_monotonic_ns >= start_wire.usage.started_monotonic_ns) and (start_wire.usage.phase_elapsed_ns.values() | sum == start_wire.usage.last_monotonic_ns - start_wire.usage.started_monotonic_ns) and (_io.stdout | trim == start_wire | to_json(sort_keys=true,separators=(",",":"),ensure_ascii=false,allow_nan=false)) and (_io.rc == 0) and (start_wire.schema == "qcl.host-swap.io-result.v1") and (start_wire.usage.schema == "qcl.host-swap.budget.v1") and (start_wire.usage.sequence == b.sequence + 1) and (start_wire.usage.attempt_id == b.attempt_id) and (start_wire.usage.boot_id == b.boot_id) and (start_wire.usage.limits == b.limits) and (start_wire.usage.started_monotonic_ns == b.started_monotonic_ns) and (start_wire.usage.deadline_monotonic_ns == b.deadline_monotonic_ns) and (start_wire.usage.last_monotonic_ns >= b.last_monotonic_ns) and (start_wire.usage.phase_elapsed_ns.preflight >= b.phase_elapsed_ns.preflight) and (start_wire.usage.phase_elapsed_ns.allocation >= b.phase_elapsed_ns.allocation) and (start_wire.usage.phase_elapsed_ns.activation >= b.phase_elapsed_ns.activation) and (start_wire.usage.output_bytes > b.output_bytes) and (start_wire.usage.output_bytes <= b.limits.output_bytes) and (start_wire.usage.write_bytes_reserved == b.write_bytes_reserved + (0)) and (start_wire.usage.metadata_bytes_reserved == b.metadata_bytes_reserved + (0)) and start_wire.owned_children_complete is sameas true and start_wire.failure == none and start_wire.rc == 0 | bool }}'
+          - name: start_failed_outcome_unknown
+            ansible.builtin.fail:
+              msg: host_swap:start_failed_outcome_unknown
+            when: not outcome_trusted
+          - name: failed_start_manager_response
+            ansible.builtin.set_fact:
+              b: '{{ start_wire.usage }}'
+              outcome_text: '{{ start_wire.stdout_b64 | b64decode }}'
+          - name: failed_start_manager_pairs
+            ansible.builtin.set_fact:
+              outcome_pairs: '{{ outcome_text.splitlines() | map("split","=",1) | list }}'
+          - name: failed_start_manager_shape
+            ansible.builtin.set_fact:
+              outcome_shape: '{{ (outcome_pairs | length == 3 and outcome_pairs | map("length") | list == [2,2,2] and outcome_pairs | map("first") | list | sort == ["ActiveState","LoadState","UnitFileState"]) | bool }}'
+          - name: start_failed_outcome_unknown
+            ansible.builtin.fail:
+              msg: host_swap:start_failed_outcome_unknown
+            when: not outcome_shape
+          - name: retain_failed_start_manager
+            ansible.builtin.set_fact:
+              failed_start_outcome: '{{ failed_start_outcome | combine({"manager":dict(outcome_pairs),"manager_wire":start_wire,"reason":"observed"}) }}'
+          rescue:
+          - name: failed_start_unavailable
+            ansible.builtin.debug:
+              msg: '{{ {"outcome":failed_start_outcome,"reason":"guard_or_malformed_read","wrapper_result":_io} }}'
+          - name: start_failed_outcome_unknown
+            ansible.builtin.fail:
+              msg: host_swap:start_failed_outcome_unknown
+          when: start_failed
+        - name: failed_start_observation
+          ansible.builtin.debug:
+            msg: '{{ failed_start_outcome }}'
+          when: start_failed
+        - name: start_failed_outcome_observed
+          ansible.builtin.fail:
+            msg: host_swap:start_failed_outcome_observed
+          when: start_failed
         - name: native_start_completed
           ansible.builtin.assert:
             that:
-            - _start.rc == 0
+            - start_failed is sameas false
+            - start_wire.owned_children_complete is sameas true
+            - start_wire.failure == none
+            - start_wire.rc == 0
             fail_msg: host_swap:native_start_completed
-          when: new_entry | length == 0
-        when: '"activation_intent" not in records'
+        when: activate_this_entry
       - name: Actual active poststate
         block:
         - name: mount_post
