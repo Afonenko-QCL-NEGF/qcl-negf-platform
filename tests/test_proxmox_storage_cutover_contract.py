@@ -18,6 +18,46 @@ BASE = Path(__file__).resolve().parents[1]
 UUID = "22222222-2222-4222-8222-222222222222"
 
 
+def fixture_final_unit_bytes(source):
+    # Independent frozen native policy oracle: never read production template or received bytes.
+    return ("# Protected host infrastructure; original tree retained for admitted recovery.\n"
+            "[Unit]\nDescription=Protected persistent Proxmox directory storage\n"
+            "Before=pve-guests.service\n[Mount]\n"
+            "What=/dev/disk/by-uuid/22222222-2222-4222-8222-222222222222\n"
+            "Where="+str(source)+"\nType=ext4\nOptions=rw,nodev,nosuid\n"
+            "LazyUnmount=no\nForceUnmount=no\n[Install]\nWantedBy=local-fs.target\n").encode('utf-8')
+
+
+def fixture_declare_final_unit(args, surrogate, source):
+    expected=fixture_final_unit_bytes(source)
+    assert args['dest']=='/etc/systemd/system/fixture-source.mount', 'wrong final unit destination'
+    assert args['content'].encode('utf-8')==expected, 'wrong complete final unit literal'
+    assert int(args['mode'],8)==0o644
+    def readback(path):
+        st=os.lstat(path)
+        assert stat.S_ISREG(st.st_mode) and st.st_nlink==1 and stat.S_IMODE(st.st_mode)==0o644
+        fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
+        try:
+            assert os.fstat(fd).st_ino==st.st_ino
+            assert os.read(fd,len(expected)+1)==expected
+            assert os.lstat(path).st_ino==st.st_ino
+        finally:os.close(fd)
+        return st
+    if os.path.lexists(surrogate):
+        before=readback(surrogate);after=readback(surrogate)
+        assert (before.st_ino,before.st_mtime_ns)==(after.st_ino,after.st_mtime_ns)
+    else:
+        pending=surrogate.with_name(surrogate.name+'.own-new')
+        fd=os.open(pending,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+        try:
+            assert os.write(fd,expected)==len(expected);os.fchmod(fd,0o644);os.fsync(fd)
+        finally:os.close(fd)
+        assert not os.path.lexists(surrogate), 'unknown raced final unit'
+        os.link(pending,surrogate,follow_symlinks=False)  # Atomic no-clobber publication in own fixture.
+        pending.unlink()
+        readback(surrogate)
+
+
 def helper(name):
     path = BASE / "ops" / ("host_storage_" + name + ".py")
     assert path.exists(), "missing cutover " + name + " helper"
@@ -459,9 +499,9 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                 assert set(args)=={"dest","content","mode"}
                 content=args["content"].encode();mode=int(args["mode"],8)
                 if effective_action=="ansible.builtin.template":
-                    destination=tmp_path/"unit";record("template");s["unit_declared"]=True
-                    assert "ForceUnmount=no" in args["content"] and "Before=pve-guests.service" in args["content"]
-                    assert mode==0o644
+                    destination=tmp_path/"unit"
+                    fixture_declare_final_unit(args,destination,source)
+                    record("template");s["unit_declared"]=True
                 else:
                     destination=Path(args["dest"]);kind="receipt" if destination.name=="host_storage_receipt.py" else "manifest"
                     assert content==(BASE/"ops"/destination.name).read_bytes() and mode==0o600
@@ -852,6 +892,10 @@ NB_RED_IDS = [
     'test_receipt_read_multiplicity_is_prepaid',
     'test_eof_waits_for_natural_epilogue',
     'test_reference_relative_inside_manifest',
+    'test_receipt_actual_dispatch_prepaid_before_mutation',
+    'test_recovery_actual_source_consumer_request',
+    'test_reference_actual_body_graph_and_paths_whole_cap',
+    'test_final_unit_independent_literal_oracle',
 ]
 
 
@@ -877,7 +921,7 @@ def test_recovery_real_consumer_scan_precedes_stop(tmp_path,monkeypatch):
     assert state.get('recovery_measurement') is True,'pre-stop recovery action64 skipped consumer measurement'
 
 
-def test_whole_metadata_proc_enumeration_cap_and_deadline(tmp_path):
+def test_whole_metadata_proc_enumeration_cap_and_deadline(tmp_path,monkeypatch):
     api=review_body('cutover_command_boundary')
     if 'MetadataBudget' not in api:raise AssertionError('own cleanup/proc lacks shared bounded metadata accessor')
     if 'budget' not in api['group_members'].__code__.co_varnames:raise AssertionError('actual group enumeration does not accept shared bounded cleanup context')
@@ -895,9 +939,26 @@ def test_whole_metadata_proc_enumeration_cap_and_deadline(tmp_path):
     budget=FixtureProcBudget(1024,__import__('time').monotonic()+1)
     with pytest.raises(ValueError,match='metadata'):api['group_members'](77,123,budget=budget)
     assert calls and any(kind=='read' for kind,_ in calls) and len([x for x in calls if x[0]=='read'])<records
-    expired=FixtureProcBudget(8192,0)
-    with pytest.raises(ValueError,match='deadline'):api['group_members'](77,123,budget=expired)
-    (tmp_path/'proc-events.json').write_text(json.dumps(calls))
+    # Expire DURING the actual pass, after one complete stat record, not at entry.
+    original_time=api['time'];clock={'now':0.0};deadline_calls=[]
+    class DeterministicTime:
+        def monotonic(self):return clock['now']
+        def __getattr__(self,key):return getattr(original_time,key)
+    monkeypatch.setitem(api,'time',DeterministicTime())
+    class DuringPassBudget(FixtureProcBudget):
+        def names(self,path):
+            deadline_calls.append(('enumerate',str(path)))
+            return super().names(path)
+        def read(self,path,maximum):
+            deadline_calls.append(('read-accessor',str(path)))
+            value=super().read(path,maximum)
+            clock['now']=2.0
+            return value
+    expiring=DuringPassBudget(8192,1.0)
+    with pytest.raises(ValueError,match='deadline'):api['group_members'](77,123,budget=expiring)
+    assert len([x for x in deadline_calls if x[0]=='read-accessor'])==1,deadline_calls
+    assert len([x for x in deadline_calls if x[0]=='enumerate'])==1,deadline_calls
+    (tmp_path/'proc-events.json').write_text(json.dumps({'cap':calls,'during_pass_deadline':deadline_calls}))
 
 
 def test_whole_reference_metadata_sum_cap(tmp_path):
@@ -1003,12 +1064,8 @@ def test_reference_actual_body_graph_and_paths_whole_cap(tmp_path):
         vol='dir:vol'+str(index);graph['volume_bindings'].append({'id':vol,'relative':relative,'storage_id':'dir'});resolution[vol]=str(file)
     manifest={'schema':1,'entries':entries,'summary':{}}
     expected={k:graph[k] for k in ('identity','d04_receipt_sha256','window_receipt_sha256','retained_manifest_sha256','excluded_old_qcl_set_sha256')}
-    # Finite graph is individually below child allowance; ten ~3KiB path results push the shared sum over it.
-    child_allowance=4194304;metadata_input=len(json.dumps({'retained_manifest':manifest}).encode())
-    target=child_allowance-metadata_input-15000
-    graph['tool_evidence'][0]['source']='installed:'+('p'*max(0,target-len(json.dumps(graph).encode())-16))
-    raw=json.dumps(graph).encode();assert len(raw)<child_allowance
-    graphpath=tmp_path/'graph.json';graphpath.write_bytes(raw);graphpath.chmod(0o600)
+    child_allowance=4194304
+    graphpath=tmp_path/'graph.json'
     witness=tmp_path/'native-path-events'
     prefix=f"""import os,subprocess,sys
 _original_lstat=os.lstat
@@ -1031,10 +1088,47 @@ subprocess.Popen=fixture_popen
     play=yaml.safe_load((BASE/'ansible/proxmox-storage-cutover.yml').read_text())[0]
     body=play['vars']['cutover_reference_check'];boundary=play['vars']['cutover_command_boundary']
     request=review_request(output=262144);request['bounds'].update(metadata_read_bytes=8388608,native_commands=16)
-    context={'h':{'tools':{'pvesm':'/usr/sbin/pvesm'},'cutover':{'limits':{'metadata_read_bytes':8388608,'reference_entries':128,'reference_hash_bytes':1048576},'preconditions':{'references_receipt':{'path':str(graphpath),'sha256':hashlib.sha256(raw).hexdigest()}},'source':{'path':str(root)}}},'boundary':boundary,'expected':expected,'retained_manifest':manifest}
-    request['operation'].update(kind='reference_check',argv=['/usr/bin/python','-c',prefix+body],stdin=json.dumps(context))
+    context={'h':{'tools':{'pvesm':'/usr/sbin/pvesm'},'cutover':{'limits':{'metadata_read_bytes':8388608,'reference_entries':128,'reference_hash_bytes':1048576},'preconditions':{'references_receipt':{'path':str(graphpath),'sha256':'0'*64}},'source':{'path':str(root)}}},'boundary':boundary,'expected':expected,'retained_manifest':manifest}
+    # Recompute from the FULL concrete final child stdin, including current boundary source.
+    # Two path results plus 8KiB retain bounded header/accessor headroom; all ten exceed it.
+    context_bytes=len(json.dumps(context).encode('utf-8'))
+    path_bytes=[len((path+'\n').encode('utf-8')) for path in resolution.values()]
+    headroom=sum(path_bytes[:2])+8192
+    target=child_allowance-context_bytes-headroom
+    base_graph_bytes=len(json.dumps(graph).encode('utf-8'))
+    assert target>base_graph_bytes and all(n<child_allowance for n in path_bytes)
+    graph['tool_evidence'][0]['source']='installed:'+('p'*(target-base_graph_bytes-len('installed:')+len('installed')))
+    raw=json.dumps(graph).encode('utf-8');assert len(raw)==target
+    graphpath.write_bytes(raw);graphpath.chmod(0o600)
+    context['h']['cutover']['preconditions']['references_receipt']['sha256']=hashlib.sha256(raw).hexdigest()
+    serialized=json.dumps(context)
+    assert len(serialized.encode('utf-8'))==context_bytes
+    assert context_bytes+len(raw)<child_allowance<context_bytes+len(raw)+sum(path_bytes)
+    request['operation'].update(kind='reference_check',argv=['/usr/bin/python','-c',prefix+body],stdin=serialized)
+    assert len(json.dumps(request).encode('utf-8'))<=request['bounds']['request_bytes']
+    (tmp_path/'reference-cap-plan.json').write_text(json.dumps({'child_allowance':child_allowance,'full_context_bytes':context_bytes,'graph_bytes':len(raw),'path_result_bytes':path_bytes,'headroom':headroom}))
     result=review_boundary(request)
     (tmp_path/'reference-cap-result.json').write_text(json.dumps(result))
     assert result['status']=='refused' and 'metadata' in result['stderr'],result
     count=len(witness.read_text().splitlines()) if witness.exists() else 0
     assert 0<count<10,'actual graph/path shared counter must refuse before further native lookup'
+
+
+@pytest.mark.parametrize('case',['valid','wrong-destination','wrong-content','existing-mismatch','existing-symlink','existing-exact'])
+def test_final_unit_independent_literal_oracle(tmp_path,case):
+    source=tmp_path/'source';surrogate=tmp_path/'unit'
+    args={'dest':'/etc/systemd/system/fixture-source.mount','content':fixture_final_unit_bytes(source).decode('utf-8'),'mode':'0644'}
+    if case=='wrong-destination':args['dest']='/etc/systemd/system/wrong.mount'
+    if case=='wrong-content':args['content']=args['content'].replace('LazyUnmount=no','LazyUnmount=yes')
+    if case=='existing-mismatch':surrogate.write_bytes(b'foreign unit');surrogate.chmod(0o644)
+    if case=='existing-symlink':surrogate.symlink_to(tmp_path/'missing')
+    if case=='existing-exact':surrogate.write_bytes(fixture_final_unit_bytes(source));surrogate.chmod(0o644)
+    before=(os.lstat(surrogate).st_ino,os.lstat(surrogate).st_mtime_ns) if os.path.lexists(surrogate) else None
+    if case in ('valid','existing-exact'):
+        fixture_declare_final_unit(args,surrogate,source)
+        assert surrogate.read_bytes()==fixture_final_unit_bytes(source)
+        if before:assert before==(surrogate.stat().st_ino,surrogate.stat().st_mtime_ns)
+    else:
+        with pytest.raises(AssertionError):fixture_declare_final_unit(args,surrogate,source)
+        if before:assert before==(os.lstat(surrogate).st_ino,os.lstat(surrogate).st_mtime_ns)
+        else:assert not os.path.lexists(surrogate)
