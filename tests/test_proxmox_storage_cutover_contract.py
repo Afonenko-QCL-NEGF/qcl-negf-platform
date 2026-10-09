@@ -18,6 +18,29 @@ BASE = Path(__file__).resolve().parents[1]
 UUID = "22222222-2222-4222-8222-222222222222"
 
 
+def fixture_pvesm_policy(argv,selected_id,current_digest):
+    assert type(argv) is list and len(argv)==7 and all(type(v) is str and v for v in argv)
+    assert argv[:3]==['/usr/sbin/pvesm','set',selected_id], 'wrong selected PVE command'
+    pairs=list(zip(argv[3::2],argv[4::2]))
+    assert len(pairs)==2 and len({key for key,_ in pairs})==2, 'duplicate PVE flag'
+    flags=dict(pairs)
+    assert '--digest' in flags and flags['--digest']==current_digest, 'CAS digest mismatch before native effect'
+    policies=set(flags)-{'--digest'}
+    assert len(policies)==1 and policies<={'--disable','--is_mountpoint','--delete'}, 'unknown PVE policy flag'
+    option=next(iter(policies));value=flags[option]
+    if option=='--delete':assert value in ('disable','is_mountpoint')
+    elif option=='--disable':native_boolean(value)
+    else:native_mountpoint(value,'/fixture/source')
+    return option,value
+
+
+def fixture_pvesm_effect(storage,option,value):
+    updated=dict(storage)
+    if option=='--delete':updated.pop(value,None)
+    else:updated[option[2:]]=value
+    return updated
+
+
 def fixture_final_unit_bytes(source):
     # Independent frozen native policy oracle: never read production template or received bytes.
     return ("# Protected host infrastructure; original tree retained for admitted recovery.\n"
@@ -338,7 +361,9 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                 if operation["kind"] == "declare_file":
                     args=json.loads(operation["stdin"]);assert set(args)-{"dest","content","mode"} <= {"src","owner","group"};args={key:args[key] for key in ("dest","content","mode")};effective_action="ansible.builtin.template" if "final unit" in name else "ansible.builtin.copy"
                 elif operation["argv"][0] == "/usr/bin/systemctl":
-                    argv=operation["argv"];assert len(argv) in (2,3) and argv[0]=="/usr/bin/systemctl";verb=argv[1];args={"verb":verb,"name":argv[2] if len(argv)==3 else None};effective_action="ansible.builtin.systemd_service"
+                    argv=operation["argv"];assert argv[0]=="/usr/bin/systemctl";verb=argv[1]
+                    assert len(argv)==(2 if verb=="daemon-reload" else 3) and all(type(v) is str and v for v in argv)
+                    args={"verb":verb,"name":argv[2] if len(argv)==3 else None};effective_action="ansible.builtin.systemd_service"
             def record(kind): s["trace"].append(kind)
             if effective_action == "ansible.builtin.command":
                 argv = args["argv"]
@@ -392,15 +417,8 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                     record("reference:"+name);out["stdout"]=json.dumps({"complete":True})
                 elif operation["kind"]=="native_argv" and argv[0]==cfg["tools"]["pvesm"]:
                     assert args["stdin"]=="", "PVE native argv does not consume JSON stdin"
-                    assert len(argv)==7 and argv[:4]==[cfg["tools"]["pvesm"],"set",cfg["cutover"]["storage"]["id"],"--digest"]
-                    assert argv[4]==s["digest"], "CAS digest mismatch before native effect"
-                    option,value=argv[5:];assert option in ("--disable","--is_mountpoint","--delete")
-                    if option=="--delete":
-                        assert value in ("disable","is_mountpoint");s["storage_current"].pop(value,None)
-                    elif option=="--disable":
-                        native_boolean(value);s["storage_current"]["disable"]=value
-                    else:
-                        assert type(value) is str and value;s["storage_current"]["is_mountpoint"]=value
+                    option,value=fixture_pvesm_policy(argv,cfg["cutover"]["storage"]["id"],s["digest"])
+                    s["storage_current"]=fixture_pvesm_effect(s["storage_current"],option,value)
                     s["disabled"]=native_boolean(s["storage_current"].get("disable","0"))
                     s["offline_raw"]=s["storage_current"].get("is_mountpoint")
                     if "reopen" in name:
@@ -413,7 +431,7 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                     s["digest"]=chr(ord(s["digest"][0])+1)*40
                 elif operation["kind"]=="native_argv" and argv[0]==cfg["tools"]["rsync"]:
                     assert args["stdin"]==""
-                    argv = argv[2:] if argv[0] == "/usr/bin/timeout" else argv
+                    assert len(argv)==10 and argv[0]==cfg["tools"]["rsync"] and argv[8:]==[str(source)+"/",str(stage)+"/"]
                     assert argv[1:8] == ["-aHAXS", "--numeric-ids", "--one-file-system", "--ignore-times", "--modify-window=-1", "--whole-file", "--"]
                     assert "--delete" not in argv and "--inplace" not in argv
                     record("retained-copy")
@@ -1132,3 +1150,41 @@ def test_final_unit_independent_literal_oracle(tmp_path,case):
         with pytest.raises(AssertionError):fixture_declare_final_unit(args,surrogate,source)
         if before:assert before==(os.lstat(surrogate).st_ino,os.lstat(surrogate).st_mtime_ns)
         else:assert not os.path.lexists(surrogate)
+
+
+@pytest.mark.parametrize('order',['policy-first','digest-first'])
+@pytest.mark.parametrize('option,value',[('--disable','1'),('--is_mountpoint','yes'),('--delete','disable'),('--delete','is_mountpoint')],ids=['disable-true','mountpoint-yes','delete-disable','delete-mountpoint'])
+def test_fixture_pvesm_native_pair_order_and_readback(order,option,value):
+    policy=[option,value];digest=['--digest','a'*40]
+    argv=['/usr/sbin/pvesm','set','fixture-dir']+(policy+digest if order=='policy-first' else digest+policy)
+    original={'type':'dir','path':'/fixture/source','disable':'no','is_mountpoint':'/fixture/source'}
+    parsed=fixture_pvesm_policy(argv,'fixture-dir','a'*40)
+    assert parsed==(option,value)
+    changed=fixture_pvesm_effect(original,*parsed)
+    assert changed['path']==original['path'] and changed['type']==original['type']
+    if option=='--delete':assert value not in changed
+    else:assert changed[option[2:]]==value
+    assert original['disable']=='no' and original['is_mountpoint']=='/fixture/source'
+
+
+@pytest.mark.parametrize('case',['duplicate-digest','duplicate-policy','unknown','wrong-digest','wrong-id','non-string','missing-pair'])
+def test_fixture_pvesm_invalid_native_pairs_have_no_effect(case):
+    argv=['/usr/sbin/pvesm','set','fixture-dir','--disable','1','--digest','a'*40]
+    if case=='duplicate-digest':argv[3:5]=['--digest','a'*40]
+    elif case=='duplicate-policy':argv[5:]=['--disable','0']
+    elif case=='unknown':argv[3]='--force'
+    elif case=='wrong-digest':argv[6]='b'*40
+    elif case=='wrong-id':argv[2]='foreign-dir'
+    elif case=='non-string':argv[4]=1
+    elif case=='missing-pair':argv=argv[:-2]
+    original={'type':'dir','path':'/fixture/source','disable':'no'}
+    with pytest.raises(AssertionError):
+        parsed=fixture_pvesm_policy(argv,'fixture-dir','a'*40)
+        fixture_pvesm_effect(original,*parsed)
+    assert original=={'type':'dir','path':'/fixture/source','disable':'no'}
+
+
+def test_fixture_pvesm_literal_mountpoint_path_preserves_native_value():
+    path='/fixture/source'
+    parsed=fixture_pvesm_policy(['/usr/sbin/pvesm','set','fixture-dir','--is_mountpoint',path,'--digest','a'*40],'fixture-dir','a'*40)
+    assert fixture_pvesm_effect({'type':'dir'},*parsed)=={'type':'dir','is_mountpoint':path}
