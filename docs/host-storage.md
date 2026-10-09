@@ -21,7 +21,9 @@ refuse before the relevant mutation; a partial transition remains a failed attem
 ## R1
 
 Exact mounted `/`, existing linear LV and PV/VG membership are checked against
-fresh `findmnt`, LVM JSON and `dumpe2fs` reports. Targets/caps are absolute MiB,
+fresh `findmnt`, LVM JSON and `dumpe2fs` reports. Multiple segment rows must share
+one consistent LV/VG identity, repeated LV size and path; every segment must be
+linear on the admitted PV. Repeated LV bytes are never summed. Targets/caps are absolute MiB,
 positive non-boolean integers aligned to measured VG extent bytes. The outside-pool
 ledger is `root_delta + protected_VG_reserve <= VG_free`; thin internal free is
 never counted. No swap is created or changed. Unknown geometry is never zero.
@@ -53,10 +55,11 @@ source in both directions, without symlink, inode identity, nested mount or bind
 alias. Each distinct mount namespace is read through one fresh positive representative
 PID (`lsns` plus `nsenter`/`findmnt`, 30-second per-view timeout). Failed, disappeared
 or inaccessible views refuse; namespace count alone does not reject a valid stage.
-The current conservative supported topology requires FSROOT=/ and no additional
-root-device alias in every view; non-root bind/remapping views refuse, even when
-a broader future implementation might prove them unrelated. Such configurations
-are not operationally accepted by this packet; no native namespace check was run.
+Physical footprints use the covering host mount's root-relative path and device
+major/minor identity. Each namespace mapping is checked only for component-wise
+physical overlap with source/stage on the same device; transparent baseline views
+are allowed, unrelated PrivateTmp/proc/container binds are preserved. Relevant
+aliases or incomplete identity refuse; namespace count does not decide safety.
 `stage.references_complete`, `reference_receipt` and empty `volume_references`
 require independently captured fresh PVE configuration/volume consumers, not
 name-based inference; no unsigned existing LV is accepted.
@@ -65,15 +68,25 @@ Native `fuser` guards inspect the exact inactive directory or mounted filesystem
 private complete-consumer admission is still required (including namespace and
 non-FD consumers), and must remain valid throughout the held owning operation.
 
+The fixed FS UUID is canonical lowercase 8-4-4-4-12 hex, nonzero and distinct
+from mounted root, validated before LV creation; random/clear/malformed values refuse.
 Only an LV newly created during this attempt and independently proven blank by
 `wipefs --no-act` and `blkid -p` reaches `community.general.filesystem`. Resume
 never formats. The fixed FS UUID is checked before activation. The mount template
 has no install/boot target; the unit is explicitly disabled. Exact active resume
-is inspected without rewriting, restarting or reloading its unit. Busy/unknown
+is inspected without rewriting, restarting or reloading its unit. Its loaded
+What/Where/type/options/fragment, empty drop-ins, no pending reload and exact
+root-owned regular fragment must match the rendered non-boot template. Loaded
+LazyUnmount/ForceUnmount must both be no, checked again before stop. Proven
+non-boot static and disabled states are accepted; enabled/indirect/unknown refuse.
+Canonical device and rdev checks accept normal mapper/UUID device aliases. Busy/unknown
 retirement preserves the mount and diagnostics. After a fresh complete no-consumer
 guard, ordinary systemd stop retires the temporary mount; no force/lazy unmount or
 delete exists. Postconditions require absent stage mount, disabled policy and
-retained exact LV. This LV has protected host-infrastructure lifetime and never
+retained exact LV. Keyed static mapping projections preserve UUIDs, paths,
+segments and geometry while allowing volatile pool usage and report ordering to
+change. Fresh final pool health/reserves are separately checked; normal foreign
+writes are not blocked to freeze percentages. This LV has protected host-infrastructure lifetime and never
 belongs to a QCL wipe set, even while empty.
 
 No retained-content copy, cutover, final mount enable/activation, PVE storage-disable,
