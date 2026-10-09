@@ -181,7 +181,16 @@
         try:os.killpg(p.pid,signal.SIGKILL)
         except ProcessLookupError:pass
         break
-      rc=p.wait()
+      def remaining():
+       return max(0.001,min(seconds-(time.monotonic()-t),deadline-time.time() if deadline else seconds))
+      try:rc=p.wait(timeout=remaining())
+      except subprocess.TimeoutExpired:
+       reason=reason or "time cap"
+       # PGID belongs to this wrapper even if its leader exited; retain descendants scope.
+       try:os.killpg(p.pid,signal.SIGKILL)
+       except ProcessLookupError:pass
+       try:rc=p.wait(timeout=remaining())
+       except subprocess.TimeoutExpired:rc=124
       if reason:sys.stderr.write(reason+"\n");sys.exit(124)
       sys.exit(rc)
   tasks:

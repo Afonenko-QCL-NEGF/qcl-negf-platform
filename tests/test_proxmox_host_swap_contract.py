@@ -270,8 +270,15 @@ def test_actual_additive_swap_boundary(name,tmp_path,monkeypatch):
     assert (rc==0) is success
     if name in ('fresh','partial-resume','old-used-changes'):
         assert kinds.count('fill')==1 and kinds.count('format')==1 and kinds.count('start')==1
-        assert kinds.index('seal-binding')<kinds.index('fill') if name=='fresh' else 'create-exclusive' not in kinds
-    if name=='fresh':
+    if name in ('fresh','old-used-changes'):
+        assert cfg['swap']['binding_sha256'] is None and not s['exists']
+        assert kinds.count('create-exclusive')==1
+        assert kinds.index('create-exclusive')<kinds.index('seal-binding')<kinds.index('fill')
+    if name=='partial-resume':
+        assert type(cfg['swap']['binding_sha256']) is str and s['exists']
+        assert s['file']['size']<cfg['swap']['target_mib']*MIB
+        assert 'create-exclusive' not in kinds and 'record-binding' not in kinds
+    if name in ('fresh','old-used-changes'):
         assert kinds.index('sync-parent-entry')<kinds.index('seal-binding')
         assert kinds.index('sync-receipts-entry')<kinds.index('seal-binding')
     if name=='formatted-resume':assert 'fill' not in kinds and 'format' not in kinds and 'start' in kinds
@@ -351,3 +358,57 @@ def test_actual_engine_syntax(tmp_path,monkeypatch):
     assert (BASE/'ansible/proxmox-host-swap.yml').exists(), 'missing additive swap playbook'
     rc,observed=execute({},state(),tmp_path,monkeypatch,syntax=True)
     assert rc==0 and observed['trace']==[] and observed['probes']==[]
+
+
+@pytest.mark.parametrize('case',['closed-streams-timeout','leader-exited-descendant-streams','closed-streams-success'])
+def test_capture_primitive_bounded_wait(case,monkeypatch):
+    """Execute saved primitive with fake Popen/selectors; never create a child."""
+    import selectors
+    import signal
+    import subprocess
+    import sys
+    import time
+    from types import SimpleNamespace
+    code=yaml.safe_load((BASE/'ansible/proxmox-host-swap.yml').read_text())[0]['vars']['run_code']
+    calls=[];killed=[]
+    process=SimpleNamespace(pid=424242,stdout=object(),stderr=object())
+    def popen(argv,**kw):
+        assert argv==['/fixture/never-executed'] and kw['start_new_session'] is True
+        assert kw['stdout']==subprocess.PIPE and kw['stderr']==subprocess.PIPE
+        return process
+    def wait(timeout=None):
+        # Independent oracle: every wait, including cleanup, remains finite.
+        assert type(timeout) in (int,float) and 0 < timeout <= 4.0
+        calls.append(timeout)
+        if case=='closed-streams-timeout' and not killed:
+            raise subprocess.TimeoutExpired('/fixture/never-executed',timeout)
+        return 0 if case!='closed-streams-timeout' else -9
+    process.wait=wait
+    process.poll=lambda:0 if case=='leader-exited-descendant-streams' else None
+    class Selector:
+        def __init__(self):self.rows={}
+        def register(self,stream,event,output):
+            self.rows[id(stream)]=SimpleNamespace(fd=id(stream),fileobj=stream,data=output)
+        def get_map(self):return self.rows
+        def select(self,timeout):return [(r,1) for r in list(self.rows.values())]
+        def unregister(self,stream):self.rows.pop(id(stream))
+    def killpg(pid,sig):
+        assert pid==process.pid and sig==signal.SIGKILL
+        killed.append(pid)
+    monkeypatch.setattr(subprocess,'Popen',popen)
+    monkeypatch.setattr(selectors,'DefaultSelector',Selector)
+    monkeypatch.setattr(os,'read',lambda fd,size:b'overflow' if case=='leader-exited-descendant-streams' else b'')
+    monkeypatch.setattr(os,'killpg',killpg)
+    # First observation is start; subsequent observations consume one second.
+    def clock():
+        value=11.0 if getattr(process,'clock_started',False) else 10.0
+        process.clock_started=True
+        return value
+    monkeypatch.setattr(time,'monotonic',clock)
+    monkeypatch.setattr(time,'time',lambda:1001.0)
+    monkeypatch.setattr(sys,'argv',['python','run','5','4','["/fixture/never-executed"]','1005'])
+    with pytest.raises(SystemExit) as exc:
+        exec(compile(code,'saved-capture-primitive','exec'),{'__name__':'__main__'})
+    assert exc.value.code==(0 if case=='closed-streams-success' else 124)
+    assert calls
+    assert killed==([] if case=='closed-streams-success' else [process.pid])
