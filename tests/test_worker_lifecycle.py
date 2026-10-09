@@ -6,6 +6,8 @@ from pathlib import Path
 import tempfile
 import unittest
 import sys
+from unittest.mock import patch
+from test_node_enrollment import CONTROLLER, WORKER, TRUST, registry
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "ops"))
 
@@ -149,16 +151,24 @@ class WorkerLifecycleTests(unittest.TestCase):
 
             def run(args):
                 calls.append(args)
-                if args[0] == "ssh" and " check " in args[-1]:
-                    return json.dumps({**expected, "ready": ready})
+                if args[0] == "ssh":
+                    actual = CONTROLLER if "controller" in args[-2] else WORKER
+                    if args[-1].endswith(" identity"):
+                        return json.dumps(actual)
+                    if " check " in args[-1]:
+                        return json.dumps({"schema": "qcl-negf-node-release-check-v1", "node_identity": actual,
+                                           "release": {**expected, "ready": ready}})
                 return ""
 
-            with self.assertRaisesRegex(ValueError, "verification"):
-                self.ops.startup("worker", "admin@worker", runtime=root, gate=gate, run=run)
-            self.assertFalse(any("State=RESUME" in args for args in calls))
-            ready = True
-            self.ops.startup("worker", "admin@worker", runtime=root, gate=gate, run=run)
-            self.assertIn("State=RESUME", calls[-1])
+            with patch.object(self.ops.release, "load_enrollment", lambda _: {"registry": registry(), "registry_sha256": "e" * 64, "known_hosts_bytes": b"synthetic"}), \
+                 patch.object(self.ops.release, "observe_node_identity", lambda **_: CONTROLLER), \
+                 patch.object(self.ops.release, "freeze_ssh_trust", lambda *a, **k: TRUST):
+                with self.assertRaisesRegex(ValueError, "verification"):
+                    self.ops.startup("worker", "admin@worker.invalid", enrollment="/synthetic/enrollment.json", runtime=root, gate=gate, run=run)
+                self.assertFalse(any("State=RESUME" in args for args in calls))
+                ready = True
+                self.ops.startup("worker", "admin@worker.invalid", enrollment="/synthetic/enrollment.json", runtime=root, gate=gate, run=run)
+                self.assertIn("State=RESUME", calls[-1])
 
 
 if __name__ == "__main__":

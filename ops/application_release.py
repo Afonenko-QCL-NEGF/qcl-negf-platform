@@ -16,6 +16,10 @@ import re
 import shlex
 import subprocess
 import math
+import hashlib
+import stat
+import socket
+from types import MappingProxyType
 import selectors
 import signal
 import time
@@ -178,6 +182,422 @@ def command(args, *, timeout_seconds=360.0, output_bytes=1048576,
     return output
 
 
+TRUST_SNAPSHOTS = Path("/var/lib/qcl-negf/trust-snapshots")
+IDENTITY_SCHEMA = "qcl-negf-node-identity-v1"
+ENVELOPE_SCHEMA = "qcl-negf-node-release-check-v1"
+
+
+def unique_json(raw, limit=65536):
+    if not isinstance(raw, (str, bytes)) or len(raw.encode() if isinstance(raw, str) else raw) > limit:
+        raise ValueError("Metadata exceeds its bound")
+    def object_pairs(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("Duplicate metadata key")
+            result[key] = value
+        return result
+    return json.loads(raw, object_pairs_hook=object_pairs)
+
+
+def normalized_uuid(value):
+    if not isinstance(value, str):
+        raise ValueError("Missing UUID")
+    try:
+        result = uuid.UUID(value)
+    except (ValueError, AttributeError) as error:
+        raise ValueError("Invalid UUID") from error
+    if result.int == 0:
+        raise ValueError("Nil UUID")
+    return str(result)
+
+
+def identity_value(value):
+    if not isinstance(value, dict) or value.get("schema") != IDENTITY_SCHEMA:
+        raise ValueError("Expected observed node identity")
+    result = {key: value.get(key) for key in ("schema", "role", "hostname", "node_name", "machine_uuid", "machine_id", "boot_id")}
+    if result["role"] not in ("controller", "worker") or not isinstance(result["hostname"], str) or not TARGET.fullmatch(result["hostname"]) or "@" in result["hostname"]:
+        raise ValueError("Invalid observed role/hostname")
+    if result["role"] == "controller":
+        if result["node_name"] is not None:
+            raise ValueError("Controller must have node_name null")
+    elif not isinstance(result["node_name"], str) or not IDENTIFIER.fullmatch(result["node_name"]):
+        raise ValueError("Invalid observed NodeName")
+    for key in ("machine_uuid", "boot_id"):
+        result[key] = normalized_uuid(result[key])
+    if not isinstance(result["machine_id"], str) or not re.fullmatch(r"[0-9a-f]{32}", result["machine_id"]) or int(result["machine_id"], 16) == 0:
+        raise ValueError("Missing/invalid observed machine-id")
+    return result
+
+
+def enrollment_records(registry):
+    if not isinstance(registry, dict) or registry.get("schema") != "qcl-negf-node-enrollment-v1":
+        raise ValueError("Expected protected node enrollment v1")
+    normalized_uuid(registry.get("inventory_id"))
+    protected_parts(registry.get("known_hosts_file"))
+    if set(registry) != {"schema", "inventory_id", "known_hosts_file", "nodes"}:
+        raise ValueError("Unknown enrollment metadata fields")
+    records = registry.get("nodes")
+    if not isinstance(records, list) or not records:
+        raise ValueError("Enrollment requires nodes")
+    seen = {key: set() for key in ("enrollment_id", "name", "machine_uuid", "machine_id", "target")}
+    result = []
+    for raw in records:
+        if not isinstance(raw, dict):
+            raise ValueError("Malformed enrolled node")
+        allowed = {"enrollment_id", "name", "role", "hostname", "node_name", "machine_uuid", "machine_id", "targets"}
+        if raw.get("role") == "controller":
+            allowed.add("primary_target")
+        if set(raw) != allowed:
+            raise ValueError("Unknown/missing enrolled node fields")
+        record = dict(raw)
+        record["enrollment_id"] = normalized_uuid(record.get("enrollment_id"))
+        permanent = identity_value({**record, "schema": IDENTITY_SCHEMA,
+                                   "boot_id": "11111111-1111-1111-1111-111111111111"})
+        record.update({key: permanent[key] for key in ("role", "hostname", "node_name", "machine_uuid", "machine_id")})
+        if not isinstance(record.get("name"), str) or not IDENTIFIER.fullmatch(record["name"]):
+            raise ValueError("Invalid enrolled name")
+        if record["role"] == "worker" and record["node_name"] != record["name"]:
+            raise ValueError("Enrolled worker NodeName must equal name")
+        for key in ("enrollment_id", "name", "machine_uuid", "machine_id"):
+            if record[key] in seen[key]:
+                raise ValueError("Duplicate enrolled " + key)
+            seen[key].add(record[key])
+        targets = record.get("targets")
+        if not isinstance(targets, list) or not targets or not all(isinstance(target, str) and TARGET.fullmatch(target) for target in targets):
+            raise ValueError("Enrollment requires explicit accepted targets")
+        for target in targets:
+            if target in seen["target"]:
+                raise ValueError("Duplicate enrolled target")
+            seen["target"].add(target)
+        if record["role"] == "controller" and record.get("primary_target") not in targets:
+            raise ValueError("Controller requires enrolled primary_target")
+        record["targets"] = tuple(targets)
+        result.append(MappingProxyType(record))
+    if sum(record["role"] == "controller" for record in result) != 1:
+        raise ValueError("Enrollment requires exactly one authoritative controller")
+    return tuple(result)
+
+
+def validate_enrollment(pool, registry):
+    records = enrollment_records(registry)
+    if not isinstance(pool, dict) or pool.get("schema") != "qcl-negf-active-pool-v2" or not isinstance(pool.get("nodes"), list) or not pool["nodes"]:
+        raise ValueError("Expected active pool v2 with enrollment references")
+    by_id = {record["enrollment_id"]: record for record in records}
+    seen = {key: set() for key in ("enrollment_id", "name", "target")}
+    selected = []
+    for entry in pool["nodes"]:
+        if not isinstance(entry, dict):
+            raise ValueError("Malformed selected node")
+        for key in seen:
+            value = entry.get(key)
+            if not isinstance(value, str) or value in seen[key]:
+                raise ValueError("Missing/duplicate selected " + key)
+            seen[key].add(value)
+        if set(entry) != {"enrollment_id", "name", "role", "target"}:
+            raise ValueError("Selected node must reference enrollment, not duplicate authority")
+        record = by_id.get(entry["enrollment_id"])
+        if record is None or entry.get("name") != record["name"] or entry.get("role") != record["role"] or entry["target"] not in record["targets"]:
+            raise ValueError("Selected NodeName/role/target differs from enrollment")
+        selected.append(MappingProxyType({**record, "target": entry["target"]}))
+    if sum(record["role"] == "controller" for record in selected) != 1:
+        raise ValueError("Select exactly one enrolled controller")
+    return tuple(selected)
+
+
+def bind_node_observation(binding, observation, *, prior_boot=None):
+    actual = identity_value(observation)
+    for key in ("role", "hostname", "node_name", "machine_uuid", "machine_id"):
+        if actual[key] != binding.get(key):
+            raise ValueError("Node identity " + key + " mismatch: expected " + str(binding.get(key)) + ", observed " + str(actual[key]))
+    if prior_boot is not None and actual["boot_id"] != normalized_uuid(prior_boot):
+        raise ValueError("Node boot_id changed")
+    return MappingProxyType({**binding, "identity": MappingProxyType(actual)})
+
+
+def verify_controller_authority(controller_binding, local_observation, remote_observation):
+    if controller_binding.get("role") != "controller" or controller_binding.get("node_name") is not None:
+        raise ValueError("Local owner requires enrolled controller")
+    local = bind_node_observation(controller_binding, local_observation)
+    bind_node_observation(controller_binding, remote_observation, prior_boot=local["identity"]["boot_id"])
+    return local
+
+
+def protected_parts(path):
+    if not isinstance(path, (str, Path)):
+        raise ValueError("Protected path must be absolute")
+    path = str(path)
+    if not path.startswith("/") or any(part in ("", ".", "..") for part in path.split("/")[1:]):
+        raise ValueError("Protected path must be absolute without traversal")
+    return path.split("/")[1:]
+
+
+def trusted_stat(info, *, directory):
+    if info.st_uid != 0 or info.st_mode & 0o022 or not (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)):
+        raise ValueError("Unprotected namespace owner/mode/type")
+
+
+@contextmanager
+def protected_directory(path):
+    parts = [] if str(path) == "/" else protected_parts(path)
+    descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        trusted_stat(os.fstat(descriptor), directory=True)
+        for part in parts:
+            following = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = following
+            trusted_stat(os.fstat(descriptor), directory=True)
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+def read_protected_file(path, limit=65536):
+    parts = protected_parts(path)
+    with protected_directory("/" + "/".join(parts[:-1])) as parent:
+        descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        try:
+            trusted_stat(os.fstat(descriptor), directory=False)
+            chunks = bytearray()
+            while len(chunks) <= limit:
+                chunk = os.read(descriptor, min(4096, limit + 1 - len(chunks)))
+                if not chunk:
+                    return bytes(chunks)
+                chunks.extend(chunk)
+            raise ValueError("Protected metadata exceeds bound")
+        finally:
+            os.close(descriptor)
+
+
+def load_enrollment(path):
+    raw = read_protected_file(path)
+    registry = unique_json(raw)
+    enrollment_records(registry)
+    known = read_protected_file(registry["known_hosts_file"])
+    if not known:
+        raise ValueError("Enrollment known_hosts is empty")
+    return {"registry": registry, "registry_sha256": hashlib.sha256(raw).hexdigest(), "known_hosts_bytes": known}
+
+
+def freeze_ssh_trust(verified_bytes, *, snapshot_root=TRUST_SNAPSHOTS):
+    if not isinstance(verified_bytes, bytes) or not verified_bytes or len(verified_bytes) > 65536:
+        raise ValueError("Invalid verified known_hosts bytes")
+    name = str(uuid.uuid4())
+    with protected_directory(snapshot_root) as parent:
+        os.mkdir(name, 0o700, dir_fd=parent)
+        directory = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        try:
+            trusted_stat(os.fstat(directory), directory=True)
+            descriptor = os.open("known_hosts", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                 0o600, dir_fd=directory)
+            try:
+                trusted_stat(os.fstat(descriptor), directory=False)
+                view = memoryview(verified_bytes)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise OSError("Trust snapshot write made no progress")
+                    view = view[written:]
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.fsync(directory)
+            os.fsync(parent)
+        finally:
+            os.close(directory)
+    return MappingProxyType({"path": str(Path(snapshot_root) / name / "known_hosts"),
+                             "sha256": hashlib.sha256(verified_bytes).hexdigest()})
+
+
+def trust_options(trust_snapshot):
+    if not isinstance(trust_snapshot, (dict, MappingProxyType)) or not re.fullmatch(r"[0-9a-f]{64}", str(trust_snapshot.get("sha256", ""))):
+        raise ValueError("Required frozen SSH trust snapshot")
+    protected_parts(trust_snapshot.get("path"))
+    return ["-F", "/dev/null", "-oStrictHostKeyChecking=yes", "-oUserKnownHostsFile=" + trust_snapshot["path"],
+            "-oGlobalKnownHostsFile=/dev/null", "-oUpdateHostKeys=no", "-oKnownHostsCommand=none"]
+
+
+def local_metadata(path, limit=16384):
+    with Path(path).open("rb") as handle:
+        data = handle.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError("Local identity metadata exceeds bound")
+    return data
+
+
+def slurmd_pids():
+    result = []
+    for path in Path("/proc").iterdir():
+        if not path.name.isdigit():
+            continue
+        try:
+            if local_metadata(path / "comm", 256).strip() == b"slurmd":
+                result.append(int(path.name))
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+    return result
+
+
+def worker_daemon_binding(config, hostname, run):
+    conf = config.get("slurm_conf")
+    if not isinstance(conf, str) or not Path(conf).is_absolute():
+        raise ValueError("Unsupported worker: missing explicit SLURM_CONF")
+    config_bytes = local_metadata(conf)
+    raw = run(["systemctl", "show", "slurmd.service", "--property=MainPID", "--property=InvocationID", "--property=Environment"])
+    service = {}
+    for line in raw.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or key in service:
+            raise ValueError("Unsupported worker: ambiguous daemon service")
+        service[key] = value
+    pid = service.get("MainPID", "")
+    if not pid.isdigit() or int(pid) <= 0 or not re.fullmatch(r"[0-9a-f]{32}", service.get("InvocationID", "")):
+        raise ValueError("Unsupported worker: missing daemon invocation")
+    if slurmd_pids() != [int(pid)]:
+        raise ValueError("Unsupported worker: multiple/missing slurmd daemons")
+    args = [part.decode() for part in local_metadata("/proc/" + pid + "/cmdline").split(b"\0") if part]
+    if not args or Path(args[0]).name != "slurmd" or any(arg not in ("-D", "-s", "-v", "-vv") for arg in args[1:]):
+        raise ValueError("Unsupported worker: slurmd NodeName/dynamic/config override")
+    environment = [part.decode() for part in local_metadata("/proc/" + pid + "/environ").split(b"\0") if part]
+    runtime_confs = [value.split("=", 1)[1] for value in environment if value.startswith("SLURM_CONF=")]
+    unit_confs = [value.split("=", 1)[1] for value in shlex.split(service.get("Environment", "")) if value.startswith("SLURM_CONF=")]
+    if runtime_confs != [conf] or unit_confs != [conf]:
+        raise ValueError("Unsupported worker: different daemon SLURM_CONF")
+    aliases = run(["env", "SLURM_CONF=" + conf, "scontrol", "show", "aliases", hostname]).strip()
+    # Narrow supported response; actual pinned-site format still needs a smoke gate.
+    match = re.fullmatch(r"NodeName=([a-zA-Z0-9][a-zA-Z0-9._-]{0,63})", aliases)
+    if not match:
+        raise ValueError("Unsupported worker: ambiguous/missing canonical aliases")
+    return match.group(1), (config_bytes, service, tuple(args), tuple(runtime_confs))
+
+
+def observe_node_identity(*, run=command, controller_only=False):
+    def machine():
+        return {"machine_uuid": local_metadata("/sys/class/dmi/id/product_uuid").decode().strip().lower(),
+                "machine_id": local_metadata("/etc/machine-id").decode().strip(),
+                "boot_id": local_metadata("/proc/sys/kernel/random/boot_id").decode().strip().lower()}
+    configuration = local_metadata("/etc/qcl-negf/release-config.json")
+    config = unique_json(configuration, 16384)
+    role = config.get("role")
+    if controller_only and role != "controller":
+        raise ValueError("Local invoking machine is not the enrolled controller")
+    hostname = socket.gethostname()
+    before = machine()
+    daemon_before = None
+    node = None
+    if role == "worker":
+        node, daemon_before = worker_daemon_binding(config, hostname, run)
+    elif role != "controller":
+        raise ValueError("Missing Nix-generated observed local role")
+    after = machine()
+    if before != after or hostname != socket.gethostname() or configuration != local_metadata("/etc/qcl-negf/release-config.json"):
+        raise ValueError("Local machine/boot/config changed during observation")
+    if role == "worker":
+        node_after, daemon_after = worker_daemon_binding(config, hostname, run)
+        if node_after != node or daemon_after != daemon_before:
+            raise ValueError("Worker daemon/config changed during observation")
+    return identity_value({"schema": IDENTITY_SCHEMA, "role": role, "hostname": hostname, "node_name": node, **before})
+
+
+def identity_probe(target, *, trust_snapshot, run):
+    return unique_json(ssh(target, ["sudo", "-n", "qcl-negf-release", "identity"], run,
+                           trust_snapshot=trust_snapshot), 16384)
+
+
+def preflight_controller_authority(enrollment_path, pool=None, *, observe_local=None,
+                                   run=command, deadline, command_timeout_seconds,
+                                   command_output_bytes, delivery_output_bytes,
+                                   snapshot_root=TRUST_SNAPSHOTS, before_remote=None):
+    if duration(command_timeout_seconds, "Authority command timeout") <= 2:
+        raise ValueError("Authority command timeout must exceed cleanup reserve")
+    duration(deadline, "Authority deadline")
+    output_bound(command_output_bytes)
+    output_bound(delivery_output_bytes)
+    loaded = load_enrollment(enrollment_path)
+    registry = loaded["registry"]
+    records = enrollment_records(registry)
+    bindings = validate_enrollment(pool, registry) if pool is not None else tuple(
+        MappingProxyType({**record, "target": record.get("primary_target")}) for record in records)
+    controller = next(record for record in bindings if record["role"] == "controller")
+    used = 0
+    def bounded(args):
+        nonlocal used
+        deadline_check(deadline)
+        available = min(command_output_bytes, delivery_output_bytes - used)
+        if available <= 0:
+            raise ValueError("Authority output budget exhausted")
+        output = (run(args, timeout_seconds=command_timeout_seconds, output_bytes=available, deadline=deadline)
+                  if run is command else run(args))
+        count = getattr(output, "output_bytes", len(output.encode()))
+        used += count
+        if count > available or used > delivery_output_bytes:
+            raise ValueError("Authority output budget exceeded")
+        deadline_check(deadline)
+        return output
+    observer = observe_local or observe_node_identity
+    local = observer(run=bounded, controller_only=True)
+    bind_node_observation(controller, local)
+    if before_remote is not None:
+        before_remote()
+    deadline_check(deadline)
+    snapshot = freeze_ssh_trust(loaded["known_hosts_bytes"], snapshot_root=snapshot_root)
+    remote = identity_probe(controller["target"], trust_snapshot=snapshot, run=bounded)
+    verify_controller_authority(controller, local, remote)
+    current = observer(run=bounded, controller_only=True)
+    verify_controller_authority(controller, current, remote)
+    if identity_value(current) != identity_value(local):
+        raise ValueError("Local controller generation changed during preflight")
+    return {"schema": "qcl-negf-controller-authority-v1", "registry": registry,
+            "registry_sha256": loaded["registry_sha256"], "controller_binding": controller,
+            "local_identity": identity_value(local), "remote_identity": identity_value(remote),
+            "trust_snapshot": snapshot, "used_output_bytes": used, "bindings": bindings}
+
+
+def recheck_controller_authority(authority, *, run=command):
+    if not isinstance(authority, dict) or authority.get("schema") != "qcl-negf-controller-authority-v1":
+        raise ValueError("Required controller authority context")
+    current = observe_node_identity(run=run, controller_only=True)
+    verify_controller_authority(authority["controller_binding"], current, authority["remote_identity"])
+    if identity_value(current) != authority["local_identity"]:
+        raise ValueError("Local controller generation changed")
+    return current
+
+
+def verify_node_envelope(binding, envelope, expected):
+    if not isinstance(envelope, dict) or envelope.get("schema") != ENVELOPE_SCHEMA:
+        error = ValueError("Fleet requires bound node release envelope")
+        error.uncertain = True
+        raise error
+    try:
+        bind_node_observation(binding, envelope.get("node_identity"), prior_boot=binding["identity"]["boot_id"])
+    except ValueError as error:
+        error.uncertain = True
+        raise
+    value = envelope.get("release")
+    if not isinstance(value, dict) or value.get("ready") is not True or manifest(value) != expected:
+        raise ValueError("Node release verification failed")
+    return value
+
+
+def assert_expected_node(expected_node_identity, *, role, run=command):
+    expected = identity_value(expected_node_identity)
+    if expected["role"] != role:
+        raise ValueError("Caller role conflicts with observed expected node")
+    actual = observe_node_identity(run=run)
+    bind_node_observation(expected, actual, prior_boot=expected["boot_id"])
+    return actual
+
+
+def unresolved_deliveries(runtime):
+    attempts = Path(runtime) / "delivery-attempts"
+    if attempts.exists():
+        for path in attempts.glob("*.json"):
+            previous = load(path)
+            if previous.get("schema") == "qcl-negf-admission-intent-v1" or previous.get("requires_reconciliation") or (previous.get("status") == "running" and previous.get("pending_command", {}).get("mutation")):
+                raise RuntimeError("Unresolved delivery requires trusted operator reconciliation")
+
+
 def manifest(value):
     if not isinstance(value, dict) or value.get("schema") != "qcl-negf-release-v1":
         raise ValueError("Expected qcl-negf-release-v1 manifest")
@@ -191,7 +611,7 @@ def manifest(value):
     return {key: value[key] for key in ("schema", "release_id", "application_path", "solver_executable")}
 
 
-def prefetch_controller_closures(value, run=command):
+def prefetch_controller_closures(value, run=command, *, validate_only=False):
     """Fetch and verify immutable release evidence before maintenance begins."""
     expected = manifest(value)
     paths = [expected["application_path"], str(Path(expected["solver_executable"]).parents[1])]
@@ -218,6 +638,8 @@ def prefetch_controller_closures(value, run=command):
         hashes[item["path"]] = item["narHash"]
     if set(hashes) != required:
         raise ValueError("Manifest lacks application or solver closure hash evidence")
+    if validate_only:
+        return hashes
     if "cache_uri" in value:
         run(["nix", "copy", "--from", cache, *paths])
     raw = run(["nix", "path-info", "--json", *paths])
@@ -343,7 +765,9 @@ def solver_self_check(expected, run):
     return receipt
 
 
-def check(manifest_value, *, profile=PROFILE, runtime=RUNTIME, role="worker", run=command):
+def check(manifest_value, *, profile=PROFILE, runtime=RUNTIME, role="worker", run=command,
+          expected_node_identity=None):
+    bound_before = assert_expected_node(expected_node_identity, role=role, run=run) if expected_node_identity is not None else None
     expected = manifest(manifest_value)
     current = load(Path(runtime) / "release.json")
     if current.get("ready") is not True or manifest(current) != expected or Path(profile).resolve() != Path(expected["application_path"]):
@@ -357,6 +781,11 @@ def check(manifest_value, *, profile=PROFILE, runtime=RUNTIME, role="worker", ru
     for unit in units:
         run(["systemctl", "is-active", "--quiet", unit])
     solver_self_check(expected, run)
+    if bound_before is not None:
+        bound_after = assert_expected_node(expected_node_identity, role=role, run=run)
+        if bound_before != bound_after:
+            raise ValueError("Node changed during release check")
+        return {"schema": ENVELOPE_SCHEMA, "node_identity": bound_after, "release": current}
     return current
 
 
@@ -427,7 +856,9 @@ def prepare_initial(manifest_value, *, profile=PROFILE, runtime=RUNTIME, gate=GA
 
 
 def activate(manifest_value, *, profile=PROFILE, runtime=RUNTIME, role="worker", run=command,
-             email=None, allowed_codes_file=Path("/var/lib/qcl-negf/aiida/code-uuid")):
+             email=None, allowed_codes_file=Path("/var/lib/qcl-negf/aiida/code-uuid"),
+             expected_node_identity=None):
+    bound_node = assert_expected_node(expected_node_identity, role=role, run=run) if expected_node_identity is not None else None
     expected = manifest(manifest_value)
     if role not in ("controller", "worker"):
         raise ValueError("Activation role must be controller or worker")
@@ -450,6 +881,8 @@ def activate(manifest_value, *, profile=PROFILE, runtime=RUNTIME, role="worker",
         if path.resolve() != Path(selected):
             raise ValueError("Installed application or solver profile differs from the selected closure")
     identity = dict(expected)
+    if bound_node is not None:
+        identity["node_identity"] = bound_node
     if role == "controller":
         if not email:
             raise ValueError("Controller activation requires the declared service email")
@@ -509,8 +942,17 @@ def node_check(runtime=RUNTIME / "release.json", gate=GATE, profile=PROFILE, *, 
 
 
 def deliver_pool(manifest_value, nodes, gate=GATE, *, deliver, quiesce, admit=lambda: None,
-                 deadline=None, checkpoint=None):
+                 deadline=None, checkpoint=None, bindings=None, authority=None, authority_run=command):
     expected = manifest(manifest_value)
+    if not isinstance(bindings, dict) or set(bindings) != set(nodes):
+        raise ValueError("Required full selected node bindings")
+    observed = [bindings[node].get("identity") for node in nodes]
+    if any(identity is None for identity in observed):
+        raise ValueError("Missing preflight observed node binding")
+    for key in ("machine_uuid", "machine_id"):
+        if len({identity[key] for identity in observed}) != len(nodes):
+            raise ValueError("Duplicate actual selected machine")
+    recheck_controller_authority(authority, run=authority_run)
     if not nodes or len(set(nodes)) != len(nodes):
         raise ValueError("Select a nonempty pool of unique active nodes")
     report = {"release_id": expected["release_id"], "open": False, "status": "running",
@@ -532,11 +974,11 @@ def deliver_pool(manifest_value, nodes, gate=GATE, *, deliver, quiesce, admit=la
         save("deliver")
         try:
             deadline_check(deadline)
-            identity = deliver(node, expected)
+            envelope = deliver(node, expected)
             deadline_check(deadline)
-            if not isinstance(identity, dict) or identity.get("ready") is not True or manifest(identity) != expected:
-                raise ValueError("Node verified a different release identity")
-            report["nodes"][node] = {"status": "verified", "identity": identity}
+            identity = verify_node_envelope(bindings[node], envelope, expected)
+            report["nodes"][node] = {"status": "verified", "identity": identity,
+                                      "node_identity": dict(bindings[node]["identity"])}
         except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
             report["nodes"][node] = {"status": "failed", "reason": str(error)}
             if isinstance(error, CommandFailure):
@@ -551,11 +993,13 @@ def deliver_pool(manifest_value, nodes, gate=GATE, *, deliver, quiesce, admit=la
         try:
             save("admit")
             deadline_check(deadline)
+            recheck_controller_authority(authority, run=authority_run)
             admit()
             deadline_check(deadline)
             report["admission_pending"] = True
             save("open_admission")
             deadline_check(deadline)
+            recheck_controller_authority(authority, run=authority_run)
             publish_admission(gate, {"open": True, "release_id": expected["release_id"]})
             report.update(open=True, status="completed")
             save("finished")
@@ -586,16 +1030,16 @@ SSH_OPTIONS = ["-oBatchMode=yes", "-oConnectionAttempts=1", "-oConnectTimeout=10
                "-oServerAliveInterval=15", "-oServerAliveCountMax=2",
                "-oControlMaster=no", "-oControlPath=none"]
 
-def ssh(target, args, run=command):
+def ssh(target, args, run=command, *, trust_snapshot):
     if not TARGET.fullmatch(target):
         raise ValueError("Invalid SSH target")
-    return run(["ssh", *SSH_OPTIONS, target, shlex.join(args)])
+    return run(["ssh", *SSH_OPTIONS, *trust_options(trust_snapshot), target, shlex.join(args)])
 
 
-def deliver_cli(expected, pool, run=command, *, runtime=RUNTIME, gate=GATE,
+def deliver_cli(expected, pool, run=command, *, enrollment, runtime=RUNTIME, gate=GATE,
                 delivery_timeout_seconds=1800.0, command_timeout_seconds=360.0,
                 command_output_bytes=1048576, delivery_output_bytes=8388608):
-    """Controller-local orchestration; explicit active inventory, no discovery."""
+    """Authority precondition precedes local writes and lock; no inventory fallback."""
     start = time.monotonic()
     for value in (delivery_timeout_seconds, command_timeout_seconds):
         if duration(value, "CLI timeout") <= 2:
@@ -603,14 +1047,26 @@ def deliver_cli(expected, pool, run=command, *, runtime=RUNTIME, gate=GATE,
     output_bound(command_output_bytes)
     output_bound(delivery_output_bytes)
     deadline = start + delivery_timeout_seconds
+    prefetch_controller_closures(expected, validate_only=True)
+    authority = preflight_controller_authority(enrollment, pool, run=run, deadline=deadline,
+        command_timeout_seconds=command_timeout_seconds, command_output_bytes=command_output_bytes,
+        delivery_output_bytes=delivery_output_bytes, before_remote=lambda: unresolved_deliveries(runtime))
+    deadline_check(deadline)
+    runtime = Path(runtime)
+    runtime.mkdir(parents=True, exist_ok=True)
+    with (runtime / "delivery.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        recheck_controller_authority(authority, run=run)
+        unresolved_deliveries(runtime)
+        return _deliver_cli_locked(expected, pool, run, runtime=runtime, gate=gate, authority=authority,
+            start=start, deadline=deadline, command_timeout_seconds=command_timeout_seconds,
+            command_output_bytes=command_output_bytes, delivery_output_bytes=delivery_output_bytes)
+
+
+def _deliver_cli_locked(expected, pool, run, *, runtime, gate, authority, start, deadline,
+                        command_timeout_seconds, command_output_bytes, delivery_output_bytes):
     runtime = Path(runtime)
     attempts = runtime / "delivery-attempts"
-    if attempts.exists():
-        for path in attempts.glob("*.json"):
-            previous = load(path)
-            if previous.get("schema") == "qcl-negf-admission-intent-v1" or previous.get("requires_reconciliation") or (previous.get("status") == "running"
-                    and previous.get("pending_command", {}).get("mutation")):
-                raise RuntimeError("Unresolved delivery requires trusted operator reconciliation")
     attempts.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(attempts, 0o700)
     attempt_id = str(uuid.uuid4())
@@ -619,7 +1075,11 @@ def deliver_cli(expected, pool, run=command, *, runtime=RUNTIME, gate=GATE,
     receipt = {"schema": "qcl-negf-delivery-attempt-v1", "attempt_id": attempt_id,
                "manifest": expected, "identity": manifest(expected), "status": "running",
                "started_utc": datetime.now(timezone.utc).isoformat(), "gate_changed": False,
-               "admission_before": None, "commands": [], "nodes": {}, "open": False}
+               "admission_before": None, "commands": [], "nodes": {}, "open": False,
+               "controller_authority": {"registry_sha256": authority["registry_sha256"],
+                   "inventory_id": authority["registry"]["inventory_id"],
+                   "local_identity": authority["local_identity"], "remote_identity": authority["remote_identity"],
+                   "trust_snapshot": dict(authority["trust_snapshot"])}}
     raw_gate = read_admission(gate, missing=True)
     if raw_gate is not None:
         try:
@@ -646,7 +1106,7 @@ def deliver_cli(expected, pool, run=command, *, runtime=RUNTIME, gate=GATE,
     checkpoint()
     native = run is command
     original_run = run
-    used_output = 0
+    used_output = authority["used_output_bytes"]
     stage = {"phase": "prefetch", "node": None, "remote": False, "mutation": False}
     def dispatch(args):
         nonlocal used_output
@@ -667,7 +1127,7 @@ def deliver_cli(expected, pool, run=command, *, runtime=RUNTIME, gate=GATE,
             env = None
             if native and args[:2] == ["nix", "copy"]:
                 env = dict(os.environ)
-                env["NIX_SSHOPTS"] = shlex.join(SSH_OPTIONS + shlex.split(env.get("NIX_SSHOPTS", "")))
+                env["NIX_SSHOPTS"] = shlex.join(SSH_OPTIONS + trust_options(authority["trust_snapshot"]) + shlex.split(env.get("NIX_SSHOPTS", "")))
             entered_callable = True
             output = (original_run(args, timeout_seconds=command_timeout_seconds, output_bytes=available,
                                    deadline=deadline, env=env) if native else original_run(args))
@@ -704,15 +1164,31 @@ def deliver_cli(expected, pool, run=command, *, runtime=RUNTIME, gate=GATE,
             raise
     run = dispatch
     try:
-        nodes = pool.get("nodes", [])
-        if not nodes or not all(isinstance(node, dict) and IDENTIFIER.fullmatch(node.get("name", ""))
-                                and node.get("role") in ("controller", "worker")
-                                and TARGET.fullmatch(node.get("target", "")) for node in nodes):
-            raise ValueError("Pool requires named controller/worker nodes and SSH targets")
-        if len({node["name"] for node in nodes}) != len(nodes):
-            raise ValueError("Pool node names must be unique")
-        if sum(node["role"] == "controller" for node in nodes) != 1:
-            raise ValueError("Select exactly one controller in the active pool")
+        nodes = pool["nodes"]
+        selected = {binding["name"]: binding for binding in authority["bindings"]}
+        bindings = {}
+        mutation_started = False
+        def probe(name, *, prior_boot=None):
+            stage.update(phase="node_identity", node=name, remote=False, mutation=False)
+            try:
+                actual = identity_probe(selected[name]["target"], trust_snapshot=authority["trust_snapshot"], run=run)
+                bound = bind_node_observation(selected[name], actual, prior_boot=prior_boot)
+                if selected[name]["role"] == "controller":
+                    verify_controller_authority(selected[name], authority["local_identity"], actual)
+                return bound
+            except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
+                if mutation_started:
+                    error.uncertain = True
+                    receipt.update(requires_reconciliation=True, remote_outcome="unknown")
+                raise
+        for name in selected:
+            bindings[name] = probe(name)
+        for key in ("machine_uuid", "machine_id"):
+            if len({binding["identity"][key] for binding in bindings.values()}) != len(bindings):
+                raise ValueError("Duplicate actual selected machine")
+        receipt["node_bindings"] = {name: dict(binding["identity"]) for name, binding in bindings.items()}
+        checkpoint()
+        stage.update(phase="prefetch", node=None, remote=False, mutation=False)
         # The controller initially receives only the manifest, never CI's local store.
         # A bad cache or hash must leave both admission and current services untouched.
         prefetch_controller_closures(expected, run)
@@ -722,6 +1198,10 @@ def deliver_cli(expected, pool, run=command, *, runtime=RUNTIME, gate=GATE,
         encoded = base64.urlsafe_b64encode(json.dumps(expected).encode()).decode()
 
         def quiesce():
+            nonlocal mutation_started
+            # deliver_pool already published the closed gate: identity drift is
+            # terminal from maintenance onward, including the first pre-copy probe.
+            mutation_started = True
             stage.update(phase="quiesce", remote=False, mutation=True)
             run(["systemctl", "stop", "qcl-negf-api.service", "qcl-negf-aiida.service"])
             for worker in workers:
@@ -732,20 +1212,28 @@ def deliver_cli(expected, pool, run=command, *, runtime=RUNTIME, gate=GATE,
                 raise RuntimeError("Slurm still has running or queued jobs; resolve the old research before delivery")
 
         def deliver(name, value):
+            nonlocal mutation_started
             node = by_name[name]
+            probe(name, prior_boot=bindings[name]["identity"]["boot_id"])
+            mutation_started = True
+            expected_node = base64.urlsafe_b64encode(json.dumps(dict(bindings[name]["identity"])).encode()).decode()
             stage.update(phase="copy", node=name, remote=True, mutation=True)
             run(["nix", "copy", "--to", "ssh-ng://" + node["target"], value["application_path"],
                  str(Path(value["solver_executable"]).parents[1])])
             stage.update(phase="activate", mutation=True)
             ssh(node["target"], ["sudo", "-n", "qcl-negf-release", "activate", "--manifest-base64", encoded,
                                 "--role", node["role"], "--command-timeout-seconds", str(command_timeout_seconds),
-                                "--command-output-bytes", str(command_output_bytes)], run)
+                                "--command-output-bytes", str(command_output_bytes),
+                                "--expected-node-identity-base64", expected_node], run,
+                                trust_snapshot=authority["trust_snapshot"])
             stage.update(phase="check", mutation=False)
             result = ssh(node["target"], ["sudo", "-n", "qcl-negf-release", "check", "--manifest-base64", encoded,
                                          "--role", node["role"], "--command-timeout-seconds", str(command_timeout_seconds),
-                                "--command-output-bytes", str(command_output_bytes)], run)
+                                "--command-output-bytes", str(command_output_bytes),
+                                "--expected-node-identity-base64", expected_node], run,
+                                trust_snapshot=authority["trust_snapshot"])
             try:
-                return json.loads(result)
+                return unique_json(result, command_output_bytes)
             except ValueError as error:
                 error.uncertain = True
                 receipt.update(requires_reconciliation=True, remote_outcome="unknown",
@@ -753,12 +1241,15 @@ def deliver_cli(expected, pool, run=command, *, runtime=RUNTIME, gate=GATE,
                 raise
 
         def admit():
+            for name in selected:
+                probe(name, prior_boot=bindings[name]["identity"]["boot_id"])
+            recheck_controller_authority(authority, run=run)
             stage.update(phase="admit", remote=False, mutation=True)
             for worker in workers:
                 run(["scontrol", "update", "NodeName=" + worker, "State=RESUME"])
 
         report = deliver_pool(expected, list(by_name), gate, deliver=deliver, quiesce=quiesce, admit=admit,
-                              deadline=deadline, checkpoint=checkpoint)
+                              deadline=deadline, checkpoint=checkpoint, bindings=bindings, authority=authority, authority_run=run)
         if report.get("status") == "completed" and intent_path.exists():
             try:
                 # Last fallible success action. Crash may restore an unsynced deletion,
@@ -784,11 +1275,13 @@ def deliver_cli(expected, pool, run=command, *, runtime=RUNTIME, gate=GATE,
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["prepare-initial", "activate", "check", "guard", "node-check", "bootstrap-identity", "deliver"])
+    parser.add_argument("action", choices=["prepare-initial", "activate", "check", "guard", "node-check", "bootstrap-identity", "identity", "deliver"])
     parser.add_argument("--manifest")
     parser.add_argument("--manifest-base64")
     parser.add_argument("--role", choices=["controller", "worker"], default="worker")
     parser.add_argument("--pool")
+    parser.add_argument("--enrollment")
+    parser.add_argument("--expected-node-identity-base64")
     parser.add_argument("--release-id")
     parser.add_argument("--solver-executable")
     parser.add_argument("--runtime", type=Path, default=RUNTIME)
@@ -802,6 +1295,9 @@ def main():
     args = parser.parse_args()
     def native_run(argv):
         return command(argv, timeout_seconds=args.command_timeout_seconds, output_bytes=args.command_output_bytes)
+    if args.action == "identity":
+        print(json.dumps(observe_node_identity(run=native_run), sort_keys=True))
+        return
     if args.action == "bootstrap-identity":
         solver, label = bootstrap_selection(args.runtime / "release.json", args.solver_executable, args.initial_label)
         print(solver + "\n" + label)
@@ -816,8 +1312,24 @@ def main():
         parser.error("Provide exactly one --manifest or --manifest-base64")
     manifest_value = load(args.manifest) if args.manifest else json.loads(base64.urlsafe_b64decode(args.manifest_base64))
     expected = manifest(manifest_value)
-    if args.action == "check":
-        result = check(expected, runtime=args.runtime, role=args.role, run=native_run)
+    expected_node = unique_json(base64.urlsafe_b64decode(args.expected_node_identity_base64), 16384) if args.expected_node_identity_base64 else None
+    if args.action == "activate" and expected_node is not None:
+        assert_expected_node(expected_node, role=args.role, run=native_run)
+    if args.action == "deliver":
+        if not args.pool or not args.enrollment:
+            parser.error("Delivery requires --pool v2 and protected --enrollment")
+        try:
+            result = deliver_cli(manifest_value, load(args.pool), enrollment=args.enrollment,
+                runtime=args.runtime, gate=args.gate, delivery_timeout_seconds=args.delivery_timeout_seconds,
+                command_timeout_seconds=args.command_timeout_seconds,
+                command_output_bytes=args.command_output_bytes, delivery_output_bytes=args.delivery_output_bytes)
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
+            result = getattr(error, "delivery_summary", None)
+            if result is None:
+                result = {"open": None, "admission_state": "unknown", "requires_reconciliation": True}
+            result = {**result, "status": "failed", "error": type(error).__name__}
+    elif args.action == "check":
+        result = check(expected, runtime=args.runtime, role=args.role, run=native_run, expected_node_identity=expected_node)
     else:
         args.runtime.mkdir(parents=True, exist_ok=True)
         # One finite invocation at a time. This is a local flock, not a lease
@@ -825,20 +1337,7 @@ def main():
         lock_file = "delivery.lock" if args.action == "deliver" else "activation.lock"
         with (args.runtime / lock_file).open("w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            if args.action == "deliver":
-                if not args.pool:
-                    parser.error("Delivery requires an explicit --pool")
-                try:
-                    result = deliver_cli(manifest_value, load(args.pool), runtime=args.runtime, gate=args.gate,
-                        delivery_timeout_seconds=args.delivery_timeout_seconds,
-                        command_timeout_seconds=args.command_timeout_seconds,
-                        command_output_bytes=args.command_output_bytes, delivery_output_bytes=args.delivery_output_bytes)
-                except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
-                    result = getattr(error, "delivery_summary", None)
-                    if result is None:
-                        result = {"open": None, "admission_state": "unknown", "requires_reconciliation": True}
-                    result = {**result, "status": "failed", "error": type(error).__name__}
-            elif args.action == "prepare-initial":
+            if args.action == "prepare-initial":
                 result = prepare_initial(manifest_value, runtime=args.runtime, gate=args.gate, role=args.role, run=native_run)
             else:
                 admission = load_admission(args.gate)
@@ -848,7 +1347,8 @@ def main():
                     raise ValueError("Close admission for the selected release before activation")
                 settings = load("/etc/qcl-negf/release-config.json")
                 result = activate(expected, runtime=args.runtime, role=args.role, email=settings.get("email"),
-                                  run=native_run, allowed_codes_file=Path(settings.get("allowed_codes_file") or "/var/lib/qcl-negf/aiida/code-uuid"))
+                                  run=native_run, allowed_codes_file=Path(settings.get("allowed_codes_file") or "/var/lib/qcl-negf/aiida/code-uuid"),
+                                  expected_node_identity=expected_node)
     print(json.dumps(result, sort_keys=True))
     if args.action == "deliver" and (result.get("status") != "completed" or not result.get("open")):
         raise SystemExit(1)

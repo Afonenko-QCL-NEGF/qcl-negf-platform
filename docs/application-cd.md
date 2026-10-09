@@ -49,13 +49,25 @@ embedded password. Keep credentials outside the URI and manifest. Nix retains it
 and trust checks; this procedure does not disable `require-sigs`.
 
 An explicit private pool is separate from the manual credentials inventory; offline daytime workers
-are omitted:
+are omitted. This synthetic v2 example references the enrollment example below; actual protected
+inventory and host-key enrollment must be supplied by the operator:
 
 ```json
 {
+  "schema": "qcl-negf-active-pool-v2",
   "nodes": [
-    { "name": "control", "target": "deploy@control", "role": "controller" },
-    { "name": "compute", "target": "deploy@compute", "role": "worker" }
+    {
+      "name": "controller",
+      "target": "admin@controller.invalid",
+      "role": "controller",
+      "enrollment_id": "10000000-0000-0000-0000-000000000001"
+    },
+    {
+      "name": "worker",
+      "target": "admin@worker.invalid",
+      "role": "worker",
+      "enrollment_id": "20000000-0000-0000-0000-000000000002"
+    }
   ]
 }
 ```
@@ -66,20 +78,22 @@ become unrestricted administrators. In the user's maintenance window run on the 
 controller:
 
 ```console
-sudo qcl-negf-release deliver --manifest /private/release.json --pool /private/active-pool.json
+sudo qcl-negf-release deliver --manifest /private/release.json --pool /private/active-pool-v2.json --enrollment /operator-protected/enrollment.json
 ```
 
 For an SSH pipeline, `--manifest /dev/stdin` accepts the manifest without copying the controller's
 private pool to CI. SSH keys/cache signing keys remain outside Git, Nix inputs and scientific
 archives.
 
-Before maintenance, the controller fetches both named closures with
+Before maintenance, protected enrollment and readonly identity probes bind the actual local
+controller and all selected nodes. The controller then fetches both named closures with
 `nix copy --from CACHE_URI APPLICATION SOLVER` and verifies their exact manifest hashes using local
 `nix path-info --json APPLICATION SOLVER`. Fetch failure, malformed or missing evidence, and either
-hash mismatch stop delivery before any gate change, service stop, worker drain or remote command. An
-older assembled manifest without `cache_uri` remains supported when both closures already exist in
-the controller store and match its declared hashes. Delivery cannot accept a manifest without both
-hashes; minimal four-field manifests remain valid for activation and runtime identity checks.
+hash mismatch stop delivery before any gate change, service stop, worker drain or remote mutation.
+Readonly identity SSH probes may already have run. An older assembled manifest without `cache_uri`
+remains supported when both closures already exist in the controller store and match its declared
+hashes. Delivery cannot accept a manifest without both hashes; minimal four-field manifests remain
+valid for activation and runtime identity checks.
 
 After this preflight, delivery closes `/srv/qcl-negf/jobs/.release-admission.json`, stops API/AiiDA,
 drains selected workers and rejects a nonempty Slurm queue. The maintenance owner first
@@ -128,7 +142,7 @@ job guard still blocks. `ReturnToService=0` forbids automatic DOWN-to-service tr
 worker:
 
 ```console
-sudo qcl-negf-worker-lifecycle startup --node day-worker --target deploy@day-worker
+sudo qcl-negf-worker-lifecycle startup --node day-worker --target deploy@day-worker --enrollment /operator-protected/enrollment.json
 ```
 
 The controller drains it, rejects active jobs/unresolved shutdown snapshots, delivers and verifies
@@ -157,7 +171,7 @@ flags are `--delivery-timeout-seconds`, `--command-timeout-seconds`, `--command-
 limits or a scientific solver budget. The existing 300-second self-check is unchanged.
 
 ```console
-sudo qcl-negf-release deliver --manifest release.json --pool pool.json --delivery-timeout-seconds 1800 --command-timeout-seconds 360 --command-output-bytes 1048576 --delivery-output-bytes 8388608
+sudo qcl-negf-release deliver --manifest release.json --pool pool-v2.json --enrollment /operator-protected/enrollment.json --delivery-timeout-seconds 1800 --command-timeout-seconds 360 --command-output-bytes 1048576 --delivery-output-bytes 8388608
 ```
 
 One monotonic controller deadline covers prefetch, every node and final admission. Native commands
@@ -200,3 +214,101 @@ When recovery receipt writes also fail, CLI stdout carries the current safe in-m
 unknown/critical summary. Without current evidence it reports unknown; it never infers a closed gate
 from an older delivery-report.json. Failure output excludes raw command output, environment and
 manifest data.
+
+## Enrolled node identity (CR03)
+
+Delivery requires `qcl-negf-active-pool-v2` and an explicit protected
+`--enrollment /operator-protected/enrollment.json`. Targets are routes, not VM identity. The
+operator enrolls actual guest DMI UUID, Linux machine-id, hostname, canonical worker Slurm NodeName
+and accepted SSH routes after provider/guest and host-key verification. Controller NodeName is null.
+Inventory, host keys and source paths are private inputs; none are generated from pool labels or
+stored in the Nix store. The following identities are synthetic examples only:
+
+```json
+{
+  "schema": "qcl-negf-node-enrollment-v1",
+  "inventory_id": "99999999-9999-9999-9999-999999999999",
+  "known_hosts_file": "/operator-protected/known_hosts",
+  "nodes": [
+    {
+      "enrollment_id": "10000000-0000-0000-0000-000000000001",
+      "name": "controller",
+      "role": "controller",
+      "hostname": "controller.invalid",
+      "node_name": null,
+      "machine_uuid": "11111111-1111-1111-1111-111111111111",
+      "machine_id": "11111111111111111111111111111111",
+      "primary_target": "admin@controller.invalid",
+      "targets": ["admin@controller.invalid"]
+    },
+    {
+      "enrollment_id": "20000000-0000-0000-0000-000000000002",
+      "name": "worker",
+      "role": "worker",
+      "hostname": "worker.invalid",
+      "node_name": "worker",
+      "machine_uuid": "22222222-2222-2222-2222-222222222222",
+      "machine_id": "22222222222222222222222222222222",
+      "targets": ["admin@worker.invalid"]
+    }
+  ]
+}
+```
+
+```json
+{
+  "schema": "qcl-negf-active-pool-v2",
+  "nodes": [
+    {
+      "name": "controller",
+      "role": "controller",
+      "target": "admin@controller.invalid",
+      "enrollment_id": "10000000-0000-0000-0000-000000000001"
+    },
+    {
+      "name": "worker",
+      "role": "worker",
+      "target": "admin@worker.invalid",
+      "enrollment_id": "20000000-0000-0000-0000-000000000002"
+    }
+  ]
+}
+```
+
+Registry and known_hosts must be bounded root-owned regular files beneath a complete root-owned
+namespace with no group/other write or symlink components. User homes and /tmp are not production
+trust inputs. Verified bytes are frozen in unique root0700 operations beneath
+/var/lib/qcl-negf/trust-snapshots, file0600; all later SSH/Nix copies use that snapshot with strict
+verification and no global known_hosts/config fallback. Source pathname substitution cannot change
+the snapshot. Snapshot hashes link private receipts to bytes; they are not source revision locks.
+Snapshots are conservatively retained, including unknown attempts; operator housekeeping must
+preserve references until reconciliation/child cleanup. Trusted root/operator mutation and hardware
+attestation are outside this contract.
+
+Before any runtime write/flock or fleet mutation, actual local controller must match sole
+enrolled/selected controller; its remote observation must match local machine and boot. After
+protected enrollment and local-only binding, unresolved CR04 receipts are checked read-only before
+snapshot creation/remote probing; the check repeats under lock after full authority. No enrollment
+change clears old uncertainty. Every selected worker is probed before prefetch/quiesce, before copy,
+and again before RESUME; remote activate binds its own machine/boot before writes. Bound check
+envelopes prove node identity and exact existing ready release. Controller receives no Slurm RESUME.
+All probes consume the original CR04 deadline and output budgets; they never renew them per node or
+phase.
+
+`qcl-negf-release identity` is read-only, requires no manifest, and observes local Nix-generated
+role, hostname, DMI/machine/boot IDs. Worker support is intentionally limited to one static slurmd,
+declared SLURM_CONF and unchanged MainPID/InvocationID, cmdline/config/environment across reads.
+NodeName comes from a single explicit `NodeName=NAME` aliases response for actual hostname. Missing
+DMI, ambiguous aliases, unsupported `-N`/dynamic/config override or daemon changes fail closed
+without echoing caller identity. Actual pinned Slurm command/output compatibility has not been
+tested; a separately budgeted site smoke gate is required before production.
+
+Legacy pool or release-only remote check responses are rejected for fleet use. Local diagnostic
+check without expected identity remains release-only. Privileged manual activate without identity
+remains diagnostic and must satisfy old gate checks; it is not enrolled fleet evidence. Older
+installed tooling without identity or role metadata must be upgraded through separately authorized
+initial bootstrap; there is no permissive copy/install before preflight or auto enrollment fallback.
+Startup uses the same authority/trust/worker binding and rejects unresolved receipts; CR02 global
+lifecycle intent/owner coordination is still a separate blocker. Synthetic API tests establish none
+of real inventory completeness, provider/SSH trust, service/VM health, all-worker I14 gates, or
+scientific acceptance.
