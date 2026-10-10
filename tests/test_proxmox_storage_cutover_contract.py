@@ -380,6 +380,8 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                             result = {"manifest": value, "sha256": digest}
                         elif request["action"] == "persist_manifest":
                             result = r.persist_manifest(request["path"], request["manifest"], request["max_bytes"])
+                            assert result["sha256"]==s["reference_canonical_sha"]
+                            s["persisted_manifest_sha"]=result["sha256"]
                         else:
                             phase = request["phase"]
                             fail_sync = (scenario in ("intent-fsync-failure", "intent-dir-fsync-failure") and phase == "rename_intent") or (scenario in ("completion-failure", "restore-completion-failure") and phase == "reopened")
@@ -412,9 +414,28 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                     except (ValueError, OSError) as exc: out.update(failed=True, rc=1, stderr=str(exc))
                     record("manifest:" + request.get("role", request.get("action")))
                 elif operation["kind"]=="reference_check":
-                    reference_request=json.loads(args["stdin"]);assert set(reference_request) in ({"h","boundary","expected"},{"h","boundary","expected","retained_manifest"})
+                    reference_request=json.loads(args["stdin"]);assert set(reference_request)=={"h","boundary","expected","retained_manifest"}
                     assert reference_request["h"]["attempt_id"]==cfg["attempt_id"]
-                    record("reference:"+name);out["stdout"]=json.dumps({"complete":True})
+                    manifest=reference_request["retained_manifest"];expected=reference_request["expected"]
+                    independently_expected={"identity":{"host_id":cfg["host_id"],"boot_id":cfg["boot_id"],"attempt_id":cfg["attempt_id"],"window_owner":cfg["cutover"]["window"]["owner"],"window_expiry":cfg["cutover"]["window"]["expires_at_epoch"],"source_dev":cfg["cutover"]["source"]["dev"],"source_ino":cfg["cutover"]["source"]["ino"],"parent_dev":cfg["cutover"]["source"]["parent_dev"],"parent_ino":cfg["cutover"]["source"]["parent_ino"],"storage_id":"fixture-dir","path":str(source),"lv_uuid":"fixture-lv","fs_uuid":UUID},"d04_receipt_sha256":"d"*64,"window_receipt_sha256":"c"*64,"excluded_old_qcl_set_sha256":"0"*64}
+                    if outer_request["slot_id"]=="action-21":
+                        s["reference_manifest_before"]=manifest
+                        canonical=json.dumps(manifest,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False).encode("utf-8")+bytes([10])
+                        s["reference_canonical_sha"]=hashlib.sha256(canonical).hexdigest()
+                        assert canonical[-1:]==bytes([10]) and canonical[-2:]!=b"\\n"
+                    else:
+                        persisted=Path(cfg["cutover"]["receipt"]["manifest_path"]).read_bytes()
+                        assert hashlib.sha256(persisted).hexdigest()==s["reference_canonical_sha"]
+                        assert manifest["entries"]==s["reference_manifest_before"]["entries"]
+                    independently_expected["retained_manifest_sha256"]=s["reference_canonical_sha"]
+                    assert expected==independently_expected,"actual rendered reference context differs from independent immutable graph oracle"
+                    s.setdefault("reference_evidence",[]).append({"slot":outer_request["slot_id"],"expected":expected,"manifest_identity":manifest["identity"],"canonical_sha":s["reference_canonical_sha"]})
+                    record("reference:"+name)
+                    native_graph_context=dict(independently_expected)
+                    if scenario=="reference-wrong-sha":native_graph_context["retained_manifest_sha256"]="f"*64
+                    s["native_graph_context"]=native_graph_context
+                    if native_graph_context!=expected:out.update(failed=True,rc=1,stderr="reference context retained_manifest_sha256: independent graph differs")
+                    else:out["stdout"]=json.dumps({"complete":True})
                 elif operation["kind"]=="native_argv" and argv[0]==cfg["tools"]["pvesm"]:
                     assert args["stdin"]=="", "PVE native argv does not consume JSON stdin"
                     option,value=fixture_pvesm_policy(argv,cfg["cutover"]["storage"]["id"],s["digest"])
@@ -463,10 +484,10 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                         "digest": s["digest"], "storage": dict(s["storage_current"]),
                         "foreign": s["foreign"], "receipt_present": receipt.exists(), "helpers_verified": True, "complete": True, "refs": [{"pid":123,"target":str(source/"new-file")}] if scenario=="complete-reader" else [], "aliases": ["source-bind"] if scenario == "relevant-alias" else [], "old_loop": scenario == "old-loop",
                         "workers": [], "workers_relevant": ["legal-current-worker"] if scenario=="complete-reader" else ["cached-native-worker"] if scenario == "cached-worker" else [], "data_used_bytes": "not_measured" if scenario == "unknown-data" else 1048576, "metadata_used_bytes": 65536,
-                        "healthy": True, "stage_active": s["stage_active"], "final_active": s["final_active"], "fs_uuid": "wrong" if scenario == "wrong-uuid-unit" else UUID,
-                        "device": "/dev/dm-0", "rdev": 254 if scenario == "wrong-rdev-unit" else 253, "mountpoint_dev": source.stat().st_dev, "mountpoint_ino": source.stat().st_ino, "Where": "/wrong" if scenario == "wrong-where-unit" else observation_request.get("path", str(source)), "Type": "xfs" if scenario == "wrong-type-unit" else "ext4", "ActiveState": "active" if (s["stage_active"] if observation_request.get("stage", False) else s["final_active"]) else "inactive", "UnitFileState": "static" if observation_request.get("stage", False) else "enabled" if s["unit_enabled"] else "disabled", "stage_policy": "static", "source_renamed": s["renamed"],
-                        "ForceUnmount": "yes" if scenario == "force-unit" else "no", "LazyUnmount": "yes" if scenario == "lazy-unit" else "no", "DropInPaths": "foreign.conf" if scenario == "dropin-unit" else "", "NeedDaemonReload": "yes" if scenario == "reload-unit" else "no",
-                        "Options": "nosuid,rw,relatime,nodev,data=ordered" + (",ro" if scenario == "ro-unit" else ",unknown-option" if scenario == "unknown-options" else ""), "fragment_exact": scenario != "unsafe-unit",
+                        "healthy": True, "stage_active": s["stage_active"], "final_active": s["final_active"], "fs_uuid": UUID,
+                        "device": "/dev/dm-0", "rdev": 253, "mountpoint_dev": source.stat().st_dev, "mountpoint_ino": source.stat().st_ino, "Where": observation_request.get("path", str(source)), "Type": "ext4", "ActiveState": "active" if (s["stage_active"] if observation_request.get("stage", False) else s["final_active"]) else "inactive", "UnitFileState": "static" if observation_request.get("stage", False) else "enabled" if s["unit_enabled"] else "disabled", "stage_policy": "static", "source_renamed": s["renamed"],
+                        "ForceUnmount": "no", "LazyUnmount": "no", "DropInPaths": "", "NeedDaemonReload": "no",
+                        "Options": "nosuid,rw,relatime,nodev,data=ordered", "fragment_exact": True,
                         "seed_sha256": hashlib.sha256(b"AAAA").hexdigest(), "is_mountpoint_raw": s["offline_raw"], "mountpoint_guard": "/wrong" if scenario.startswith(("nb-restore","nb-disable")) and name=="Observe native offline policy and disabled gate before reopen" else native_mountpoint(s["offline_raw"],str(source)), "storage_disabled": s["disabled"], "original_disabled": cfg["cutover"]["storage"]["stanza"].get("disable") in (1,"1","yes",True),
                         "absent": bool(observation_request.get("allow_absent",False) and not s["unit_declared"])})
                     if name == "Verify exact loaded mount policy":
@@ -478,6 +499,14 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                             loaded.update(FragmentPath="/etc/systemd/system/"+observation_request["unit"],What=cfg["cutover"]["final"]["device"])
                         out["stdout"]=json.dumps(loaded)
                     observed=json.loads(out["stdout"])
+                    if outer_request["slot_id"]=="guard-15":
+                        valid=dict(observed)
+                        if scenario in NAMED_NEGATIVE_GUARDS:
+                            field=NAMED_NEGATIVE_GUARDS[scenario][1]
+                            if scenario in UNIT_NEGATIVE_VALUES:observed[field]=UNIT_NEGATIVE_VALUES[scenario]
+                        delta={key:[valid[key],value] for key,value in observed.items() if valid[key]!=value}
+                        s["guard15_evidence"]={"slot":"guard-15","request":observation_request,"valid":valid,"observation":observed,"delta":delta}
+                        out["stdout"]=json.dumps(observed)
                     if outer_request and outer_request["operation"]["kind"]=="probe":
                         mode=observation_request.get("observe_only",False) or (observation_request.get("initial",False) and receipt.exists())
                         if "consumers_measured" in task_vars["cutover_native_probe"]:
@@ -488,7 +517,7 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                         if name=="Reconcile actual fixed config mount units and callers read-only":
                             s["recovery_measurement"]=not mode
                             if not mode:
-                                scanner=review_body("cutover_consumer_scan")["consumer_refs"]
+                                scanner_api=review_body("cutover_consumer_scan");scanner=scanner_api["consumer_refs"]
                                 holder=None;previous_cwd=os.getcwd()
                                 unrelated=tmp_path/"unrelated-map";unrelated.write_bytes(b"ordinary unrelated metadata")
                                 maps_patch=pytest.MonkeyPatch();independent_maps(maps_patch,unrelated)
@@ -496,12 +525,25 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                                     target=source if scenario in ("nb-restore-fd","nb-restore-cwd","nb-restore-root") else tmp_path
                                     if scenario=="nb-restore-cwd":os.chdir(target)
                                     elif scenario in ("nb-restore-fd","nb-restore-root","nb-restore-unrelated"):holder=os.open(target,os.O_RDONLY|os.O_DIRECTORY)
-                                    observed["refs"]=scanner([tmp_path/"original",source,stage],cfg["cutover"]["limits"]["entries"],cfg["cutover"]["limits"]["metadata_read_bytes"],5,pids=[os.getpid()])
+                                    observed["refs"]=scanner(scanner_api["consumer_roots"](tmp_path/"original" if s["renamed"] else source,source,stage),cfg["cutover"]["limits"]["entries"],cfg["cutover"]["limits"]["metadata_read_bytes"],5,pids=[os.getpid()])
                                     observed["consumers_measured"]=True
-                                    s.setdefault("scan_evidence",[]).append({"slot":outer_request["slot_id"],"measured":True,"refs":observed["refs"],"case":scenario,"physical_root":"ordinary directory root FD; process /root remains actual unrelated /"})
+                                    s.setdefault("scan_evidence",[]).append({"slot":outer_request["slot_id"],"roots":[str(x) for x in scanner_api["consumer_roots"](tmp_path/"original" if s["renamed"] else source,source,stage)],"measured":True,"refs":observed["refs"],"case":scenario,"physical_root":"ordinary directory root FD; process /root remains actual unrelated /"})
                                 finally:
                                     if holder is not None:os.close(holder)
                                     os.chdir(previous_cwd);maps_patch.undo()
+                        if scenario.startswith("new-point-") and s["renamed"] and not s["final_active"] and outer_request["slot_id"]=="action-42":
+                            api=review_body("cutover_consumer_scan");roots=api["consumer_roots"](tmp_path/"original",source,stage)
+                            holder=None;previous=os.getcwd();mapping=tmp_path/"unrelated-map";mapping.write_bytes(b"ordinary map metadata")
+                            maps_patch=pytest.MonkeyPatch();independent_maps(maps_patch,mapping)
+                            try:
+                                if scenario=="new-point-cwd":os.chdir(source)
+                                else:holder=os.open(source,os.O_RDONLY|os.O_DIRECTORY)
+                                observed["refs"]=api["consumer_refs"](roots,cfg["cutover"]["limits"]["entries"],cfg["cutover"]["limits"]["metadata_read_bytes"],5,pids=[os.getpid()])
+                                s["point_scan_evidence"]={"slot":"action-42","roots":[str(x) for x in roots],"source_inode":source.stat().st_ino,"original_inode":(tmp_path/"original").stat().st_ino,"refs":observed["refs"]}
+                            finally:
+                                if holder is not None:os.close(holder)
+                                os.chdir(previous);maps_patch.undo()
+                        if outer_request["slot_id"]=="action-1":s["initial_observation"]=observed
                         out["stdout"]=json.dumps(observed)
                     record("observe:" + name)
                 else: raise AssertionError("Unrecognized native command " + name + " " + str(argv))
@@ -532,6 +574,8 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                     destination.write_bytes(content);destination.chmod(mode)
                 assert destination.read_bytes()==content
             else: raise AssertionError(self._task.action)
+            if outer_request is not None and out.get("failed"):
+                s.setdefault("native_failures",[]).append({"slot":outer_request["slot_id"],"rc":out.get("rc"),"stderr":out.get("stderr",""),"status":out.get("boundary_status","refused")})
             state_file.write_text(json.dumps(s))
             if outer_request is not None:
                 native=dict(out);payload={"schema":outer_request["schema"],"slot_id":outer_request["slot_id"],"identity":outer_request["identity"],"clock":outer_request["clock"],"status":native.get("boundary_status","refused" if native.get("failed") else "ok"),"returncode":native.get("rc",0),"stdout":native.get("stdout",""),"stderr":native.get("stderr",""),"observed_bytes":{"stdout":len(native.get("stdout","")),"stderr":len(native.get("stderr","")),"metadata":0},"reserved_bytes":outer_request["bounds"],"cleanup":{"pgid":None,"term_sent":False,"kill_sent":False,"reaped":True,"group_absent":True}}
@@ -539,7 +583,17 @@ def run_playbook(tmp_path, monkeypatch, scenario):
             return out
     def handler(executor, templar):
         if executor._task.action in ("ansible.builtin.assert", "ansible.builtin.set_fact", "ansible.builtin.debug", "ansible.builtin.fail", "ansible.builtin.include_tasks"):
-            return original(executor, templar)
+            action,extra=original(executor,templar)
+            if executor._task.action=="ansible.builtin.assert":
+                actual_run=action.run
+                def observed_assert(*args,**kwargs):
+                    result=actual_run(*args,**kwargs);saved=json.loads(state_file.read_text())
+                    event={"task":executor._task.name,"failed":bool(result.get("failed")),"assertion":result.get("assertion"),"evaluated_to":result.get("evaluated_to"),"msg":result.get("msg")}
+                    if event["failed"] and "first_assert_failure" not in saved:saved["first_assert_failure"]=event
+                    if executor._task.name in ("Accept only complete safe loaded policy observation","Match initial fixed native identity and selected digest"):saved.setdefault("guard_results",[]).append(event)
+                    state_file.write_text(json.dumps(saved));return result
+                action.run=observed_assert
+            return action,extra
         return FakeAction(task=executor._task, connection=executor._connection, play_context=executor._play_context,
                           loader=executor._loader, templar=Templar._from_template_engine(templar), shared_loader_obj=executor._shared_loader_obj), None
     monkeypatch.setattr(TaskExecutor, "_get_action_handler_with_module_context", handler)
@@ -590,6 +644,42 @@ def run_playbook(tmp_path, monkeypatch, scenario):
     return rc, json.loads(state_file.read_text()), receipt, source, stage
 
 
+
+UNIT_NEGATIVE_VALUES={'unsafe-unit':False,'force-unit':'yes','lazy-unit':'yes','dropin-unit':'foreign.conf','reload-unit':'yes','ro-unit':'nosuid,rw,relatime,nodev,data=ordered,ro','unknown-options':'nosuid,rw,relatime,nodev,data=ordered,unknown-option','wrong-type-unit':'xfs','wrong-where-unit':'/fixture/wrong','wrong-uuid-unit':'11111111-2222-3333-4444-555555555555','wrong-rdev-unit':254}
+NAMED_NEGATIVE_GUARDS={
+ 'unsafe-unit':('Accept only complete safe loaded policy observation','fragment_exact',"(mount_guard.stdout | from_json).fragment_exact is sameas true"),
+ 'force-unit':('Accept only complete safe loaded policy observation','ForceUnmount',"(mount_guard.stdout | from_json).get('ForceUnmount', 'no') == 'no'"),
+ 'lazy-unit':('Accept only complete safe loaded policy observation','LazyUnmount',"(mount_guard.stdout | from_json).get('LazyUnmount', 'no') == 'no'"),
+ 'dropin-unit':('Accept only complete safe loaded policy observation','DropInPaths',"(mount_guard.stdout | from_json).get('DropInPaths', '') == ''"),
+ 'reload-unit':('Accept only complete safe loaded policy observation','NeedDaemonReload',"(mount_guard.stdout | from_json).get('NeedDaemonReload', 'no') == 'no'"),
+ 'ro-unit':('Accept only complete safe loaded policy observation','Options',"not (['ro','dev','suid'] | intersect((mount_guard.stdout | from_json).get('Options', 'rw,nodev,nosuid').split(',')))"),
+ 'unknown-options':('Accept only complete safe loaded policy observation','Options',"((mount_guard.stdout | from_json).get('Options', 'rw,nodev,nosuid').split(',') | difference(['rw','nodev','nosuid'] + c.final.allowed_defaults)) | length == 0"),
+ 'wrong-type-unit':('Accept only complete safe loaded policy observation','Type',"(mount_guard.stdout | from_json).get('absent', false) or (mount_guard.stdout | from_json).Type == 'ext4'"),
+ 'wrong-where-unit':('Accept only complete safe loaded policy observation','Where',"(mount_guard.stdout | from_json).get('absent', false) or (mount_guard.stdout | from_json).Where == guard_path"),
+ 'wrong-uuid-unit':('Accept only complete safe loaded policy observation','fs_uuid',"(mount_guard.stdout | from_json).get('absent', false) or (mount_guard.stdout | from_json).fs_uuid == c.final.fs_uuid"),
+ 'wrong-rdev-unit':('Accept only complete safe loaded policy observation','rdev',"(mount_guard.stdout | from_json).get('absent', false) or (mount_guard.stdout | from_json).rdev == c.final.rdev"),
+ 'cached-worker':('Match initial fixed native identity and selected digest','workers_relevant',"(admission_live.stdout | from_json).receipt_present or ((admission_live.stdout | from_json).workers_relevant | length == 0)"),
+ 'old-loop':('Match initial fixed native identity and selected digest','old_loop',"not (admission_live.stdout | from_json).old_loop"),
+ 'relevant-alias':('Match initial fixed native identity and selected digest','aliases',"(admission_live.stdout | from_json).receipt_present or ((admission_live.stdout | from_json).aliases | length == 0)"),
+ 'unknown-data':('Match initial fixed native identity and selected digest','data_used_bytes',"(admission_live.stdout | from_json).data_used_bytes is integer"),
+}
+
+def assert_named_negative(state,scenario,stage):
+    task,field,predicate=NAMED_NEGATIVE_GUARDS[scenario]
+    failure=state.get('first_assert_failure');assert failure and failure['task']==task,failure
+    assert failure['evaluated_to'] is False and ' '.join(failure['assertion'].split())==' '.join(predicate.split()),failure
+    if scenario in UNIT_NEGATIVE_VALUES:
+        event=state['guard15_evidence'];assert event['slot']=='guard-15'
+        assert event['request']['path']==str(stage) and event['request']['stage'] is True
+        assert event['delta']=={field:[event['valid'][field],UNIT_NEGATIVE_VALUES[scenario]]}
+        assert 'CAS:disable' in state['trace'] and 'observe:Verify exact loaded mount policy' in state['trace']
+        assert not any(x['slot']=='action-16' for x in state['boundary_events'])
+    else:
+        observed=state['initial_observation'];assert observed['complete'] is True and observed['consumers_measured'] is True
+        assert observed[field]=={'cached-worker':['cached-native-worker'],'old-loop':True,'relevant-alias':['source-bind'],'unknown-data':'not_measured'}[scenario]
+        assert any(x['slot']=='action-1' for x in state['boundary_events'])
+        assert not any(x.startswith(('helper-declare:','receipt:','CAS:')) or x in ('template','retained-copy','rename','restore') for x in state['trace'])
+
 @pytest.mark.parametrize("scenario", ["success", "completion-failure", "unknown-cas", "disabled", "check", "bad-input", "unsafe-unit", "force-unit", "lazy-unit", "dropin-unit", "reload-unit", "ro-unit", "unknown-options", "wrong-type-unit", "wrong-where-unit", "wrong-uuid-unit", "wrong-rdev-unit", "cached-worker", "old-loop", "relevant-alias", "intent-fsync-failure", "intent-dir-fsync-failure", "copy-timeout", "copy-mismatch", "unknown-data", "native-offline-yes", "native-offline-path"])
 def test_actual_cutover_yaml_and_sticky_cas_boundary(tmp_path, monkeypatch, scenario):
     rc, state, path, source, stage = run_playbook(tmp_path, monkeypatch, scenario)
@@ -599,6 +689,7 @@ def test_actual_cutover_yaml_and_sticky_cas_boundary(tmp_path, monkeypatch, scen
         assert (source / "disk.raw").read_bytes() == b"AAAA"
         assert ("CAS:disable" not in trace) if scenario in ("disabled", "check", "bad-input") else True
         assert (rc == 0) if scenario in ("disabled", "check") else rc != 0
+        if scenario in NAMED_NEGATIVE_GUARDS:assert_named_negative(state,scenario,stage)
         return
     if scenario in ("copy-timeout", "copy-mismatch"):
         assert rc != 0 and "retained-copy" in trace and "rename" not in trace and "CAS:reopen" not in trace
@@ -801,13 +892,14 @@ def test_review_nested_cumulative_output_and_expiry(tmp_path):
 @pytest.mark.parametrize("target", ["stage-root","stage-subdir","inactive-point","deleted-original","unrelated"])
 def test_review_actual_directory_consumer(tmp_path,target,monkeypatch):
     api=review_body("cutover_consumer_scan")
-    original=tmp_path/'source';original.mkdir(); stage=tmp_path/'stage';stage.mkdir(); sub=stage/'sub';sub.mkdir();other=tmp_path/'other';other.mkdir()
+    original=tmp_path/'source';original.mkdir(); source=original;stage=tmp_path/'stage';stage.mkdir(); sub=stage/'sub';sub.mkdir();other=tmp_path/'other';other.mkdir()
+    if target=='inactive-point':original.rename(tmp_path/'rollback');original=tmp_path/'rollback';source.mkdir();assert source.stat().st_ino!=original.stat().st_ino
     maps=tmp_path/'map-unrelated';maps.write_bytes(b'x');independent_maps(monkeypatch,maps)
-    opened=stage if target in ('stage-root','inactive-point') else sub if target=='stage-subdir' else original if target=='deleted-original' else other
+    opened=source if target=='inactive-point' else stage if target=='stage-root' else sub if target=='stage-subdir' else original if target=='deleted-original' else other
     fd=os.open(opened,os.O_RDONLY|os.O_DIRECTORY)
     if target=='deleted-original': original.rmdir()
     try:
-        result=api['consumer_refs']([original,stage],100,8388608,5,pids=[os.getpid()])
+        result=api['consumer_refs'](api['consumer_roots'](original,source,stage),100,8388608,5,pids=[os.getpid()])
         assert bool(result)==(target!='unrelated')
     finally:os.close(fd)
 
@@ -842,11 +934,11 @@ def test_review_finite_slot_reservations():
     with pytest.raises(ValueError):api['charge_slot']('a',seen,{'read':10,'write':10,'output':10},{'read':1,'write':1,'output':1})
 
 
-def review_boundary(request):
+def review_boundary(request,prefix=""):
     # Subreaper belongs only to a fresh own boundary process, never pytest/controller.
     import subprocess, yaml
     code=yaml.safe_load((BASE/'ansible/proxmox-storage-cutover.yml').read_text())[0]['vars']['cutover_command_boundary']
-    result=subprocess.run(['/usr/bin/python','-c',code],input=json.dumps(request),text=True,capture_output=True,timeout=5,start_new_session=True)
+    result=subprocess.run(['/usr/bin/python','-c',prefix+code],input=json.dumps(request),text=True,capture_output=True,timeout=5,start_new_session=True)
     assert result.stdout, result.stderr
     return json.loads(result.stdout)
 
@@ -1001,12 +1093,18 @@ def test_receipt_read_multiplicity_is_prepaid(action,factor):
 
 
 def test_eof_waits_for_natural_epilogue(tmp_path):
-    witness=tmp_path/'epilogue'
-    code="import os,time;os.close(1);os.close(2);time.sleep(.15);open("+repr(str(witness))+",'w').write('finished')"
-    result=review_boundary(review_request(['/usr/bin/python','-c',code],seconds=3))
-    assert result['status']=='ok',result
+    closed=tmp_path/'closed';witness=tmp_path/'epilogue';wait=tmp_path/'wait-entry'
+    code="import os,time;marker=os.open("+repr(str(closed))+",os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600);os.close(1);os.close(2);os.write(marker,b'both closed');os.close(marker);time.sleep(.15);open("+repr(str(witness))+",'x').write('finished')"
+    request=review_request(['/usr/bin/env','/usr/bin/python','-c',code],seconds=3)
+    assert request['operation']['argv'][1]!='-c' and len(request['operation']['argv'])==4
+    prefix="import subprocess,json,os\n_real_popen=subprocess.Popen\ndef witnessed_popen(*a,**kw):\n p=_real_popen(*a,**kw);actual_wait=p.wait\n def observed_wait(*args,**kwargs):\n  if not os.path.exists("+repr(str(wait))+"):\n   with open("+repr(str(wait))+",'x') as log:json.dump({'leader_alive':p.poll() is None,'stdout_closed':not os.path.lexists('/proc/'+str(p.pid)+'/fd/1'),'stderr_closed':not os.path.lexists('/proc/'+str(p.pid)+'/fd/2'),'epilogue_exists':os.path.exists("+repr(str(witness))+"),'telemetry_passed':bool(kw.get('pass_fds'))},log)\n  return actual_wait(*args,**kwargs)\n p.wait=observed_wait;return p\nsubprocess.Popen=witnessed_popen\n"
+    import time
+    started=time.monotonic();result=review_boundary(request,prefix=prefix);elapsed=time.monotonic()-started
+    assert .1<=elapsed<4
+    assert result['status']=='ok' and result['returncode']==0 and result['cleanup']['reaped'] and result['cleanup']['group_absent'],result
     assert not result['cleanup']['term_sent'] and not result['cleanup']['kill_sent']
-    assert witness.read_text()=='finished'
+    assert closed.read_text()=='both closed' and witness.read_text()=='finished'
+    assert json.loads(wait.read_text())=={'leader_alive':True,'stdout_closed':True,'stderr_closed':True,'epilogue_exists':False,'telemetry_passed':False}
 
 
 @pytest.mark.parametrize('case',['absolute','empty','parent','noncanonical','outside','missing','type','valid'])
@@ -1237,3 +1335,173 @@ def test_retained_backing_edges_inside_manifest(tmp_path,case):
     if case=='valid':assert invoke()
     else:
         with pytest.raises(ValueError):invoke()
+
+
+@pytest.mark.parametrize('case',['unsafe-unit','force-unit','lazy-unit','dropin-unit','reload-unit','ro-unit','unknown-options','wrong-type-unit','wrong-where-unit','wrong-uuid-unit','wrong-rdev-unit','cached-worker','old-loop','relevant-alias','unknown-data'])
+def test_named_negative_independent_positive_controls(tmp_path,monkeypatch,case):
+    rc,state,path,source,stage=run_playbook(tmp_path,monkeypatch,'control:'+case)
+    assert rc==0 and 'CAS:reopen' in state['trace']
+    assert 'first_assert_failure' not in state
+    task,field,_=NAMED_NEGATIVE_GUARDS[case]
+    assert any(row['task']==task and row['failed'] is False for row in state['guard_results'])
+    if case in UNIT_NEGATIVE_VALUES:
+        observed=state['guard15_evidence'];assert observed['delta']=={} and observed['observation']==observed['valid']
+        assert observed['request']['path']==str(stage) and observed['request']['stage'] is True
+        assert any(row['slot']=='action-16' for row in state['boundary_events'])
+    else:
+        assert state['initial_observation'][field]=={'cached-worker':[],'old-loop':False,'relevant-alias':[],'unknown-data':1048576}[case]
+
+
+def test_actual_reference_graph_wrong_sha_control(tmp_path,monkeypatch):
+    rc,state,path,source,stage=run_playbook(tmp_path,monkeypatch,'reference-wrong-sha')
+    assert rc!=0 and state['reference_evidence'][0]['slot']=='action-21'
+    assert state['reference_evidence'][0]['expected']['retained_manifest_sha256']==state['reference_canonical_sha']
+    assert state['native_graph_context']['retained_manifest_sha256']=='f'*64 and state['reference_canonical_sha']!='f'*64
+    assert state['native_failures'][0]=={'slot':'action-21','rc':1,'stderr':'reference context retained_manifest_sha256: independent graph differs','status':'refused'}
+    assert not any(row in state['trace'] for row in ('retained-copy','rename','CAS:reopen'))
+
+
+@pytest.mark.parametrize('case',['fd','cwd','root'])
+def test_actual_postrename_new_point_consumer_scope(tmp_path,monkeypatch,case):
+    rc,state,path,source,stage=run_playbook(tmp_path,monkeypatch,'new-point-'+case)
+    assert rc!=0 and 'rename' in state['trace']
+    event=state['point_scan_evidence'];assert event['slot']=='action-42'
+    assert event['roots']==[str(tmp_path/'original'),str(source),str(stage)]
+    assert event['source_inode']!=event['original_inode'] and event['refs']
+    assert any(row['ino']==event['source_inode'] and row['target']==str(source) for row in event['refs'])
+    assert 'systemd:stopped' not in state['trace'] and 'restore' not in state['trace'] and 'CAS:reopen' not in state['trace'] and 'CAS:reopen-original' not in state['trace']
+
+
+@pytest.mark.parametrize('case',['new-point-bind','unrelated-bind'])
+def test_actual_postrename_namespace_roots(tmp_path,case):
+    api=review_body('cutover_consumer_scan');source=tmp_path/'source';source.mkdir();rollback=tmp_path/'original';source.rename(rollback);source.mkdir();stage=tmp_path/'stage';stage.mkdir()
+    roots=api['consumer_roots'](rollback,source,stage);assert roots==[rollback,source,stage] and source.stat().st_ino!=rollback.stat().st_ino
+    device=str(os.major(source.stat().st_dev))+':'+str(os.minor(source.stat().st_dev))
+    physical=str(source) if case=='new-point-bind' else str(tmp_path/'unrelated')
+    rows=['1 0 '+device+' / / rw - ext4 /dev/root rw','2 1 '+device+' '+physical+' /fixture-bind rw - ext4 /dev/root rw']
+    aliases=api['mount_aliases'](rows,device,[str(x) for x in roots],'253:0',[str(stage),str(source)])
+    assert bool(aliases)==(case=='new-point-bind')
+
+
+def extracted_wrapper_classes(budget):
+    import ast,io,time
+    api=review_body('cutover_command_boundary');tree=ast.parse(api['CHILD_WRAPPER'])
+    nodes=[node for node in tree.body if isinstance(node,ast.ClassDef) and node.name in ('Entries','Entry','MetadataFile','Input')]
+    scope={'budget':budget,'io':io,'os':os,'stat':stat,'need':api['need'],'input_size':200}
+    exec(compile(ast.Module(body=nodes,type_ignores=[]),'<actual-owning-wrapper-classes>','exec'),scope)
+    return scope
+
+
+@pytest.mark.parametrize('maximum',[4096,256])
+@pytest.mark.parametrize('mode',['near-cap','expired','positive'])
+def test_actual_owner_pipe_preaccess(tmp_path,monkeypatch,maximum,mode):
+    import time
+    api=review_body('cutover_command_boundary');limit=maximum+1;budget=api['MetadataBudget'](limit,time.monotonic()+1)
+    calls=[];raw=os.read
+    read,write=os.pipe();os.write(write,b'p'*min(maximum,200));os.close(write)
+    def observed(fd,n):calls.append((fd,n));return raw(fd,n)
+    monkeypatch.setattr(os,'read',observed)
+    if mode=='near-cap':budget.used=limit-1
+    if mode=='expired':budget.deadline=time.monotonic()-1
+    try:
+        if mode=='positive':
+            assert api['metadata_pipe_read'](budget,read,maximum)==b'p'*min(maximum,200)
+            assert calls==[(read,maximum)] and budget.used==1+min(maximum,200)
+        else:
+            with pytest.raises(ValueError,match='metadata'):api['metadata_pipe_read'](budget,read,maximum)
+            assert calls==[] and budget.used<=limit
+    finally:os.close(read)
+
+
+@pytest.mark.parametrize('mode',['near-cap','expired','positive','unknown-native'])
+def test_actual_name_enumeration_preaccess(tmp_path,mode):
+    import time
+    api=review_body('cutover_command_boundary');budget=api['MetadataBudget'](8192,time.monotonic()+1);calls=[]
+    class Item:name='n'*200
+    class Iterator:
+        def __init__(self):self.sent=False
+        def __next__(self):
+            calls.append('next')
+            if self.sent:raise StopIteration
+            self.sent=True;return Item()
+        def close(self):calls.append('close')
+    def pathconf(path,key):calls.append('pathconf');assert key=='PC_NAME_MAX';return -1 if mode=='unknown-native' else 255
+    def scandir(path):
+        calls.append('scandir')
+        if mode=='near-cap':budget.used=budget.limit-1
+        if mode=='expired':budget.deadline=time.monotonic()-1
+        return Iterator()
+    budget.raw=dict(budget.raw,pathconf=pathconf,scandir=scandir)
+    if mode=='positive':assert budget.names(tmp_path)==['n'*200] and calls==['pathconf','scandir','next','next','close']
+    else:
+        with pytest.raises(ValueError,match='metadata|filename'):budget.names(tmp_path)
+        assert 'next' not in calls and budget.used<=budget.limit
+        if mode=='unknown-native':assert 'scandir' not in calls
+
+
+@pytest.mark.parametrize('mode',['near-cap','expired','positive'])
+def test_actual_buffered_second_read_preaccess(tmp_path,mode):
+    import io,time
+    api=review_body('cutover_command_boundary');budget=api['MetadataBudget'](8192,time.monotonic()+1);scope=extracted_wrapper_classes(budget)
+    file=tmp_path/'record';file.write_bytes(b'b'*200);reader=scope['MetadataFile'](file,'rb');calls=[]
+    class Witness(io.BytesIO):
+        def read(self,n=-1):calls.append(n);return super().read(n)
+    reader.data=Witness(b'b'*200)
+    if mode=='near-cap':budget.used=budget.limit-1
+    if mode=='expired':budget.deadline=time.monotonic()-1
+    if mode=='positive':
+        budget.used=budget.limit-21;before=budget.used;assert reader.read(20)==b'b'*20 and calls==[20] and budget.used==before+21==budget.limit and reader.remaining==180
+    else:
+        with pytest.raises(ValueError,match='metadata'):reader.read(200)
+        assert calls==[] and budget.used<=budget.limit
+    reader.data.close()
+
+
+@pytest.mark.parametrize('mode',['near-cap','expired','positive'])
+def test_actual_text_input_utf8_bytes_charge(mode):
+    import io,time
+    api=review_body('cutover_command_boundary');budget=api['MetadataBudget'](6,time.monotonic()+1);scope=extracted_wrapper_classes(budget);calls=[]
+    payload='яя';scope['input_size']=len(payload.encode())
+    class Witness(io.BytesIO):
+        def read(self,n=-1):calls.append(n);return super().read(n)
+    handle=Witness(payload.encode());reader=scope['Input'](handle)
+    if mode=='near-cap':budget.used=budget.limit-1
+    if mode=='expired':budget.deadline=time.monotonic()-1
+    if mode=='positive':assert reader.read()==payload and calls==[5] and budget.used==5 and reader.remaining==0
+    else:
+        with pytest.raises(ValueError,match='metadata'):reader.read()
+        assert calls==[] and budget.used<=budget.limit
+
+
+@pytest.mark.parametrize('mode',['near-cap','expired','positive'])
+def test_actual_child_entry_preaccess(tmp_path,mode):
+    import time
+    api=review_body('cutover_command_boundary');budget=api['MetadataBudget'](8192,time.monotonic()+1);calls=[]
+    class Item:name='n'*200;path=str(tmp_path/'file')
+    class Iterator:
+        def __next__(self):calls.append('next');return Item()
+        def close(self):calls.append('close')
+    def pathconf(path,key):calls.append('pathconf');assert key=='PC_NAME_MAX';return 255
+    def scandir(path):
+        calls.append('scandir')
+        if mode=='near-cap':budget.used=budget.limit-1
+        if mode=='expired':budget.deadline=time.monotonic()-1
+        return Iterator()
+    budget.raw=dict(budget.raw,pathconf=pathconf,scandir=scandir);scope=extracted_wrapper_classes(budget);entries=scope['Entries'](tmp_path)
+    if mode=='positive':
+        before=budget.used;item=next(entries);assert item.name=='n'*200 and calls==['pathconf','scandir','next'] and budget.used==before+201
+    else:
+        with pytest.raises(ValueError,match='metadata'):next(entries)
+        assert 'next' not in calls and budget.used<=budget.limit
+    entries.close()
+
+
+@pytest.mark.parametrize('value',[-1,0,4097,True])
+def test_native_name_maximum_unknown_refuses_before_iterator(tmp_path,value):
+    import time
+    api=review_body('cutover_command_boundary');budget=api['MetadataBudget'](8192,time.monotonic()+1);calls=[]
+    def query(path,key):calls.append('pathconf');assert key=='PC_NAME_MAX';return value
+    def iterator(path):calls.append('scandir');raise AssertionError('unsupported maximum cannot reach enumeration')
+    budget.raw=dict(budget.raw,pathconf=query,scandir=iterator)
+    with pytest.raises(ValueError,match='filename'):budget.names(tmp_path)
+    assert calls==['pathconf'] and budget.used<=budget.limit

@@ -84,18 +84,18 @@
       \ else:need(not receipt_present,'missing helper for existing receipt; no deployment on resume')\n\
       receipt_present=os.path.lexists(receipt)\nread_only_resume=r['observe_only'] or (r['initial'] and\
       \ receipt_present)\nscan={'__name__':'scan','MetadataBudget':scope['MetadataBudget']};exec(r['consumers'],scan)\n\
-      refs=None if read_only_resume else scan['consumer_refs']([original,stage],c['limits']['entries'],c['limits']['metadata_read_bytes'],c['limits']['action_seconds'],filesystem_devices=(device.st_rdev,))\n\
+      roots=scan['consumer_roots'](original,source,stage)\nrefs=None if read_only_resume else scan['consumer_refs'](roots,c['limits']['entries'],c['limits']['metadata_read_bytes'],c['limits']['action_seconds'],filesystem_devices=(device.st_rdev,))\n\
       metadata_total+=0;  # Shared child accessor counter includes consumer reads; do not reset/add another\
       \ allowance.\nneed(metadata_total+runner.total<=c['limits']['metadata_read_bytes'],'whole consumer\
       \ metadata cap')\nfor loop in loops:\n backing=os.stat(loop['back-file']);need((backing.st_dev,backing.st_ino)\
       \ not in getattr(scan['consumer_refs'],'footprint',set()) and backing.st_dev!=device.st_rdev,'physical\
-      \ loop/backing footprint')\nneed(read_only_resume or not refs,'live original/stage references')\n\
+      \ loop/backing footprint')\nneed(read_only_resume or not refs,'live original/source/stage references')\n\
       namespaces={}\nproc_names=os.listdir('/proc');need(len(proc_names)<=c['limits']['entries'],'process\
       \ enumeration cap')\nfor pid in proc_names:\n if pid.isdigit():\n  try:namespaces.setdefault(os.stat('/proc/'+pid+'/ns/mnt').st_ino,pid)\n\
-      \  except FileNotFoundError:raise ValueError('raced namespace scan')\nsource_root='/'+str(original).lstrip('/')\n\
-      aliases=[]\ndef overlap(a,z):return a==z or a.startswith(z.rstrip('/')+'/') or z.startswith(a.rstrip('/')+'/')\n\
-      for pid in namespaces.values():\n raw=bounded_file('/proc/'+pid+'/mountinfo',c['limits']['metadata_read_bytes'])\n\
-      \ aliases+=scan['mount_aliases'](raw.decode().splitlines(),str(os.major(old.st_dev))+':'+str(os.minor(old.st_dev)),[source_root,str(stage)],str(os.major(device.st_rdev))+':'+str(os.minor(device.st_rdev)),[str(stage),str(source)])\n\
+      \  except FileNotFoundError:raise ValueError('raced namespace scan')\nphysical_roots=[str(path)\
+      \ for path in roots]\naliases=[]\ndef overlap(a,z):return a==z or a.startswith(z.rstrip('/')+'/')\
+      \ or z.startswith(a.rstrip('/')+'/')\nfor pid in namespaces.values():\n raw=bounded_file('/proc/'+pid+'/mountinfo',c['limits']['metadata_read_bytes'])\n\
+      \ aliases+=scan['mount_aliases'](raw.decode().splitlines(),str(os.major(old.st_dev))+':'+str(os.minor(old.st_dev)),physical_roots,str(os.major(device.st_rdev))+':'+str(os.minor(device.st_rdev)),[str(stage),str(source)])\n\
       need(read_only_resume or not aliases,'relevant physical namespace alias')\nworkers=json.loads(run([h['tools']['pvenode'],'task','list','--source','active','--output-format','json']))\n\
       need(read_only_resume or all(x['upid'] in window['foreign_upids'] for x in workers),'predisable\
       \ relevant workers not naturally drained')\n# Static foreign disk bindings, not percentages/open\
@@ -140,7 +140,7 @@
       \ type(v) is int and v>=(1 if positive else 0)\nMETADATA_SOURCE=\"class MetadataBudget:\\n def __init__(self,allowance,deadline):\\\
       n  need(type(allowance) is int and allowance>0 and type(deadline) in (int,float) and math.isfinite(deadline),'metadata\
       \ allowance/deadline');self.limit=allowance;self.deadline=deadline;self.used=0;self.payload=0;self.accesses=0\\\
-      n  self.raw=getattr(os,'_qcl_originals',{k:getattr(os,k) for k in ('open','read','close','stat','lstat','fstat','readlink','scandir','listxattr','getxattr')})\\\
+      n  self.raw=getattr(os,'_qcl_originals',{k:getattr(os,k) for k in ('open','read','close','stat','lstat','fstat','readlink','scandir','pathconf','listxattr','getxattr')})\\\
       n def content_fd(self,fd):\\n  roles=getattr(os,'_qcl_content_roles',None)\\n  if roles is not None:roles[fd]='content'\\\
       n def tick(self):need(time.monotonic()<self.deadline,'metadata deadline')\\n def reserve(self,n):self.tick();need(type(n)\
       \ is int and n>=0 and self.used+n<=self.limit,'metadata shared cap')\\n def charge(self,n):self.reserve(n);self.used+=n;self.payload+=n\\\
@@ -155,9 +155,13 @@
       \ detection allowance')\\n    self.reserve(size);chunk=self.raw['read'](fd,size);self.charge(len(chunk));self.tick()\\\
       n    if not chunk:break\\n    value.extend(chunk);need(len(value)<=maximum,'metadata read cap')\\\
       n   final=self.fdinfo(fd);need((initial.st_dev,initial.st_ino,initial.st_size,initial.st_mtime_ns,initial.st_ctime_ns)==(final.st_dev,final.st_ino,final.st_size,final.st_mtime_ns,final.st_ctime_ns),'metadata\
-      \ raced');return bytes(value)\\n  finally:self.raw['close'](fd)\\n def names(self,path):\\n  values=[];self.access();iterator=self.raw['scandir'](path)\\\
-      n  try:\\n   while True:\\n    self.access()\\n    try:entry=next(iterator)\\n    except StopIteration:break\\\
-      n    self.charge(len(os.fsencode(entry.name)));self.tick();values.append(entry.name)\\n  finally:iterator.close()\\\
+      \ raced');return bytes(value)\\n  finally:self.raw['close'](fd)\\n def name_max(self,path):\\n \
+      \ self.access(65);value=self.raw['pathconf'](path,'PC_NAME_MAX');need(type(value) is int and 0<value<=4096,'finite\
+      \ native filename maximum')\\n  raw=str(value).encode('ascii');need(len(raw)<=64,'native name maximum\
+      \ projection');self.charge(len(raw));self.tick();return value\\n def names(self,path):\\n  values=[];maximum=self.name_max(path);self.access();iterator=self.raw['scandir'](path)\\\
+      n  try:\\n   while True:\\n    self.access(maximum+1)\\n    try:entry=next(iterator)\\n    except\
+      \ StopIteration:break\\n    raw=os.fsencode(entry.name);need(len(raw)<=maximum,'native filename\
+      \ maximum exceeded');self.charge(len(raw));self.tick();values.append(entry.name)\\n  finally:iterator.close()\\\
       n  return values\\n def link(self,path,*args,**kwargs):\\n  self.access(4097);value=self.raw['readlink'](path,*args,**kwargs);need(len(os.fsencode(value))<=4096,'metadata\
       \ native link maximum');self.charge(len(os.fsencode(value)));self.tick();return value\\n\\ndef current_metadata():return\
       \ getattr(os,'_qcl_metadata_budget',None)\\ndef helper_metadata_bound(kind,request,input_bytes,load_bytes,output_bytes=0):\\\
@@ -185,8 +189,8 @@
       nbudget.charge(int(os.environ['QCL_CUTOVER_CHILD_LOAD_BYTES'])-input_size)\\nclass Input:\\n encoding='utf-8'\\\
       n def __init__(self,handle,binary=False):self.handle=handle;self.binary=binary;self.remaining=input_size\\\
       n @property\\n def buffer(self):return self if self.binary else binary_input\\n def read(self,n=-1):\\\
-      n  budget.access();size=self.remaining+1 if n<0 else min(n,self.remaining+1);budget.reserve(size)\\\
-      n  data=self.handle.read(size);self.remaining-=len(data);budget.charge(len(data));budget.tick();return\
+      n  need(type(n) is int and n>=-1,'finite input read size');size=self.remaining+1 if n==-1 else min(n,self.remaining+1);budget.access(size+1)\\\
+      n  data=self.handle.read(size);need(len(data)<=size,'input maximum exceeded');self.remaining-=len(data);budget.charge(len(data));budget.tick();return\
       \ data if self.binary else data.decode('utf-8')\\n def readline(self,n=-1):raise ValueError('unadmitted\
       \ stdin line reader')\\nbinary_input=Input(sys.stdin.buffer,True);sys.stdin=Input(binary_input.handle)\\\
       ndef guarded_open(path,flags,*a,**kw):\\n budget.access();fd=raw_open(path,flags,*a,**kw);roles[fd]='content'\
@@ -198,16 +202,16 @@
       \ assigned hash cap')\\n else:\\n  need(type(n) is int and n>=0,'finite metadata read size');budget.reserve(n);data=raw_read(fd,n);budget.charge(len(data))\\\
       n budget.tick();return data\\ndef guarded_stat(path,*a,**kw):\\n budget.access(513);s=budget.raw['stat'](path,*a,**kw);return\
       \ budget.record(s)\\ndef guarded_lstat(path,*a,**kw):budget.access(513);return budget.record(budget.raw['lstat'](path,*a,**kw))\\\
-      ndef guarded_fstat(fd):return budget.fdinfo(fd)\\nclass Entries:\\n def __init__(self,path):budget.access();self.handle=budget.raw['scandir'](path)\\\
+      ndef guarded_fstat(fd):return budget.fdinfo(fd)\\nclass Entries:\\n def __init__(self,path):self.maximum=budget.name_max(path);budget.access();self.handle=budget.raw['scandir'](path)\\\
       n def __enter__(self):return self\\n def __exit__(self,*args):self.close()\\n def close(self):self.handle.close()\\\
-      n def __iter__(self):return self\\n def __next__(self):\\n  budget.access();item=next(self.handle);budget.charge(len(os.fsencode(item.name)));budget.tick();return\
-      \ Entry(item)\\nclass Entry:\\n def __init__(self,entry):self.entry=entry;self.name=entry.name;self.path=entry.path\\\
-      n def stat(self,*,follow_symlinks=True):return guarded_stat(self.path,follow_symlinks=follow_symlinks)\\\
-      n def is_dir(self,*,follow_symlinks=True):return stat.S_ISDIR(self.stat(follow_symlinks=follow_symlinks).st_mode)\\\
-      n def is_file(self,*,follow_symlinks=True):return stat.S_ISREG(self.stat(follow_symlinks=follow_symlinks).st_mode)\\\
-      n def is_symlink(self):return stat.S_ISLNK(self.stat(follow_symlinks=False).st_mode)\\n def inode(self):return\
-      \ self.stat(follow_symlinks=False).st_ino\\n def __fspath__(self):return self.path\\ndef xattrs(path,*a,**kw):\\\
-      n budget.access(65537);value=budget.raw['listxattr'](path,*a,**kw);amount=sum(len(os.fsencode(x))+1\
+      n def __iter__(self):return self\\n def __next__(self):\\n  budget.access(self.maximum+1);item=next(self.handle);raw=os.fsencode(item.name);need(len(raw)<=self.maximum,'native\
+      \ filename maximum exceeded');budget.charge(len(raw));budget.tick();return Entry(item)\\nclass Entry:\\\
+      n def __init__(self,entry):self.entry=entry;self.name=entry.name;self.path=entry.path\\n def stat(self,*,follow_symlinks=True):return\
+      \ guarded_stat(self.path,follow_symlinks=follow_symlinks)\\n def is_dir(self,*,follow_symlinks=True):return\
+      \ stat.S_ISDIR(self.stat(follow_symlinks=follow_symlinks).st_mode)\\n def is_file(self,*,follow_symlinks=True):return\
+      \ stat.S_ISREG(self.stat(follow_symlinks=follow_symlinks).st_mode)\\n def is_symlink(self):return\
+      \ stat.S_ISLNK(self.stat(follow_symlinks=False).st_mode)\\n def inode(self):return self.stat(follow_symlinks=False).st_ino\\\
+      n def __fspath__(self):return self.path\\ndef xattrs(path,*a,**kw):\\n budget.access(65537);value=budget.raw['listxattr'](path,*a,**kw);amount=sum(len(os.fsencode(x))+1\
       \ for x in value);need(amount<=65536,'metadata native xattr names maximum');budget.charge(amount);budget.tick();return\
       \ value\\ndef xattr(path,name,*a,**kw):\\n budget.access(65537);value=budget.raw['getxattr'](path,name,*a,**kw);need(len(value)<=65536,'metadata\
       \ native xattr maximum');budget.charge(len(value));budget.tick();return value\\ndef ioctl(fd,command,arg=0,mutate_flag=True):\\\
@@ -215,9 +219,11 @@
       \ metadata ioctl');result=raw_ioctl(fd,command,arg,mutate_flag);budget.charge(len(arg.tobytes()));budget.tick();return\
       \ result\\n# Buffered metadata readers use the same no-follow/stable bounded accessor, never unlimited\
       \ read_text.\\nold_io_open=io.open\\nclass MetadataFile:\\n def __init__(self,path,mode):self.data=io.BytesIO(budget.read(path,budget.limit-budget.used));self.binary='b'\
-      \ in mode\\n def __enter__(self):return self\\n def __exit__(self,*a):self.data.close()\\n def read(self,n=-1):\\\
-      n  budget.access();data=self.data.read(n);budget.charge(len(data));return data if self.binary else\
-      \ data.decode('utf-8')\\n def readlines(self,*a):raise ValueError('unadmitted metadata readlines')\\\
+      \ in mode;self.remaining=self.data.getbuffer().nbytes\\n def __enter__(self):return self\\n def\
+      \ __exit__(self,*a):self.data.close()\\n def read(self,n=-1):\\n  need(type(n) is int and n>=-1,'finite\
+      \ buffered read size');possible=self.remaining if n==-1 else min(n,self.remaining);budget.access(possible+1);data=self.data.read(possible);need(len(data)<=possible,'buffered\
+      \ maximum');budget.charge(len(data));self.remaining-=len(data);budget.tick();return data if self.binary\
+      \ else data.decode('utf-8')\\n def readlines(self,*a):raise ValueError('unadmitted metadata readlines')\\\
       n def __iter__(self):raise ValueError('unadmitted metadata iteration')\\ndef metadata_open(path,mode='r',*a,**kw):\\\
       n if not isinstance(path,int) and 'r' in mode and not any(x in mode for x in '+wa'):return MetadataFile(path,mode)\\\
       n return old_io_open(path,mode,*a,**kw)\\nos.open=guarded_open;os.close=guarded_close;os.read=guarded_read;os.stat=guarded_stat;os.lstat=guarded_lstat;os.fstat=guarded_fstat;os.readlink=budget.link;os.scandir=Entries;os.listdir=budget.names;os.listxattr=xattrs;os.getxattr=xattr\\\
@@ -246,9 +252,11 @@
       \   return bytes(buf[p.stdout.fileno()]).decode('utf-8')\n  finally:\n   if p.poll() is None:p.kill()\n\
       \   try:p.wait(timeout=.2)\n   except subprocess.TimeoutExpired:pass\n   sel.close();p.stdout.close();p.stderr.close()\n\
       def metadata_file(path,cap):\n budget=current_metadata()\n if budget is None:budget=MetadataBudget(cap,time.monotonic()+1)\n\
-      \ return budget.read(path,cap)\ndef group_members(pgid,generation,budget=None):\n if budget is None:budget=MetadataBudget(1048576,time.monotonic()+1)\n\
-      \ members=[]\n for name in budget.names('/proc'):\n  budget.tick()\n  if not name.isdigit():continue\n\
-      \  try:\n   raw=budget.read('/proc/'+name+'/stat',4096).decode();fields=raw[raw.rfind(')')+2:].split()\n\
+      \ return budget.read(path,cap)\ndef metadata_pipe_read(budget,fd,maximum):\n need(type(maximum)\
+      \ is int and 0<maximum<=4096,'finite pipe maximum');budget.access(maximum+1)\n chunk=os.read(fd,maximum);need(len(chunk)<=maximum,'pipe\
+      \ maximum exceeded');budget.charge(len(chunk));budget.tick();return chunk\ndef group_members(pgid,generation,budget=None):\n\
+      \ if budget is None:budget=MetadataBudget(1048576,time.monotonic()+1)\n members=[]\n for name in\
+      \ budget.names('/proc'):\n  budget.tick()\n  if not name.isdigit():continue\n  try:\n   raw=budget.read('/proc/'+name+'/stat',4096).decode();fields=raw[raw.rfind(')')+2:].split()\n\
       \   need(len(fields)>=20,'bounded proc record schema')\n   if int(fields[2])==pgid:\n    need(int(name)!=pgid\
       \ or int(fields[19])==generation,'own group leader generation changed')\n    need(int(fields[3])==pgid\
       \ and int(fields[19])>=generation,'own group generation uncertain')\n    if fields[0]!='Z':members.append(int(name))\n\
@@ -317,9 +325,9 @@
       \  while sel.get_map():\n   if time.monotonic()>=work_end:status='deadline';break\n   for key,mask\
       \ in sel.select(min(.05,max(0,work_end-time.monotonic()))):\n    if mask&selectors.EVENT_WRITE:\n\
       \     try:n=os.write(key.fd,pending[:4096]);pending=pending[n:]\n     except BrokenPipeError:pending=memoryview(b'')\n\
-      \     if not pending:sel.unregister(key.fileobj);key.fileobj.close()\n    else:\n     chunk=os.read(key.fd,256\
+      \     if not pending:sel.unregister(key.fileobj);key.fileobj.close()\n    else:\n     chunk=metadata_pipe_read(owner_budget,key.fd,256\
       \ if key.fd==telemetry_read else 4096)\n     if not chunk:sel.unregister(key.fileobj);continue\n\
-      \     owner_budget.charge(len(chunk)+1)\n     if key.fd==telemetry_read:\n      telemetry.extend(chunk);need(len(telemetry)<=256,'metadata\
+      \     if key.fd==telemetry_read:\n      telemetry.extend(chunk);need(len(telemetry)<=256,'metadata\
       \ telemetry cap');continue\n     count+=len(chunk)\n     if count>payload_cap:buffers[key.fd].extend(chunk[:max(0,payload_cap-count+len(chunk))]);status='output_cap';break\n\
       \     buffers[key.fd].extend(chunk)\n   if status!='ok':break\n  result['stdout']=bytes(buffers[p.stdout.fileno()]).decode(errors='replace');result['stderr']=bytes(buffers[p.stderr.fileno()]).decode(errors='replace')\n\
       \  result['observed_bytes'].update(stdout=len(buffers[p.stdout.fileno()]),stderr=len(buffers[p.stderr.fileno()]))\n\
@@ -344,7 +352,8 @@
       \ request cap')\n r=json.loads(raw,parse_constant=lambda x:(_ for _ in ()).throw(ValueError('nonfinite\
       \ JSON')))\n answer=boundary(r);encoded=json.dumps(answer,allow_nan=False);need(len(encoded.encode())<=r['bounds']['output_bytes'],'boundary\
       \ result cap');print(encoded)\n sys.exit(0 if answer['status']=='ok' else 1)\n"
-    cutover_consumer_scan: "import os,pathlib,stat,time\n\ndef consumer_refs(roots,entries,metadata_bytes,seconds,pids=None,filesystem_devices=()):\n\
+    cutover_consumer_scan: "import os,pathlib,stat,time\n\ndef consumer_roots(original,source,stage):return\
+      \ list(dict.fromkeys([original,source,stage]))\n\ndef consumer_refs(roots,entries,metadata_bytes,seconds,pids=None,filesystem_devices=()):\n\
       \ start=time.monotonic();budget=getattr(os,'_qcl_metadata_budget',None) or MetadataBudget(metadata_bytes,start+seconds)\n\
       \ known=set();prefix=[str(p) for p in roots];pending=list(roots);count=0\n def tick():\n  budget.tick()\n\
       \  if time.monotonic()-start>=seconds:raise ValueError('consumer deadline')\n def relevant(path):return\
@@ -1938,8 +1947,8 @@
               - -c
               - '{{ cutover_reference_check }}'
               stdin: '{{ {''h'':h,''boundary'':cutover_command_boundary,''expected'':{''identity'':{''host_id'':h.host_id,''boot_id'':h.boot_id,''attempt_id'':h.attempt_id,''window_owner'':c.window.owner,''window_expiry'':c.window.expires_at_epoch,''source_dev'':c.source.dev,''source_ino'':c.source.ino,''parent_dev'':c.source.parent_dev,''parent_ino'':c.source.parent_ino,''storage_id'':c.storage.id,''path'':c.source.path,''lv_uuid'':h.stage.lv_uuid,''fs_uuid'':c.final.fs_uuid},''d04_receipt_sha256'':c.preconditions.d04_receipt.sha256,''window_receipt_sha256'':c.window.reference.sha256,''retained_manifest_sha256'':((manifest_before.stdout
-                | from_json | to_json(sort_keys=true,separators=['','','':''],ensure_ascii=true)) ~ ''\n'')
-                | hash(''sha256''),''excluded_old_qcl_set_sha256'':c.preconditions.excluded_old_qcl_set_sha256},''retained_manifest'':(manifest_before.stdout
+                | from_json | to_json(sort_keys=true,separators=['','','':''],ensure_ascii=true,allow_nan=false))
+                ~ (''Cg=='' | b64decode)) | hash(''sha256''),''excluded_old_qcl_set_sha256'':c.preconditions.excluded_old_qcl_set_sha256},''retained_manifest'':(manifest_before.stdout
                 | from_json)} | to_json }}'
               mutation: false
           block:
