@@ -35,7 +35,7 @@ def settings():
                 device='/dev/mapper/final', rdev='253:4', fs_uuid=FS, lv_uuid='image-lv', vg_uuid='vg-id', pool_uuid='pool-id',
                 cutover_receipt='accepted-native-final', accepted=True),
             support=dict(fresh=True, receipt='tools-ext4-fiemap', page_bytes=4096, minimum_file_pages=10,
-                maximum_file_pages=4294967295, direct=True, fiemap=True, ext4=True, swapon_json=True, systemd_version=257,busctl_json=True,wipefs_json=True,header_write_bytes=4096,synchronous_child_scope=True),
+                maximum_file_pages=4294967295, direct=True, fiemap=True, ext4=True, swapon_raw_columns=True, systemd_version=257,busctl_json=True,wipefs_json=True,header_write_bytes=4096,synchronous_child_scope=True),
             ledger=dict(fresh=True, receipt='physical-reservation', expires_at_epoch=200,
                 incremental_swap_bytes=4*MIB, protected_data_growth_bytes=8*MIB, data_reserve_bytes=8*MIB,
                 data_overhead_bytes=MIB, metadata_growth_bytes=MIB, metadata_reserve_bytes=MIB,
@@ -245,7 +245,7 @@ def configure(name,cfg,s):
 UNIT_PROPERTIES=('Id','FragmentPath','DropInPaths','NeedDaemonReload','DefaultDependencies','LoadState','ActiveState','UnitFileState','Requires','After','RequiresMountsFor','Conditions','ConditionResult')
 SWAP_PROPERTIES=('What','Options','TimeoutUSec')
 FIND_FIELDS='TARGET,SOURCE,UUID,FSTYPE,FSROOT,MAJ:MIN'
-SWAP_FIELDS='NAME,TYPE,SIZE,USED,PRIO'
+SWAP_FIELDS='NAME,TYPE,SIZE,USED,PRIO,UUID,LABEL'
 LV_FIELDS='lv_uuid,vg_uuid,lv_name,segtype,lv_size,lv_metadata_size,data_percent,metadata_percent,lv_attr,lv_health_status,pool_lv,lv_path'
 
 
@@ -263,9 +263,9 @@ def parse_native_cli(argv,cfg):
         for name,expected in (('conv',{'nocreat','notrunc','fsync'}),('oflag',{'direct','nofollow'})):
             values=options[name].split(',');assert len(values)==len(set(values)) and set(values)==expected
         return dict(command=cmd,options=options,operands=[])
-    flags={'findmnt':{'--json'},'swapon':{'--show','--json','--bytes'},'lvs':{'--nosuffix'},'busctl':{'--system'},'blkid':{'--probe'},'wipefs':{'--no-act','--json'},'systemctl':set(),'mkswap':set(),'df':set(),'getconf':set(),'systemd-escape':{'--path'}}.get(cmd)
+    flags={'findmnt':{'--json'},'swapon':{'--raw','--noheadings','--bytes'},'lvs':{'--nosuffix'},'busctl':{'--system'},'blkid':{'--probe'},'wipefs':{'--no-act','--json'},'systemctl':set(),'mkswap':set(),'df':set(),'getconf':set(),'systemd-escape':{'--path'}}.get(cmd)
     assert flags is not None, ('unsupported CLI',argv)
-    values={'findmnt':{'--mountpoint','--target','--output'},'swapon':{'--output'},'lvs':{'--reportformat','--units','--options'},'busctl':{'--json'},'blkid':{'--output'},'wipefs':set(),'systemctl':{'--property'},'mkswap':{'--uuid','--pagesize'},'df':{'--block-size','--output'},'getconf':set(),'systemd-escape':{'--suffix'}}[cmd]
+    values={'findmnt':{'--mountpoint','--target','--output'},'swapon':{'--show'},'lvs':{'--reportformat','--units','--options'},'busctl':{'--json'},'blkid':{'--output'},'wipefs':set(),'systemctl':{'--property'},'mkswap':{'--uuid','--pagesize'},'df':{'--block-size','--output'},'getconf':set(),'systemd-escape':{'--suffix'}}[cmd]
     options={};operands=[];i=0
     while i<len(args):
         token=args[i];i+=1
@@ -286,7 +286,7 @@ def parse_native_cli(argv,cfg):
         assert options['--output']==FIND_FIELDS
         assert options.get('--mountpoint',w['mount']['path'])==w['mount']['path']
         assert options.get('--target',w['parent']) in (w['mount']['path'],w['parent'],w['path'])
-    elif cmd=='swapon':assert options=={'--show':True,'--json':True,'--bytes':True,'--output':SWAP_FIELDS} and not operands
+    elif cmd=='swapon':assert options=={'--show':SWAP_FIELDS,'--raw':True,'--noheadings':True,'--bytes':True} and not operands
     elif cmd=='lvs':assert options=={'--reportformat':'json','--units':'b','--nosuffix':True,'--options':LV_FIELDS} and not operands
     elif cmd=='busctl':
         assert options=={'--system':True,'--json':'short'}
@@ -392,7 +392,7 @@ def execute(cfg,s,tmp_path,monkeypatch,*,syntax=False):
                     if s['used_changes']:old['used']+=1234
                     rows=[] if s['old_changed'] and s['active'] else [old]
                     if s['active']:rows.append(dict(name=cfg['swap']['path'],type='file',size=4*MIB-(8192 if s['malformed']=='usable' else 4096),used=0,prio=-3))
-                    out['stdout']=json.dumps({'swaps':rows})
+                    out['stdout']=''.join(r['name']+' '+r['type']+' '+str(r['size'])+' '+str(r['used'])+' '+str(r['prio'])+' '+(UUID if r['name']==cfg['swap']['path'] else 'a798c08a-1f3f-40f6-bd9a-47a316f90fe5')+' \n' for r in rows)
                 elif cmd=='wipefs':
                     signatures=[] if s['signature'] is None else [dict(type=s['signature']['TYPE'],uuid=s['signature']['UUID'])]
                     out['stdout']=json.dumps({'signatures':signatures})
@@ -1108,14 +1108,14 @@ def test_cli_semantic_controls(case):
     cfg=settings()
     vectors={
       'busctl-unit-order':['/usr/bin/busctl','get-property','--json=short','org.freedesktop.systemd1','--system','/org/freedesktop/systemd1/unit/fixture_swap','org.freedesktop.systemd1.Unit',*UNIT_PROPERTIES],
-      'swapon-option-order':['/usr/bin/swapon','--output='+SWAP_FIELDS,'--bytes','--show','--json'],
+      'swapon-option-order':['/usr/bin/swapon','--bytes','--noheadings','--show='+SWAP_FIELDS,'--raw'],
       'systemctl-property-separate':['/usr/bin/systemctl','--property','LoadState','show',UNIT],
       'findmnt-option-order':['/usr/bin/findmnt','--output='+FIND_FIELDS,'--target='+PATH,'--json'],
       'dd-operand-order':['/usr/bin/dd','count=4','oflag=nofollow,direct','of='+PATH,'if=/dev/zero','conv=fsync,notrunc,nocreat','bs=1M'],
       'mkswap-option-order':['/usr/bin/mkswap',PATH,'--pagesize=4096','--uuid='+UUID],
-      'duplicate-option':['/usr/bin/swapon','--show','--show','--json','--bytes','--output',SWAP_FIELDS],
+      'duplicate-option':['/usr/bin/swapon','--show='+SWAP_FIELDS,'--show='+SWAP_FIELDS,'--raw','--noheadings','--bytes'],
       'unknown-option':['/usr/bin/swapon','--foreign'],
-      'extra-operand':['/usr/bin/swapon','--show','--json','--bytes','--output',SWAP_FIELDS,PATH]}
+      'extra-operand':['/usr/bin/swapon','--show='+SWAP_FIELDS,'--raw','--noheadings','--bytes',PATH]}
     if case in ('duplicate-option','unknown-option','extra-operand'):
         with pytest.raises(AssertionError):parse_native_cli(vectors[case],cfg)
     else:parse_native_cli(vectors[case],cfg)
@@ -1135,8 +1135,13 @@ def test_failed_start_readonly_outcome(case,tmp_path,monkeypatch,capfd):
     if known:
         assert len(late)==2 and [Path(q['argv'][0]).name for q in late]==['swapon','systemctl']
         assert late[0]['index']<late[1]['index'] and all(q['phase']=='activation' for q in late)
-        rows=json.loads(late[0]['stdout'])['swaps']
-        assert any(row['name']==PATH for row in rows) is (case!='start-inactive')
+        # Independent exact raw7 wire witness, not the production normalizer.
+        expected_raw = ('/dev/mapper/old-swap partition 8388608 1024 -2 '
+                        'a798c08a-1f3f-40f6-bd9a-47a316f90fe5 \n')
+        if case!='start-inactive':
+            expected_raw += ('/srv/final/protected-swap/swapfile file 4190208 0 -3 '
+                             '33333333-3333-4333-8333-333333333333 \n')
+        assert late[0]['stdout']==expected_raw
     else:assert not late
 
 

@@ -1880,7 +1880,7 @@
         - w.support.direct is sameas true
         - w.support.fiemap is sameas true
         - w.support.ext4 is sameas true
-        - w.support.swapon_json is sameas true
+        - w.support.swapon_raw_columns is sameas true
         - w.support.systemd_version == 257
         fail_msg: 'Host swap refusal: preserve original receipts and exact observed state; no automatic cleanup.'
     - name: Finite preflight_seconds
@@ -2769,8 +2769,7 @@
         - preflight
         - '{{ 0 }}'
         - '{{ 0 }}'
-        - '{{ [((h.tools.swapon)) | string, ("--show") | string, ("--json") | string, ("--bytes") | string, ("--output") |
-          string, ("NAME,TYPE,SIZE,USED,PRIO") | string] | to_json }}'
+        - '{{ [h.tools.swapon,"--show=NAME,TYPE,SIZE,USED,PRIO,UUID,LABEL","--raw","--noheadings","--bytes"] | to_json }}'
       register: _io
       changed_when: false
       check_mode: false
@@ -2809,7 +2808,7 @@
         b: '{{ (_io.stdout | from_json).usage }}'
     - name: swaps_parse_entry_value
       ansible.builtin.set_fact:
-        swaps_entry: '{{ _swaps.stdout | from_json }}'
+        swaps_entry: '{{ _swaps.stdout | qcl_swapon_raw(w.budgets.maximum_swap_rows) }}'
     - name: kernel_rows_entry
       ansible.builtin.assert:
         that:
@@ -5215,8 +5214,7 @@
             - allocation
             - '{{ 0 }}'
             - '{{ 0 }}'
-            - '{{ [((h.tools.swapon)) | string, ("--show") | string, ("--json") | string, ("--bytes") | string, ("--output")
-              | string, ("NAME,TYPE,SIZE,USED,PRIO") | string] | to_json }}'
+            - '{{ [h.tools.swapon,"--show=NAME,TYPE,SIZE,USED,PRIO,UUID,LABEL","--raw","--noheadings","--bytes"] | to_json }}'
           register: _io
           changed_when: false
           check_mode: false
@@ -5255,7 +5253,7 @@
             b: '{{ (_io.stdout | from_json).usage }}'
         - name: swaps_parse_allocated_value
           ansible.builtin.set_fact:
-            swaps_allocated: '{{ _swaps.stdout | from_json }}'
+            swaps_allocated: '{{ _swaps.stdout | qcl_swapon_raw(w.budgets.maximum_swap_rows) }}'
         - name: kernel_rows_allocated
           ansible.builtin.assert:
             that:
@@ -7275,8 +7273,7 @@
             - activation
             - '{{ 0 }}'
             - '{{ 0 }}'
-            - '{{ [((h.tools.swapon)) | string, ("--show") | string, ("--json") | string, ("--bytes") | string, ("--output")
-              | string, ("NAME,TYPE,SIZE,USED,PRIO") | string] | to_json }}'
+            - '{{ [h.tools.swapon,"--show=NAME,TYPE,SIZE,USED,PRIO,UUID,LABEL","--raw","--noheadings","--bytes"] | to_json }}'
           register: _io
           changed_when: false
           check_mode: false
@@ -7315,7 +7312,7 @@
             b: '{{ (_io.stdout | from_json).usage }}'
         - name: swaps_parse_activation_value
           ansible.builtin.set_fact:
-            swaps_activation: '{{ _swaps.stdout | from_json }}'
+            swaps_activation: '{{ _swaps.stdout | qcl_swapon_raw(w.budgets.maximum_swap_rows) }}'
         - name: kernel_rows_activation
           ansible.builtin.assert:
             that:
@@ -8219,7 +8216,7 @@
               - activation
               - '{{ 0 }}'
               - '{{ 0 }}'
-              - '{{ [h.tools.swapon,"--show","--json","--bytes","--output","NAME,TYPE,SIZE,USED,PRIO"] | to_json }}'
+              - '{{ [h.tools.swapon,"--show=NAME,TYPE,SIZE,USED,PRIO,UUID,LABEL","--raw","--noheadings","--bytes"] | to_json }}'
             register: _io
             changed_when: false
             check_mode: false
@@ -8241,7 +8238,7 @@
               outcome_text: '{{ start_wire.stdout_b64 | b64decode }}'
           - name: failed_start_swaps_value
             ansible.builtin.set_fact:
-              outcome_table: '{{ outcome_text | from_json }}'
+              outcome_table: '{{ outcome_text | qcl_swapon_raw(w.budgets.maximum_swap_rows) }}'
           - name: failed_start_swaps_shape
             ansible.builtin.set_fact:
               outcome_shape: '{{ (outcome_table is mapping and outcome_table.keys() | list == ["swaps"] and outcome_table.swaps is sequence and outcome_table.swaps is not string and outcome_table.swaps | length <= w.budgets.maximum_swap_rows and outcome_table.swaps | map(attribute="name") | list | unique | length == outcome_table.swaps | length) | bool }}'
@@ -8894,8 +8891,7 @@
             - activation
             - '{{ 0 }}'
             - '{{ 0 }}'
-            - '{{ [((h.tools.swapon)) | string, ("--show") | string, ("--json") | string, ("--bytes") | string, ("--output")
-              | string, ("NAME,TYPE,SIZE,USED,PRIO") | string] | to_json }}'
+            - '{{ [h.tools.swapon,"--show=NAME,TYPE,SIZE,USED,PRIO,UUID,LABEL","--raw","--noheadings","--bytes"] | to_json }}'
           register: _io
           changed_when: false
           check_mode: false
@@ -8934,7 +8930,7 @@
             b: '{{ (_io.stdout | from_json).usage }}'
         - name: swaps_parse_post_value
           ansible.builtin.set_fact:
-            swaps_post: '{{ _swaps.stdout | from_json }}'
+            swaps_post: '{{ _swaps.stdout | qcl_swapon_raw(w.budgets.maximum_swap_rows) }}'
         - name: kernel_rows_post
           ansible.builtin.assert:
             that:

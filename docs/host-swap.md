@@ -15,8 +15,16 @@ root/final/старые swap UUID; новый UUID не может совпад�
 DD direct и native versions/features. Source execution не устанавливает tools.
 
 Mount policy читается `systemctl show`; swap policy использует native typed
-`busctl --json=short` свойства Unit/Swap. Native JSON findmnt/lvs/swapon/wipefs
-проверяется strict decoder без duplicate keys. Точные final mount/device/rdev/UUID, ordinary mount
+`busctl --json=short` свойства Unit/Swap. Native JSON findmnt/lvs/wipefs
+проверяется strict decoder без duplicate keys. Active swaps читаются только supported
+`swapon --show=NAME,TYPE,SIZE,USED,PRIO,UUID,LABEL --raw --noheadings --bytes`;
+`--json` и неоднозначный `--output` не используются. Fresh support
+`swapon_raw_columns=true` требует actual native help/zero-return evidence.
+Raw parser требует точные7 полей (пустой LABEL — trailing space), canonical
+полный UUID, canonical безопасный absolute path, byte integers и уникальные
+имена. Escapes, неизвестные/пропущенные поля и malformed rows отказывают.
+Нормализованный existing5-field row contract сохраняется; UUID/LABEL text
+типизированы, named inode/rdev и actual header UUID проверяются независимо. Точные final mount/device/rdev/UUID, ordinary mount
 policy, pool LV/VG identities и reserves проверяются до allocation и повторно
 перед/после activation. Data и metadata physical backing проверяются отдельно от
 filesystem available bytes и st_blocks. FIEMAP не является thin reservation.
