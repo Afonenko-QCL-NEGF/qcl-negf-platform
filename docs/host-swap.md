@@ -175,3 +175,14 @@ transported write-completion usage includes its precharges, bounded output and e
 own capture/readback; immutable completion is not rewritten to contain itself. Final
 controller latency, physical journal I/O and concurrent tree RSS remain unmeasured.
 Local synthetic source tests do not grant native/boot/pressure/SCI acceptance.
+
+Current observations consumed by immediate_header, immediate_start_fs_header and
+actual_new_swap require their own `stable is sameas true`, alongside the existing
+sample/layout/static identity and filesystem checks. A current unstable observation
+refuses before activation-intent publication, start, or enable respectively. Prior unit
+publication, sealed sticky intent, or one already completed start can remain; refusal
+performs no rollback or retry. Independent task-bound False vectors test consuming
+policy; they do not reproduce a kernel race. The historical GREEN11 ended at its wall
+cap without footer/JUnit; its original signature failure fatal was not retained. The
+corrected coherent partial signature fixture preserves the entry refusal oracle.
+New source remains pending whole local, native, cold dependency and boot acceptance.

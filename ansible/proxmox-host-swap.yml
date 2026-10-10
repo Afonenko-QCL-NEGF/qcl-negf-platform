@@ -7807,6 +7807,7 @@
         - name: immediate_header
           ansible.builtin.assert:
             that:
+            - file_activation.stable is sameas true
             - file_activation.sample_sha256 == records.header.payload.sample_sha256
             - file_activation.layout_hash == records.allocation.payload.layout_hash
             - sig_activation_kind == "known"
@@ -8016,6 +8017,7 @@
         - name: immediate_start_fs_header
           ansible.builtin.assert:
             that:
+            - file_start_guard.stable is sameas true
             - file_start_guard.sample_sha256 == records.header.payload.sample_sha256
             - file_start_guard.layout_hash == records.allocation.payload.layout_hash
             - '{"dev":file_start_guard.stat.dev,"inode":file_start_guard.stat.inode,"nlink":file_start_guard.stat.nlink,"uid":file_start_guard.stat.uid,"gid":file_start_guard.stat.gid,"mode":file_start_guard.stat.mode,"kind":file_start_guard.stat.kind}
@@ -9420,6 +9422,7 @@
         - name: actual_new_swap
           ansible.builtin.assert:
             that:
+            - file_post.stable is sameas true
             - new_post | length == 1
             - new_post[0].type == "file"
             - new_post[0].size == target_bytes-page_bytes

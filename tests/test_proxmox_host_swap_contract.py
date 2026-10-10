@@ -228,7 +228,7 @@ def configure(name,cfg,s):
     if name=='formatted-resume':seed_owned(cfg,s,stage='formatted')
     if name=='active-resume':seed_owned(cfg,s,stage='active')
     if name=='active-changed-policy':seed_owned(cfg,s,stage='active');s['policy_bad']=True
-    if name=='signature-error':s['failure']='signature-error'
+    if name=='signature-error':seed_owned(cfg,s,stage='partial');s['failure']='signature-error'
     if name in ('layout-gap','layout-unwritten'):s['layout_bad']=name
     if name=='wrong-page-usable':s['malformed']='usable'
     if name=='old-used-changes':s['used_changes']=True
@@ -454,6 +454,18 @@ def execute(cfg,s,tmp_path,monkeypatch,*,syntax=False):
                         if not s['parent_exists']:ancestor.update(dev=os.makedev(253,4),dev_major=253,dev_minor=4)
                         f=dict(s['file']);f.update(dev_major=os.major(f['dev']),dev_minor=os.minor(f['dev']))
                         out['stdout']=json.dumps(dict(exists=s['exists'],stat=f,parent=parent,ancestor=ancestor,coverage_complete=s['exists'] and not s['layout_bad'],unsupported_flags=2 if s['layout_bad']=='layout-unwritten' else 0,layout_hash=fixture_layout_hash(f['size']),stable=True,hole_offset=f['size'],observed_bytes=min(f['size'],4096),sample_sha256=fixture_sample_hash(s['signature']['UUID'] if s['signature'] else None,min(f['size'],4096),s.get('other_header_page',False)),header_metadata=dict(magic_hex='00000000000000000000' if s.get('other_header_page') else '53574150535041434532' if s['signature'] else '00000000000000000000',version=1 if s['signature'] else 0,last_page=63 if s.get('other_header_page') else 1023 if s['signature'] else 0,badpages=0,uuid=s['signature']['UUID'] if s['signature'] else '00000000-0000-0000-0000-000000000000')))
+                        if s.get('unstable_query')==event['task']:
+                            before=json.loads(out['stdout'])
+                            assert before['stable'] is True and before['exists'] is True
+                            assert before['coverage_complete'] is True and before['unsupported_flags']==0
+                            assert before['stat']==f and before['stat']['size']==4*MIB
+                            assert before['sample_sha256']==fixture_sample_hash(UUID,4096)
+                            assert before['layout_hash']==fixture_layout_hash(4*MIB)
+                            assert before['header_metadata']['uuid']==UUID
+                            after=dict(before,stable=False)
+                            assert {k:v for k,v in after.items() if k!='stable'}=={k:v for k,v in before.items() if k!='stable'}
+                            s.setdefault('stable_injections',[]).append(dict(index=event['index'],task=event['task'],before=before,after=after))
+                            out['stdout']=json.dumps(after)
                     elif argv[2]==data[0]['vars']['old_observer_code']:
                         rows=json.loads(argv[5]);assert int(argv[6])==16
                         out['stdout']=json.dumps([dict(name=r['name'],type=r['type'],size=r['size'],prio=r['prio'],identity={'kind':'block','rdev':[253,1]}) for r in sorted(rows,key=lambda r:r['name'])])
@@ -571,6 +583,10 @@ def assert_boundary(rc,observed,output,predicate,*,query=None,forbidden=None,pha
 @pytest.mark.parametrize('name',CASES)
 def test_actual_additive_swap_boundary(name,tmp_path,monkeypatch,capfd):
     cfg,s=configure(name,settings(),state())
+    if name=='signature-error':
+        positive_cfg,positive_state=configure('partial-resume',settings(),state())
+        assert cfg==positive_cfg
+        assert s==dict(positive_state,failure='signature-error')
     rc,observed=execute(cfg,s,tmp_path,monkeypatch)
     kinds=[row['kind'] for row in observed['trace']]
     success=name in ('fresh','disabled','preflight-only','partial-resume','formatted-resume','active-resume','old-used-changes')
@@ -582,6 +598,15 @@ def test_actual_additive_swap_boundary(name,tmp_path,monkeypatch,capfd):
     if name in early:
         mutation_before=name in ('creation-collision','parent-sync-failure','receipt-sync-failure','layout-gap','layout-unwritten')
         assert_boundary(rc,observed,output,early[name],forbidden=('format','start','enable','record-completion') if mutation_before else None)
+    if name=='signature-error':
+        entry=[q for q in observed['native_queries'] if q['task']=='file_entry']
+        signature=[q for q in observed['native_queries'] if q['task']=='blkid_entry']
+        assert len(entry)==len(signature)==1
+        assert json.loads(entry[0]['stdout'])['exists'] is True
+        assert signature[0]['rc']==4 and signature[0]['stderr']=='unknown signature'
+        assert signature[0]['phase']=='preflight' and entry[0]['index']<signature[0]['index']
+        assert not any(q['task']=='blkid_before_fill' for q in observed['native_queries'])
+        assert observed['trace']==[]
     if name in ('wrong-page-usable','old-swap-missing','completion-failure'):
         predicate={'wrong-page-usable':'actual_new_swap','old-swap-missing':'original_old_set_post','completion-failure':'write_completion_transport'}[name]
         assert_boundary(rc,observed,output,predicate,forbidden=('enable','record-completion','seal-completion') if name!='completion-failure' else ('seal-completion',))
@@ -1080,3 +1105,44 @@ def test_minimal_response_unicode_counter_bound(failure,monkeypatch):
     assert ns['MINIMAL_REFUSAL_BOUND']>=len(wire)
     assert len(wire)<=4096 and result['usage']['output_bytes']==len(wire)
     assert result['owned_children_complete'] is (failure is None) and result['failure']==failure
+
+
+@pytest.mark.parametrize('name',['activation-stable-false','start-guard-stable-false','post-stable-false'])
+def test_current_file_observation_stability(name,tmp_path,monkeypatch,capfd):
+    cfg,s=settings(),state()
+    seed_owned(cfg,s,stage='formatted')
+    query,predicate={
+        'activation-stable-false':('file_activation','immediate_header'),
+        'start-guard-stable-false':('file_start_guard','immediate_start_fs_header'),
+        'post-stable-false':('file_post','actual_new_swap'),
+    }[name]
+    s['unstable_query']=query
+    rc,observed=execute(cfg,s,tmp_path,monkeypatch)
+    output=retained_output(capfd)
+    forbidden={'enable','record-completion','seal-completion','format','fill'}
+    if name!='post-stable-false':forbidden.add('start')
+    if name=='activation-stable-false':forbidden.update(('record-activation_intent','seal-activation_intent'))
+    assert_boundary(rc,observed,output,predicate,query=query,phase='activation',forbidden=forbidden)
+    selected=[q for q in observed['native_queries'] if q['task']==query]
+    assert len(selected)==1
+    selected=selected[0]
+    injections=observed['stable_injections']
+    assert len(injections)==1 and injections[0]['task']==query
+    witness=injections[0]
+    assert witness['index']==selected['index'] and witness['before']['stable'] is True
+    assert json.loads(selected['stdout'])==witness['after'] and witness['after']['stable'] is False
+    assert {k:v for k,v in witness['before'].items() if k!='stable'}=={k:v for k,v in witness['after'].items() if k!='stable'}
+    trace=observed['trace']
+    if name!='activation-stable-false':
+        seals=[r for r in trace if r['kind']=='seal-activation_intent']
+        assert len(seals)==1 and seals[0]['index']<selected['index']
+        earlier=[q for q in observed['native_queries'] if q['task']=='file_activation']
+        assert len(earlier)==1 and json.loads(earlier[0]['stdout'])['stable'] is True
+    starts=[r for r in trace if r['kind']=='start']
+    if name=='post-stable-false':
+        assert len(starts)==1 and starts[0]['index']<selected['index']
+        assert observed['active'] is True
+        earlier=[q for q in observed['native_queries'] if q['task']=='file_start_guard']
+        assert len(earlier)==1 and json.loads(earlier[0]['stdout'])['stable'] is True
+    else:assert starts==[]
+    assert not any(r['index']>selected['index'] for r in trace)
