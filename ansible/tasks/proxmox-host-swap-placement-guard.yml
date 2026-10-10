@@ -1,0 +1,80 @@
+- name: placement_reference
+  ansible.builtin.assert:
+    that:
+    - w.placement_admission is mapping
+    - w.placement_admission.keys() | list | sort == ['path','sha256']
+    - w.placement_admission.path is string
+    - w.placement_admission.sha256 is match('^[0-9a-f]{64}$')
+    fail_msg: host_swap:placement_reference
+- name: placement_expected
+  ansible.builtin.set_fact:
+    placement_expected: '{{ {"h":h,"w":w,"attempt_id":b.attempt_id,"boundary":placement_boundary,"context_sha256":context_sha,"fs_pair":fs_pair,"fragment_path":fragment_path} }}'
+- name: placement_read
+  ansible.builtin.command:
+    argv:
+    - '{{ h.tools.python3 }}'
+    - -c
+    - '{{ run_code }}'
+    - run-v2
+    - '{{ b | to_json }}'
+    - '{{ placement_phase }}'
+    - '0'
+    - '0'
+    - '{{ [h.tools.python3, "-c", placement_code, "@BUDGET@", placement_phase, placement_expected | to_json] | to_json }}'
+  register: _placement_io
+  changed_when: false
+  check_mode: false
+  environment:
+    LC_ALL: C
+- name: placement_transport
+  ansible.builtin.assert:
+    that:
+    - _placement_io.rc == 0
+    - io_result.schema == "qcl.host-swap.io-result.v1"
+    - io_result.usage.schema == "qcl.host-swap.budget.v1"
+    - io_result.usage.sequence == b.sequence + 1
+    - io_result.usage.attempt_id == b.attempt_id
+    - io_result.usage.boot_id == b.boot_id
+    - io_result.usage.limits == b.limits
+    - io_result.usage.started_monotonic_ns == b.started_monotonic_ns
+    - io_result.usage.deadline_monotonic_ns == b.deadline_monotonic_ns
+    - io_result.usage.last_monotonic_ns >= b.last_monotonic_ns
+    - io_result.usage.phase_elapsed_ns.preflight >= b.phase_elapsed_ns.preflight
+    - io_result.usage.phase_elapsed_ns.allocation >= b.phase_elapsed_ns.allocation
+    - io_result.usage.phase_elapsed_ns.activation >= b.phase_elapsed_ns.activation
+    - io_result.usage.output_bytes > b.output_bytes
+    - io_result.usage.output_bytes <= b.limits.output_bytes
+    - io_result.usage.write_bytes_reserved == b.write_bytes_reserved + (0)
+    - io_result.usage.metadata_bytes_reserved == b.metadata_bytes_reserved + (0)
+    - io_result.owned_children_complete is sameas true
+    - io_result.failure == none
+    - io_result.rc in [0]
+    fail_msg: host_swap:placement_transport
+  vars:
+    io_result: '{{ _placement_io.stdout | from_json }}'
+- name: placement_response
+  ansible.builtin.set_fact:
+    b: '{{ (_placement_io.stdout | from_json).usage }}'
+    placement_observed: '{{ (_placement_io.stdout | from_json).stdout_b64 | b64decode | from_json }}'
+- name: placement_observation
+  ansible.builtin.assert:
+    that:
+    - placement_observed.keys() | list | sort == ['context_sha256','entry_count','host_namespace','schema','sha256','stat']
+    - placement_observed.schema == 'qcl.host-swap.placement-observation.v1'
+    - placement_observed.sha256 == w.placement_admission.sha256
+    - placement_observed.context_sha256 == context_sha
+    - placement_observed.entry_count is integer
+    - placement_observed.entry_count is not boolean
+    - 0 <= placement_observed.entry_count <= w.budgets.maximum_extents
+    - placement_observed.host_namespace is string
+    - placement_observed.host_namespace | length > 0
+    - placement_initial_namespace is not defined or placement_observed.host_namespace == placement_initial_namespace
+    - placement_observed.stat.kind == 'regular'
+    - placement_observed.stat.uid == 0 and placement_observed.stat.gid == 0
+    - placement_observed.stat.mode == 384 and placement_observed.stat.nlink == 1
+    - placement_initial_stat is not defined or placement_observed.stat == placement_initial_stat
+    fail_msg: host_swap:placement_observation
+- name: placement_baseline
+  ansible.builtin.set_fact:
+    placement_initial_stat: '{{ placement_observed.stat }}'
+    placement_initial_namespace: '{{ placement_observed.host_namespace }}'

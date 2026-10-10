@@ -54,9 +54,17 @@ revisions; no separate source lock is maintained here. Nix inputs are pinned by 
 For platform-only checks, from this repository:
 
 ```sh
-nix develop --command deno task check
+nix develop --no-update-lock-file --command deno task check
 nix build --no-link --no-update-lock-file .#checks.x86_64-linux.slurm-vm
 ```
+
+The shared operations/devShell environment declares Python 3.14 and ansible-core 2.21.1,
+with community.general 13.4.0 and community.library_inventory_filtering_v1 1.1.5 from
+fixed upstream archives. Versions are checked against [Ansible requirements](ansible/requirements.yml).
+The storage, cutover and swap fixtures require this environment and verify the actual
+interpreter, engine files and collection resolver origins before running YAML; missing or
+foreign dependencies fail setup. Collection unpacking belongs to the Nix dependency derivation.
+These recording fixtures do not establish native host enforcement, boot or scientific acceptance.
 
 The Slurm test boots storage, controller and worker VMs, submits a batch job, checks shared output
 ownership and verifies result persistence across controller restart. It needs a Linux builder with

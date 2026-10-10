@@ -14,6 +14,8 @@ import stat
 import pytest
 import yaml
 
+pytestmark = pytest.mark.usefixtures("ansible_test_environment")
+
 BASE = Path(__file__).resolve().parents[1]
 UUID = "22222222-2222-4222-8222-222222222222"
 
@@ -328,12 +330,8 @@ def run_playbook(tmp_path, monkeypatch, scenario):
     from ansible.executor.playbook_executor import PlaybookExecutor
     from ansible.executor.task_executor import TaskExecutor
     from ansible.plugins.action import ActionBase
-    from ansible.plugins.loader import init_plugin_loader
     from ansible.plugins.connection.local import Connection
-    from ansible.utils.collection_loader import AnsibleCollectionConfig
     from ansible.template import Templar, trust_as_template
-    if AnsibleCollectionConfig.collection_finder is None: init_plugin_loader()
-    assert json.loads(Path("/tmp/qcl-host-storage-ansible/ansible_collections/community/general/MANIFEST.json").read_text())["collection_info"]["version"] == "13.4.0"
     monkeypatch.setenv("ANSIBLE_LOCAL_TEMP", str(tmp_path / "ansible-local"))
     source = tree(tmp_path)
     stage = tmp_path / "stage"; stage.mkdir()

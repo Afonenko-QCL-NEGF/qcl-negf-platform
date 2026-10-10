@@ -33,6 +33,52 @@ Parent, file, receipts и `.swap` unit имеют lifetime
 private `binding_sha256` канонического original binding на resume. Управление
 содержимым protected directory имеет одного владельца для exact file/unit.
 
+Enabled swap дополнительно требует private `swap.placement_admission.path/sha256`:
+канонический digest-bound `qcl.host-swap.placement-admission.v1` record от отдельно
+проверенного native collector/coordinator. Это одна fresh per-attempt ссылка;
+record находится вне final filesystem, receipts и frozen wipe targets. Проверка
+не создаёт admission и не добавляет retained phase. Допускается dedicated parent
+в принятом `/var/lib/vz`, если весь exact placement proof проходит; conventional
+имена `images`/`snippets` сами по себе не являются доказательством безопасности.
+
+Record связывает current accepted source/host/boot/attempt/owner/expiry, original
+context, held cooperative window, complete frozen PVE configuration/reference
+capture, namespace/consumer capture и exact D04 wipe set с protected exclusions.
+Namespace locations сохраняют native FSROOT и root-relative coordinates; absent
+content directories и configuration references не отбрасываются. Same-device
+physical overlap, exact inode aliases, lexical wipe overlap и relevant consumers
+дают отказ. Raw block refs/wipe targets связываются с полным направленным native
+backing graph: disk/partition/PV/data/metadata/pool ancestors защищены даже с другим
+rdev. Isolated thin sibling допускается только с distinct native thin ID/LV UUID,
+тем же pool и explicit installed kernel-isolation evidence; shared PV не означает
+raw ancestor access и не отменяет reserve guards.
+
+Тот же proof child на каждой границе наблюдает current stat-device exact parent,
+file, receipts, admission, unit fragment и их containing directories. Для ещё
+отсутствующего объекта берётся только closest existing canonical ancestor;
+symlink/error/race отказывают. Все filesystem carriers должны иметь exact native
+association и fs_uuid в том же complete graph. Защищённое множество включает их
+всех, а не только image LV: raw wipe root FS с admission/receipts/unit также
+отказывается. Unknown association не считается disjoint. Эти metadata observations
+не выполняют topology discovery и не присваивают неизвестному объекту ownership.
+
+Initial proof и ровно по одному proof перед каждым из 16 logical mutations
+выполняются через existing `run-v2` child boundary; максимум 17 bounded reads.
+Каждый сохраняет фазу/identity/deadline, обновляет sequence/time/output usage и имеет
+zero write/metadata precharge. Raw bytes используют `maximum_record_bytes`; graph,
+references и evidence-ID entries — existing `maximum_extents`. Новый budget/clock
+не вводится и caps не увеличиваются автоматически. Changed/revoked proof или inode
+останавливает следующую mutation, сохраняя исходные receipts и sticky intent;
+после фактической activation failure может оставить active swap без completion.
+Failed-start diagnostic path остаётся прежним. Proof/current backing facts не входят
+в original v2 context, binding, unit hash или phase schemas: fresh admission на
+resume не переписывает durable identity/provenance.
+
+Synthetic validator/recording tests проверяют linkage и refusal predicates.
+Complete native capture, held exclusion window, installed mapping support, operational
+admission, boot/pressure и scientific acceptance остаются отдельными gates;
+данный source contract не доказывает их и не создаёт live placement admission.
+
 Создание использует mkdir0700 и O_CREAT|O_EXCL|O_NOFOLLOW0600. Fsync containing
 parent нового directory выполняется до fsync нового directory. File и его parent
 fsync предшествуют durable binding. Binding/phase records — immutable v2 envelopes: bounded standard-library

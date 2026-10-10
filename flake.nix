@@ -33,12 +33,18 @@
       import ./nix/local-lab.nix { inherit nixpkgs site system; platform = self; };
     lib.mkImages = { configurations }:
       import ./nix/images.nix { inherit nixpkgs configurations; };
-    devShells = forAll (system: let pkgs = nixpkgs.legacyPackages.${system}; in {
-      default = pkgs.mkShell {
-        packages = with pkgs; [ deno git nix nixos-rebuild uv python314 nodejs_24 opentofu ansible ];
-      };
+    devShells = forAll (system: let
+      pkgs = nixpkgs.legacyPackages.${system};
+      testEnvironment = import ./nix/operations-test-environment.nix { inherit pkgs; };
+    in {
+      default = pkgs.mkShell (testEnvironment.environment // {
+        packages = with pkgs; [ deno git nix nixos-rebuild uv nodejs_24 opentofu testEnvironment.python ];
+      });
     });
-    checks = forAll (system: let pkgs = nixpkgs.legacyPackages.${system}; in {
+    checks = forAll (system: let
+      pkgs = nixpkgs.legacyPackages.${system};
+      testEnvironment = import ./nix/operations-test-environment.nix { inherit pkgs; };
+    in {
       infrastructure = let
         checked = import ./tests/infrastructure/invariants.nix { inherit nixpkgs; platform = self; };
         checkedProduction = import ./tests/infrastructure/production-template.nix { inherit nixpkgs; platform = self; };
@@ -52,7 +58,7 @@
         checkedMonitoring = import ./tests/infrastructure/monitoring.nix { nixpkgs = nixpkgs.outPath; };
       in builtins.deepSeq [ checked checkedProduction checkedMunge checkedBuilder checkedRunner checkedRunnerRouting checkedRelease checkedMonitoring checkedLocalLab checkedSlurmNetwork ] (pkgs.runCommand "qcl-negf-infrastructure-check" {} "touch $out");
       slurm-vm = import ./tests/slurm-vm.nix { inherit pkgs; module = self.nixosModules.default; };
-      operations = pkgs.runCommand "qcl-negf-operations-check" { nativeBuildInputs = [ pkgs.deno pkgs.ansible pkgs.nix (pkgs.python314.withPackages (ps: [ ps.pytest ])) ]; } ''
+      operations = pkgs.runCommand "qcl-negf-operations-check" (testEnvironment.environment // { nativeBuildInputs = [ pkgs.deno pkgs.nix testEnvironment.python ]; }) ''
         cp -r ${./.} source
         chmod -R u+w source
         cd source

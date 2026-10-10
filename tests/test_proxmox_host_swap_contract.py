@@ -12,6 +12,8 @@ import struct
 import pytest
 import yaml
 
+pytestmark = pytest.mark.usefixtures("ansible_test_environment")
+
 BASE = Path(__file__).resolve().parents[1]
 MIB = 1048576
 UUID = '33333333-3333-4333-8333-333333333333'
@@ -29,7 +31,7 @@ def settings():
         tools={n:'/usr/bin/'+n.replace('_','-') for n in ['python3','dd','mkswap','swapon','blkid','timeout','systemctl','systemd_escape','findmnt','realpath','lvs','df','getconf','busctl','wipefs']},
         swap=dict(enabled=True, path=PATH, parent='/srv/final/protected-swap', unit=UNIT,
             target_mib=4, authorized_cap_mib=8, header_uuid=UUID, lifetime='protected-host-infrastructure',
-            receipts=REC, binding_sha256=None, mount=dict(path='/srv/final', unit='srv-final.mount',
+            receipts=REC, binding_sha256=None, placement_admission=dict(path='/var/lib/host-infrastructure/placement.json',sha256=None), mount=dict(path='/srv/final', unit='srv-final.mount',
                 device='/dev/mapper/final', rdev='253:4', fs_uuid=FS, lv_uuid='image-lv', vg_uuid='vg-id', pool_uuid='pool-id',
                 cutover_receipt='accepted-native-final', accepted=True),
             support=dict(fresh=True, receipt='tools-ext4-fiemap', page_bytes=4096, minimum_file_pages=10,
@@ -39,7 +41,7 @@ def settings():
                 data_overhead_bytes=MIB, metadata_growth_bytes=MIB, metadata_reserve_bytes=MIB,
                 filesystem_growth_bytes=MIB, filesystem_reserve_bytes=MIB),
             budgets=dict(preflight_seconds=100, allocation_seconds=100, activation_seconds=40, aggregate_seconds=240,
-                maximum_write_bytes=4*MIB+4096+65536,maximum_metadata_write_bytes=65536, maximum_extents=16, maximum_probe_bytes=4096, maximum_record_bytes=16384,
+                maximum_write_bytes=4*MIB+4096+65536,maximum_metadata_write_bytes=65536, maximum_extents=256, maximum_probe_bytes=4096, maximum_record_bytes=16384,
                 maximum_output_bytes=524288, maximum_swap_rows=16)))
 
 
@@ -311,7 +313,9 @@ def parse_native_cli(argv,cfg):
 
 
 def execute(cfg,s,tmp_path,monkeypatch,*,syntax=False):
-    monkeypatch.setenv('ANSIBLE_COLLECTIONS_PATH','/tmp/qcl-host-storage-ansible')
+    if cfg.get('swap',{}).get('enabled') and 'placement_record' not in s:
+        from test_host_swap_placement_admission import fixture as placement_fixture
+        proof,expected=placement_fixture(cfg);cfg['swap']['placement_admission']['sha256']=expected['w']['placement_admission']['sha256'];s['placement_record']=proof
     monkeypatch.setenv('ANSIBLE_LOCAL_TEMP',str(tmp_path/'ansible-local'))
     from ansible import context
     from ansible.module_utils.common.collections import ImmutableDict
@@ -321,11 +325,7 @@ def execute(cfg,s,tmp_path,monkeypatch,*,syntax=False):
     from ansible.executor.playbook_executor import PlaybookExecutor
     from ansible.executor.task_executor import TaskExecutor
     from ansible.plugins.action import ActionBase
-    from ansible.plugins.loader import init_plugin_loader
     from ansible.plugins.connection.local import Connection
-    from ansible.utils.collection_loader import AnsibleCollectionConfig
-    assert json.loads(Path('/tmp/qcl-host-storage-ansible/ansible_collections/community/general/MANIFEST.json').read_text())['collection_info']['version']=='13.4.0'
-    if AnsibleCollectionConfig.collection_finder is None:init_plugin_loader()
     recording=tmp_path/'recording.json';recording.write_text(json.dumps(s))
     original=TaskExecutor._get_action_handler_with_module_context
     def forbidden(*args,**kwargs):raise AssertionError('native host operation escaped fake boundary')
@@ -368,13 +368,13 @@ def execute(cfg,s,tmp_path,monkeypatch,*,syntax=False):
                 s['probes'].append(cmd)
                 if cmd in ('clock-done','budget-refusal'):pass
                 elif cmd=='date':out['stdout']='100'
-                elif cmd=='cat':out['stdout']='fixture-host' if argv[-1]=='/etc/machine-id' else 'fixture-boot'
+                elif cmd=='cat':out['stdout']='fixture-host' if argv[-1]=='/etc/machine-id' else s.get('observed_boot_id','fixture-boot')
                 elif cmd=='getconf':out['stdout']=str(s['page_bytes'])
-                elif cmd=='systemd-escape':out['stdout']=UNIT
+                elif cmd=='systemd-escape':out['stdout']=cfg['swap']['unit']
                 elif cmd=='realpath':out['stdout']='/dev/dm-4'
                 elif cmd=='stat':out['stdout']='253:4'
                 elif cmd=='findmnt':
-                    row=dict(target='/srv/final',source='/dev/mapper/final',uuid=s['fs'],fstype=s['fs_type'],fsroot='/',**{'maj:min':'253:4'})
+                    row=dict(target=cfg['swap']['mount']['path'],source=cfg['swap']['mount']['device'],uuid=s['fs'],fstype=s['fs_type'],fsroot='/',**{'maj:min':'253:4'})
                     if '--target' in shape['options'] and s.get('submount'):
                         requested=shape['options']['--target']
                         if requested==s['submount']['target'] or requested.startswith(s['submount']['target']+'/'):
@@ -385,13 +385,13 @@ def execute(cfg,s,tmp_path,monkeypatch,*,syntax=False):
                         dict(lv_uuid='pool-id',vg_uuid='vg-id',lv_name='hostpool',segtype='thin-pool',lv_size=str(256*MIB),lv_metadata_size=str(32*MIB),
                             data_percent=str(100*(1-s['pool_free']/(256*MIB))),metadata_percent='' if s['metadata_free'] is None else str(100*(1-s['metadata_free']/(32*MIB))),
                             lv_attr=s.get('pool_attr','twi-a-tz--' if s['pool_healthy'] else 'twi-a-Fz--'),lv_health_status='' if s['pool_healthy'] else 'failed'),
-                        dict(lv_uuid='image-lv',vg_uuid='vg-id',lv_name='final',segtype='thin',pool_lv='hostpool',lv_size=str(512*MIB),lv_path='/dev/mapper/final')]}]})
+                        dict(lv_uuid='image-lv',vg_uuid='vg-id',lv_name='final',segtype='thin',pool_lv='hostpool',lv_size=str(512*MIB),lv_path=cfg['swap']['mount']['device'])]}]})
                 elif cmd=='df':out['stdout']='Avail\n  '+str(s['fs_free'])
                 elif cmd=='swapon':
                     old=dict(OLD)
                     if s['used_changes']:old['used']+=1234
                     rows=[] if s['old_changed'] and s['active'] else [old]
-                    if s['active']:rows.append(dict(name=PATH,type='file',size=4*MIB-(8192 if s['malformed']=='usable' else 4096),used=0,prio=-3))
+                    if s['active']:rows.append(dict(name=cfg['swap']['path'],type='file',size=4*MIB-(8192 if s['malformed']=='usable' else 4096),used=0,prio=-3))
                     out['stdout']=json.dumps({'swaps':rows})
                 elif cmd=='wipefs':
                     signatures=[] if s['signature'] is None else [dict(type=s['signature']['TYPE'],uuid=s['signature']['UUID'])]
@@ -402,12 +402,12 @@ def execute(cfg,s,tmp_path,monkeypatch,*,syntax=False):
                     elif operands[3]=='org.freedesktop.systemd1.Unit':
                         props=['Id','FragmentPath','DropInPaths','NeedDaemonReload','DefaultDependencies','LoadState','ActiveState','UnitFileState','Requires','After','RequiresMountsFor','Conditions','ConditionResult']
                         assert operands[4:]==props
-                        values=[UNIT,'/etc/systemd/system/'+UNIT,[],False,True,'loaded','active' if s['unit_active'] else 'inactive','enabled' if s['unit_enabled'] else 'disabled',['srv-final.mount'],['srv-final.mount'],['/srv/final',cfg['swap']['path']],s.get('conditions',[['ConditionPathIsMountPoint',False,False,'/srv/final',1 if s['unit_active'] else 0]]),s['unit_active']]
+                        values=[cfg['swap']['unit'],'/etc/systemd/system/'+cfg['swap']['unit'],[],False,True,'loaded','active' if s['unit_active'] else 'inactive','enabled' if s['unit_enabled'] else 'disabled',[cfg['swap']['mount']['unit']],[cfg['swap']['mount']['unit']],[cfg['swap']['mount']['path'],cfg['swap']['path']],s.get('conditions',[['ConditionPathIsMountPoint',False,False,cfg['swap']['mount']['path'],1 if s['unit_active'] else 0]]),s['unit_active']]
                         signatures=['s','s','as','b','b','s','s','s','as','as','as','a(sbbsi)','b']
                         out['stdout']='\n'.join(json.dumps({'type':t,'data':v}) for t,v in zip(signatures,values))
                     else:
                         assert operands[3]=='org.freedesktop.systemd1.Swap' and operands[4:]==['What','Options','TimeoutUSec']
-                        out['stdout']='\n'.join(json.dumps({'type':t,'data':v}) for t,v in [('s','/foreign' if s['policy_bad'] else PATH),('s',''),('t',cfg['swap']['budgets']['activation_seconds']*1000000)])
+                        out['stdout']='\n'.join(json.dumps({'type':t,'data':v}) for t,v in [('s','/foreign' if s['policy_bad'] else cfg['swap']['path']),('s',''),('t',cfg['swap']['budgets']['activation_seconds']*1000000)])
                 elif cmd=='blkid':
                     if s['failure']=='signature-error':out.update(failed=True,rc=4,stderr='unknown signature')
                     elif s['signature']:out['stdout']='\n'.join(k+'='+v for k,v in s['signature'].items())
@@ -427,15 +427,15 @@ def execute(cfg,s,tmp_path,monkeypatch,*,syntax=False):
                 elif cmd=='systemctl':
                     operation=shape['operands'][0]
                     if operation=='show':
-                        if shape['operands'][1]=='srv-final.mount':
-                            out['stdout']='\n'.join(k+'='+v for k,v in dict(LoadState='loaded' if s['mount_loaded'] else 'not-found',What='/dev/mapper/final',Where='/srv/final',Type='ext4',FragmentPath='/etc/systemd/system/srv-final.mount',DropInPaths='',NeedDaemonReload='no',ForceUnmount='no',LazyUnmount='no',Options='rw').items())
-                        else:out['stdout']='\n'.join(k+'='+v for k,v in dict(LoadState='loaded' if s['unit_exists'] else 'not-found',ActiveState='active' if s['unit_active'] else 'inactive',UnitFileState='enabled' if s['unit_enabled'] else 'disabled',What='/foreign' if s['policy_bad'] else PATH,FragmentPath='/etc/systemd/system/'+UNIT,DropInPaths='',NeedDaemonReload='no',Options='',DefaultDependencies='yes',Requires='srv-final.mount',After='srv-final.mount').items())
+                        if shape['operands'][1]==cfg['swap']['mount']['unit']:
+                            out['stdout']='\n'.join(k+'='+v for k,v in dict(LoadState='loaded' if s['mount_loaded'] else 'not-found',What=cfg['swap']['mount']['device'],Where=cfg['swap']['mount']['path'],Type='ext4',FragmentPath='/etc/systemd/system/'+cfg['swap']['mount']['unit'],DropInPaths='',NeedDaemonReload='no',ForceUnmount='no',LazyUnmount='no',Options='rw').items())
+                        else:out['stdout']='\n'.join(k+'='+v for k,v in dict(LoadState='loaded' if s['unit_exists'] else 'not-found',ActiveState='active' if s['unit_active'] else 'inactive',UnitFileState='enabled' if s['unit_enabled'] else 'disabled',What='/foreign' if s['policy_bad'] else cfg['swap']['path'],FragmentPath='/etc/systemd/system/'+cfg['swap']['unit'],DropInPaths='',NeedDaemonReload='no',Options='',DefaultDependencies='yes',Requires=cfg['swap']['mount']['unit'],After=cfg['swap']['mount']['unit']).items())
                         requested=shape['options']['--property'].split(',')
                         fields=dict(row.split('=',1) for row in out['stdout'].splitlines())
                         assert all(key in fields for key in requested)
                         out['stdout']='\n'.join(key+'='+fields[key] for key in requested)
                     elif operation=='start':
-                        assert shape['operands'][1]==UNIT and s['records'].get('activation_intent')
+                        assert shape['operands'][1]==cfg['swap']['unit'] and s['records'].get('activation_intent')
                         trace('start');s.update(active=True,unit_active=True)
                         if s['failure']=='activation-timeout-late':out.update(failed=True,rc=124,stderr='late activation')
                         if s['failure']=='start-inactive':s.update(active=False,unit_active=False);out.update(rc=1,stderr='failed inactive')
@@ -445,12 +445,25 @@ def execute(cfg,s,tmp_path,monkeypatch,*,syntax=False):
                     else:raise AssertionError('prohibited systemctl mutation '+repr(argv))
                 elif cmd=='python3':
                     if 'machine-id' in argv[2]:out['stdout']='fixture-host'
-                    elif 'boot_id' in argv[2] and len(argv)==3:out['stdout']='fixture-boot'
+                    elif 'boot_id' in argv[2] and len(argv)==3:out['stdout']=s.get('observed_boot_id','fixture-boot')
+                    elif argv[2].rstrip().endswith('placement_main()'):
+                        from test_host_swap_placement_admission import validator,encoded,protected_frame
+                        expected=json.loads(argv[5]);boundary=expected['boundary'];w=expected['w'];proof=json.loads(json.dumps(s['placement_record']))
+                        assert write==metadata==0 and expected['attempt_id']==incoming['attempt_id']
+                        expected['host_namespace']='mnt:[fixture-host]';expected['protected_objects']=protected_frame(w,s)
+                        proofstat=dict(dev=os.makedev(8,1),dev_major=8,dev_minor=1,inode=100,nlink=1,uid=0,gid=0,mode=384,size=len(encoded(proof)),blocks=8,mtime_ns=100,ctime_ns=100,kind='regular')
+                        if s.get('placement_failure_before')==boundary:proof['window']['held']=False
+                        if s.get('placement_stat_before')==boundary:proofstat['inode']=101
+                        try:
+                            result=validator().validate(encoded(proof),expected,maximum_bytes=w['budgets']['maximum_record_bytes'],maximum_entries=w['budgets']['maximum_extents'])
+                            out['stdout']=json.dumps(dict(schema='qcl.host-swap.placement-observation.v1',sha256=w['placement_admission']['sha256'],stat=proofstat,**result))
+                        except ValueError as error:out.update(rc=1,stdout='',stderr=str(error))
+                        s.setdefault('placement_reads',[]).append(dict(index=event['index'],boundary=boundary,phase=phase,sequence=wire_usage['sequence'],rc=out['rc'],frame=expected['protected_objects']))
                     elif argv[2]==data[0]['vars']['probe_code']:
-                        assert len(argv)==8 and argv[5]==PATH
+                        assert len(argv)==8 and argv[5]==cfg['swap']['path']
                         parent_dev=s.get('parent_dev',os.makedev(253,4))
                         parent=dict(exists=s['parent_exists'],path=cfg['swap']['parent'],dev=parent_dev,dev_major=os.major(parent_dev),dev_minor=os.minor(parent_dev),inode=80,nlink=2,uid=0 if s['owned'] or not s['parent_exists'] or s.get('safe_parent') else 1000,gid=0,mode=448,kind='directory')
-                        ancestor=dict(parent,exists=True,path=cfg['swap']['parent'] if s['parent_exists'] else '/srv/final')
+                        ancestor=dict(parent,exists=True,path=cfg['swap']['parent'] if s['parent_exists'] else cfg['swap']['mount']['path'])
                         if not s['parent_exists']:ancestor.update(dev=os.makedev(253,4),dev_major=253,dev_minor=4)
                         f=dict(s['file']);f.update(dev_major=os.major(f['dev']),dev_minor=os.minor(f['dev']))
                         out['stdout']=json.dumps(dict(exists=s['exists'],stat=f,parent=parent,ancestor=ancestor,coverage_complete=s['exists'] and not s['layout_bad'],unsupported_flags=2 if s['layout_bad']=='layout-unwritten' else 0,layout_hash=fixture_layout_hash(f['size']),stable=True,hole_offset=f['size'],observed_bytes=min(f['size'],4096),sample_sha256=fixture_sample_hash(s['signature']['UUID'] if s['signature'] else None,min(f['size'],4096),s.get('other_header_page',False)),header_metadata=dict(magic_hex='00000000000000000000' if s.get('other_header_page') else '53574150535041434532' if s['signature'] else '00000000000000000000',version=1 if s['signature'] else 0,last_page=63 if s.get('other_header_page') else 1023 if s['signature'] else 0,badpages=0,uuid=s['signature']['UUID'] if s['signature'] else '00000000-0000-0000-0000-000000000000')))
@@ -495,12 +508,12 @@ def execute(cfg,s,tmp_path,monkeypatch,*,syntax=False):
                             import base64
                             path=parameters[0];raw=base64.b64decode(parameters[1]);mode=int(parameters[2]);assert len(raw)<=int(parameters[3])
                             if path==cfg['swap']['receipts']+'/binding.json':assert 'binding' not in s['records']
-                            if path.startswith(REC+'/'):
+                            if path.startswith(cfg['swap']['receipts']+'/'):
                                 assert mode==384;phase=Path(path).stem;trace('record-'+phase)
                                 if phase=='completion' and s['failure']=='completion-failure':out.update(rc=1,stderr='completion durability failed')
                                 else:assert phase not in s['records'];s['records'][phase]=json.loads(raw);trace('seal-'+phase)
                             else:
-                                assert path=='/etc/systemd/system/'+UNIT and mode==420 and not s['unit_exists']
+                                assert path=='/etc/systemd/system/'+cfg['swap']['unit'] and mode==420 and not s['unit_exists']
                                 assert raw.decode()==expected_fragment(cfg);trace('unit');s['unit_exists']=True
                             out['stdout']='{}'
                         else:raise AssertionError('unexpected primitive '+operation)
@@ -525,7 +538,7 @@ def execute(cfg,s,tmp_path,monkeypatch,*,syntax=False):
                     out=dict(changed=False,rc=0,stdout=json.dumps(result,sort_keys=True,separators=(',',':')))
             elif action=='ansible.builtin.copy':
                 assert args['force'] is False and args['mode']=='0600'
-                assert args['dest'].startswith(REC+'/')
+                assert args['dest'].startswith(cfg['swap']['receipts']+'/')
                 phase=Path(args['dest']).name.split('.')[0]
                 trace('record-'+phase)
                 if phase=='completion' and s['failure']=='completion-failure':out.update(failed=True,rc=1,msg='completion durability failed')
@@ -533,7 +546,7 @@ def execute(cfg,s,tmp_path,monkeypatch,*,syntax=False):
             else:raise AssertionError('unexpected action '+str(action))
             recording.write_text(json.dumps(s));return out
     def handler(executor,templar):
-        if executor._task.action in ('ansible.builtin.assert','ansible.builtin.set_fact','ansible.builtin.debug','ansible.builtin.fail'):
+        if executor._task.action in ('ansible.builtin.assert','ansible.builtin.set_fact','ansible.builtin.debug','ansible.builtin.fail','ansible.builtin.include_tasks'):
             return original(executor,templar)
         from ansible.template import Templar
         return Fake(task=executor._task,connection=executor._connection,play_context=executor._play_context,
@@ -545,8 +558,10 @@ def execute(cfg,s,tmp_path,monkeypatch,*,syntax=False):
     source=BASE/'ansible/proxmox-host-swap.yml'
     data=yaml.safe_load(source.read_text()) if source.exists() else [dict(hosts='proxmox_hypervisors',gather_facts=False,tasks=[])]
     data[0]['become']=False;data[0]['vars']=dict(data[0].get('vars',{}),qcl_host_storage=cfg)
-    pb=tmp_path/'playbook.yml';pb.write_text(yaml.safe_dump(data,sort_keys=False))
-    if (BASE/'ansible/templates').exists():(tmp_path/'templates').symlink_to(BASE/'ansible/templates',target_is_directory=True)
+    pb=tmp_path/'ansible/playbook.yml';pb.parent.mkdir();pb.write_text(yaml.safe_dump(data,sort_keys=False))
+    if (BASE/'ansible/templates').exists():(pb.parent/'templates').symlink_to(BASE/'ansible/templates',target_is_directory=True)
+    (pb.parent/'tasks').symlink_to(BASE/'ansible/tasks',target_is_directory=True)
+    (tmp_path/'ops').symlink_to(BASE/'ops',target_is_directory=True)
     rc=PlaybookExecutor(playbooks=[str(pb)],inventory=inv,variable_manager=vm,loader=loader,passwords={}).run()
     return rc,json.loads(recording.read_text())
 
@@ -714,8 +729,24 @@ def test_directory_primitive_parent_entry_durability(tmp_path,monkeypatch):
 def test_actual_engine_syntax(tmp_path,monkeypatch):
     import ast
     data=yaml.safe_load((BASE/'ansible/proxmox-host-swap.yml').read_text())
+    # Literal fragments keep independent syntax checks. The composed child uses
+    # the same supported loader/template rendering and file lookup as the play.
+    from ansible.parsing.dataloader import DataLoader
+    from ansible.template import Templar
+    from ansible.plugins.loader import init_plugin_loader
+    from ansible.utils.collection_loader import AnsibleCollectionConfig
+    if AnsibleCollectionConfig.collection_finder is None:init_plugin_loader()
+    loader=DataLoader();loader.set_basedir(str(BASE/'ansible'))
+    loaded=loader.load_from_file(str(BASE/'ansible/proxmox-host-swap.yml'),trusted_as_template=True)
+    variables=dict(loaded[0]['vars'],playbook_dir=str(BASE/'ansible'))
     for name,code in data[0]['vars'].items():
-        if name.endswith('_code'):ast.parse(code,filename=name)
+        if name.endswith('_code') and name!='placement_code':ast.parse(code,filename=name)
+    rendered=Templar(loader=loader,variables=variables).template(variables['placement_code'])
+    expected=(data[0]['vars']['primitive_code'].replace("if __name__=='__main__':main_primitive()",'').rstrip()+'\n'
+              +(BASE/'ops/host_swap_placement_admission.py').read_text().rstrip()+'\n'
+              +data[0]['vars']['placement_entry_code'])
+    assert rendered==expected
+    ast.parse(rendered,filename='assembled-placement-child')
     ast.parse((BASE/'ops/host_swap_file_probe.py').read_text(),filename='readonly-helper')
     assert data[0]['hosts']=='proxmox_hypervisors' and data[0]['gather_facts'] is False
 
@@ -753,7 +784,7 @@ def actual_engine_syntax_after_whole_file(request,tmp_path_factory):
     with pytest.MonkeyPatch.context() as patch:
         syntax_dir=tmp_path_factory.mktemp('accepted-whole-file-syntax')
         result,observed=execute({},state(),syntax_dir,patch,syntax=True)
-        assert syntax_listing_matches(result,syntax_dir/'playbook.yml')
+        assert syntax_listing_matches(result,syntax_dir/'ansible/playbook.yml')
         assert observed['trace']==[] and observed['probes']==[]
         print('ACTUAL_ENGINE_SYNTAX_AFTER_WHOLE_FILE_PASS rc=0 native_probes=0')
 
@@ -1173,3 +1204,71 @@ def test_current_file_observation_stability(name,tmp_path,monkeypatch,capfd):
         assert len(earlier)==1 and json.loads(earlier[0]['stdout'])['stable'] is True
     else:assert starts==[]
     assert not any(r['index']>selected['index'] for r in trace)
+
+
+@pytest.mark.parametrize('mount', ['/var/lib/vz','/srv/final'])
+def test_actual_final_mount_placement_lifecycle(mount,tmp_path,monkeypatch,capfd):
+    cfg,s=settings(),state()
+    if mount=='/var/lib/vz':
+        cfg['swap'].update(path=mount+'/protected-swap/swapfile',parent=mount+'/protected-swap',unit='var-lib-vz-protected\\x2dswap-swapfile.swap')
+        cfg['swap']['mount'].update(path=mount,unit='var-lib-vz.mount')
+    # RED at old source: exact geometry blanket, all fake observations derive from cfg.
+    rc,observed=execute(cfg,s,tmp_path,monkeypatch)
+    output=retained_output(capfd)
+    assert rc==0, output
+    kinds=[row['kind'] for row in observed['trace']]
+    assert kinds.count('fill')==kinds.count('format')==kinds.count('start')==kinds.count('enable')==1
+    assert set(observed['records'])==set(PHASE_CHAIN)
+    assert_placement_counter_and_order(observed)
+    assert_lifecycle_history(observed)
+
+
+def assert_placement_counter_and_order(observed):
+    reads=observed['placement_reads'];assert 1<=len(reads)<=17 and reads[0]['boundary']=='initial'
+    mutations={'mkdir_parent','mkdir_receipts','create_exclusive','write_binding','full_dense_fill','write_allocation','write_format_intent','format_exact_page','write_header','publish_fragment','daemon_reload','write_unit','write_activation_intent','start_once','enable_exact','write_completion'}
+    events=[q for q in observed['events'] if q['action']=='ansible.builtin.command']
+    for event in events:
+        if event['task'] in mutations:
+            previous=[q for q in events if q['index']<event['index']][-1]
+            assert previous['task']=='placement_read'
+            proof=[r for r in reads if r['index']==previous['index']][0]
+            assert proof['boundary']==event['task'] and proof['rc']==0 and proof['phase']==event['phase']
+    for read in reads:
+        history=[h for h in observed['wire_usage_history'] if h['index']==read['index']][0]
+        assert history['precharge']==dict(write=0,metadata=0)
+        assert history['returned']['sequence']==history['incoming']['sequence']+1
+        assert history['returned']['output_bytes']>history['incoming']['output_bytes']
+        assert history['returned']['write_bytes_reserved']==history['incoming']['write_bytes_reserved']
+        assert history['returned']['metadata_bytes_reserved']==history['incoming']['metadata_bytes_reserved']
+
+
+@pytest.mark.parametrize('before,retained,forbidden',[('full_dense_fill',{'binding'},{'fill','format','start','enable'}),('format_exact_page',{'binding','allocation','format_intent'},{'format','start','enable'}),('write_activation_intent',{'binding','allocation','format_intent','header','unit'},{'start','enable'}),('start_once',{'binding','allocation','format_intent','header','unit','activation_intent'},{'start','enable'}),('enable_exact',{'binding','allocation','format_intent','header','unit','activation_intent'},{'enable'}),('write_completion',{'binding','allocation','format_intent','header','unit','activation_intent'},set())])
+def test_actual_placement_closure_stops_exact_mutation(before,retained,forbidden,tmp_path,monkeypatch,capfd):
+    cfg,s=settings(),state();s['placement_failure_before']=before
+    rc,observed=execute(cfg,s,tmp_path,monkeypatch);output=retained_output(capfd)
+    assert_boundary(rc,observed,output,'placement_transport',forbidden=forbidden)
+    assert set(observed['records'])==retained and observed['placement_reads'][-1]['boundary']==before
+    assert observed['placement_reads'][-1]['rc']==1
+    assert not any(e['task']==before for e in observed['events'])
+    if before in ('enable_exact','write_completion'):assert observed['active']
+    if before=='write_completion':assert observed['unit_enabled'] and 'completion' not in observed['records']
+
+
+def test_actual_placement_stat_change_refuses_before_fill(tmp_path,monkeypatch,capfd):
+    cfg,s=settings(),state();s['placement_stat_before']='full_dense_fill'
+    rc,observed=execute(cfg,s,tmp_path,monkeypatch);output=retained_output(capfd)
+    assert_boundary(rc,observed,output,'placement_observation',forbidden={'fill','format','start'})
+    assert set(observed['records'])=={'binding'} and observed['placement_reads'][-1]['boundary']=='full_dense_fill'
+
+
+def test_fresh_placement_on_old_binding_preserves_original_bytes(tmp_path,monkeypatch,capfd):
+    cfg,s=settings(),state();seed_owned(cfg,s,stage='completed')
+    before={key:canonical_fixture(value) for key,value in s['records'].items()};digest=cfg['swap']['binding_sha256']
+    cfg.update(accepted_source='fresh-reviewed-source',attempt_id='fresh-attempt',boot_id='fresh-boot')
+    s['observed_boot_id']=cfg['boot_id']
+    cfg['admission']['operation_owner']='fresh-attempt'
+    rc,observed=execute(cfg,s,tmp_path,monkeypatch);output=retained_output(capfd)
+    assert rc==0,output
+    assert {key:canonical_fixture(value) for key,value in observed['records'].items()}==before
+    assert cfg['swap']['binding_sha256']==digest
+    assert len(observed['placement_reads'])==1 and observed['placement_reads'][0]['boundary']=='initial'

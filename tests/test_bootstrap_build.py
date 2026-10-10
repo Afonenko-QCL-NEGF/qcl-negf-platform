@@ -240,3 +240,91 @@ def test_namespace_child_refuses_host_namespace_before_any_mount(tmp_path):
                os.readlink("/proc/self/ns/mnt"), os.readlink("/proc/self/ns/net")], 5, 4096)
     assert "Separate root mount/network engineering namespace required" in error.value.record["stderr"]
     assert "invalid/mount" not in error.value.record["stderr"]
+
+
+def test_successfully_reaped_command_does_not_signal_obsolete_group(monkeypatch):
+    """Completed command identity cannot authorize a later numeric group signal."""
+    m = load()
+    attempted = []
+    # Never deliver a signal. The assertion diagnoses obsolete group signalling;
+    # process ownership/descendant containment need separate GREEN evidence.
+    monkeypatch.setattr(m.os, "killpg", lambda pgid, sig: attempted.append((pgid, sig)))
+    result = m.run([str(Path(sys.executable).resolve()), "-c", "print('completed')"], seconds=2, cap=1024)
+    assert result["exit_code"] == 0 and result["failure"] is None
+    assert result["stdout"] == "completed\n"
+    assert attempted == [], "obsolete numeric group identity signalled after reap"
+
+
+@pytest.mark.parametrize('escaped', [False, True])
+def test_command_supervision_reaps_descendants_and_preserves_foreign_sentinel(tmp_path, escaped):
+    """Tiny local fork fixture: own descendants only, including a new session."""
+    import subprocess
+    import time
+    m = load()
+    sentinel = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)'])
+    evidence = tmp_path / 'owned-child.json'
+    source = """import json,os,pathlib,sys,time
+pid=os.fork()
+if pid==0:
+ if sys.argv[2]=='true':os.setsid()
+ fields=pathlib.Path('/proc/self/stat').read_text().rsplit(') ',1)[1].split()
+ pathlib.Path(sys.argv[1]).write_text(json.dumps({'pid':os.getpid(),'birth':int(fields[19])}))
+ print('owned child diagnostic',file=sys.stderr,flush=True)
+ time.sleep(10)
+else:os._exit(0)
+"""
+    try:
+        with pytest.raises(m.CommandFailure) as error:
+            m.run([str(Path(sys.executable).resolve()), '-c', source, str(evidence), str(escaped).lower()], 2, 4096)
+        assert error.value.record['failure'] == 'deadline'
+        assert 'owned child diagnostic' in error.value.record['stderr']
+        assert sentinel.poll() is None, 'unrelated process was signalled'
+        child = json.loads(evidence.read_text())
+        path = Path('/proc') / str(child['pid']) / 'stat'
+        if path.exists():
+            fields = path.read_text().rsplit(') ', 1)[1].split()
+            assert int(fields[19]) != child['birth'], 'owned descendant remains unreaped'
+    finally:
+        sentinel.terminate()
+        sentinel.wait(timeout=2)
+
+
+@pytest.mark.parametrize('drift', ['disappeared', 'birth', 'uid'])
+def test_pidfd_guard_refuses_disappeared_or_replaced_identity(monkeypatch, drift):
+    m = load()
+    owner = m._CommandOwner.__new__(m._CommandOwner)
+    owner.deadline = float('inf')
+    owner.owned = {(43210, 123, 1000): True}
+    owner.fds = {}
+    monkeypatch.setattr(owner, 'observe', lambda: {43210: (123, 1, b'S', 1000)})
+    def opened(pid, flags):
+        assert pid == 43210
+        if drift == 'disappeared':raise ProcessLookupError()
+        return 8765
+    monkeypatch.setattr(m.os, 'pidfd_open', opened)
+    monkeypatch.setattr(m.os, 'close', lambda fd: None)
+    monkeypatch.setattr(owner, 'row', lambda pid: (124 if drift == 'birth' else 123, 1, b'S', 1001 if drift == 'uid' else 1000))
+    monkeypatch.setattr(m.signal, 'pidfd_send_signal', lambda *a: pytest.fail('foreign/reused process handle signalled'))
+    owner.signal(m.signal.SIGKILL)
+
+
+def test_timeout_preserves_sigterm_tail(tmp_path):
+    """The command can emit useful diagnostics after the work deadline."""
+    m = load()
+    ready = tmp_path / 'handler-ready'
+    source = """import signal,sys,time,pathlib
+def stop(signum, frame):
+ print('late-stdout',flush=True)
+ print('late-stderr',file=sys.stderr,flush=True)
+ raise SystemExit(0)
+signal.signal(signal.SIGTERM,stop)
+pathlib.Path(sys.argv[1]).write_text('SIGTERM handler armed')
+time.sleep(30)
+"""
+    with pytest.raises(m.CommandFailure) as error:
+        m.run([str(Path(sys.executable).resolve()), '-c', source, str(ready)], 2, 4096)
+    assert ready.read_text() == 'SIGTERM handler armed'
+    assert error.value.record['failure'] == 'deadline'
+    assert error.value.record['exit_code'] == 0
+    assert error.value.record['stdout'] == 'late-stdout\n'
+    assert error.value.record['stderr'] == 'late-stderr\n'

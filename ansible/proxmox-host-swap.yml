@@ -1777,6 +1777,55 @@
        observed=area_observation(row['name'])
        result.append(dict(name=observed['path'],type=row['type'],size=row['size'],prio=row['prio'],identity=observed['identity']))
       sys.stdout.buffer.write(canonical(sorted(result,key=lambda r:r['name']))+b'\n')
+    placement_entry_code: |
+      def protected_object(path,directory,u,phase):
+          wanted=parts(path);cursor='/';chain=[];missing=False
+          # Read only the bounded canonical prefixes; no directory inventory or topology.
+          for index,component in enumerate(('',)+wanted):
+              guard(u,phase)
+              if index:cursor=os.path.join(cursor,component)
+              try:before=os.lstat(cursor)
+              except FileNotFoundError:
+                  if not index:raise
+                  missing=True;cursor=os.path.dirname(cursor);break
+              if stat.S_ISLNK(before.st_mode) or (index<len(wanted) or directory) and not stat.S_ISDIR(before.st_mode):raise ValueError('protected component type')
+              chain.append((cursor,observed_stat(before)))
+          guard(u,phase)
+          fd=os.open(cursor,os.O_PATH|os.O_NOFOLLOW|os.O_CLOEXEC)
+          try:
+              before=os.fstat(fd);named=os.lstat(cursor);after=os.fstat(fd)
+              if observed_stat(before)!=observed_stat(after) or observed_stat(named)!=observed_stat(after):raise ValueError('protected object race')
+              if missing and not stat.S_ISDIR(after.st_mode):raise ValueError('closest ancestor directory')
+              for name,original in chain:
+                  guard(u,phase)
+                  if observed_stat(os.lstat(name))!=original:raise ValueError('protected component race')
+              if missing:
+                  absent=os.path.join(cursor,wanted[len(parts(cursor))])
+                  try:os.lstat(absent)
+                  except FileNotFoundError:pass
+                  else:raise ValueError('protected absence changed')
+              return dict(path=path,observed_path=cursor,exists=not missing,device=[os.major(after.st_dev),os.minor(after.st_dev)],inode=after.st_ino)
+          finally:os.close(fd)
+
+      def placement_main():
+          u=strict_load(sys.argv[1]);phase=sys.argv[2];guard(u,phase)
+          expected=strict_load(sys.argv[3]);w=expected['w'];reference=w['placement_admission']
+          raw,observed=read_bytes(reference['path'],w['budgets']['maximum_record_bytes'])
+          if observed['uid']!=0 or observed['gid']!=0 or observed['mode']!=384 or observed['nlink']!=1 or observed['kind']!='regular':raise ValueError('placement root-owned regular0600')
+          if hashlib.sha256(raw).hexdigest()!=reference['sha256']:raise ValueError('placement raw SHA')
+          expected['host_namespace']=os.readlink('/proc/self/ns/mnt')
+          frame=[dict(path=reference['path'],observed_path=reference['path'],exists=True,device=[observed['dev_major'],observed['dev_minor']],inode=observed['inode'])]
+          for path,directory in protected_requests(w,expected['fragment_path'])[1:]:
+              frame.append(protected_object(path,directory,u,phase))
+          # Recheck the proof leaf after metadata observations; never accept a replaced inode.
+          if observed_stat(os.lstat(reference['path']))!=observed:raise ValueError('placement named identity changed')
+          expected['protected_objects']=frame
+          result=validate(raw,expected,maximum_bytes=w['budgets']['maximum_record_bytes'],maximum_entries=w['budgets']['maximum_extents'],tick=lambda:guard(u,phase))
+          guard(u,phase)
+          out=dict(schema='qcl.host-swap.placement-observation.v1',sha256=reference['sha256'],stat=observed,**result)
+          sys.stdout.buffer.write(canonical(out)+b'\n')
+      placement_main()
+    placement_code: '{{ primitive_code.replace("if __name__==''__main__'':main_primitive()", "").rstrip() ~ ("%c" | format(10)) ~ lookup("ansible.builtin.file", playbook_dir + "/../ops/host_swap_placement_admission.py") ~ ("%c" | format(10)) ~ placement_entry_code }}'
   tasks:
   - name: Enabled private swap
     block:
@@ -1827,7 +1876,6 @@
         - '"." not in w.path.split("/")'
         - w.path | dirname == w.parent
         - w.parent.startswith(w.mount.path + "/")
-        - not w.path.startswith("/var/lib/vz/")
         - not w.receipts.startswith(w.mount.path + "/")
         - w.support.direct is sameas true
         - w.support.fiemap is sameas true
@@ -3903,6 +3951,11 @@
         - new_entry | length == 0 or (new_entry[0].type == "file" and new_entry[0].size == target_bytes-page_bytes)
         - load_entry.LoadState != "loaded" or "unit" in records
         fail_msg: host_swap:new_activity
+    - name: Initial current placement admission
+      ansible.builtin.include_tasks: tasks/proxmox-host-swap-placement-guard.yml
+      vars:
+        placement_phase: preflight
+        placement_boundary: initial
     - name: freeze_entry_decisions
       ansible.builtin.set_fact:
         allocate_this_entry: '{{ ("allocation" not in records) | bool }}'
@@ -3930,6 +3983,12 @@
           when: '"completion" not in records'
       - name: Prepare and prove allocation
         block:
+        - name: Current placement before mkdir_parent
+          ansible.builtin.include_tasks: tasks/proxmox-host-swap-placement-guard.yml
+          vars:
+            placement_phase: allocation
+            placement_boundary: mkdir_parent
+          when: not file_entry.parent.exists
         - name: mkdir_parent
           ansible.builtin.command:
             argv:
@@ -3982,6 +4041,12 @@
               (_io.stdout | from_json).stderr_b64 | b64decode} }}'
             b: '{{ (_io.stdout | from_json).usage }}'
           when: not file_entry.parent.exists
+        - name: Current placement before mkdir_receipts
+          ansible.builtin.include_tasks: tasks/proxmox-host-swap-placement-guard.yml
+          vars:
+            placement_phase: allocation
+            placement_boundary: mkdir_receipts
+          when: not record_area.exists
         - name: mkdir_receipts
           ansible.builtin.command:
             argv:
@@ -4034,6 +4099,12 @@
               "stderr": (_io.stdout | from_json).stderr_b64 | b64decode} }}'
             b: '{{ (_io.stdout | from_json).usage }}'
           when: not record_area.exists
+        - name: Current placement before create_exclusive
+          ansible.builtin.include_tasks: tasks/proxmox-host-swap-placement-guard.yml
+          vars:
+            placement_phase: allocation
+            placement_boundary: create_exclusive
+          when: not file_entry.exists
         - name: create_exclusive
           ansible.builtin.command:
             argv:
@@ -4292,6 +4363,12 @@
             that:
             - retained_record_bytes + binding_length <= w.budgets.maximum_record_bytes
             fail_msg: host_swap:binding_record_cap
+          when: '"binding" not in records'
+        - name: Current placement before write_binding
+          ansible.builtin.include_tasks: tasks/proxmox-host-swap-placement-guard.yml
+          vars:
+            placement_phase: allocation
+            placement_boundary: write_binding
           when: '"binding" not in records'
         - name: write_binding
           ansible.builtin.command:
@@ -4634,6 +4711,12 @@
             - file_before_fill.stable is sameas true
             fail_msg: host_swap:immediate_fill_identity
           when: '"allocation" not in records'
+        - name: Current placement before full_dense_fill
+          ansible.builtin.include_tasks: tasks/proxmox-host-swap-placement-guard.yml
+          vars:
+            placement_phase: allocation
+            placement_boundary: full_dense_fill
+          when: '"allocation" not in records'
         - name: full_dense_fill
           ansible.builtin.command:
             argv:
@@ -4841,6 +4924,12 @@
             that:
             - retained_record_bytes + length_allocation <= w.budgets.maximum_record_bytes
             fail_msg: host_swap:record_bytes_allocation
+          when: '"allocation" not in records'
+        - name: Current placement before write_allocation
+          ansible.builtin.include_tasks: tasks/proxmox-host-swap-placement-guard.yml
+          vars:
+            placement_phase: allocation
+            placement_boundary: write_allocation
           when: '"allocation" not in records'
         - name: write_allocation
           ansible.builtin.command:
@@ -5433,6 +5522,12 @@
             - retained_record_bytes + length_format_intent <= w.budgets.maximum_record_bytes
             fail_msg: host_swap:record_bytes_format_intent
           when: '"format_intent" not in records'
+        - name: Current placement before write_format_intent
+          ansible.builtin.include_tasks: tasks/proxmox-host-swap-placement-guard.yml
+          vars:
+            placement_phase: allocation
+            placement_boundary: write_format_intent
+          when: '"format_intent" not in records'
         - name: write_format_intent
           ansible.builtin.command:
             argv:
@@ -5623,6 +5718,12 @@
             - '{"dev":file_before_format.stat.dev,"inode":file_before_format.stat.inode,"nlink":file_before_format.stat.nlink,"uid":file_before_format.stat.uid,"gid":file_before_format.stat.gid,"mode":file_before_format.stat.mode,"kind":file_before_format.stat.kind}
               == file_identity'
             fail_msg: host_swap:immediate_before_format
+        - name: Current placement before format_exact_page
+          ansible.builtin.include_tasks: tasks/proxmox-host-swap-placement-guard.yml
+          vars:
+            placement_phase: allocation
+            placement_boundary: format_exact_page
+          when: '"header" not in records'
         - name: format_exact_page
           ansible.builtin.command:
             argv:
@@ -5969,6 +6070,12 @@
             - retained_record_bytes + length_header <= w.budgets.maximum_record_bytes
             fail_msg: host_swap:record_bytes_header
           when: '"header" not in records'
+        - name: Current placement before write_header
+          ansible.builtin.include_tasks: tasks/proxmox-host-swap-placement-guard.yml
+          vars:
+            placement_phase: allocation
+            placement_boundary: write_header
+          when: '"header" not in records'
         - name: write_header
           ansible.builtin.command:
             argv:
@@ -6030,6 +6137,12 @@
         when: format_this_entry
       - name: Prepare and prove unit
         block:
+        - name: Current placement before publish_fragment
+          ansible.builtin.include_tasks: tasks/proxmox-host-swap-placement-guard.yml
+          vars:
+            placement_phase: allocation
+            placement_boundary: publish_fragment
+          when: '"unit" not in records'
         - name: publish_fragment
           ansible.builtin.command:
             argv:
@@ -6082,6 +6195,12 @@
             _fragment_written: '{{ {"rc": (_io.stdout | from_json).rc, "stdout": (_io.stdout | from_json).stdout_b64 | b64decode,
               "stderr": (_io.stdout | from_json).stderr_b64 | b64decode} }}'
             b: '{{ (_io.stdout | from_json).usage }}'
+          when: '"unit" not in records'
+        - name: Current placement before daemon_reload
+          ansible.builtin.include_tasks: tasks/proxmox-host-swap-placement-guard.yml
+          vars:
+            placement_phase: allocation
+            placement_boundary: daemon_reload
           when: '"unit" not in records'
         - name: daemon_reload
           ansible.builtin.command:
@@ -6528,6 +6647,12 @@
             that:
             - retained_record_bytes + length_unit <= w.budgets.maximum_record_bytes
             fail_msg: host_swap:record_bytes_unit
+          when: '"unit" not in records'
+        - name: Current placement before write_unit
+          ansible.builtin.include_tasks: tasks/proxmox-host-swap-placement-guard.yml
+          vars:
+            placement_phase: allocation
+            placement_boundary: write_unit
           when: '"unit" not in records'
         - name: write_unit
           ansible.builtin.command:
@@ -7834,6 +7959,12 @@
             - retained_record_bytes + length_activation_intent <= w.budgets.maximum_record_bytes
             fail_msg: host_swap:record_bytes_activation_intent
           when: '"activation_intent" not in records'
+        - name: Current placement before write_activation_intent
+          ansible.builtin.include_tasks: tasks/proxmox-host-swap-placement-guard.yml
+          vars:
+            placement_phase: activation
+            placement_boundary: write_activation_intent
+          when: '"activation_intent" not in records'
         - name: write_activation_intent
           ansible.builtin.command:
             argv:
@@ -8023,6 +8154,11 @@
             - '{"dev":file_start_guard.stat.dev,"inode":file_start_guard.stat.inode,"nlink":file_start_guard.stat.nlink,"uid":file_start_guard.stat.uid,"gid":file_start_guard.stat.gid,"mode":file_start_guard.stat.mode,"kind":file_start_guard.stat.kind}
               == file_identity'
             fail_msg: host_swap:immediate_start_fs_header
+        - name: Current placement before start_once
+          ansible.builtin.include_tasks: tasks/proxmox-host-swap-placement-guard.yml
+          vars:
+            placement_phase: activation
+            placement_boundary: start_once
         - name: start_once
           ansible.builtin.command:
             argv:
@@ -9431,6 +9567,12 @@
             - '{"dev":file_post.stat.dev,"inode":file_post.stat.inode,"nlink":file_post.stat.nlink,"uid":file_post.stat.uid,"gid":file_post.stat.gid,"mode":file_post.stat.mode,"kind":file_post.stat.kind}
               == file_identity'
             fail_msg: host_swap:actual_new_swap
+        - name: Current placement before enable_exact
+          ansible.builtin.include_tasks: tasks/proxmox-host-swap-placement-guard.yml
+          vars:
+            placement_phase: activation
+            placement_boundary: enable_exact
+          when: props_post[7].data != "enabled"
         - name: enable_exact
           ansible.builtin.command:
             argv:
@@ -9871,6 +10013,12 @@
             that:
             - props_enabled[7].data == "enabled"
             fail_msg: host_swap:enabled_verified
+        - name: Current placement before write_completion
+          ansible.builtin.include_tasks: tasks/proxmox-host-swap-placement-guard.yml
+          vars:
+            placement_phase: activation
+            placement_boundary: write_completion
+          when: '"completion" not in records'
         - name: build_completion_envelope
           ansible.builtin.set_fact:
             envelope_completion: '{{ {"schema": "qcl.host-swap.completion.v2", "context_sha256": context_sha, "binding_sha256":

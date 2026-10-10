@@ -11,6 +11,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+pytestmark = pytest.mark.usefixtures("ansible_test_environment")
+
 BASE = Path(__file__).resolve().parents[1]
 MIB = 1048576
 
@@ -174,7 +176,6 @@ def lvs(state):
 @pytest.mark.parametrize("name,want,refused", CASES)
 def test_actual_ansible_action_contract(name, want, refused, tmp_path, monkeypatch):
     # A bad dispatch must not escape to a real command/module/SSH process.
-    monkeypatch.setenv("ANSIBLE_COLLECTIONS_PATH", "/tmp/qcl-host-storage-ansible")
     monkeypatch.setenv("ANSIBLE_LOCAL_TEMP", str(tmp_path/"ansible-local"))
     from ansible import context
     from ansible.module_utils.common.collections import ImmutableDict
@@ -184,13 +185,7 @@ def test_actual_ansible_action_contract(name, want, refused, tmp_path, monkeypat
     from ansible.executor.playbook_executor import PlaybookExecutor
     from ansible.executor.task_executor import TaskExecutor
     from ansible.plugins.action import ActionBase
-    from ansible.plugins.loader import init_plugin_loader
     from ansible.plugins.connection.local import Connection
-    from ansible.utils.collection_loader import AnsibleCollectionConfig
-    if AnsibleCollectionConfig.collection_finder is None:
-        init_plugin_loader()
-    manifest = Path('/tmp/qcl-host-storage-ansible/ansible_collections/community/general/MANIFEST.json')
-    assert json.loads(manifest.read_text())["collection_info"]["version"] == "13.4.0"
     cfg, state = configure(name, *fixture())
     state_path = tmp_path / "recording.json"
     state_path.write_text(json.dumps(state))
@@ -327,3 +322,22 @@ def test_actual_ansible_action_contract(name, want, refused, tmp_path, monkeypat
     assert observed["original_receipt"] == "failed-1"
     if name in ("root-grow", "fs-only-recovery", "root-complete"):
         assert observed["blocks"] == 32768 and observed["fs_uuid"] == "11111111-1111-4111-8111-111111111111"
+
+
+@pytest.mark.parametrize("foreign", ["engine_init", "engine_release", "executable", "process_executable"])
+def test_declared_origins_refuse_same_version_foreign_tree(foreign):
+    from conftest import _assert_declared_ansible_origins
+    expected = {
+        "base": "/declared/base", "launcher": "/declared/launcher",
+        "engine_init": "/declared/engine/ansible/__init__.py",
+        "engine_release": "/declared/engine/ansible/release.py", "engine_version": "2.21.1",
+    }
+    observed = {
+        "python_version": (3, 14), "engine_version": "2.21.1", "no_user_site": 1,
+        "executable": expected["launcher"], "process_executable": expected["base"],
+        "engine_init": expected["engine_init"], "engine_release": expected["engine_release"],
+    }
+    assert all(_assert_declared_ansible_origins(observed, expected).values())
+    observed[foreign] = "/foreign/same-version/" + foreign
+    with pytest.raises(ValueError, match="Declared Ansible origin mismatch"):
+        _assert_declared_ansible_origins(observed, expected)

@@ -41,6 +41,9 @@ qcl_host_storage:
     lifetime: protected-host-infrastructure
     receipts: null
     binding_sha256: null
+    placement_admission:
+      path: null
+      sha256: null
     mount:
       accepted: false
       cutover_receipt: null
