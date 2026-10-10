@@ -912,7 +912,7 @@ def test_independent_v2_native_and_record_guards(case,tmp_path,monkeypatch,capfd
         longest=[q for q in observed['native_queries'] if Path(q['argv'][0]).name=='findmnt' and '--target' in q['argv']]
         assert len(longest)==1 and longest[0]['argv'][longest[0]['argv'].index('--target')+1]==cfg['swap']['parent']
         actual=json.loads(longest[0]['stdout'])['filesystems'][0]
-        assert actual==s['submount'] and longest[0]['rc']==0 and longest[0]['stderr']=='' 
+        assert actual==s['submount'] and longest[0]['rc']==0 and longest[0]['stderr']==''
 
 
 @pytest.mark.parametrize('case',['duplicate-json','float-json','bool-counter','unknown-budget-key'])
