@@ -54,54 +54,329 @@ class CommandFailure(RuntimeError):
         super().__init__("Bootstrap command failed; inspect retained stdout/stderr")
 
 
-def run(argv, seconds=60, cap=1024 * 1024):
-    """Combined streaming bound, deadline, and unconditional owned-group cleanup."""
-    if not Path(argv[0]).is_absolute() or seconds <= 0 or cap <= 0:
-        raise ValueError("Explicit absolute executable and positive budget required")
-    process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               start_new_session=True)
-    streams = {"stdout": bytearray(), "stderr": bytearray()}
-    poller = selectors.DefaultSelector()
-    for name in streams:
-        poller.register(getattr(process, name), selectors.EVENT_READ, name)
-    deadline = time.monotonic() + seconds
-    failure = None
-    try:
-        while poller.get_map():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                failure = "deadline"
-                break
-            for key, _ in poller.select(min(remaining, 0.1)):
-                chunk = os.read(key.fileobj.fileno(), 65536)
-                if not chunk:
-                    poller.unregister(key.fileobj)
+class _CommandOwner:
+    """Per-supervisor ownership: baseline exclusion, ancestry, UID/birth and pidfds."""
+    def __init__(self, deadline):
+        self.deadline = deadline
+        self.owned = {}
+        self.fds = {}
+        self.baseline = self.scan()
+
+    def row(self, pid):
+        try:
+            path = Path('/proc') / str(pid)
+            uid = path.stat().st_uid
+            raw = (path / 'stat').read_bytes()
+            if len(raw) > 4096:
+                raise ValueError('proc identity bound')
+            fields = raw.rsplit(b') ', 1)[1].split()
+            return (int(fields[19]), int(fields[1]), fields[0], uid)
+        except (FileNotFoundError, ProcessLookupError):
+            return None
+
+    def scan(self):
+        result = {}
+        for path in Path('/proc').iterdir():
+            if time.monotonic() >= self.deadline:
+                raise TimeoutError('ownership observation deadline')
+            if not path.name.isdecimal():
+                continue
+            if len(result) >= 8192:
+                raise ValueError('proc enumeration bound')
+            row = self.row(int(path.name))
+            if row is not None:
+                result[int(path.name)] = row
+        return result
+
+    def observe(self):
+        rows = self.scan()
+        changed = True
+        while changed:
+            changed = False
+            for pid, row in rows.items():
+                key = (pid, row[0], row[3])
+                if pid == os.getpid() or key in self.owned or self.baseline.get(pid, (None,))[0] == row[0]:
                     continue
-                room = cap - sum(map(len, streams.values()))
+                if any(old[0] == pid and old[1] == row[0] and old[2] != row[3] for old in self.owned):
+                    raise ValueError('owned process UID drift')
+                parent = rows.get(row[1])
+                if row[1] == os.getpid() or parent is not None and (row[1], parent[0], parent[3]) in self.owned:
+                    self.owned[key] = True
+                    changed = True
+        return {pid: row for pid, row in rows.items() if (pid, row[0], row[3]) in self.owned}
+
+    def signal(self, sig):
+        for pid, row in self.observe().items():
+            if row[2] == b'Z':
+                continue
+            key = (pid, row[0], row[3])
+            fd = self.fds.get(key)
+            if fd is None:
+                try:
+                    fd = os.pidfd_open(pid, 0)
+                except ProcessLookupError:
+                    continue
+                current = self.row(pid)
+                if current is None or (current[0], current[3]) != (row[0], row[3]):
+                    os.close(fd)
+                    continue
+                self.fds[key] = fd
+            current = self.row(pid)
+            if current is None or (current[0], current[3]) != (row[0], row[3]):
+                continue
+            try:
+                signal.pidfd_send_signal(fd, sig, None, 0)
+            except ProcessLookupError:
+                pass
+
+    def reap(self, leader):
+        leader.poll()
+        for pid, row in self.observe().items():
+            if pid == leader.pid or row[2] != b'Z' or row[1] != os.getpid():
+                continue
+            current = self.row(pid)
+            if current is None or current[0] != row[0] or current[3] != row[3]:
+                continue
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+
+    def close(self):
+        for fd in self.fds.values():
+            os.close(fd)
+
+
+def _command_supervisor(status_fd, gate_fd, argv, end, work_end, cap):
+    """Fresh private subreaper holds its identity until the caller's ACK."""
+    import ctypes
+    if ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) != 0:
+        raise RuntimeError('private command subreaper unavailable')
+    owner = _CommandOwner(end)
+    selector = selectors.DefaultSelector()
+    streams = {'stdout': bytearray(), 'stderr': bytearray()}
+    process = None
+    failure = None
+    cleaning = False
+
+    def interrupted(signum, frame):
+        if not cleaning:
+            raise TimeoutError('caller cancelled command')
+
+    def drain_ready():
+        # Cleanup keeps the same combined cap and deadline as the work loop.
+        nonlocal failure
+        for key, _ in selector.select(0):
+            chunk = os.read(key.fd, 65536)
+            if not chunk:
+                selector.unregister(key.fileobj)
+                continue
+            room = max(0, cap-sum(map(len, streams.values())))
+            streams[key.data].extend(chunk[:room])
+            if len(chunk) > room:
+                failure = failure or 'output limit'
+                # Further bytes exceed the evidence budget; do not busy-drain them.
+                selector.unregister(key.fileobj)
+
+    signal.signal(signal.SIGTERM, interrupted)
+    os.set_blocking(gate_fd, False)
+    try:
+        # No command starts until the caller has pinned this supervisor's identity.
+        while True:
+            if time.monotonic() >= work_end:
+                raise TimeoutError('deadline before command dispatch')
+            try:
+                permission = os.read(gate_fd, 1)
+                if permission != b'g':
+                    raise RuntimeError('caller cancelled before command dispatch')
+                break
+            except BlockingIOError:
+                time.sleep(.001)
+        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, start_new_session=True)
+        identity = owner.row(process.pid)
+        if identity is None:
+            raise RuntimeError('command leader identity unavailable')
+        owner.owned[(process.pid, identity[0], identity[3])] = True
+        for name in streams:
+            pipe = getattr(process, name)
+            os.set_blocking(pipe.fileno(), False)
+            selector.register(pipe, selectors.EVENT_READ, name)
+        while True:
+            if time.monotonic() >= work_end:
+                failure = 'deadline'
+                break
+            try:
+                if os.read(gate_fd, 1) == b'':
+                    failure = 'caller cancelled command'
+                    break
+            except BlockingIOError:
+                pass
+            owner.reap(process)
+            rows = owner.observe()
+            if process.returncode is not None and not selector.get_map() and not rows:
+                break
+            for key, _ in selector.select(min(.01, max(0, work_end-time.monotonic()))):
+                chunk = os.read(key.fd, 65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                room = max(0, cap-sum(map(len, streams.values())))
                 streams[key.data].extend(chunk[:room])
                 if len(chunk) > room:
-                    failure = "output limit"
+                    failure = 'output limit'
                     break
             if failure:
                 break
-        if not failure:
-            try:
-                process.wait(timeout=max(0.001, deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:
-                failure = "deadline"
+    except BaseException as error:
+        failure = failure or ('deadline' if isinstance(error, TimeoutError) else 'command supervision failed')
     finally:
-        # Descendants can retain pipes after the immediate parent has exited.
+        cleaning = True
         try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait()
-        poller.close()
-        process.stdout.close()
-        process.stderr.close()
-    record = {"argv": argv, "exit_code": process.returncode, "failure": failure,
-              **{name: data.decode("utf-8", "replace") for name, data in streams.items()}}
-    if failure or process.returncode != 0:
+            if process is not None:
+                owner.signal(signal.SIGTERM)
+                kill_at = min(end-.005, time.monotonic()+max(0, (end-time.monotonic())/3))
+                while time.monotonic() < end-.005:
+                    drain_ready()
+                    owner.reap(process)
+                    if not owner.observe():
+                        break
+                    if time.monotonic() >= kill_at:
+                        owner.signal(signal.SIGKILL)
+                    time.sleep(.001)
+                owner.reap(process)
+                if owner.observe() or process.returncode is None:
+                    failure = (failure+'; ' if failure else '')+'cleanup uncertain'
+        except BaseException:
+            failure = (failure+'; ' if failure else '')+'cleanup uncertain'
+        try:
+            # Reaped producers can still leave queued bytes in both pipes.
+            while selector.get_map() and time.monotonic() < end-.005:
+                drain_ready()
+                if selector.get_map():
+                    time.sleep(.001)
+        except BaseException:
+            failure = (failure+'; ' if failure else '')+'cleanup uncertain'
+        selector.close()
+        if process is not None:
+            process.stdout.close()
+            process.stderr.close()
+        owner.close()
+    record = {'exit_code': process.returncode if process is not None else None, 'failure': failure,
+              **{name: data.decode('utf-8', 'replace') for name, data in streams.items()}}
+    raw = json.dumps(record, ensure_ascii=False).encode('utf-8')
+    if len(raw) > 6*cap+65536:
+        raise ValueError('supervisor response bound')
+    os.set_blocking(status_fd, False)
+    pending = memoryview(raw)
+    while pending:
+        if time.monotonic() >= end:
+            raise TimeoutError('supervisor publication deadline')
+        try:
+            pending = pending[os.write(status_fd, pending[:65536]):]
+        except BlockingIOError:
+            time.sleep(.001)
+    os.close(status_fd)
+    # Parent closes or ACKs the gate after it reads the bounded completion record.
+    while time.monotonic() < end:
+        try:
+            os.read(gate_fd, 1)
+            break
+        except BlockingIOError:
+            time.sleep(.001)
+    os.close(gate_fd)
+
+
+def run(argv, seconds=60, cap=1024 * 1024):
+    """Bounded command record with fresh per-command ownership supervision."""
+    if not Path(argv[0]).is_absolute() or seconds <= 0 or cap <= 0:
+        raise ValueError('Explicit absolute executable and positive budget required')
+    start = time.monotonic()
+    end = start+seconds
+    reserve = min(.5, seconds/5)
+    work_end = end-reserve
+    status_read, status_write = os.pipe()
+    gate_read, gate_write = os.pipe()
+    process = None
+    pidfd = None
+    raw = bytearray()
+    record = {'argv': argv, 'exit_code': None, 'failure': 'command supervision failed',
+              'stdout': '', 'stderr': ''}
+    try:
+        # Reuse the owning same-file private child/ACK pattern, not a global subreaper.
+        process = subprocess.Popen([str(Path(sys.executable).resolve()), str(Path(__file__).resolve()),
+                                    '__command_supervisor', str(status_write), str(gate_read),
+                                    json.dumps(argv), str(end), str(work_end), str(cap)],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, pass_fds=(status_write, gate_read),
+                                   start_new_session=True)
+        os.close(status_write); status_write = None
+        os.close(gate_read); gate_read = None
+        owner = _CommandOwner(end)
+        identity = owner.row(process.pid)
+        if identity is None or identity[1] != os.getpid():
+            raise RuntimeError('private supervisor identity unavailable')
+        pidfd = os.pidfd_open(process.pid, 0)
+        current = owner.row(process.pid)
+        if current is None or (current[0], current[3]) != (identity[0], identity[3]):
+            raise RuntimeError('private supervisor identity drift')
+        os.write(gate_write, b'g')
+        os.set_blocking(status_read, False)
+        selector = selectors.DefaultSelector()
+        selector.register(status_read, selectors.EVENT_READ)
+        try:
+            while selector.get_map():
+                if time.monotonic() >= end:
+                    raise TimeoutError('deadline')
+                for key, _ in selector.select(min(.01, max(0, end-time.monotonic()))):
+                    chunk = os.read(key.fd, min(65536, 6*cap+65537-len(raw)))
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    raw.extend(chunk)
+                    if len(raw) > 6*cap+65536:
+                        raise ValueError('supervisor response bound')
+        finally:
+            selector.close()
+        result = json.loads(raw)
+        if set(result) != {'exit_code', 'failure', 'stdout', 'stderr'}:
+            raise ValueError('supervisor completion shape')
+        record.update(result)
+        os.write(gate_write, b'1')
+        os.close(gate_write); gate_write = None
+        process.wait(timeout=max(.001, end-time.monotonic()))
+        if process.returncode != 0:
+            record['failure'] = record['failure'] or 'command supervision failed'
+    except BaseException as error:
+        record['failure'] = 'deadline' if isinstance(error, TimeoutError) else (record['failure'] or 'command supervision failed')
+    finally:
+        for fd in (status_read, status_write, gate_read, gate_write):
+            if fd is not None:
+                os.close(fd)
+        if process is not None and process.poll() is None:
+            # Kernel handle pins ONLY this continuously owned private supervisor.
+            if pidfd is not None:
+                try:
+                    signal.pidfd_send_signal(pidfd, signal.SIGTERM, None, 0)
+                    process.wait(timeout=max(.001, end-time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    signal.pidfd_send_signal(pidfd, signal.SIGKILL, None, 0)
+                    try:
+                        process.wait(timeout=.001)
+                    except subprocess.TimeoutExpired:
+                        record['failure'] = (record['failure']+'; ' if record['failure'] else '')+'cleanup uncertain'
+                except ProcessLookupError:
+                    pass
+            try:
+                process.wait(timeout=max(.001, end-time.monotonic()))
+            except subprocess.TimeoutExpired:
+                record['failure'] = (record['failure']+'; ' if record['failure'] else '')+'cleanup uncertain'
+            record['failure'] = record['failure'] or 'cleanup uncertain'
+        if pidfd is not None:
+            os.close(pidfd)
+    if time.monotonic() >= end:
+        record['failure'] = record['failure'] or 'deadline'
+    if record['failure'] or record['exit_code'] != 0:
         raise CommandFailure(record)
     return record
 
@@ -314,4 +589,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "__command_supervisor":
+        _command_supervisor(int(sys.argv[2]), int(sys.argv[3]), json.loads(sys.argv[4]), float(sys.argv[5]), float(sys.argv[6]), int(sys.argv[7]))
+    else:
+        main()
