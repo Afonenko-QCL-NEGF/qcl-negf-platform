@@ -4409,6 +4409,17 @@
           ansible.builtin.set_fact:
             receipt_current: '{{ receipt_write.stdout | from_json }}'
       rescue:
+      - name: Capture original public rescue failure before receipt reread
+        ansible.builtin.set_fact:
+          cutover_original_failed_task: '{{ ansible_failed_task | default(none) }}'
+          cutover_original_failed_result: '{{ ansible_failed_result | default(none) }}'
+          cutover_recovery_slot: '{{ none }}'
+          cutover_recovery_raw: '{{ none }}'
+          cutover_recovery_envelope: '{{ none }}'
+          cutover_recovery_inner: '{{ none }}'
+          cutover_recovery_envelope_ok: false
+          cutover_recovery_origin_ok: false
+          pre_marker_recovery_candidate: false
       - name: Bounded owning slot action-63
         vars:
           cutover_operation:
@@ -4477,12 +4488,85 @@
         ansible.builtin.set_fact:
           receipt_current: '{{ rescue_receipt.stdout | from_json }}'
         when: fresh_cutover_branch | default(false)
+      - name: Require exact original post-observation assert shape
+        ansible.builtin.set_fact:
+          cutover_recovery_assert_shape: >-
+            {{ cutover_original_failed_task is mapping
+               and cutover_original_failed_task.get('action') == 'ansible.builtin.assert'
+               and cutover_original_failed_result is mapping
+               and cutover_original_failed_result.get('failed') is sameas true
+               and cutover_original_failed_result.get('evaluated_to') is sameas false
+               and ('stdout' not in cutover_original_failed_result
+                    or (cutover_original_failed_result.stdout is string
+                        and cutover_original_failed_result.stdout == '')) }}
+      - name: Select only two bound original assertion origins
+        ansible.builtin.set_fact:
+          cutover_recovery_slot: >-
+            {{ 'action-51' if cutover_recovery_assert_shape
+                 and cutover_original_failed_task.get('name') == 'Final mounted retained manifest verified before reopening'
+                 and cutover_original_failed_result.get('assertion') == '(comparison.stdout | from_json).equal is sameas true'
+               else 'action-56' if cutover_recovery_assert_shape
+                 and cutover_original_failed_task.get('name') == 'Offline readback before durable reopening'
+                 and cutover_original_failed_result.get('assertion') == '(live.stdout | from_json).mountpoint_guard == c.storage.path'
+               else none }}
+      - name: Select unique original raw slot register
+        ansible.builtin.set_fact:
+          cutover_recovery_raw: >-
+            {{ boundary_action_51 | default(none) if cutover_recovery_slot == 'action-51'
+               else boundary_action_56 | default(none) if cutover_recovery_slot == 'action-56'
+               else none }}
+      - name: Decode only bounded successful original raw slot
+        ansible.builtin.set_fact:
+          cutover_recovery_envelope: '{{ cutover_recovery_raw.stdout | from_json }}'
+        when:
+        - cutover_recovery_slot is not none
+        - cutover_recovery_slot in used_cutover_slots
+        - cutover_recovery_raw is mapping
+        - cutover_recovery_raw.get('rc') is integer and cutover_recovery_raw.rc == 0
+        - cutover_recovery_raw.get('stdout') is string
+        - cutover_recovery_raw.stdout.encode('utf-8') | length <= c.limits.output_bytes
+      - name: Require exact own completed original envelope
+        ansible.builtin.set_fact:
+          cutover_recovery_envelope_ok: >-
+            {{ cutover_recovery_envelope is mapping
+               and cutover_recovery_envelope.get('schema') == 'qcl.storage-cutover.command.v1'
+               and cutover_recovery_envelope.get('slot_id') == cutover_recovery_slot
+               and cutover_recovery_envelope.get('identity') == {'host_id':h.host_id,'boot_id':h.boot_id,'attempt_id':h.attempt_id}
+               and cutover_recovery_envelope.get('clock') == cutover_clock
+               and cutover_recovery_envelope.get('status') == 'ok'
+               and cutover_recovery_envelope.get('returncode') is integer
+               and cutover_recovery_envelope.returncode == 0
+               and cutover_recovery_envelope.get('cleanup') is mapping
+               and cutover_recovery_envelope.cleanup.get('reaped') is sameas true
+               and cutover_recovery_envelope.cleanup.get('group_absent') is sameas true
+               and cutover_recovery_envelope.cleanup.get('term_sent') is sameas false
+               and cutover_recovery_envelope.cleanup.get('kill_sent') is sameas false
+               and cutover_recovery_envelope.get('stdout') is string
+               and cutover_recovery_envelope.stdout.encode('utf-8') | length <= c.limits.output_bytes }}
+      - name: Decode only own successful original comparison payload
+        ansible.builtin.set_fact:
+          cutover_recovery_inner: '{{ cutover_recovery_envelope.stdout | from_json }}'
+        when: cutover_recovery_envelope_ok
+      - name: Admit only exact negative comparison evidence
+        ansible.builtin.set_fact:
+          cutover_recovery_origin_ok: >-
+            {{ cutover_recovery_envelope_ok and cutover_recovery_inner is mapping
+               and ((cutover_recovery_slot == 'action-51' and cutover_recovery_inner.get('equal') is sameas false)
+                    or (cutover_recovery_slot == 'action-56'
+                        and cutover_recovery_inner.get('mountpoint_guard') is string
+                        and cutover_recovery_inner.mountpoint_guard != c.storage.path
+                        and cutover_recovery_inner.get('storage_disabled') is sameas true
+                        and cutover_recovery_inner.get('final_active') is sameas true)) }}
       - name: Choose immutable pre-marker candidate before any recovery observation
         ansible.builtin.set_fact:
-          pre_marker_recovery_candidate: '{{ ((_ansible_failed_result.stdout | default(''{}'') | from_json).get(''status'',''ok'')
-            == ''ok'') and (fresh_cutover_branch | default(false)) and fresh_attempt_started | default(false)
-            and receipt_current.record is not none and receipt_current.record.reopening is none and receipt_current.record.phase
-            in [''source_renamed'',''final_activation_intent'',''final_verified''] }}'
+          pre_marker_recovery_candidate: >-
+            {{ cutover_recovery_origin_ok
+               and fresh_cutover_branch | default(false) is sameas true
+               and fresh_attempt_started | default(false) is sameas true
+               and receipt_current | default(none) is mapping
+               and receipt_current.get('record') is mapping
+               and 'reopening' in receipt_current.record and receipt_current.record.reopening is none
+               and receipt_current.record.get('phase') in ['source_renamed','final_activation_intent','final_verified'] }}
       - name: Bounded owning slot action-64
         vars:
           cutover_operation:

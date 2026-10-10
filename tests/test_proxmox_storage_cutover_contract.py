@@ -18,6 +18,64 @@ BASE = Path(__file__).resolve().parents[1]
 UUID = "22222222-2222-4222-8222-222222222222"
 
 
+def fixture_actual_rescue_candidate(variables):
+    # Evaluate only actual owning fact expressions, never a copied classifier/full play.
+    from ansible.template import Templar, trust_as_template
+    data=yaml.safe_load((BASE/'ansible/proxmox-storage-cutover.yml').read_text())
+    found=[]
+    def visit(tasks):
+        for task in tasks:
+            if task.get('name')=='Capture original public rescue failure before receipt reread':found.append(task)
+            if task.get('name') in ('Require exact original post-observation assert shape','Select only two bound original assertion origins',
+                'Select unique original raw slot register','Decode only bounded successful original raw slot',
+                'Require exact own completed original envelope','Decode only own successful original comparison payload',
+                'Admit only exact negative comparison evidence','Choose immutable pre-marker candidate before any recovery observation'):found.append(task)
+            for key in ('block','rescue','always'):
+                if key in task:visit(task[key])
+    visit(data[0]['tasks']);assert len(found)==9 and len({x['name'] for x in found})==9
+    scope=dict(variables)
+    for task in found:
+        assert 'ansible.builtin.set_fact' in task
+        templar=Templar(variables=scope);conditions=task.get('when',[])
+        if isinstance(conditions,str):conditions=[conditions]
+        if not all(templar.template(trust_as_template('{{ '+condition+' }}')) is True for condition in conditions):continue
+        scope.update({k:templar.template(trust_as_template(v)) if isinstance(v,str) else v for k,v in task['ansible.builtin.set_fact'].items()})
+    return scope['pre_marker_recovery_candidate']
+
+
+def fixture_probe_consumer_code(rendered_probe):
+    # Select actual native nodes; no imports, native main or copied guard predicate.
+    import ast
+    assert type(rendered_probe) is str and len(rendered_probe.encode()) <= 262144
+    tree=ast.parse(rendered_probe)
+    needs=[node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='need']
+    modes=[node for node in tree.body if isinstance(node,ast.Assign) and
+           any(isinstance(target,ast.Name) and target.id=='read_only_resume' for target in node.targets)]
+    guards=[node for node in tree.body if isinstance(node,ast.Expr) and isinstance(node.value,ast.Call) and
+            isinstance(node.value.func,ast.Name) and node.value.func.id=='need' and
+            any(isinstance(arg,ast.Constant) and arg.value=='live original/source/stage references' for arg in node.value.args)]
+    assert len(needs)==len(modes)==len(guards)==1, 'unique actual probe consumer nodes'
+    need,mode,guard=needs[0],modes[0],guards[0]
+    expected_need=ast.parse('def need(condition,message):\n if not condition: raise ValueError(message)').body[0]
+    assert ast.dump(need,include_attributes=False)==ast.dump(expected_need,include_attributes=False), 'actual need raises ValueError only'
+    assert len(mode.targets)==1 and isinstance(mode.targets[0],ast.Name) and mode.targets[0].id=='read_only_resume'
+    mode_types=(ast.Assign,ast.Name,ast.Store,ast.Load,ast.BoolOp,ast.Or,ast.And,ast.Subscript,ast.Constant)
+    assert all(isinstance(node,mode_types) for node in ast.walk(mode)), 'bounded native mode AST'
+    assert {node.id for node in ast.walk(mode.value) if isinstance(node,ast.Name)}=={'r','receipt_present'}
+    assert all(isinstance(node.value,ast.Name) and node.value.id=='r' and isinstance(node.slice,ast.Constant) and
+               node.slice.value in ('observe_only','initial') for node in ast.walk(mode) if isinstance(node,ast.Subscript))
+    assert all(node.value in ('observe_only','initial') for node in ast.walk(mode) if isinstance(node,ast.Constant))
+    guard_types=(ast.Expr,ast.Call,ast.Name,ast.Load,ast.BoolOp,ast.Or,ast.UnaryOp,ast.Not,ast.Constant)
+    assert all(isinstance(node,guard_types) for node in ast.walk(guard)), 'bounded native guard AST'
+    assert {node.id for node in ast.walk(guard) if isinstance(node,ast.Name)}=={'need','read_only_resume','refs'}
+    assert len(guard.value.args)==2 and not guard.value.keywords and isinstance(guard.value.args[1],ast.Constant)
+    assert guard.value.args[1].value=='live original/source/stage references'
+    assert sum(isinstance(node,ast.Call) for node in ast.walk(guard))==1
+    return (compile(ast.Module(body=[mode],type_ignores=[]),'<actual-probe-mode>','exec'),
+            compile(ast.Module(body=[need,guard],type_ignores=[]),'<actual-probe-guard>','exec'),
+            hashlib.sha256(rendered_probe.encode()).hexdigest())
+
+
 def fixture_pvesm_policy(argv,selected_id,current_digest):
     assert type(argv) is list and len(argv)==7 and all(type(v) is str and v for v in argv)
     assert argv[:3]==['/usr/sbin/pvesm','set',selected_id], 'wrong selected PVE command'
@@ -304,6 +362,23 @@ def run_playbook(tmp_path, monkeypatch, scenario):
     state = {"trace": [], "disabled": False, "renamed": False, "stage_active": True, "final_active": False,
              "foreign": cfg.get("cutover", {}).get("storage", {}).get("foreign", {}), "digest": "a" * 40,
              "scenario": scenario, "receipt_reads": 0, "unit_declared": False, "unit_enabled": False, "offline_raw": None}
+    if scenario == "success":
+        # Exercise the inactive branch in the existing case; preserve the bound point and seed.
+        def source_seed_identity():
+            root_info = source.stat(); seed = source / "disk.raw"; seed_info = seed.stat()
+            return {"source_dev": root_info.st_dev, "source_ino": root_info.st_ino,
+                    "dev": seed_info.st_dev, "ino": seed_info.st_ino, "size": seed_info.st_size,
+                    "mtime_ns": seed_info.st_mtime_ns, "sha256": hashlib.sha256(seed.read_bytes()).hexdigest()}
+        seed_before = source_seed_identity()
+        (stage / "disk.raw").unlink()
+        state["stage_active"] = False
+        point = stage.lstat(); seed_after = source_seed_identity()
+        assert seed_after == seed_before
+        assert (point.st_dev, point.st_ino) == (cfg["stage"]["path_dev"], cfg["stage"]["path_ino"])
+        state["initial_stage_evidence"] = {"active": state["stage_active"], "empty": not any(stage.iterdir()),
+            "type": stat.S_IFMT(point.st_mode), "dev": point.st_dev, "ino": point.st_ino,
+            "bound_dev": cfg["stage"]["path_dev"], "bound_ino": cfg["stage"]["path_ino"],
+            "seed_before": seed_before, "seed_after": seed_after}
     if scenario in ("active-incomplete-resume", "complete-resume", "complete-reader", "complete-disable-changed", "complete-add-false", "complete-original-disabled", "complete-missing-disable", "complete-restored"):
         shutil.copytree(source, stage, dirs_exist_ok=True, symlinks=True)
         (stage / "linked.raw").unlink(); os.link(stage / "disk.raw", stage / "linked.raw")
@@ -363,6 +438,9 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                 elif operation["argv"][0] == "/usr/bin/systemctl":
                     argv=operation["argv"];assert argv[0]=="/usr/bin/systemctl";verb=argv[1]
                     assert len(argv)==(2 if verb=="daemon-reload" else 3) and all(type(v) is str and v for v in argv)
+                    if outer_request["slot_id"] == "action-16":
+                        assert operation["kind"] == "native_argv" and argv == ["/usr/bin/systemctl", "start", "fixture-stage.mount"]
+                        assert operation["stdin"] == "" and operation["mutation"] is True
                     args={"verb":verb,"name":argv[2] if len(argv)==3 else None};effective_action="ansible.builtin.systemd_service"
             def record(kind): s["trace"].append(kind)
             if effective_action == "ansible.builtin.command":
@@ -508,7 +586,11 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                         s["guard15_evidence"]={"slot":"guard-15","request":observation_request,"valid":valid,"observation":observed,"delta":delta}
                         out["stdout"]=json.dumps(observed)
                     if outer_request and outer_request["operation"]["kind"]=="probe":
-                        mode=observation_request.get("observe_only",False) or (observation_request.get("initial",False) and receipt.exists())
+                        mode_code,guard_code,probe_sha=fixture_probe_consumer_code(operation['argv'][2])
+                        assert probe_sha==body_sha and probe_sha in source_body_hashes
+                        receipt_present=os.path.lexists(receipt)
+                        mode_scope={'r':observation_request,'receipt_present':receipt_present,'__builtins__':{}}
+                        exec(mode_code,mode_scope);mode=mode_scope['read_only_resume']
                         if "consumers_measured" in task_vars["cutover_native_probe"]:
                             observed.update(consumers_measured=not mode,refs=None if mode else observed["refs"])
                         if observation_request.get("final_policy_readback"):
@@ -531,7 +613,7 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                                 finally:
                                     if holder is not None:os.close(holder)
                                     os.chdir(previous_cwd);maps_patch.undo()
-                        if scenario.startswith("new-point-") and s["renamed"] and not s["final_active"] and outer_request["slot_id"]=="action-42":
+                        if scenario.startswith("new-point-") and not mode and s["renamed"] and not s["final_active"] and outer_request["slot_id"]=="action-42":
                             api=review_body("cutover_consumer_scan");roots=api["consumer_roots"](tmp_path/"original",source,stage)
                             holder=None;previous=os.getcwd();mapping=tmp_path/"unrelated-map";mapping.write_bytes(b"ordinary map metadata")
                             maps_patch=pytest.MonkeyPatch();independent_maps(maps_patch,mapping)
@@ -544,19 +626,34 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                                 if holder is not None:os.close(holder)
                                 os.chdir(previous);maps_patch.undo()
                         if outer_request["slot_id"]=="action-1":s["initial_observation"]=observed
-                        out["stdout"]=json.dumps(observed)
+                        if outer_request["slot_id"]=="action-17":
+                            s["stage17_evidence"]={"slot":"action-17", **{key:observed[key] for key in ("stage_active","final_active","fs_uuid","rdev")}}
+                        guard_scope={'read_only_resume':mode,'refs':observed['refs'],'__builtins__':{'ValueError':ValueError}}
+                        try:
+                            exec(guard_code,guard_scope)
+                        except ValueError as error:
+                            out.update(failed=True,rc=1,stdout='',stderr=str(error),boundary_status='refused')
+                        else:
+                            out["stdout"]=json.dumps(observed)
+                        s.setdefault('probe_consumer_evidence',[]).append({'slot':outer_request['slot_id'],
+                            'body_sha256':probe_sha,'observe_only':observation_request['observe_only'],
+                            'initial':observation_request['initial'],'receipt_present':receipt_present,'mode':mode,
+                            'consumers_measured':observed['consumers_measured'],
+                            'refs_count':None if observed['refs'] is None else len(observed['refs']),
+                            'status':'refused' if out.get('failed') else 'passed'})
                     record("observe:" + name)
                 else: raise AssertionError("Unrecognized native command " + name + " " + str(argv))
             elif effective_action == "ansible.builtin.systemd_service":
                 verb=args["verb"];assert verb in ("start","stop","enable","disable","daemon-reload")
                 assert verb=="daemon-reload" or args["name"] in ("fixture-stage.mount","fixture-source.mount")
                 if args["name"]=="fixture-source.mount":assert s["unit_declared"], "absent final unit reached systemd before declaration"
+                s.setdefault("systemd_events",[]).append({"slot":outer_request["slot_id"],"verb":verb,"unit":args["name"],"trace_index":len(s["trace"])})
                 record("systemd:"+{"start":"started","stop":"stopped","disable":"disable","enable":"enable","daemon-reload":"reload"}[verb])
                 if args["name"]=="fixture-source.mount":
                     if verb=="disable" and scenario=="nb-disable-unknown":out.update(failed=True,rc=1,stderr="unknown own disable outcome",boundary_status="native_outcome_unknown")
                     elif verb in ("enable","disable"):s["unit_enabled"]=verb=="enable"
                     if verb in ("start","stop"):s["final_active"]=verb=="start"
-                if args["name"]=="fixture-stage.mount" and verb=="stop":s["stage_active"]=False
+                if args["name"]=="fixture-stage.mount" and verb in ("start","stop"):s["stage_active"]=verb=="start"
             elif effective_action in ("ansible.builtin.template","ansible.builtin.copy"):
                 assert set(args)=={"dest","content","mode"}
                 content=args["content"].encode();mode=int(args["mode"],8)
@@ -576,10 +673,12 @@ def run_playbook(tmp_path, monkeypatch, scenario):
             else: raise AssertionError(self._task.action)
             if outer_request is not None and out.get("failed"):
                 s.setdefault("native_failures",[]).append({"slot":outer_request["slot_id"],"rc":out.get("rc"),"stderr":out.get("stderr",""),"status":out.get("boundary_status","refused")})
-            state_file.write_text(json.dumps(s))
             if outer_request is not None:
                 native=dict(out);payload={"schema":outer_request["schema"],"slot_id":outer_request["slot_id"],"identity":outer_request["identity"],"clock":outer_request["clock"],"status":native.get("boundary_status","refused" if native.get("failed") else "ok"),"returncode":native.get("rc",0),"stdout":native.get("stdout",""),"stderr":native.get("stderr",""),"observed_bytes":{"stdout":len(native.get("stdout","")),"stderr":len(native.get("stderr","")),"metadata":0},"reserved_bytes":outer_request["bounds"],"cleanup":{"pgid":None,"term_sent":False,"kill_sent":False,"reaped":True,"group_absent":True}}
+                if native.get('failed'):
+                    s.setdefault('failed_envelopes',[]).append({key:payload[key] for key in ('slot_id','status','returncode','stdout','stderr')})
                 out["stdout"]=json.dumps(payload)
+            state_file.write_text(json.dumps(s))
             return out
     def handler(executor, templar):
         if executor._task.action in ("ansible.builtin.assert", "ansible.builtin.set_fact", "ansible.builtin.debug", "ansible.builtin.fail", "ansible.builtin.include_tasks"):
@@ -590,9 +689,25 @@ def run_playbook(tmp_path, monkeypatch, scenario):
                     result=actual_run(*args,**kwargs);saved=json.loads(state_file.read_text())
                     event={"task":executor._task.name,"failed":bool(result.get("failed")),"assertion":result.get("assertion"),"evaluated_to":result.get("evaluated_to"),"msg":result.get("msg")}
                     if event["failed"] and "first_assert_failure" not in saved:saved["first_assert_failure"]=event
-                    if executor._task.name in ("Accept only complete safe loaded policy observation","Match initial fixed native identity and selected digest"):saved.setdefault("guard_results",[]).append(event)
+                    if executor._task.name in ("Accept only complete safe loaded policy observation","Match initial fixed native identity and selected digest","Actual stage required before any copy"):saved.setdefault("guard_results",[]).append(event)
                     state_file.write_text(json.dumps(saved));return result
                 action.run=observed_assert
+            if executor._task.action=='ansible.builtin.set_fact' and executor._task.name in (
+                'Capture original public rescue failure before receipt reread',
+                'Choose immutable pre-marker candidate before any recovery observation'):
+                actual_fact=action.run
+                def observed_fact(*args,**kwargs):
+                    result=actual_fact(*args,**kwargs);saved=json.loads(state_file.read_text())
+                    facts=result.get('ansible_facts',{})
+                    if 'cutover_original_failed_task' in facts:
+                        task=facts['cutover_original_failed_task'];failure=facts['cutover_original_failed_result']
+                        saved['rescue_origin']={'action':task.get('action') if isinstance(task,dict) else None,
+                            'name':task.get('name') if isinstance(task,dict) else None,
+                            'assertion':failure.get('assertion') if isinstance(failure,dict) else None}
+                    if 'pre_marker_recovery_candidate' in facts:
+                        saved.setdefault('rescue_candidates',[]).append(facts['pre_marker_recovery_candidate'])
+                    state_file.write_text(json.dumps(saved));return result
+                action.run=observed_fact
             return action,extra
         return FakeAction(task=executor._task, connection=executor._connection, play_context=executor._play_context,
                           loader=executor._loader, templar=Templar._from_template_engine(templar), shared_loader_obj=executor._shared_loader_obj), None
@@ -674,6 +789,7 @@ def assert_named_negative(state,scenario,stage):
         assert event['delta']=={field:[event['valid'][field],UNIT_NEGATIVE_VALUES[scenario]]}
         assert 'CAS:disable' in state['trace'] and 'observe:Verify exact loaded mount policy' in state['trace']
         assert not any(x['slot']=='action-16' for x in state['boundary_events'])
+        assert not any(x['slot']=='action-17' for x in state['boundary_events'])
     else:
         observed=state['initial_observation'];assert observed['complete'] is True and observed['consumers_measured'] is True
         assert observed[field]=={'cached-worker':['cached-native-worker'],'old-loop':True,'relevant-alias':['source-bind'],'unknown-data':'not_measured'}[scenario]
@@ -701,8 +817,31 @@ def test_actual_cutover_yaml_and_sticky_cas_boundary(tmp_path, monkeypatch, scen
         assert (source / "disk.raw").read_bytes() == b"AAAA" and state["disabled"]
         return
     required = ["receipt:gate_disable_intent", "CAS:disable", "receipt:gate_disabled", "receipt:copy_started", "retained-copy", "receipt:copy_verified", "receipt:rename_intent", "rename", "receipt:source_renamed", "receipt:final_activation_intent", "systemd:started", "receipt:final_verified", "CAS:offline", "receipt:reopening_intent", "CAS:reopen"]
-    position = [trace.index(x) for x in required]
+    final_starts = [event for event in state["systemd_events"] if event["verb"]=="start" and event["unit"]=="fixture-source.mount"]
+    assert len(final_starts)==1 and trace[final_starts[0]["trace_index"]]=="systemd:started"
+    position = [final_starts[0]["trace_index"] if x=="systemd:started" else trace.index(x) for x in required]
     assert position == sorted(position), "missing cutover durable intent/native/observed order"
+    if scenario == "success":
+        initial = state["initial_stage_evidence"]
+        assert initial["active"] is False and initial["empty"] is True and initial["type"]==stat.S_IFDIR
+        assert (initial["dev"],initial["ino"])==(initial["bound_dev"],initial["bound_ino"])==(stage.stat().st_dev,stage.stat().st_ino)
+        assert initial["seed_before"]==initial["seed_after"] and initial["seed_after"]["sha256"]==hashlib.sha256(b"AAAA").hexdigest()
+        assert state["initial_observation"]["stage_active"] is False
+        guard=state["guard15_evidence"];assert guard["delta"]=={} and guard["observation"]==guard["valid"]
+        assert guard["observation"]["ActiveState"]=="inactive" and guard["observation"]["UnitFileState"]=="static"
+        assert guard["request"]["path"]==str(stage) and guard["request"]["stage"] is True
+        assert "first_assert_failure" not in state
+        assert any(row["task"]=="Accept only complete safe loaded policy observation" and row["failed"] is False for row in state["guard_results"])
+        events=state["boundary_events"];slots=[event["slot"] for event in events]
+        assert slots.count("guard-15")==slots.count("action-16")==slots.count("action-17")==slots.count("action-18")==1
+        assert next(event for event in events if event["slot"]=="action-16")["kind"]=="native_argv"
+        assert next(event for event in events if event["slot"]=="action-17")["kind"]=="probe"
+        assert slots.index("guard-15")<slots.index("action-16")<slots.index("action-17")<slots.index("action-18")
+        stage_starts=[event for event in state["systemd_events"] if event["verb"]=="start" and event["unit"]=="fixture-stage.mount"]
+        assert len(stage_starts)==1 and stage_starts[0]["slot"]=="action-16"
+        assert stage_starts[0]["trace_index"]<trace.index("manifest:before")<trace.index("retained-copy")
+        assert state["stage17_evidence"]=={"slot":"action-17","stage_active":True,"final_active":False,"fs_uuid":UUID,"rdev":253}
+        assert any(row["task"]=="Actual stage required before any copy" and row["failed"] is False for row in state["guard_results"])
     assert state["foreign"] == {"foreign-block": {"type": "lvmthin", "vgname": "fixture"}}
     assert (source.parent / "original" / "disk.raw").read_bytes() == b"AAAA"
     assert (stage / "disk.raw").read_bytes() == b"AAAA"
@@ -1170,7 +1309,7 @@ def test_recovery_actual_source_consumer_request(tmp_path,monkeypatch,case):
 
 
 def test_reference_actual_body_graph_and_paths_whole_cap(tmp_path):
-    import time
+    import time,subprocess
     root=tmp_path/'tree';root.mkdir();directory=root
     for _ in range(14):directory=directory/('d'*220);directory.mkdir()
     entries={'.':{'type':'directory'}}
@@ -1231,9 +1370,16 @@ subprocess.Popen=fixture_popen
     request['operation'].update(kind='reference_check',argv=['/usr/bin/python','-c',prefix+body],stdin=serialized)
     assert len(json.dumps(request).encode('utf-8'))<=request['bounds']['request_bytes']
     (tmp_path/'reference-cap-plan.json').write_text(json.dumps({'child_allowance':child_allowance,'full_context_bytes':context_bytes,'source_defined_prepaid_context_bytes':prepaid_context,'graph_bytes':len(raw),'path_result_bytes':path_bytes,'headroom':headroom}))
-    result=review_boundary(request)
+    # Only dispatch/accessor execution spends the real runtime clock.
+    now=time.monotonic_ns()
+    request['clock'].update(started_monotonic_ns=now,deadline_monotonic_ns=now+3000000000,expires_at_epoch=int(time.time())+60)
+    assert load_api['child_metadata_load_bound'](request)==prepaid_context,'refreshed clock changed prepaid load; replan required'
+    assert len(json.dumps(request).encode('utf-8'))<=request['bounds']['request_bytes']
+    dispatched=subprocess.run(['/usr/bin/python','-c',boundary],input=json.dumps(request),text=True,capture_output=True,timeout=5,start_new_session=True)
+    assert dispatched.stdout,dispatched.stderr
+    result=json.loads(dispatched.stdout)
     (tmp_path/'reference-cap-result.json').write_text(json.dumps(result))
-    assert result['status']=='refused' and 'metadata' in result['stderr'],result
+    assert result['status']=='refused' and 'metadata' in result['stderr'] and 'metadata deadline' not in result['stderr'],result
     count=len(witness.read_text().splitlines()) if witness.exists() else 0
     assert 0<count<10,'actual graph/path shared counter must refuse before further native lookup'
 
@@ -1347,7 +1493,14 @@ def test_named_negative_independent_positive_controls(tmp_path,monkeypatch,case)
     if case in UNIT_NEGATIVE_VALUES:
         observed=state['guard15_evidence'];assert observed['delta']=={} and observed['observation']==observed['valid']
         assert observed['request']['path']==str(stage) and observed['request']['stage'] is True
-        assert any(row['slot']=='action-16' for row in state['boundary_events'])
+        assert state['initial_observation']['stage_active'] is True and observed['observation']['ActiveState']=='active'
+        events=state['boundary_events'];slots=[row['slot'] for row in events]
+        assert 'action-16' not in slots
+        assert slots.count('guard-15')==slots.count('action-17')==slots.count('action-18')==1
+        assert next(row for row in events if row['slot']=='action-17')['kind']=='probe'
+        assert slots.index('guard-15')<slots.index('action-17')<slots.index('action-18')
+        assert state['stage17_evidence']=={'slot':'action-17','stage_active':True,'final_active':False,'fs_uuid':UUID,'rdev':253}
+        assert any(row['task']=='Actual stage required before any copy' and row['failed'] is False for row in state['guard_results'])
     else:
         assert state['initial_observation'][field]=={'cached-worker':[],'old-loop':False,'relevant-alias':[],'unknown-data':1048576}[case]
 
@@ -1370,6 +1523,89 @@ def test_actual_postrename_new_point_consumer_scope(tmp_path,monkeypatch,case):
     assert event['source_inode']!=event['original_inode'] and event['refs']
     assert any(row['ino']==event['source_inode'] and row['target']==str(source) for row in event['refs'])
     assert 'systemd:stopped' not in state['trace'] and 'restore' not in state['trace'] and 'CAS:reopen' not in state['trace'] and 'CAS:reopen-original' not in state['trace']
+    cause='live original/source/stage references'
+    assert state['native_failures'][0]=={'slot':'action-42','rc':1,'stderr':cause,'status':'refused'}
+    assert state['failed_envelopes'][0]=={'slot_id':'action-42','status':'refused','returncode':1,'stdout':'','stderr':cause}
+    probes=state['probe_consumer_evidence'];failed=next(row for row in probes if row['slot']=='action-42')
+    assert failed['observe_only'] is False and failed['initial'] is False and failed['mode'] is False
+    assert failed['receipt_present'] is True and failed['consumers_measured'] is True
+    assert failed['refs_count']==len(event['refs']) and failed['status']=='refused'
+    boundary=next(row for row in state['boundary_events'] if row['slot']=='action-42')
+    assert boundary['kind']=='probe' and boundary['body_sha256']==failed['body_sha256']
+    assert not any(row['status']=='refused' for row in probes[:probes.index(failed)])
+    assert path.exists() and 'reopening_intent' not in state['trace'] and 'complete' not in state['trace']
+    assert not state['final_active']
+    suffix=state['trace'][state['trace'].index('rename')+1:]
+    assert not any(row in suffix for row in ('systemd:stopped','systemd:started','restore','CAS:reopen','CAS:reopen-original',
+                                           'receipt:final_activation_intent','receipt:rollback_intent','receipt:rolled_back','receipt:reopening_intent','receipt:reopened','receipt:complete'))
+    rescue=[row for row in probes if row['slot']=='action-64']
+    assert rescue and all(row['observe_only'] is True and row['mode'] is True and
+                          row['consumers_measured'] is False and row['refs_count'] is None for row in rescue)
+    assert state['rescue_origin']['action']=='ansible.builtin.command'
+    assert state['rescue_candidates']==[False,False]
+    # Fixed literal matrix via actual owning Jinja facts; no extra engine/native calls.
+    from ansible.errors import AnsibleError
+    import copy
+    host={'host_id':'own-host','boot_id':'own-boot','attempt_id':'own-attempt'}
+    clock={'deadline':123}
+    base={'h':host,'c':{'storage':{'path':'/own/source'},'limits':{'output_bytes':65536}},'cutover_clock':clock,
+          'fresh_cutover_branch':True,'fresh_attempt_started':True,
+          'receipt_current':{'record':{'phase':'final_verified','reopening':None}},'used_cutover_slots':['action-51','action-56']}
+    for slot,name,assertion,payload in (
+        ('action-51','Final mounted retained manifest verified before reopening','(comparison.stdout | from_json).equal is sameas true',{'equal':False}),
+        ('action-56','Offline readback before durable reopening','(live.stdout | from_json).mountpoint_guard == c.storage.path',{'mountpoint_guard':'/wrong','storage_disabled':True,'final_active':True})):
+        envelope={'schema':'qcl.storage-cutover.command.v1','slot_id':slot,'identity':host,'clock':clock,'status':'ok','returncode':0,
+                  'cleanup':{'reaped':True,'group_absent':True,'term_sent':False,'kill_sent':False},'stdout':json.dumps(payload)}
+        v=dict(base,ansible_failed_task={'action':'ansible.builtin.assert','name':name},
+               ansible_failed_result={'failed':True,'evaluated_to':False,'assertion':assertion})
+        v['boundary_'+slot.replace('-','_')]={'rc':0,'stdout':json.dumps(envelope)}
+        assert fixture_actual_rescue_candidate(v) is True
+        negatives=[]
+        for status in ('refused','deadline','output_cap','metadata_unknown','cleanup_unknown','native_outcome_unknown','arbitrary',None):
+            e=copy.deepcopy(envelope);e['status']=status;negatives.append(('envelope',e))
+        for key,value in (('slot_id','action-42'),('identity',dict(host,host_id='foreign')),('identity',dict(host,boot_id='foreign')),
+                          ('identity',dict(host,attempt_id='foreign')),('clock',{'deadline':124}),('returncode',True),('returncode',1),('cleanup',None)):
+            e=copy.deepcopy(envelope);e[key]=value;negatives.append(('envelope',e))
+        for key,value in (('term_sent',True),('kill_sent',True),('reaped',False),('group_absent',False)):
+            e=copy.deepcopy(envelope);e['cleanup'][key]=value;negatives.append(('envelope',e))
+        for e in ({},None,{'status':'ok'}):negatives.append(('envelope',e))
+        for raw in ('invalid JSON',''):negatives.append(('raw',{'rc':0,'stdout':raw}))
+        for raw in (None,{}, {'rc':True,'stdout':json.dumps(envelope)}, {'rc':1,'stdout':json.dumps(envelope)}):negatives.append(('raw',raw))
+        for payload_bad in (None,{}, {'equal':None}, {'equal':'false'}, {'mountpoint_guard':'/wrong','storage_disabled':'true','final_active':True}):
+            e=copy.deepcopy(envelope);e['stdout']=json.dumps(payload_bad);negatives.append(('envelope',e))
+        for kind,value in (('task',None),('task',{'action':'ansible.builtin.command','name':name}),('task',{'action':'ansible.builtin.assert','name':'other'}),
+                           ('failure',None),('failure',{'failed':True,'evaluated_to':False,'assertion':'other'}),
+                           ('phase','complete'),('phase','copy_started'),('marker',{'intended_tree':'new_final'}),('slots',[])):
+            negatives.append((kind,value))
+        for kind,value in negatives:
+            n=copy.deepcopy(v);register='boundary_'+slot.replace('-','_')
+            if kind=='envelope':n[register]['stdout']=json.dumps(value)
+            elif kind=='raw':n[register]=value
+            elif kind=='task':n['ansible_failed_task']=value
+            elif kind=='failure':n['ansible_failed_result']=value
+            elif kind=='phase':n['receipt_current']['record']['phase']=value
+            elif kind=='marker':n['receipt_current']['record']['reopening']=value
+            elif kind=='slots':n['used_cutover_slots']=value
+            try:actual=fixture_actual_rescue_candidate(n)
+            except AnsibleError:continue # Supported branch parse refusal before candidate/mutation is allowed.
+            assert actual is False,(slot,kind,value)
+    rendered=yaml.safe_load((BASE/'ansible/proxmox-storage-cutover.yml').read_text())[0]['vars']['cutover_native_probe']
+    mode_code,guard_code,body_sha=fixture_probe_consumer_code(rendered)
+    assert body_sha==failed['body_sha256']
+    # Fixed independent inputs/expectations: five pure clauses in each existing ID.
+    literal_refs=[{'target':'/independent/source','ino':123}]
+    for flags,present,refs,expected_mode,refused in (
+        ({'observe_only':False,'initial':False},False,[],False,False),
+        ({'observe_only':False,'initial':False},True,literal_refs,False,True),
+        ({'observe_only':True,'initial':False},False,literal_refs,True,False),
+        ({'observe_only':False,'initial':True},True,literal_refs,True,False),
+        ({'observe_only':False,'initial':True},False,literal_refs,False,True)):
+        scope={'r':flags,'receipt_present':present,'__builtins__':{}}
+        exec(mode_code,scope);assert scope['read_only_resume'] is expected_mode
+        guard_scope={'read_only_resume':scope['read_only_resume'],'refs':refs,'__builtins__':{'ValueError':ValueError}}
+        if refused:
+            with pytest.raises(ValueError,match='^live original/source/stage references$'):exec(guard_code,guard_scope)
+        else:exec(guard_code,guard_scope)
 
 
 @pytest.mark.parametrize('case',['new-point-bind','unrelated-bind'])
@@ -1442,11 +1678,12 @@ def test_actual_name_enumeration_preaccess(tmp_path,mode):
 @pytest.mark.parametrize('mode',['near-cap','expired','positive'])
 def test_actual_buffered_second_read_preaccess(tmp_path,mode):
     import io,time
-    api=review_body('cutover_command_boundary');budget=api['MetadataBudget'](8192,time.monotonic()+1);scope=extracted_wrapper_classes(budget)
-    file=tmp_path/'record';file.write_bytes(b'b'*200);reader=scope['MetadataFile'](file,'rb');calls=[]
+    api=review_body('cutover_command_boundary');scope=extracted_wrapper_classes(None)
+    file=tmp_path/'record';file.write_bytes(b'b'*200);calls=[]
     class Witness(io.BytesIO):
         def read(self,n=-1):calls.append(n);return super().read(n)
-    reader.data=Witness(b'b'*200)
+    budget=api['MetadataBudget'](8192,time.monotonic()+1);scope['budget']=budget
+    reader=scope['MetadataFile'](file,'rb');reader.data=Witness(b'b'*200)
     if mode=='near-cap':budget.used=budget.limit-1
     if mode=='expired':budget.deadline=time.monotonic()-1
     if mode=='positive':
@@ -1460,11 +1697,13 @@ def test_actual_buffered_second_read_preaccess(tmp_path,mode):
 @pytest.mark.parametrize('mode',['near-cap','expired','positive'])
 def test_actual_text_input_utf8_bytes_charge(mode):
     import io,time
-    api=review_body('cutover_command_boundary');budget=api['MetadataBudget'](6,time.monotonic()+1);scope=extracted_wrapper_classes(budget);calls=[]
+    api=review_body('cutover_command_boundary');scope=extracted_wrapper_classes(None);calls=[]
     payload='яя';scope['input_size']=len(payload.encode())
     class Witness(io.BytesIO):
         def read(self,n=-1):calls.append(n);return super().read(n)
-    handle=Witness(payload.encode());reader=scope['Input'](handle)
+    handle=Witness(payload.encode())
+    budget=api['MetadataBudget'](6,time.monotonic()+1);scope['budget']=budget
+    reader=scope['Input'](handle)
     if mode=='near-cap':budget.used=budget.limit-1
     if mode=='expired':budget.deadline=time.monotonic()-1
     if mode=='positive':assert reader.read()==payload and calls==[5] and budget.used==5 and reader.remaining==0
@@ -1476,7 +1715,7 @@ def test_actual_text_input_utf8_bytes_charge(mode):
 @pytest.mark.parametrize('mode',['near-cap','expired','positive'])
 def test_actual_child_entry_preaccess(tmp_path,mode):
     import time
-    api=review_body('cutover_command_boundary');budget=api['MetadataBudget'](8192,time.monotonic()+1);calls=[]
+    api=review_body('cutover_command_boundary');scope=extracted_wrapper_classes(None);calls=[]
     class Item:name='n'*200;path=str(tmp_path/'file')
     class Iterator:
         def __next__(self):calls.append('next');return Item()
@@ -1487,7 +1726,8 @@ def test_actual_child_entry_preaccess(tmp_path,mode):
         if mode=='near-cap':budget.used=budget.limit-1
         if mode=='expired':budget.deadline=time.monotonic()-1
         return Iterator()
-    budget.raw=dict(budget.raw,pathconf=pathconf,scandir=scandir);scope=extracted_wrapper_classes(budget);entries=scope['Entries'](tmp_path)
+    budget=api['MetadataBudget'](8192,time.monotonic()+1);scope['budget']=budget
+    budget.raw=dict(budget.raw,pathconf=pathconf,scandir=scandir);entries=scope['Entries'](tmp_path)
     if mode=='positive':
         before=budget.used;item=next(entries);assert item.name=='n'*200 and calls==['pathconf','scandir','next'] and budget.used==before+201
     else:
