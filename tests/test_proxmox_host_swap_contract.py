@@ -720,14 +720,41 @@ def test_actual_engine_syntax(tmp_path,monkeypatch):
     assert data[0]['hosts']=='proxmox_hypervisors' and data[0]['gather_facts'] is False
 
 
+def syntax_listing_matches(result, playbook):
+    """Accept only the single-playbook syntax listing, never an exit status."""
+    return (type(result) is list and len(result)==1
+            and type(result[0]) is dict and set(result[0])=={'playbook','plays'}
+            and result[0]['playbook']==str(playbook)
+            and type(result[0]['plays']) is list and result[0]['plays']==[])
+
+
+@pytest.mark.parametrize('result,accepted',[
+    pytest.param([{'playbook':'/fixture/playbook.yml','plays':[]}],True,id='single-exact-playbook'),
+    pytest.param(0,False,id='integer-exit-status'),
+    pytest.param(None,False,id='missing-result'),
+    pytest.param([],False,id='empty-listing'),
+    pytest.param([{'playbook':'/fixture/playbook.yml','plays':[]}]*2,False,id='multiple-entries'),
+    pytest.param([{'playbook':'/fixture/other.yml','plays':[]}],False,id='wrong-playbook'),
+    pytest.param([{'playbook':'/fixture/playbook.yml','plays':[{}]}],False,id='nonempty-plays'),
+    pytest.param([{'playbook':'/fixture/playbook.yml','plays':()}],False,id='wrong-plays-type'),
+    pytest.param([{'playbook':'/fixture/playbook.yml'}],False,id='missing-plays'),
+    pytest.param([{'playbook':'/fixture/playbook.yml','plays':[],'error':'syntax failed'}],False,id='extra-error-field'),
+    pytest.param([0],False,id='malformed-entry'),
+])
+def test_syntax_listing_contract(result,accepted):
+    assert syntax_listing_matches(result,'/fixture/playbook.yml') is accepted
+
+
 @pytest.fixture(scope='session',autouse=True)
 def actual_engine_syntax_after_whole_file(request,tmp_path_factory):
     yield
     if request.session.testsfailed:
         return
     with pytest.MonkeyPatch.context() as patch:
-        rc,observed=execute({},state(),tmp_path_factory.mktemp('accepted-whole-file-syntax'),patch,syntax=True)
-        assert rc==0 and observed['trace']==[] and observed['probes']==[]
+        syntax_dir=tmp_path_factory.mktemp('accepted-whole-file-syntax')
+        result,observed=execute({},state(),syntax_dir,patch,syntax=True)
+        assert syntax_listing_matches(result,syntax_dir/'playbook.yml')
+        assert observed['trace']==[] and observed['probes']==[]
         print('ACTUAL_ENGINE_SYNTAX_AFTER_WHOLE_FILE_PASS rc=0 native_probes=0')
 
 
