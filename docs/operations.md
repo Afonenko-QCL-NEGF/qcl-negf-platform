@@ -250,3 +250,29 @@ PostgreSQL database.
 - [AiiDA installation and profiles](https://aiida.readthedocs.io/projects/aiida-core/en/stable/installation/guide_complete.html)
 - [Slurm cgroup v2](https://slurm.schedmd.com/cgroup_v2.html)
 - [GitHub self-hosted runners](https://docs.github.com/en/actions/concepts/runners/self-hosted-runners)
+
+## Local serial whole-cluster update
+
+GitHub is the source/build/check service. The permanent enrolled controller owns local
+`qcl-negf-release update` (`deliver` is the same guarded alias), protected enrollment, local
+artifacts/trust and deployment credentials. It never obtains delivery credentials from Actions.
+The operator first cancels plan and execution_restart WorkChains and all Slurm work, then sends
+the separate update signal. Full enrolled coverage is mandatory, including offline workers.
+Admission stays closed across cancellation checks, all-worker stopped/masked barrier, serial
+activation of one release and fresh final fleet health. Runtime masks stop execution, not VMs;
+provider poweroff/RAM handoff remains separate. Failed/unknown transitions retain receipts and
+own markers; transport loss is not proof of remote completion. Native prerequisites and
+source-test limits are in [application CD](application-cd.md).
+
+I14 whole F1–F7 repair is source-only pending a separately admitted whole source-test packet
+and independent review. Original failed source evidence is retained; native current daemon/UTC
+registration, full service membership, SQL NULL handling and NFS ownership remain unmeasured.
+An original foreign worker DOWN/DRAIN/reason requires operator diagnosis and is never overwritten
+by application update. Stopped worker execution does not authorize VM poweroff or RAM reclamation.
+
+The I14 R1–R5/role-health amendment is prepared only in source. All 97 prior selectors are retained,
+with eight new body oracles proposed for the same sole future whole packet. Native global PID/member
+applicability, actual Slurm full Reason/effective actor/explicit UTC + configured SLURM_CONF, current
+daemon registration, AiiDA SQL NULL, NFS/trust and installed repaired-source provenance remain fresh
+Root gates. Controller health has no worker slurmd requirement. Runtime tests/native acceptance have
+not been performed by this amendment; the original failed logs remain unchanged.

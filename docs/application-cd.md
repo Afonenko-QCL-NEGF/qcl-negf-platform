@@ -1,7 +1,8 @@
 # Application CD and closed admission
 
-The existing umbrella GitHub Actions workflow owns build/test/publish/deliver/check. This component
-adds no second CI, deploy daemon, discovery or revision lock catalog. The initial deployment is
+The umbrella GitHub Actions workflow builds and checks immutable source artifacts. A local serial
+owner on the permanent controller performs whole-cluster update; it needs no GitHub deployment
+credential or delivery runner. This component adds no deploy daemon, discovery or revision lock catalog. The initial deployment is
 CPU-only and selects one release for the active pool.
 
 ## One-time image preparation
@@ -48,8 +49,9 @@ identity. It must be a nonempty string without whitespace, control characters, a
 embedded password. Keep credentials outside the URI and manifest. Nix retains its normal signature
 and trust checks; this procedure does not disable `require-sigs`.
 
-An explicit private pool is separate from the manual credentials inventory; offline daytime workers
-are omitted. This synthetic v2 example references the enrollment example below; actual protected
+The explicit private pool is a routing projection of protected enrollment and must cover every
+enrolled controller/worker exactly. An offline enrolled worker blocks update; retiring one requires
+a separate trusted enrollment change before the update signal. This synthetic v2 example references the enrollment example below; actual protected
 inventory and host-key enrollment must be supplied by the operator:
 
 ```json
@@ -72,21 +74,23 @@ inventory and host-key enrollment must be supplied by the operator:
 }
 ```
 
-Build/test/publish closures through the existing workflow. Its protected delivery job/environment
-receives reviewed limited SSH deployment access; build jobs do not receive production credentials or
-become unrestricted administrators. In the user's maintenance window run on the permanent
-controller:
+Build/check artifacts through the source workflow; the local publisher retains signing/trust
+credentials. After manually cancelling both AiiDA `qcl_negf.plan` and `qcl_negf.execution_restart`
+workflows (including paused/waiting retries) and all Slurm jobs/queue, signal update locally:
 
 ```console
-sudo qcl-negf-release deliver --manifest /private/release.json --pool /private/active-pool-v2.json --enrollment /operator-protected/enrollment.json
+sudo qcl-negf-release update --manifest /private/release.json --pool /private/pool-v2.json --enrollment /operator-protected/enrollment.json
 ```
 
-For an SSH pipeline, `--manifest /dev/stdin` accepts the manifest without copying the controller's
-private pool to CI. SSH keys/cache signing keys remain outside Git, Nix inputs and scientific
-archives.
+`deliver` is a compatibility alias of this same safe whole-cluster path; it cannot omit workers
+or bypass cancellation. Defaults are one 1800-second operation, 360-second bounded commands,
+1 MiB per-command combined output and 8 MiB aggregate; deadlines never reset by node. These are
+engineering bounds, not a scientific CPU/RAM grant. An optional operator-owned standard
+`systemd-run` oneshot can detach the exact immutable command with `RuntimeMaxSec`; no new service
+or automatic admission opener is installed.
 
 Before maintenance, protected enrollment and readonly identity probes bind the actual local
-controller and all selected nodes. The controller then fetches both named closures with
+controller and all enrolled nodes. The controller then fetches both named closures with
 `nix copy --from CACHE_URI APPLICATION SOLVER` and verifies their exact manifest hashes using local
 `nix path-info --json APPLICATION SOLVER`. Fetch failure, malformed or missing evidence, and either
 hash mismatch stop delivery before any gate change, service stop, worker drain or remote mutation.
@@ -95,8 +99,22 @@ remains supported when both closures already exist in the controller store and m
 hashes. Delivery cannot accept a manifest without both hashes; minimal four-field manifests remain
 valid for activation and runtime identity checks.
 
-After this preflight, delivery closes `/srv/qcl-negf/jobs/.release-admission.json`, stops API/AiiDA,
-drains selected workers and rejects a nonempty Slurm queue. The maintenance owner first
+After this preflight and installed capability checks on every node, update captures original
+healthy IDLE state, full Reason and exact registration for every worker. Foreign DOWN/DRAIN or
+maintenance reason refuses before the gate changes. Protected matching retry provenance retains
+the first original state. Update then closes `/srv/qcl-negf/jobs/.release-admission.json`, stops API/AiiDA,
+drains all enrolled workers after a fresh unchanged original-state read before each
+`Reason=application-release:<attempt_id>` DRAIN and a complete after-readback. It requires complete readonly AiiDA workflow/CalcJob and whole Slurm
+queue absence. Missing/NULL/unknown process states and inaccessible queries are blockers. Both
+published workflow types are queried without parent, creator, release or newest-page filters.
+Every worker is then independently stopped and read back before the first copy/activation. A
+standard runtime mask inhibits only `slurmd.service`; protected own markers retain original
+machine/boot/daemon/SLURM_CONF identity. Bounded scans refuse incomplete proc/cgroup evidence.
+A hard stop requires a positively measured singleton captured daemon generation and complete
+root/sub-cgroup membership, with UID/state/full executable/start-ticks/cgroup evidence and no
+snapshot drift. Empty daemon evidence or any unknown helper/member forbids force. Only the exact
+bound service receives the one scoped kill after empty job-process proof. This barrier stops worker execution; it does not power off VMs
+or prove RAM reclamation. The maintenance owner first
 completes/cancels the old research and removes its automatic resume/queued attempts. The command
 never cancels or restarts research on the user's behalf. `JobRequeue=0` and AiiDA's `--no-requeue`
 prevent a second independent owner. The shared NFS gate is published as the scientific UID because
@@ -107,8 +125,15 @@ require access to the shared job group, whose UID/GID mapping is a site check.
 release-specific InstalledCode label with the exact solver path, updates runtime UUID, restarts
 affected services and checks closure/profile identity and service health on every selected node.
 `ready:false` marks prepared configuration; `ready:true` is published only after checks. Old Code
-provenance is not relabelled/deleted. Only after all selected nodes verify and resume succeed does
-admission open. Partial failure leaves it closed and publishes node statuses in
+provenance is not relabelled/deleted. After the last activation, fresh whole-fleet checks verify every enrolled identity, both profiles,
+service/auth health, the configured real NFS endpoint with one exclusive tiny own probe, and
+actual zero-allocation Slurm registration. The complete AiiDA/Slurm absence checks repeat after
+restart and before admission. RESUME requires retained original→own tagged DRAIN→measured stop
+provenance, a current body-derived six-field tuple and actual restarted daemon UTC window. A
+standard not-responding DOWN reason is supported only in its measured own stop window. One RESUME
+is followed by at most ten readonly polls; exact same-generation IDLE and zero allocations on
+every worker precede gate opening. Other state/reason/resource/generation changes remain closed. Own stop
+markers are removed after durable terminal success. Partial/unknown outcomes never auto-retry. Partial failure leaves it closed and publishes node statuses in
 `/var/lib/qcl-negf/runtime/delivery-report.json`; for a known failure, fix the cause and explicitly
 repeat the same idempotent command. An uncertain outcome requires trusted reconciliation first. A
 repeated successful activation retains profile/Code identity and repeats checks. Application and
@@ -311,7 +336,7 @@ remains diagnostic and must satisfy old gate checks; it is not enrolled fleet ev
 installed tooling without identity or role metadata must be upgraded through separately authorized
 initial bootstrap; there is no permissive copy/install before preflight or auto enrollment fallback.
 Startup uses the same authority/trust/worker binding and rejects unresolved receipts; CR02 shared
-lifecycle intent/owner coordination is implemented below; full I14 remains a separate blocker.
+lifecycle intent/owner coordination is implemented below. I14 software adapters are prepared in source; native full-fleet acceptance remains a separate gate.
 Synthetic API tests establish none of real inventory completeness, provider/SSH trust, service/VM
 health, all-worker I14 gates, or scientific acceptance.
 
@@ -338,5 +363,51 @@ requires reconciliation, never trustworthy completion. All preexisting CR04 byte
 retry blocks before further snapshot/SSH/copy/RESUME. The Windows wrappers coordinate protected
 registry route and scoped enrollment output; actual authenticated actor mapping, private inventory,
 SSH trust and Hyper-V/GPO event ordering remain deployment gates. See
-[Windows lifecycle](windows-workers.md). Whole-cluster I14 VM-stop/cancellation/complete-health
-adapters are not implemented here; durable unknown update ownership inhibits ordinary startup.
+[Windows lifecycle](windows-workers.md). Whole-cluster I14 cancellation, stopped-worker and final-health adapters are prepared in source;
+VM poweroff is excluded. Durable unknown update ownership inhibits ordinary startup. The original
+source packet failed (76 test methods, 13 failures including subtests, 10 errors); the whole F1–F7
+repair is source-only and awaits the separately admitted whole test packet and independent review.
+No native proc/cgroup/Slurm/NFS/SQL or scientific acceptance is inherited from this source work.
+
+## Rollout and evidence boundaries
+
+The new actions/helper and configured NFS endpoint must already be installed on controller and
+workers before their first whole update. An older CLI fails the readonly capability preflight;
+there is no fallback to old partial delivery. Application/solver closures do not imply OS image
+compatibility. A candidate requiring OS/Slurm/NFS changes needs a separately reviewed prebuilt-role
+maintenance gate; `requires_os_maintenance` candidates are refused by this application path.
+Source fakes/stdlib tests do not establish native QueryBuilder NULL semantics, mask/proc/cgroup
+permissions, NFS durability, installed runtime, guest/restore, CI or scientific acceptance.
+
+Update metadata bytes are conservatively precharged upper bounds (32 MiB per action), not
+server IO measurements. Actual returned bytes are separate. Reads include sentinel reservations;
+iterator caps charge before each access, including skipped names. Health, marker cleanup and
+update activation share finite action deadlines. Expired probes/publications retain own cleanup
+evidence and unknown status; source bounds do not promise interrupting kernel-blocked fsync.
+
+The R1–R5 source amendment separates complete global PID classification (comm, UID tuple,
+unified cgroup, encoded PID/start ticks/state) from mandatory full executable proof for every
+own root/sub-cgroup member and daemon. Unrelated classified kernel/zombie processes may lack a
+userspace executable; missing own executable or denied/malformed classification still refuses.
+PID/start/executable/UID/comm/cgroup identity and live/nonexecuting class are compared separately
+from volatile accounting. Bounded raw before/after observations remain private evidence.
+
+Complete healthy IDLE may omit the optional native Reason. Its raw record is retained, while
+before-DRAIN comparisons use registration/allocation/state/full-Reason safety fields, preserving
+volatile native fields privately. Own DRAIN records measured effective `id -u`/`id -un`, UTC
+request/readback clock endpoints and the exact attempt tag. An exact actor/time suffix is accepted
+only within this measured UTC window; prefix matches and foreign/stale/future suffixes refuse.
+Executed scheduler show/update argv explicitly includes `TZ=UTC LC_ALL=C SLURM_CONF=<configured>`.
+The complete accepted full Reason/raw record is reused for known retry and before RESUME; missing
+causal evidence blocks a new dispatch before identity/capability children. Installed Slurm actor,
+timezone and wire semantics remain a native gate, not a source-fixture result.
+
+Actual update CLI manifest/settings/gate/release reads, controller/worker identity, check and Code
+UUID publication share one UpdateScan from the first access through terminal IO; legacy non-update
+routes keep their existing contract. Nested primitive/null stopped member/systemd objects become
+bounded ValueError in the existing unknown boundary. Full malformed observations stay private;
+public failure summaries retain status/error class without raw identities or command bodies.
+Controller fleet-health reads its own AiiDA/API/munged/NFS/profile/identity evidence and does not
+query worker slurmd/cgroup/stop markers. The source amendment declares 105 test methods (97 retained
+plus eight named bodies); none have been executed or accepted by this amendment. Absent-unit native
+failure is not measured, and no source/native/scientific-ready claim follows from the declaration.

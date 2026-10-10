@@ -7,6 +7,7 @@ let
     mkdir -p "$out/ops"
     cp ${../ops/application_release.py} "$out/ops/application_release.py"
     cp ${../ops/worker_lifecycle.py} "$out/ops/worker_lifecycle.py"
+    cp ${../ops/aiida_update_check.py} "$out/ops/aiida_update_check.py"
     cp ${../ops/register_aiida.py} "$out/ops/register_aiida.py"
   '';
   releaseCommand = pkgs.writeShellApplication {
@@ -58,6 +59,7 @@ in {
         email = config.qclNegf.application.bootstrap.email;
         allowed_codes_file = config.qclNegf.application.api.allowedCodesFile;
         role = if cluster.controller then "controller" else "worker";
+        nfs_source = "${cluster.storageHost}:/srv/qcl-negf/jobs";
         slurm_conf = "${config.services.slurm.etcSlurm}/slurm.conf";
       };
       systemd.tmpfiles.rules = [
