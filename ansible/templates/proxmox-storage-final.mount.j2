@@ -1,0 +1,13 @@
+# Protected host infrastructure; original tree retained for admitted recovery.
+[Unit]
+Description=Protected persistent Proxmox directory storage
+Before=pve-guests.service
+[Mount]
+What=/dev/disk/by-uuid/{{ c.final.fs_uuid }}
+Where={{ c.final.path }}
+Type=ext4
+Options=rw,nodev,nosuid
+LazyUnmount=no
+ForceUnmount=no
+[Install]
+WantedBy=local-fs.target
