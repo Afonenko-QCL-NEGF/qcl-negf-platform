@@ -12,6 +12,44 @@ FIEMAP = 0xC020660B
 EXTENT = struct.Struct("=QQQQQIIII")
 HEADER = struct.Struct("=QQIIII")
 
+def normalize_swapon_raw(text, maximum_rows):
+    """Normalize exact seven-column util-linux raw output into existing typed rows.
+
+    UUID must be fully measured and LABEL is empty or one safe token. Raw escapes,
+    ambiguous whitespace, unknown paths/units and duplicate rows are refusals.
+    Independent named inode/rdev and header UUID checks remain in the playbook.
+    """
+    import re
+    if not isinstance(text, str) or len(text.encode('utf-8')) > 65536:
+        raise ValueError('bounded raw swap table required')
+    if not isinstance(maximum_rows, int) or isinstance(maximum_rows, bool) or not 0 < maximum_rows <= 65536:
+        raise ValueError('finite swap row bound required')
+    if any(c in text for c in ('\\', '\r', '\t', '\x00')):
+        raise ValueError('escaped or control swap table')
+    if not text:
+        return {'swaps': []}
+    if not text.endswith('\n'):
+        raise ValueError('complete raw swap rows required')
+    lines = text[:-1].split('\n')
+    if len(lines) > maximum_rows:
+        raise ValueError('swap row bound')
+    rows=[]; names=set()
+    pattern=re.compile(r'(/[A-Za-z0-9_./+-]+) (file|partition) ([0-9]+) ([0-9]+) (-?[0-9]+) ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}) ([A-Za-z0-9_.+-]{0,128})')
+    for line in lines:
+        match=pattern.fullmatch(line)
+        if match is None:
+            raise ValueError('unknown raw swap row')
+        name,kind,size,used,prio,identifier,label=match.groups()
+        if os.path.normpath(name)!=name or name in names or identifier=='00000000-0000-0000-0000-000000000000':
+            raise ValueError('noncanonical/duplicate swap identity')
+        size=int(size); used=int(used); prio=int(prio)
+        if not 0<size<=9223372036854775807 or not 0<=used<=size or not -9223372036854775807<=prio<=9223372036854775807:
+            raise ValueError('invalid swap byte counters/priority')
+        names.add(name)
+        rows.append(dict(name=name,type=kind,size=size,used=used,prio=prio))
+    return {'swaps':rows}
+
+
 
 def identity(s):
     return dict(dev=s.st_dev, dev_major=os.major(s.st_dev), dev_minor=os.minor(s.st_dev), inode=s.st_ino, nlink=s.st_nlink, uid=s.st_uid,

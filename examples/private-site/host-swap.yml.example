@@ -64,7 +64,7 @@ qcl_host_storage:
       direct: false
       fiemap: false
       ext4: false
-      swapon_json: false
+      swapon_raw_columns: false
       systemd_version: null
       busctl_json: false
       wipefs_json: false
