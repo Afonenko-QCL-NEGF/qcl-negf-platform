@@ -264,3 +264,39 @@ boundary: a root flake's relative `../other-site` input crosses that boundary.
 Render a reviewed canonical absolute input in an external private overlay, or
 keep the sibling beneath one common flake source tree; do not copy a temporary
 server path into public source.
+
+## Fresh private inputs and local update
+
+Cold bootstrap starts from the selected fresh source ref and authoritative Gitlinks, not old
+private volumes, receipts or a copied scientific depot. The operator explicitly supplies an
+already-trusted root-owned 0600 shell input file. Source only that declared file without `set -x`,
+environment dumps or token/address echo; never discover or execute shell files from an archive.
+It declares fresh site paths, source ref, protected enrollment/known_hosts/pool paths, local
+release/cache/signing inputs and actual provider/endpoint/storage/network identities. Standard
+NixOS/Proxmox/Slurm resource policy/reserves stay in their owning configurations, not shell text.
+The update API consumes validated paths, not shell bodies. Missing/duplicate/unreadable mandatory
+inputs and a missing accepted fresh-site producer are blockers; old private state is not a
+substitute. The Root fresh-site producer is a separate owning implementation.
+
+Use the existing official pinned builder seed, four-role evaluation, strict native nginx
+preflight, executable/flake/owner checks and fresh capacity admission before an explicitly
+budgeted build. Build, signing/trust, delivery, guest/restore, final CI and scientific acceptance
+remain separate gates. One day is a planning target, not a measured bootstrap SLA.
+
+Install whole-update actions/helper/NFS metadata on every role during one-time preparation.
+Subsequent compatible application updates are local serial operations described in
+[application CD](application-cd.md); CI does not operate deployment. OS configuration changes
+require their separate reviewed prebuilt-role maintenance procedure.
+
+I14 whole F1–F7 repair is source-only pending a separately admitted whole source-test packet
+and independent review. Original failed source evidence is retained; native current daemon/UTC
+registration, full service membership, SQL NULL handling and NFS ownership remain unmeasured.
+An original foreign worker DOWN/DRAIN/reason requires operator diagnosis and is never overwritten
+by application update. Stopped worker execution does not authorize VM poweroff or RAM reclamation.
+
+The I14 R1–R5/role-health amendment is prepared only in source. All 97 prior selectors are retained,
+with eight new body oracles proposed for the same sole future whole packet. Native global PID/member
+applicability, actual Slurm full Reason/effective actor/explicit UTC + configured SLURM_CONF, current
+daemon registration, AiiDA SQL NULL, NFS/trust and installed repaired-source provenance remain fresh
+Root gates. Controller health has no worker slurmd requirement. Runtime tests/native acceptance have
+not been performed by this amendment; the original failed logs remain unchanged.
