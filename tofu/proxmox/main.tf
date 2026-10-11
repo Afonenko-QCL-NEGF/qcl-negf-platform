@@ -2,8 +2,8 @@ locals {
   build_profiles = jsondecode(file("${path.module}/../../ops/build-profiles.json"))
   persistent     = { for name, vm in var.vms : name => vm if contains(["storage", "control"], name) }
   replaceable    = { for name, vm in var.vms : name => vm if contains(["compute", "ci"], name) }
-  local_images   = { for name, vm in var.vms : name => vm if vm.image_file_id == null }
-  root_images    = { for name, vm in var.vms : name => vm.image_file_id != null ? vm.image_file_id : proxmox_virtual_environment_file.root_image[name].id }
+  local_images   = { for name, vm in var.vms : name => vm if !vm.adopt_existing_root && vm.image_file_id == null }
+  root_images    = { for name, vm in var.vms : name => vm.image_file_id != null ? vm.image_file_id : proxmox_virtual_environment_file.root_image[name].id if !vm.adopt_existing_root }
 }
 resource "proxmox_virtual_environment_file" "root_image" {
   for_each     = local.local_images
@@ -131,11 +131,13 @@ resource "proxmox_virtual_environment_vm" "replaceable" {
     floating  = 0
   }
   disk {
-    datastore_id = var.root_datastore
-    import_from  = local.root_images[each.key]
+    # CI adoption names the observed existing root, without an image import.
+    # A native saved-plan disk/VM identity review remains required before apply.
+    datastore_id = each.value.adopt_existing_root ? each.value.existing_root.datastore_id : var.root_datastore
+    import_from  = each.value.adopt_existing_root ? null : local.root_images[each.key]
     interface    = "virtio0"
-    size         = each.value.root_gib
-    serial       = "qcl-root"
+    size         = each.value.adopt_existing_root ? each.value.existing_root.size_gib : each.value.root_gib
+    serial       = each.value.adopt_existing_root ? each.value.existing_root.serial : "qcl-root"
   }
   dynamic "disk" {
     for_each = each.key == "compute" ? [1] : []

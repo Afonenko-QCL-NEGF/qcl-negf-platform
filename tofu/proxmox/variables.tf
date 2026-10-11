@@ -67,18 +67,24 @@ variable "ssh_public_keys" {
 }
 variable "vms" {
   type = map(object({
-    vm_id         = number
-    vcpus         = number
-    memory_mib    = number
-    root_gib      = number
-    mac           = string
-    address       = string
-    gateway       = string
-    started       = optional(bool, true)
-    on_boot       = optional(bool, true)
+    vm_id               = number
+    vcpus               = number
+    memory_mib          = number
+    root_gib            = number
+    mac                 = string
+    address             = string
+    gateway             = string
+    started             = optional(bool, true)
+    on_boot             = optional(bool, true)
+    adopt_existing_root = optional(bool, false)
+    existing_root = optional(object({
+      datastore_id = string
+      size_gib     = number
+      serial       = string
+    }))
     image_path    = optional(string)
     image_file_id = optional(string)
-    image_sha256  = string
+    image_sha256  = optional(string)
   }))
   description = "Exactly storage, control, compute and ci, with real site addresses and measured resource budgets."
   validation {
@@ -86,12 +92,24 @@ variable "vms" {
     error_message = "Define all four VM roles and no additional names."
   }
   validation {
-    condition     = alltrue([for vm in values(var.vms) : vm.vcpus >= 1 && vm.memory_mib >= 1024 && vm.root_gib >= 16 && can(cidrhost(vm.address, 0)) && can(regex("^[0-9a-f]{64}$", vm.image_sha256))])
-    error_message = "VMs need positive resources, an IPv4 CIDR and a SHA-256 pinned QCOW2 image."
+    condition     = alltrue([for vm in values(var.vms) : vm.vcpus >= 1 && vm.memory_mib >= 1024 && vm.root_gib >= 16 && can(cidrhost(vm.address, 0)) && (vm.adopt_existing_root ? true : can(regex("^[0-9a-f]{64}$", vm.image_sha256)))])
+    error_message = "VMs need positive resources and an IPv4 CIDR; image-backed roots require a pinned SHA-256."
   }
   validation {
-    condition     = alltrue([for vm in values(var.vms) : (vm.image_path != null) != (vm.image_file_id != null)])
-    error_message = "Choose exactly one image source: an operator-local image_path or a verified existing image_file_id."
+    condition = alltrue([for name, vm in var.vms : vm.adopt_existing_root ? (
+      name == "ci" && vm.existing_root != null &&
+      vm.image_path == null && vm.image_file_id == null && vm.image_sha256 == null
+    ) : (vm.existing_root == null && ((vm.image_path != null) != (vm.image_file_id != null)))])
+    error_message = "Choose one image source, or CI-only existing-root adoption with an explicit descriptor and no image source/hash."
+  }
+  validation {
+    condition = alltrue([for vm in values(var.vms) : vm.adopt_existing_root ? try(
+      vm.existing_root.size_gib == vm.root_gib && vm.existing_root.size_gib >= 16 &&
+      floor(vm.existing_root.size_gib) == vm.existing_root.size_gib &&
+      can(regex("^[A-Za-z0-9_][A-Za-z0-9_.-]*$", vm.existing_root.datastore_id)) &&
+      can(regex("^[A-Za-z0-9_.-]{1,20}$", vm.existing_root.serial)), false
+    ) : true])
+    error_message = "An adopted CI root must name the observed datastore/serial and the exact declared positive integer root size; never request a shrink."
   }
   validation {
     condition     = alltrue([for name, vm in var.vms : vm.image_file_id == null ? true : vm.image_file_id == "${var.image_datastore}:import/qcl-negf-${name}-${vm.image_sha256}.qcow2"])
