@@ -141,6 +141,41 @@ unreviewed install script. Cloud-init receives only hostname, MAC-matched networ
 keys. Runtime Munge keys, runner tokens and API credentials are delivered by the site's secret
 manager after provisioning, outside the Nix store and OpenTofu state.
 
+### Preserve an already owned CI root
+
+The default remains an imported QCOW2 root for every role. An existing CI VM can
+instead declare `adopt_existing_root = true` and `existing_root = { datastore_id,
+size_gib, serial }` in its private `vms.ci` record. Supply the measured current
+root tuple, set `root_gib` to that same size, and omit all three image fields
+(`image_path`, `image_file_id`, `image_sha256`). Only CI accepts this mode. The
+module then omits its image upload and root import and retains the descriptor's
+VirtIO root datastore, size and serial. The existing serial must contain 1–20 ASCII letters, digits, dots, underscores or hyphens, matching the pinned provider schema. No disk changes are hidden by lifecycle
+`ignore_changes`. This input declaration does not prove that a provider will
+adopt an existing disk in place.
+
+Keep the four image artifacts and their hashes separately. The image build
+command still attaches image fields to every generated VM record; create a
+separate private adoption variable file after that build, removing the CI image
+fields and adding the observed descriptor. Do not treat the generated file as an
+adoption plan or erase its original image manifest.
+
+Before changing ownership, stop at a reviewed native saved plan. Retain the
+bootstrap state and its lock/backup, VM configuration, root LV/filesystem identity,
+source checkout, Nix store/database and receipts. There must be exactly one state
+owner of the VM throughout the separately authorized state handoff; never apply
+an independent backend that creates the same VM ID. Refuse any plan that destroys
+or replaces the VM or detaches, reformats, imports over or shrinks its existing
+root. The descriptor and its lower-bound checks must use current observations,
+not example values. If the pinned provider cannot preserve the root, retain the
+bootstrap owner and prepare a reviewed alternative; do not suppress disk diffs.
+
+Preserving a VM root is separate from activating the full CI operating system.
+Evaluate the configuration against that root's actual hardware/filesystem facts.
+A changed derivation needs a matching new role/nginx preflight; unchanged
+configuration does not acquire a new acceptance merely from the state handoff.
+Neither variable validation nor a mocked plan proves boot, services, capacity or
+scientific acceptance.
+
 5. Initialize and inspect the provider plans, using the generated input files:
 
 ```sh
