@@ -1315,6 +1315,13 @@ def process_record(budget,path):
     if not executable.startswith('/') or executable!=later_executable or not same_process(before,after,include_executable=False):raise ValueError('Process generation/executable identity changed')
     return {**after,'executable':executable,'observations':{'before':raw_before,'after':raw_after}}
 
+def daemon_scope_bound(cgroup,service_cgroup):
+    # Slurm may delegate a child cgroup inside its own systemd service. Reject
+    # noncanonical paths before a component-wise containment comparison.
+    for value in (cgroup,service_cgroup):
+        if not isinstance(value,str) or not value.startswith('/') or value.startswith('//') or '\x00' in value or '..' in Path(value).parts or str(Path(value))!=value:return False
+    return service_cgroup!='/' and Path(cgroup).is_relative_to(Path(service_cgroup))
+
 def physical_stop_scan(budget,service):
     budget.read('/sys/fs/cgroup/cgroup.controllers')
     uid=pwd.getpwnam('qcl-negf').pw_uid;records={};jobs=[];daemon=[]
@@ -1327,7 +1334,7 @@ def physical_stop_scan(budget,service):
             full=process_record(budget,path)
             if not same_process(full,record,include_executable=False):raise ValueError('Daemon classification generation changed')
             record=full
-            if record['cgroup']!=service['ControlGroup'] or not record['executable'].startswith('/nix/store/') or Path(record['executable']).name!='slurmd':raise ValueError('Unbound daemon scope/executable')
+            if not daemon_scope_bound(record['cgroup'],service['ControlGroup']) or not record['executable'].startswith('/nix/store/') or Path(record['executable']).name!='slurmd':raise ValueError('Unbound daemon scope/executable')
             daemon.append(record)
         elif record['comm'].startswith(('slurmstepd','slurm_script')) or '/job_' in record['cgroup'] or '/step_' in record['cgroup'] or uid in record['uids']:jobs.append(record['pid'])
     cg=service['ControlGroup'];members=[]

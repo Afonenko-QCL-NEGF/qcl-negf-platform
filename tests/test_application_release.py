@@ -1856,6 +1856,39 @@ class I14WholeRepairTests(unittest.TestCase):
         self.assertGreaterEqual(sum(a[:2]==['systemctl','show'] for a in fs.calls),30)
         for suffix in ('/cgroup.procs','/123/stat','/123/status','/release-config.json','/slurm.conf'):
             self.assertTrue(any(t[0]=='read' and t[1].endswith(suffix) for t in fs.trace),suffix)
+    def test_native_slurmd_delegated_leaf_is_bound_and_stops_without_force(self):
+        fs=self.fs();leaf=fs.state['ControlGroup']+'/slurmd'
+        fs.process(123,cgroup=leaf)
+        fs.write('/sys/fs/cgroup/system.slice/slurmd.service/cgroup.procs','')
+        fs.write('/sys/fs/cgroup'+leaf+'/cgroup.procs','123\n')
+        scan=fs.scan();captured=self.ops.singleton_scope(scan,fs.state)
+        self.assertEqual(captured['cgroup'],leaf);self.assertEqual(captured['pid'],123)
+        self.assertEqual([r['pid']for r in scan['service_members']],[123])
+        native=fs.native
+        def stop_leaf(args):
+            result=native(args)
+            if args[:2]==['systemctl','stop']:fs.write('/sys/fs/cgroup'+leaf+'/cgroup.procs','')
+            return result
+        fs.native=stop_leaf;result=fs.stop()
+        self.assertTrue(result['service_scope_complete']);self.assertEqual(result['service_members'],[])
+        self.assertTrue(result['job_processes_empty']);self.assertFalse(result['forced_daemon_stop'])
+        self.assertFalse(any(a[:2]==['systemctl','kill']for a in fs.calls))
+    def test_delegated_daemon_scope_rejects_foreign_malformed_or_membership_drift(self):
+        cases=('sibling','prefix','traversal','double_slash','dot','trailing_slash','leaf_mismatch','extra_member')
+        for case in cases:
+            with self.subTest(case=case),tempfile.TemporaryDirectory()as temporary,ExitStack()as scope:
+                old=self.root;self.root=Path(temporary)
+                try:
+                    fs=self.fs(force=True);scope.callback(fs.stack.close);root=fs.state['ControlGroup'];leaf=root+'/slurmd'
+                    paths={'sibling':'/system.slice/foreign.service/slurmd','prefix':root+'-foreign/slurmd',
+                           'traversal':root+'/../foreign','double_slash':root+'//slurmd','dot':root+'/./slurmd','trailing_slash':root+'/'}
+                    fs.process(123,cgroup=paths.get(case,leaf))
+                    if case=='extra_member':
+                        fs.write('/sys/fs/cgroup'+root+'/cgroup.procs','');fs.write('/sys/fs/cgroup'+leaf+'/cgroup.procs','123\n456\n')
+                        fs.process(456,comm='foreign-helper',cgroup=leaf,executable='/nix/store/helper/bin/helper')
+                    with self.assertRaisesRegex(ValueError,'scope|metadata|member|cgroup'):fs.stop()
+                    self.assertFalse(any(a[:2]in(['systemctl','mask'],['systemctl','stop'],['systemctl','kill'])for a in fs.calls))
+                finally:self.root=old
     def test_f1_subgroup_pid_reuse_exec_invocation_and_race_refuse(self):
         for fault in ('subgroup','ticks','exe','invocation','snapshot_member'):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temporary:
