@@ -478,9 +478,10 @@ def worker_daemon_binding(config, hostname, run,metadata_budget=None):
     unit_confs = [value.split("=", 1)[1] for value in shlex.split(service.get("Environment", "")) if value.startswith("SLURM_CONF=")]
     if runtime_confs != [conf] or unit_confs != [conf]:
         raise ValueError("Unsupported worker: different daemon SLURM_CONF")
-    aliases = run(["env", "SLURM_CONF=" + conf, "scontrol", "show", "aliases", hostname]).strip()
-    # Narrow supported response; actual pinned-site format still needs a smoke gate.
-    match = re.fullmatch(r"NodeName=([a-zA-Z0-9][a-zA-Z0-9._-]{0,63})", aliases)
+    aliases = run(["env", "SLURM_CONF=" + conf, "scontrol", "show", "aliases", hostname])
+    # Slurm emits a bare canonical name; retain the legacy labelled response.
+    # Only one name and an optional terminal LF are supported, never a list.
+    match = re.fullmatch(r"(?:NodeName=)?([a-zA-Z0-9][a-zA-Z0-9._-]{0,63})\n?", aliases)
     if not match:
         raise ValueError("Unsupported worker: ambiguous/missing canonical aliases")
     return match.group(1), (config_bytes, service, tuple(args), tuple(runtime_confs))

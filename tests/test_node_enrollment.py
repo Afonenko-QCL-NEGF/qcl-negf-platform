@@ -584,5 +584,46 @@ class EnrollmentTests(unittest.TestCase):
                             enrollment="/protected/registry.json", runtime=runtime, gate=gate)
                     self.assertEqual(run.calls, calls_before)
 
+
+
+class WorkerAliasResponseTests(unittest.TestCase):
+    """Native-format compatibility at the existing daemon identity boundary."""
+    def bind(self, aliases):
+        files = {"/protected/slurm.conf": b"synthetic static config",
+                 "/proc/42/cmdline": b"/nix/store/slurm/bin/slurmd\0-D\0-s\0",
+                 "/proc/42/environ": b"SLURM_CONF=/protected/slurm.conf\0"}
+        calls = []
+        def system(args):
+            calls.append(args)
+            if args[0] == "systemctl":
+                return "MainPID=42\nInvocationID=" + "f" * 32 + "\nEnvironment=SLURM_CONF=/protected/slurm.conf"
+            self.assertEqual(args, ["env", "SLURM_CONF=/protected/slurm.conf", "scontrol", "show", "aliases", "worker.invalid"])
+            return aliases
+        with patch.object(ops, "local_metadata", lambda path, limit=16384: files[str(path)]), \
+             patch.object(ops, "slurmd_pids", lambda: [42]):
+            node, daemon = ops.worker_daemon_binding({"slurm_conf": "/protected/slurm.conf"}, "worker.invalid", system)
+        self.assertEqual(daemon[1]["MainPID"], "42")
+        self.assertEqual(daemon[1]["InvocationID"], "f" * 32)
+        self.assertEqual(daemon[3], ("/protected/slurm.conf",))
+        return node
+
+    def test_native_single_name_and_legacy_label_bind_same_canonical_node(self):
+        for response in ("worker", "worker\n", "NodeName=worker", "NodeName=worker\n"):
+            with self.subTest(response=response):
+                try:
+                    node = self.bind(response)
+                except ValueError as error:
+                    self.fail(f"Supported native alias response was rejected: {error}")
+                self.assertEqual(node, "worker")
+
+    def test_ambiguous_or_unrecognized_alias_output_is_rejected(self):
+        for response in ("", "\n", "worker\nother\n", "worker,other\n", " worker\n", "worker \n",
+                         "worker\n\n", "worker\t", "worker other", "NodeName=worker extra",
+                         "NodeName=worker,other", " NodeName=worker", "NodeName=worker ", "NodeName=worker\n\n", "NodeAddr=worker", "NodeName=", "worker\r\n", "-worker",
+                         "w" * 65):
+            with self.subTest(response=response):
+                with self.assertRaisesRegex(ValueError, "ambiguous/missing canonical aliases"):
+                    self.bind(response)
+
 if __name__ == "__main__":
     unittest.main()
