@@ -435,3 +435,8 @@ and the same release identity. This prepares the new service environment before
 the changed `EnvironmentFile` and slurmd `ExecStartPre` become active. Do not copy
 old runtime files as a substitute for checked initial preparation. Existing-state
 reconciliation remains an explicit operator step.
+
+Both owning operational commands, `qcl-negf-release` and
+`qcl-negf-worker-lifecycle`, explicitly export the same generated `SLURM_CONF`
+used by the configured Slurm daemon. Their raw Slurm dependencies must not fall
+back to DNS configless discovery or a caller's unrelated configuration.

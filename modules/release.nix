@@ -13,12 +13,18 @@ let
   releaseCommand = pkgs.writeShellApplication {
     name = "qcl-negf-release";
     runtimeInputs = [ pkgs.nix pkgs.systemd pkgs.slurm pkgs.openssh pkgs.util-linux pkgs.coreutils pkgs.python314 ];
-    text = ''exec python3 ${operations}/ops/application_release.py "$@"'';
+    text = ''
+      export SLURM_CONF=${config.services.slurm.etcSlurm}/slurm.conf
+      exec python3 ${operations}/ops/application_release.py "$@"
+    '';
   };
   lifecycleCommand = pkgs.writeShellApplication {
     name = "qcl-negf-worker-lifecycle";
     runtimeInputs = [ pkgs.nix pkgs.systemd pkgs.slurm pkgs.openssh pkgs.util-linux pkgs.python314 ];
-    text = ''exec python3 ${operations}/ops/worker_lifecycle.py "$@"'';
+    text = ''
+      export SLURM_CONF=${config.services.slurm.etcSlurm}/slurm.conf
+      exec python3 ${operations}/ops/worker_lifecycle.py "$@"
+    '';
   };
 in {
   options.qclNegf.release = {
