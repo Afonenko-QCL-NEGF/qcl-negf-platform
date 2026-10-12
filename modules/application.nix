@@ -151,7 +151,7 @@ in {
       serviceConfig = {
         User = "qcl-negf"; Group = "qcl-negf";
         WorkingDirectory = "/var/lib/qcl-negf";
-        EnvironmentFile = "-/var/lib/qcl-negf/runtime/service.env";
+        EnvironmentFile = "-/var/lib/qcl-negf-admin/runtime/service.env";
         ExecStart = daemonStart;
         Restart = "on-failure"; RestartSec = 5;
         NoNewPrivileges = true;
@@ -185,7 +185,7 @@ in {
         User = "qcl-negf"; Group = "qcl-negf";
         WorkingDirectory = "/var/lib/qcl-negf";
         LoadCredential = "api-token:${cfg.api.tokenFile}";
-        EnvironmentFile = "-/var/lib/qcl-negf/runtime/service.env";
+        EnvironmentFile = "-/var/lib/qcl-negf-admin/runtime/service.env";
         ExecStart = apiStart;
         Restart = "on-failure";
         NoNewPrivileges = true;

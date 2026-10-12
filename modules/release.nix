@@ -63,8 +63,9 @@ in {
         slurm_conf = "${config.services.slurm.etcSlurm}/slurm.conf";
       };
       systemd.tmpfiles.rules = [
-        "d /var/lib/qcl-negf/runtime 0755 root root -"
-        "d /var/lib/qcl-negf/trust-snapshots 0700 root root -"
+        "d /var/lib/qcl-negf-admin 0755 root root -"
+        "d /var/lib/qcl-negf-admin/runtime 0755 root root -"
+        "d /var/lib/qcl-negf-admin/trust-snapshots 0700 root root -"
       ];
       systemd.services.slurmd = lib.mkIf cluster.worker {
         requires = [ "qcl-negf-application-profile.service" ];

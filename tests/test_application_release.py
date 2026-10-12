@@ -1653,7 +1653,7 @@ class IsolatedWorkerIO:
             'ControlGroup':'/system.slice/slurmd.service','InvocationID':'a'*32,'UnitFileState':'enabled',
             'FragmentPath':'/nix/store/unit/slurmd.service','DropInPaths':''}
         self.attempt='77777777-7777-7777-7777-777777777777'
-        self.runtime=Path('/var/lib/qcl-negf/runtime');self.gate=Path('/srv/qcl-negf/jobs/admission.json')
+        self.runtime=Path('/var/lib/qcl-negf-admin/runtime');self.gate=Path('/srv/qcl-negf/jobs/admission.json')
         self.write('/etc/qcl-negf/release-config.json',json.dumps({'role':role,'slurm_conf':'/etc/slurm.conf','nfs_source':'storage.invalid:/srv/qcl-negf/jobs','email':'test@example.invalid','allowed_codes_file':'/var/lib/qcl-negf/allowed-codes'}))
         self.write('/etc/slurm.conf','NodeName=worker CPUs=12 RealMemory=28000\n')
         self.write('/sys/class/dmi/id/product_uuid',self.identity['machine_uuid'])
@@ -1670,7 +1670,7 @@ class IsolatedWorkerIO:
     def mapped(self,path):
         if isinstance(path,int):return path
         value=os.fspath(path)
-        roots=('/proc','/sys','/etc','/run','/var/lib/qcl-negf','/srv/qcl-negf','/nix')
+        roots=('/proc','/sys','/etc','/run','/var/lib/qcl-negf-admin','/var/lib/qcl-negf','/srv/qcl-negf','/nix')
         if value=='/' or any(value==root or value.startswith(root+'/') for root in roots):
             actual=self.real(value)
             self.test.assertTrue(actual.is_relative_to(self.root),'covered logical IO remains in this fresh own root')

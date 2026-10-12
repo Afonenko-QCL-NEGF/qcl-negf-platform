@@ -29,7 +29,8 @@ import tempfile
 from urllib.parse import urlsplit
 
 
-RUNTIME = Path("/var/lib/qcl-negf/runtime")
+ADMIN_STATE = Path("/var/lib/qcl-negf-admin")
+RUNTIME = ADMIN_STATE / "runtime"
 PROFILE = Path("/nix/var/nix/profiles/qcl-negf-application")
 GATE = Path("/srv/qcl-negf/jobs/.release-admission.json")
 IDENTIFIER = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}\Z")
@@ -182,7 +183,7 @@ def command(args, *, timeout_seconds=360.0, output_bytes=1048576,
     return output
 
 
-TRUST_SNAPSHOTS = Path("/var/lib/qcl-negf/trust-snapshots")
+TRUST_SNAPSHOTS = ADMIN_STATE / "trust-snapshots"
 IDENTITY_SCHEMA = "qcl-negf-node-identity-v1"
 ENVELOPE_SCHEMA = "qcl-negf-node-release-check-v1"
 

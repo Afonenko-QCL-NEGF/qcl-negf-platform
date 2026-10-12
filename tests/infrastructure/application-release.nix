@@ -44,7 +44,13 @@ assert controller.qclNegf.release.enable;
 assert worker.qclNegf.release.enable;
 assert lib.hasPrefix "/nix/store/" controller.systemd.services.qcl-negf-aiida.serviceConfig.ExecStart;
 assert lib.hasSuffix "-qcl-negf-aiida-start" controller.systemd.services.qcl-negf-aiida.serviceConfig.ExecStart;
-assert controller.systemd.services.qcl-negf-aiida.serviceConfig.EnvironmentFile == "-/var/lib/qcl-negf/runtime/service.env";
+assert controller.systemd.services.qcl-negf-aiida.serviceConfig.EnvironmentFile == "-/var/lib/qcl-negf-admin/runtime/service.env";
+assert controller.systemd.services.qcl-negf-api.serviceConfig.EnvironmentFile == "-/var/lib/qcl-negf-admin/runtime/service.env";
+assert lib.all (role: lib.all (rule: lib.elem rule role.systemd.tmpfiles.rules) [
+  "d /var/lib/qcl-negf-admin 0755 root root -"
+  "d /var/lib/qcl-negf-admin/runtime 0755 root root -"
+  "d /var/lib/qcl-negf-admin/trust-snapshots 0700 root root -"
+]) [ controller worker ];
 assert lib.hasInfix "qcl-negf-release node-check" worker.systemd.services.slurmd.serviceConfig.ExecStartPre;
 assert lib.hasInfix "ReturnToService=0" worker.services.slurm.extraConfig;
 assert lib.hasInfix "JobRequeue=0" worker.services.slurm.extraConfig;
