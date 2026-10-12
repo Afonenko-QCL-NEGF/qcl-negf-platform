@@ -2015,7 +2015,7 @@ def _deliver_cli_locked(expected, pool, run, *, runtime, gate, authority, start,
                 stage.update(phase='admit',node=worker,remote=False,mutation=True)
                 receipt['slurm_drain'][worker]['resume_status']='pending';checkpoint()
                 try:
-                    run([*slurm_argv,'update','NodeName='+worker,'State=RESUME'])
+                    run([*slurm_argv,'update','NodeName='+worker,'State=RESUME','Reason=None'])
                     accepted=False
                     for _ in range(10):
                         stage.update(phase='resume_readback',node=worker,remote=False,mutation=False)

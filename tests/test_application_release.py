@@ -221,7 +221,11 @@ class NativeUpdateModel:
             elif self.reason_fault=='extra':reason+=' extra'
             self.nodes[name].update(State='IDLE+DRAIN',Reason=reason)
             if self.after_drain:self.after_drain(name)
-        elif fields['State']=='RESUME':self.nodes[name].update(State='IDLE',Reason='None')
+        elif fields['State']=='RESUME':
+            # Slurm 25.11 keeps the historical reason on RESUME unless the
+            # update explicitly supplies a nonempty Reason value.
+            self.nodes[name]['State']='IDLE'
+            if fields.get('Reason'):self.nodes[name]['Reason']=fields['Reason']
         else:raise AssertionError('unauthorized synthetic state transition')
         self.transitions.append((name,dict(fields)))
         return ''
@@ -1974,6 +1978,17 @@ class I14WholeRepairTests(unittest.TestCase):
             return value
         self.model.health=stale
         result=self.deliver();self.assertFalse(result['open']);self.assertFalse(any('State=RESUME' in a for a in self.calls))
+    def test_resume_explicitly_clears_own_reason_before_opening_admission(self):
+        result=self.deliver()
+        self.assertTrue(result['open'],'RESUME must not strand the own drain reason on an idle node')
+        self.assertTrue(json.loads(self.gate.read_text())['open'])
+        for name in ('worker','second'):
+            self.assertEqual(self.model.nodes[name]['State'],'IDLE')
+            self.assertEqual(self.model.nodes[name]['Reason'],'None')
+            updates=[args for args in self.calls if 'State=RESUME' in args and 'NodeName='+name in args]
+            self.assertEqual(len(updates),1,'each proven own drain gets exactly one resume')
+            self.assertIn('Reason=None',updates[0])
+
     def test_f4_postresume_wait_and_exact_idle(self):
         self.model.resume_reads['worker']=[{'State':'IDLE+NOT_RESPONDING','BootTime':'None','SlurmdStartTime':'None'}]*2
         # Responses apply only after RESUME, not during initial capture.
