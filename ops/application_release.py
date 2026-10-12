@@ -1537,9 +1537,20 @@ def registration_fields(raw):
     return values
 
 
+def unset_registration_reason(reason):
+    """Recognize native unset metadata without rewriting retained raw evidence."""
+    if reason in ('None',''):return True
+    if not isinstance(reason,str):return False
+    match=re.fullmatch(r'None \[([^\s@\[\]\x00]+)@(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)\]',reason)
+    if not match or len(match.group(1).encode())>128:return False
+    try:datetime.strptime(match.group(2),'%Y-%m-%dT%H:%M:%S')
+    except ValueError:return False
+    return True
+
+
 def registration_safety(value):
     result={k:value[k] for k in (*REGISTRATION_FIELDS,'CPUAlloc','AllocMem','State','Reason')}
-    if result['State']=='IDLE' and result['Reason'] in ('None',''):result['Reason']=''
+    if result['State']=='IDLE' and unset_registration_reason(result['Reason']):result['Reason']=''
     return result
 
 
@@ -1587,10 +1598,10 @@ def registration_ready(wanted,value):
     # Owner-equivalent registration_ready: ops/slurm_maintenance.py:88–104.
     if any(value[k]!=wanted[k] for k in ('NodeName','CPUTot','RealMemory','Version')):raise ValueError('Current registration tuple changed')
     if value['State']=='IDLE+NOT_RESPONDING':
-        if value['Reason'] not in ('None',''):raise ValueError('Unexpected post-RESUME registration Reason')
+        if not unset_registration_reason(value['Reason']):raise ValueError('Unexpected post-RESUME registration Reason')
         if any(value[k] not in ('None',wanted[k]) for k in ('BootTime','SlurmdStartTime')):raise ValueError('Registration generation changed')
         return False
-    if value['State']!='IDLE' or registration_tuple(value)!=wanted or value['Reason'] not in ('None',''):raise ValueError('Final same-generation IDLE registration not established')
+    if value['State']!='IDLE' or registration_tuple(value)!=wanted or not unset_registration_reason(value['Reason']):raise ValueError('Final same-generation IDLE registration not established')
     return True
 
 def current_worker_health(value,binding,original):
@@ -1901,10 +1912,10 @@ def _deliver_cli_locked(expected, pool, run, *, runtime, gate, authority, start,
             if worker in prior_drain:
                 original,drain,previous_identity=prior_drain[worker]
                 if previous_identity!=dict(bindings[worker]['identity']):raise ValueError('Retained original Slurm binding/boot changed')
-                if not original or original.get('State')!='IDLE' or original.get('Reason') not in ('None','') or value['State']!='IDLE+DRAIN' or not retained_drain_complete(drain) or value['Reason']!=drain['after_readback']['Reason'] or registration_tuple(value)!=registration_tuple(original):raise ValueError('Retained Slurm provenance/generation changed')
+                if not original or original.get('State')!='IDLE' or not unset_registration_reason(original.get('Reason')) or value['State']!='IDLE+DRAIN' or not retained_drain_complete(drain) or value['Reason']!=drain['after_readback']['Reason'] or registration_tuple(value)!=registration_tuple(original):raise ValueError('Retained Slurm provenance/generation changed')
                 receipt['slurm_before'][worker]=original
             else:
-                if value['State']!='IDLE' or value['Reason'] not in ('None',''):raise ValueError('Original Slurm state/reason requires retained provenance')
+                if value['State']!='IDLE' or not unset_registration_reason(value['Reason']):raise ValueError('Original Slurm state/reason requires retained provenance')
                 receipt['slurm_before'][worker]=value
             return value
         original_current={worker:capture_original(worker) for worker in workers}

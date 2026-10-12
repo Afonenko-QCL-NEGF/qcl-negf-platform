@@ -1989,6 +1989,41 @@ class I14WholeRepairTests(unittest.TestCase):
             self.assertEqual(len(updates),1,'each proven own drain gets exactly one resume')
             self.assertIn('Reason=None',updates[0])
 
+    def test_native_annotated_unset_reason_completes_update_without_losing_raw(self):
+        annotation='None [root@2026-10-12T15:48:11]'
+        for node in self.model.nodes.values():node['Reason']=annotation
+        command=self.model.command
+        def annotated(args):
+            text=command(args)
+            if 'State=RESUME' in args:
+                name=next(x.split('=',1)[1] for x in args if x.startswith('NodeName='))
+                self.model.nodes[name]['Reason']=annotation
+            return text
+        self.model.command=annotated
+        result=self.deliver();self.assertTrue(result['open'])
+        record=self.receipt()
+        for name in ('worker','second'):
+            original=record['slurm_before'][name]
+            self.assertEqual(original['Reason'],annotation)
+            self.assertIn('Reason='+annotation,original['_raw'])
+            self.assertEqual(self.ops.registration_fields(original['_raw']),original)
+            self.assertTrue(self.ops.retained_drain_complete(record['slurm_drain'][name]))
+            self.assertEqual(self.model.nodes[name]['Reason'],annotation)
+        self.assertTrue(json.loads(self.gate.read_text())['open'])
+
+    def test_annotated_unset_rejects_malformed_or_foreign_reason_before_mutation(self):
+        for reason in ('None extra','None [root@2026-02-30T15:48:11]',
+                       'None [root@2026-10-12T25:48:11]','None [root@2026-10-12T15:48:11] extra',
+                       'None [root@other@2026-10-12T15:48:11]',
+                       'None ['+'a'*129+'@2026-10-12T15:48:11]',
+                       'foreign maintenance [root@2026-10-12T15:48:11]'):
+            with self.subTest(reason=reason),self.isolated_delivery_case():
+                self.model.nodes['worker']['Reason']=reason
+                before=self.gate.read_bytes()
+                with self.assertRaisesRegex(ValueError,'Original Slurm state/reason'):self.deliver()
+                self.assertEqual(self.gate.read_bytes(),before)
+                self.assertFalse(self.model.transitions);self.no_later()
+
     def test_f4_postresume_wait_and_exact_idle(self):
         self.model.resume_reads['worker']=[{'State':'IDLE+NOT_RESPONDING','BootTime':'None','SlurmdStartTime':'None'}]*2
         # Responses apply only after RESUME, not during initial capture.
