@@ -1804,7 +1804,7 @@ class IsolatedWorkerIO:
         return self.module.stop_update(release(),self.attempt,WORKER,runtime=self.runtime,gate=self.gate,run=self.native,deadline=200.,enrollment_id=ENROLL_IDS[1])
     def scan(self):
         self.budget=self.module.UpdateScan(200.)
-        return self.module.physical_stop_scan(self.budget,self.state)
+        return self.module.physical_stop_scan(self.budget,self.state,run=self.native)
     def health(self,*,deadline=200.):
         self.budget=self.module.UpdateScan(deadline)
         return self.module.fleet_health(release(),self.identity,runtime=self.runtime,gate=self.gate,run=self.native,deadline=deadline,metadata_budget=self.budget)
@@ -2512,3 +2512,117 @@ class I14WholeRepairTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class I14SlurmInfinityTests(I14WholeRepairTests):
+    """Own PID1 keeper is measured separately; job/unknown processes still block."""
+    PACKAGE='/nix/store/9gqliw4qwklfly65fffdz0v8qxd0l0nz-slurm-25-11-8-1'
+    SCOPE='/system.slice/slurmstepd.scope'
+    def keeper(self,fs):
+        package=self.PACKAGE;scope=self.SCOPE
+        fs.process(123,executable=package+'/bin/slurmd')
+        fs.process(1356,comm='slurmstepd',uid=0,cgroup=scope+'/system',ticks=540955,executable=package+'/bin/slurmstepd')
+        fs.write('/proc/1356/cmdline',(package+'/sbin/slurmstepd').encode()+b'\0infinity\0')
+        fs.write('/sys/fs/cgroup'+scope+'/cgroup.procs','')
+        fs.write('/sys/fs/cgroup'+scope+'/system/cgroup.procs','1356\n')
+        for name in ('slurmd','slurmstepd'):
+            fs.write(package+'/bin/'+name,'fixture selected binary');fs.real(package+'/bin/'+name).chmod(0o555)
+        fs.real(package+'/sbin').mkdir();fs.real(package+'/sbin/slurmstepd').symlink_to('../bin/slurmstepd')
+        fs.real('/run/current-system/sw/bin').mkdir(parents=True);fs.real('/run/current-system/sw/bin/slurmd').symlink_to(package+'/bin/slurmd')
+        old_stat=self.ops.UpdateScan.stat
+        def root_owned(budget,path,**kwargs):
+            value=old_stat(budget,path,**kwargs)
+            if str(path).startswith('/nix/') or str(path).startswith('/sys/fs/cgroup'+scope):
+                actual=value
+                class RootOwned:
+                    st_uid=0
+                    def __getattr__(self,name):return getattr(actual,name)
+                return RootOwned()
+            return value
+        fs.stack.enter_context(patch.object(self.ops.UpdateScan,'stat',root_owned))
+        native=fs.native
+        fs.scope_state={'ActiveState':'active','SubState':'running','Slice':'system.slice','ControlGroup':scope,'Delegate':'yes'}
+        def scope_native(args):
+            if args[:3]==['systemctl','show','slurmstepd.scope']:
+                props=[v.split('=',1)[1]for v in args if v.startswith('--property=')]
+                return '\n'.join(k+'='+fs.scope_state[k]for k in props)
+            return native(args)
+        fs.native=scope_native;return fs
+    def scan_keeper(self,fs):
+        fs.budget=self.ops.UpdateScan(200.)
+        return fs.scan()
+    def test_keeper_alias_active_stopped_and_force_survival(self):
+        fs=self.keeper(self.fs(force=True));scan=self.scan_keeper(fs)
+        self.assertTrue(scan['job_processes_empty']);self.assertEqual([r['pid']for r in scan['slurm_infinity_processes']],[1356])
+        result=fs.stop();self.assertTrue(result['job_processes_empty']);self.assertEqual(result['daemon_processes'],[])
+        self.assertEqual([r['pid']for r in result['slurm_infinity_processes']],[1356]);self.assertTrue(fs.real('/proc/1356').exists())
+        self.assertEqual(sum(a[:2]==['systemctl','kill']for a in fs.calls),1)
+        self.assertTrue(all(a[-1]=='slurmd.service'for a in fs.calls if a[:2]==['systemctl','kill']))
+    def test_keeper_negative_boundaries(self):
+        for fault in ('arguments','extra_argument','uid','executable','alias','extra_member','job_child','delegate','birth','scope_drift','scope_prefix','final_unit_drift','native_owner_writable'):
+            with self.subTest(fault=fault),tempfile.TemporaryDirectory()as temporary,ExitStack()as scope:
+                old=self.root;self.root=Path(temporary)
+                try:
+                    fs=self.keeper(self.fs());scope.callback(fs.stack.close)
+                    if fault in ('arguments','extra_argument'):
+                        fs.write('/proc/1356/cmdline',(self.PACKAGE+'/bin/slurmstepd').encode()+b'\0'+(b'123\0'if fault=='arguments'else b'infinity\0extra\0'))
+                    if fault in ('uid','executable','scope_prefix'):
+                        fs.process(1356,comm='slurmstepd',uid=3000 if fault=='uid'else 0,cgroup=self.SCOPE+('/system-extra'if fault=='scope_prefix'else '/system'),ticks=540955,executable=self.PACKAGE+('/bin/slurmd'if fault=='executable'else '/bin/slurmstepd'))
+                        fs.write('/proc/1356/cmdline',(self.PACKAGE+'/bin/slurmstepd').encode()+b'\0infinity\0')
+                    if fault=='alias':fs.real(self.PACKAGE+'/sbin/slurmstepd').unlink();fs.real(self.PACKAGE+'/sbin/slurmstepd').symlink_to('../bin/slurmd')
+                    if fault=='extra_member':
+                        fs.process(1357,comm='foreign-helper',uid=0,cgroup=self.SCOPE+'/system');fs.write('/sys/fs/cgroup'+self.SCOPE+'/system/cgroup.procs','1356\n1357\n')
+                    if fault=='job_child':fs.write('/sys/fs/cgroup'+self.SCOPE+'/job_1/cgroup.procs','')
+                    if fault=='delegate':fs.scope_state['Delegate']='no'
+                    if fault=='native_owner_writable':fs.real(self.PACKAGE+'/bin/slurmd').chmod(0o755)
+                    if fault=='final_unit_drift':
+                        original=self.ops.UpdateScan.read;reads=[0]
+                        def unit_drift(budget,path,*args,**kwargs):
+                            value=original(budget,path,*args,**kwargs)
+                            if str(path)=='/sys/fs/cgroup'+self.SCOPE+'/system/cgroup.procs':
+                                reads[0]+=1
+                                if reads[0]==2:fs.scope_state['Delegate']='no'
+                            return value
+                        scope.enter_context(patch.object(self.ops.UpdateScan,'read',unit_drift))
+                    if fault in ('birth','scope_drift'):
+                        original=self.ops.UpdateScan.read;count=[0]
+                        def drift(budget,path,*args,**kwargs):
+                            value=original(budget,path,*args,**kwargs)
+                            if str(path)==('/proc/1356/cmdline'if fault=='birth'else '/sys/fs/cgroup'+self.SCOPE+'/system/cgroup.procs'):
+                                count[0]+=1
+                                if count[0]==1:
+                                    if fault=='birth':fs.write('/proc/1356/stat','1356 (slurmstepd) S '+' '.join(['0']*18+['540956'])+'\n')
+                                    else:fs.write('/sys/fs/cgroup'+self.SCOPE+'/system/cgroup.procs','')
+                            return value
+                        scope.enter_context(patch.object(self.ops.UpdateScan,'read',drift))
+                    try:result=self.scan_keeper(fs)
+                    except (ValueError,OSError):pass
+                    else:self.assertFalse(result['job_processes_empty'],'unknown keeper cannot produce positive empty-jobs proof')
+                    self.assertFalse(any(a[:2]in(['systemctl','kill'],['systemctl','stop'],['systemctl','mask'])for a in fs.calls))
+                finally:self.root=old
+    def test_selected_wrapper_exact_grammar_and_config(self):
+        for fault in ('valid','extra_line','other_native','different_conf','ambiguous','writable','owner_writable','native_shell','conf_shell'):
+            with self.subTest(fault=fault),tempfile.TemporaryDirectory()as temporary,ExitStack()as scope:
+                old=self.root;self.root=Path(temporary)
+                try:
+                    fs=self.keeper(self.fs());scope.callback(fs.stack.close)
+                    wrapper='/nix/store/'+'a'*32+'-wrappedSlurm/bin/slurmd'
+                    native=self.PACKAGE+'/bin/slurmd';conf='/nix/store/7r5rc73h5lk36iiakc13hi187dbkplja-etc-slurm/slurm.conf'
+                    config=json.loads(fs.real('/etc/qcl-negf/release-config.json').read_text());config['slurm_conf']=conf
+                    fs.write('/etc/qcl-negf/release-config.json',json.dumps(config));fs.write(conf,'fixture selected config')
+                    text='#!/bin/sh\nif [ -z "$SLURM_CONF" ]\nthen\n  SLURM_CONF="'+conf+'" "'+native+'" "$@"\nelse\n  "'+native+'" "$@"\nfi\n'
+                    if fault=='extra_line':text+='exit 0\n'
+                    if fault=='native_shell':text=text.replace('-slurm-25-11-8-1/','-slurm-$(x)/')
+                    if fault=='conf_shell':text=text.replace('-etc-slurm/','-etc-$(x)/')
+                    if fault=='other_native':text=text.replace(native,'/nix/store/'+'b'*32+'-slurm-other/bin/slurmd')
+                    if fault=='different_conf':text=text.replace(conf,'/etc/foreign-slurm.conf')
+                    if fault=='ambiguous':text=text.replace('else\n  "'+native,'else\n  "'+self.PACKAGE+'/sbin/slurmd')
+                    fs.write(wrapper,text);fs.real(wrapper).chmod(0o777 if fault=='writable'else 0o755 if fault=='owner_writable'else 0o555)
+                    fs.real('/run/current-system/sw/bin/slurmd').unlink();fs.real('/run/current-system/sw/bin/slurmd').symlink_to(wrapper)
+                    if fault=='valid':self.assertTrue(self.scan_keeper(fs)['job_processes_empty'])
+                    else:
+                        with self.assertRaises((ValueError,OSError)):self.scan_keeper(fs)
+                finally:self.root=old
+    def test_stopped_without_keeper_scope_is_measured_empty(self):
+        fs=self.fs();fs.clear_scope();scan=self.scan_keeper(fs)
+        self.assertTrue(scan['job_processes_empty']);self.assertEqual(scan['slurm_infinity_processes'],[])

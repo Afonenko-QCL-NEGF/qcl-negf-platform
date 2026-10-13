@@ -1322,7 +1322,133 @@ def daemon_scope_bound(cgroup,service_cgroup):
         if not isinstance(value,str) or not value.startswith('/') or value.startswith('//') or '\x00' in value or '..' in Path(value).parts or str(Path(value))!=value:return False
     return service_cgroup!='/' and Path(cgroup).is_relative_to(Path(service_cgroup))
 
-def physical_stop_scan(budget,service):
+
+def public_binary_origin(budget,path):
+    """Resolve a bounded public Nix executable origin without running it."""
+    pending=list(Path(path).parts[1:]);current=Path('/');chain=[];links=0
+    if not str(path).startswith('/') or len(os.fsencode(path))>4096:raise ValueError('Invalid public executable path')
+    for _ in range(256):
+        if not pending:break
+        part=pending.pop(0)
+        if part in ('','.'):continue
+        if part=='..':current=current.parent;continue
+        candidate=current/part;info=budget.stat(candidate)
+        signature=(info.st_dev,info.st_ino,info.st_mode,info.st_uid,info.st_size,info.st_mtime_ns,info.st_ctime_ns)
+        if stat.S_ISLNK(info.st_mode):
+            links+=1
+            if links>32:raise ValueError('Public executable symlink bound')
+            target=budget.link(candidate);chain.append((str(candidate),signature,target))
+            if target.startswith('/'):current=Path('/')
+            pending=list(Path(target).parts[1:]if target.startswith('/')else Path(target).parts)+pending
+            if len(pending)>64:raise ValueError('Public executable component bound')
+        else:
+            chain.append((str(candidate),signature,None));current=candidate
+            if pending and not stat.S_ISDIR(info.st_mode):raise ValueError('Public executable non-directory ancestor')
+    else:raise ValueError('Public executable resolution bound')
+    info=budget.stat(current)
+    if not str(current).startswith('/nix/store/') or not stat.S_ISREG(info.st_mode) or info.st_uid!=0 or info.st_mode&0o222 or not info.st_mode&0o111:raise ValueError('Untrusted public executable origin')
+    return {'path':str(current),'chain':chain}
+
+
+def immutable_public_bytes(budget,path,limit):
+    """Public immutable final file; mutable protected readers remain unchanged."""
+    budget.reserve(limit+1);fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
+    try:
+        before=os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_uid!=0 or before.st_mode&0o222 or before.st_size>limit:raise ValueError('Untrusted public wrapper')
+        data=os.read(fd,limit+1);budget.actual_bytes+=len(data);budget.before();after=os.fstat(fd)
+        signature=lambda value:(value.st_dev,value.st_ino,value.st_uid,value.st_mode,value.st_size,value.st_mtime_ns,value.st_ctime_ns)
+        if len(data)>limit or len(data)!=before.st_size or signature(before)!=signature(after) or signature(after)!=signature(budget.stat(path)):raise ValueError('Public wrapper origin changed')
+        return data
+    finally:os.close(fd)
+
+
+def selected_native_slurmd(budget):
+    origin=public_binary_origin(budget,'/run/current-system/sw/bin/slurmd');selected=origin['path']
+    native_pattern=r'/nix/store/[0123456789abcdfghijklmnpqrsvwxyz]{32}-slurm-[A-Za-z0-9+._-]+/bin/slurmd'
+    if re.fullmatch(native_pattern,selected):return {**origin,'native':selected}
+    if not re.fullmatch(r'/nix/store/[0123456789abcdfghijklmnpqrsvwxyz]{32}-wrappedSlurm/bin/slurmd',selected):raise ValueError('Unknown selected Slurm wrapper')
+    raw=immutable_public_bytes(budget,selected,4096)
+    pattern=(rb'#!/bin/sh\nif \[ -z "\$SLURM_CONF" \]\nthen\n  SLURM_CONF="(?P<conf>/nix/store/[0123456789abcdfghijklmnpqrsvwxyz]{32}-etc-slurm/slurm\.conf)" "(?P<native>'+native_pattern.encode()+rb')" "\$@"\nelse\n  "(?P=native)" "\$@"\nfi\n')
+    match=re.fullmatch(pattern,raw)
+    if not match:raise ValueError('Unsupported selected Slurm wrapper grammar')
+    config=unique_json(budget.read('/etc/qcl-negf/release-config.json'),65536)
+    if config.get('role')!='worker' or match['conf'].decode()!=config.get('slurm_conf'):raise ValueError('Selected Slurm wrapper config mismatch')
+    native=match['native'].decode();native_origin=public_binary_origin(budget,native)
+    if native_origin['path']!=native:raise ValueError('Selected native Slurm path changed')
+    return {**origin,'native':native,'native_origin':native_origin,'wrapper_sha256':hashlib.sha256(raw).hexdigest(),'wrapper_conf':match['conf'].decode()}
+
+
+def slurm_infinity_unit(run):
+    properties=('ActiveState','SubState','Slice','ControlGroup','Delegate')
+    raw=run(['systemctl','show','slurmstepd.scope',*['--property='+key for key in properties]])
+    fields={}
+    for line in raw.splitlines():
+        key,sep,value=line.partition('=')
+        if not sep or key not in properties or key in fields:raise ValueError('Unknown Slurm keeper scope readback')
+        fields[key]=value
+    if fields!=dict(zip(properties,('active','running','system.slice','/system.slice/slurmstepd.scope','yes'))):raise ValueError('Unbound Slurm keeper delegated scope')
+    return fields
+
+
+def slurm_infinity_snapshot(budget,records,run):
+    scope='/system.slice/slurmstepd.scope';root=Path('/sys/fs/cgroup'+scope)
+    try:info=budget.stat(root)
+    except FileNotFoundError:return None
+    fields=slurm_infinity_unit(run)
+    rows=[];members=[];seen=set();stack=[root]
+    while stack:
+        directory=stack.pop();info=budget.stat(directory)
+        if directory not in (root,root/'system') or not stat.S_ISDIR(info.st_mode) or info.st_uid!=0:raise ValueError('Unsupported Slurm keeper namespace')
+        raw_members=budget.read(directory/'cgroup.procs');values=raw_members.decode().split()
+        if any(not value.isdigit() or int(value)<=0 for value in values)or len(set(values))!=len(values):raise ValueError('Malformed Slurm keeper membership')
+        children=[]
+        for child in budget.entries(directory,'cgroup'):
+            meta=budget.stat(child)
+            if stat.S_ISLNK(meta.st_mode):raise ValueError('Slurm keeper namespace symlink')
+            if stat.S_ISDIR(meta.st_mode):children.append(str(child));stack.append(child)
+        rows.append((str(directory),info.st_dev,info.st_ino,info.st_uid,info.st_mode,raw_members,sorted(children)))
+        for value in values:
+            pid=int(value)
+            if pid in seen or pid not in records:raise ValueError('Incomplete Slurm keeper generation')
+            seen.add(pid);record=process_record(budget,Path('/proc')/value)
+            if not same_process(record,records[pid],include_executable=False)or record['cgroup']!=scope+'/system' or directory!=root/'system':raise ValueError('Slurm keeper generation/cgroup changed')
+            members.append(record)
+    budget.before()
+    if slurm_infinity_unit(run)!=fields:raise ValueError('Slurm keeper unit snapshot changed')
+    budget.before()
+    if not members:return {'scope':fields,'rows':sorted(rows),'keepers':[]}
+    if len(members)!=1:raise ValueError('Extra Slurm keeper scope member')
+    record=members[0]
+    if record['comm']!='slurmstepd' or record['uids']!=[0]*4 or process_state_class(record)!='live':raise ValueError('Unknown Slurm keeper process')
+    origin=selected_native_slurmd(budget);expected=str(Path(origin['native']).parent/'slurmstepd')
+    if record['executable']!=expected:raise ValueError('Slurm keeper selected package mismatch')
+    proc=Path('/proc')/str(record['pid']);args=budget.read(proc/'cmdline',8192).split(b'\0')
+    if len(args)!=3 or args[1:]!=[b'infinity',b'']:raise ValueError('Unknown Slurm keeper arguments')
+    argv0=args[0].decode();package=Path(origin['native']).parents[1]
+    if argv0 not in (str(package/'bin/slurmstepd'),str(package/'sbin/slurmstepd')):raise ValueError('Slurm keeper argv origin mismatch')
+    alias=public_binary_origin(budget,argv0)
+    if alias['path']!=expected:raise ValueError('Slurm keeper argv alias mismatch')
+    after=process_record(budget,proc)
+    if not same_process(after,record) or budget.read(proc/'cmdline',8192).split(b'\0')!=args:raise ValueError('Slurm keeper process/arguments changed')
+    budget.before()
+    if slurm_infinity_unit(run)!=fields:raise ValueError('Slurm keeper final unit snapshot changed')
+    budget.before()
+    return {'scope':fields,'rows':sorted(rows),'keepers':[record],'origin':origin,'argv':args,'alias':alias}
+
+
+def slurm_infinity_proof(budget,records,run):
+    boot=budget.read('/proc/sys/kernel/random/boot_id',64)
+    first=slurm_infinity_snapshot(budget,records,run);second=slurm_infinity_snapshot(budget,records,run)
+    # Raw observations include scheduler state. Compare generation/state class,
+    # not incidental context switches or sleeping/runnable transitions.
+    def identity(snapshot):
+        if snapshot is None:return None
+        return {**snapshot,'keepers':[dict(process_identity(r),state_class=process_state_class(r))for r in snapshot['keepers']]}
+    if identity(first)!=identity(second) or budget.read('/proc/sys/kernel/random/boot_id',64)!=boot:raise ValueError('Slurm keeper scope snapshot changed')
+    return []if first is None else first['keepers']
+
+def physical_stop_scan(budget,service,*,run=command):
     budget.read('/sys/fs/cgroup/cgroup.controllers')
     uid=pwd.getpwnam('qcl-negf').pw_uid;records={};jobs=[];daemon=[]
     for path in budget.entries('/proc','pid'):
@@ -1337,6 +1463,9 @@ def physical_stop_scan(budget,service):
             if not daemon_scope_bound(record['cgroup'],service['ControlGroup']) or not record['executable'].startswith('/nix/store/') or Path(record['executable']).name!='slurmd':raise ValueError('Unbound daemon scope/executable')
             daemon.append(record)
         elif record['comm'].startswith(('slurmstepd','slurm_script')) or '/job_' in record['cgroup'] or '/step_' in record['cgroup'] or uid in record['uids']:jobs.append(record['pid'])
+    keepers=slurm_infinity_proof(budget,records,run)
+    if keepers and any(record['executable']!=str(Path(keepers[0]['executable']).parent/'slurmd')for record in daemon):raise ValueError('Daemon and keeper selected package mismatch')
+    keeper_pids={record['pid']for record in keepers};jobs=[pid for pid in jobs if pid not in keeper_pids]
     cg=service['ControlGroup'];members=[]
     if cg:
         if not cg.startswith('/') or '..' in Path(cg).parts:raise ValueError('Invalid service scope')
@@ -1380,7 +1509,7 @@ def physical_stop_scan(budget,service):
             final=budget.stat(root)
             if (initial.st_dev,initial.st_ino)!=(final.st_dev,final.st_ino):raise ValueError('Service scope generation changed')
     return {'job_processes_measured':True,'job_processes_empty':not jobs,'job_pids':jobs,'daemon_processes':daemon,
-            'service_members':members,'service_members_measured':True,'service_scope_complete':True,
+            'service_members':members,'service_members_measured':True,'service_scope_complete':True,'slurm_infinity_processes':keepers,
             'metadata_bytes':budget.bytes,'metadata_actual_bytes':budget.actual_bytes,'pid_entries':budget.pid_entries,'cgroup_entries':budget.cgroup_entries}
 
 
@@ -1420,7 +1549,7 @@ def observe_stopped_update(expected,attempt_id,*,runtime=RUNTIME,gate=GATE,run=c
     service=unit_state(run)
     if service['LoadState']!='masked' or service['UnitFileState']!='masked-runtime' or service['ActiveState']!='inactive' or service['SubState']!='dead' or service['MainPID']!='0':raise ValueError('Worker is not measured stopped/masked')
     if service['ControlGroup'] or service['InvocationID']:raise ValueError('Inactive daemon retains unknown invocation/cgroup')
-    scan=physical_stop_scan(budget,{**service,'ControlGroup':marker['daemon']['ControlGroup']})
+    scan=physical_stop_scan(budget,{**service,'ControlGroup':marker['daemon']['ControlGroup']},run=run)
     if scan['daemon_processes'] or any(m['state'] not in ('Z','X') for m in scan['service_members']) or not scan['service_scope_complete'] or not scan['service_members_measured'] or not scan['job_processes_empty']:raise ValueError('Stopped worker retains daemon/job processes')
     if stopped_machine(budget)!=before:raise ValueError('Stopped identity raced')
     actual=identity_value({**marker['node_identity'],'hostname':before['hostname'],**{k:before[k] for k in ('machine_uuid','machine_id','boot_id')}})
@@ -1448,7 +1577,7 @@ def stop_update(expected,attempt_id,expected_node_identity,*,runtime=RUNTIME,gat
     if service['LoadState']!='loaded' or service['ActiveState']!='active' or service['UnitFileState'].startswith('masked') or service['DropInPaths'] or not service['ControlGroup'] or not re.fullmatch('[0-9a-f]{32}',service['InvocationID']):raise ValueError('Unsupported/colliding daemon mask or invocation')
     budget.before()
     if os.path.lexists('/run/systemd/system/slurmd.service'):raise ValueError('Runtime unit/mask collision')
-    scan=physical_stop_scan(budget,service)
+    scan=physical_stop_scan(budget,service,run=run)
     if unit_state(run)!=service:raise ValueError('Service invocation changed during initial scope snapshot')
     if not scan['job_processes_empty']:raise ValueError('Worker job process cancellation incomplete')
     captured=singleton_scope(scan,service)
@@ -1465,13 +1594,13 @@ def stop_update(expected,attempt_id,expected_node_identity,*,runtime=RUNTIME,gat
     budget.before();run(['systemctl','mask','--runtime','slurmd.service'])
     budget.before();run(['systemctl','stop','--no-block','slurmd.service'])
     for _ in range(30):
-        budget.before();state=unit_state(run);scan=physical_stop_scan(budget,service)
+        budget.before();state=unit_state(run);scan=physical_stop_scan(budget,service,run=run)
         if not scan['job_processes_empty']:raise ValueError('Worker job process cancellation incomplete')
         if state['ActiveState']=='inactive' and state['MainPID']=='0' and not scan['daemon_processes'] and not any(m['state'] not in ('Z','X') for m in scan['service_members']):
             marker['stop_window']['captured_epoch']=utc_epoch(run,budget);publish_json(path,marker,mode=0o600,before=budget.before)
             return observe_stopped_update(expected,attempt_id,runtime=runtime,gate=gate,run=run,budget=budget)
         budget.before();time.sleep(min(1,max(0,deadline-time.monotonic())) if deadline else 1)
-    budget.before();state=unit_state(run);scan=physical_stop_scan(budget,service)
+    budget.before();state=unit_state(run);scan=physical_stop_scan(budget,service,run=run)
     if state['ControlGroup']!=service['ControlGroup'] or state['InvocationID']!=service['InvocationID'] or state['MainPID']!=service['MainPID']:raise ValueError('Daemon cgroup/invocation/generation changed; force forbidden')
     singleton_scope(scan,state,captured)
     if unit_state(run)!=state:raise ValueError('Daemon generation changed before force')
@@ -1480,7 +1609,7 @@ def stop_update(expected,attempt_id,expected_node_identity,*,runtime=RUNTIME,gat
     budget.before();run(['systemctl','reset-failed','slurmd.service'])
     marker['forced_daemon_stop']=True;publish_json(path,marker,mode=0o600,before=budget.before)
     for _ in range(10):
-        budget.before();state=unit_state(run);scan=physical_stop_scan(budget,service)
+        budget.before();state=unit_state(run);scan=physical_stop_scan(budget,service,run=run)
         if not scan['job_processes_empty']:raise ValueError('Job processes after force')
         if state['ActiveState']=='inactive' and state['MainPID']=='0' and not scan['daemon_processes'] and not any(m['state'] not in ('Z','X') for m in scan['service_members']):
             marker['stop_window']['captured_epoch']=utc_epoch(run,budget);publish_json(path,marker,mode=0o600,before=budget.before)
@@ -1654,7 +1783,7 @@ def fleet_health(expected,expected_node_identity,*,runtime=RUNTIME,gate=GATE,run
     generation=None;registration=None;window=None
     if role=='worker':
         unit=unit_state(run)
-        scan=physical_stop_scan(budget,unit);record=singleton_scope(scan,unit)
+        scan=physical_stop_scan(budget,unit,run=run);record=singleton_scope(scan,unit)
         marker=unique_json(budget.protected(Path(runtime)/'update-stop.json'),65536)
         window=marker.get('restart_window');registration=registration_tuple(final_registration(run,before['node_name'],slurm_conf=config['slurm_conf']))
         generation={'pid':record['pid'],'start_ticks':record['start_ticks'],'executable':record['executable'],'InvocationID':unit['InvocationID'],'slurm_conf_sha256':hashlib.sha256(budget.read(config['slurm_conf'])).hexdigest()}
@@ -1682,7 +1811,7 @@ def fleet_health(expected,expected_node_identity,*,runtime=RUNTIME,gate=GATE,run
     budget.before();after=assert_expected_node(expected_node_identity,role=role,run=run,metadata_budget=budget)
     if before!=after:raise ValueError('Fleet health machine/config changed')
     if role=='worker':
-        later=unit_state(run);later_record=singleton_scope(physical_stop_scan(budget,later),later)
+        later=unit_state(run);later_record=singleton_scope(physical_stop_scan(budget,later,run=run),later)
         if later!=unit or not same_process(later_record,record) or unique_json(budget.read('/etc/qcl-negf/release-config.json'))!=config:raise ValueError('Current daemon generation/config changed')
         current_worker_health({'registration':registration,'daemon_generation':generation,'restart_window':window},{'name':before['node_name']},registration)
     result={**envelope,'nfs_verified':True,'nfs_source':source,'auth_verified':True}
