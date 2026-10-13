@@ -101,7 +101,8 @@ def stopped_response(actual,attempt):
         'machine':{**{k:actual[k] for k in ('hostname','machine_uuid','machine_id','boot_id')},'release_config_sha256':'c'*64,'slurm_conf':'/etc/slurm.conf','slurm_conf_sha256':'d'*64},'stop_window':{'requested_epoch':1791504120,'captured_epoch':1791504121},
         'original_config_digest':'d'*64,'job_processes_measured':True,'job_processes_empty':True,
         'daemon_processes':[],'service_members':[],'service_members_measured':True,'service_scope_complete':True,'restart_inhibited':True,'forced_daemon_stop':False,
-        'systemd':{'LoadState':'masked','UnitFileState':'masked-runtime','ActiveState':'inactive','SubState':'dead','MainPID':'0','ControlGroup':'','InvocationID':''}}
+        'owned_effective_runtime_mask':{'schema':'qcl-negf-owned-effective-runtime-mask-v1','origin':{'path':'/run/systemd/system.control/slurmd.service','uid':0,'nlink':1,'mode':0o777,'target':'/dev/null','device':25,'inode':8617},'original_unit_origin':{'selected_path':'/nix/store/unit/slurmd.service','path':'/nix/store/unit/slurmd.service','sha256':'c'*64,'bytes':64,'chain':[]},'effective_fragment':'/run/systemd/system.control/slurmd.service','original_invocation_id':'a'*32},
+        'systemd':{'LoadState':'masked','UnitFileState':'masked-runtime','ActiveState':'inactive','SubState':'dead','MainPID':'0','ControlGroup':'','InvocationID':'','FragmentPath':'/run/systemd/system.control/slurmd.service','DropInPaths':''}}
 
 def control_response(args,actual,model=None):
     words=shlex.split(args[-1])
@@ -1598,7 +1599,8 @@ class I14UpdateTests(unittest.TestCase):
         attempt,_,state,native,calls=self.stop_fixture()
         result=self.ops.stop_update(release(),attempt,WORKER,runtime=self.runtime,gate=self.gate,run=native,deadline=200.,enrollment_id=ENROLL_IDS[1])
         self.assertEqual(result['systemd']['LoadState'],'masked');self.assertTrue(result['restart_inhibited'])
-        self.assertTrue(any(a[:3]==['systemctl','mask','--runtime'] for a in calls))
+        self.assertTrue(self.body_fixture.real('/run/systemd/system.control/slurmd.service').is_symlink())
+        self.assertTrue(any(a[:2]==['systemctl','daemon-reload']for a in calls))
         state['UnitFileState']='enabled'
         with self.assertRaisesRegex(ValueError,'stopped/masked'):self.ops.observe_stopped_update(release(),attempt,runtime=self.runtime,gate=self.gate,run=native,deadline=200.)
 
@@ -1669,6 +1671,9 @@ class IsolatedWorkerIO:
         self.process(123)
         if jobs:self.process(321,comm='slurmstepd',uid=3000,cgroup='/jobs/job_1');self.write('/sys/fs/cgroup/jobs/job_1/cgroup.procs','321\n')
         self.put_release()
+        self.write('/nix/store/unit/slurmd.service','[Service]\nExecStart=/nix/store/slurm/bin/slurmd\n')
+        self.real('/nix/store/unit/slurmd.service').chmod(0o444)
+        self.real('/run/systemd/system').mkdir(parents=True,exist_ok=True)
     def real(self,path):
         return self.root/str(path).lstrip('/')
     def mapped(self,path):
@@ -1748,8 +1753,12 @@ class IsolatedWorkerIO:
             own=fixture.raw_stat(fixture.root)
             fixture.trace.append(('mkdir-map',str(path),str(actual),own.st_dev,own.st_ino))
             return fixture.raw_mkdir(actual,*args,**kwargs)
-        def stat(path,*args,**kw):fixture.trace.append(('stat',str(path),fixture.charge()));return fixture.raw_stat(fixture.mapped(path),*args,**kw)
-        def lstat(path,*args,**kw):fixture.trace.append(('lstat',str(path),fixture.charge()));return fixture.raw_lstat(fixture.mapped(path),*args,**kw)
+        class RootMetadata:
+            st_uid=0
+            def __init__(self,value):self.value=value
+            def __getattr__(self,name):return getattr(self.value,name)
+        def stat(path,*args,**kw):fixture.trace.append(('stat',str(path),fixture.charge()));return RootMetadata(fixture.raw_stat(fixture.mapped(path),*args,**kw))
+        def lstat(path,*args,**kw):fixture.trace.append(('lstat',str(path),fixture.charge()));return RootMetadata(fixture.raw_lstat(fixture.mapped(path),*args,**kw))
         def readlink(path,*args,**kw):fixture.trace.append(('readlink',str(path),fixture.charge()));return fixture.raw_readlink(fixture.mapped(path),*args,**kw)
         for obj,name,value in ((os,'open',open_fd),(os,'close',close_fd),(os,'read',read_fd),(os,'fstat',fstat),
             (os,'stat',stat),(os,'lstat',lstat),(os,'readlink',readlink),(os,'scandir',scandir),
@@ -1780,7 +1789,11 @@ class IsolatedWorkerIO:
             props=[a.split('=',1)[1] for a in args if a.startswith('--property=')]
             fields={**self.state,'Environment':'SLURM_CONF=/etc/slurm.conf'}
             return '\n'.join(k+'='+fields[k] for k in props)
-        if args[:3]==['systemctl','mask','--runtime']:self.state.update(LoadState='masked',UnitFileState='masked-runtime')
+        if args[:2]==['systemctl','daemon-reload']:
+            high=self.real('/run/systemd/system.control/slurmd.service')
+            effective=high.is_symlink()and self.raw_readlink(high)=='/dev/null'
+            self.state.update(LoadState='masked'if effective else'loaded',UnitFileState='masked-runtime'if effective else'enabled',FragmentPath='/run/systemd/system.control/slurmd.service'if effective else'/nix/store/unit/slurmd.service')
+        elif args[:3]==['systemctl','mask','--runtime']:self.state.update(LoadState='masked',UnitFileState='masked-runtime')
         elif args[:2]==['systemctl','stop'] and not self.force:self.clear_scope()
         elif args[:2]==['systemctl','kill']:
             self.test.assertEqual(args,['systemctl','kill','--kill-whom=all','--signal=SIGKILL','slurmd.service']);self.clear_scope()
@@ -1809,6 +1822,166 @@ class IsolatedWorkerIO:
         self.budget=self.module.UpdateScan(deadline)
         return self.module.fleet_health(release(),self.identity,runtime=self.runtime,gate=self.gate,run=self.native,deadline=deadline,metadata_budget=self.budget)
 
+
+
+class EffectiveRuntimeMaskTests(unittest.TestCase):
+    """Unit-path selection differs from the old argv-driven mask fixture."""
+    @classmethod
+    def setUpClass(cls):
+        cls.ops = importlib.util.module_from_spec(SPEC)
+        SPEC.loader.exec_module(cls.ops)
+    setUp=I14UpdateTests.setUp
+
+    def effective_fixture(self):
+        fs=IsolatedWorkerIO(self,self.ops).install();self.fs=fs
+        # Root-only ownership is an explicit IO boundary. Production rules stay real.
+        native_stat=self.ops.os.stat;native_lstat=self.ops.os.lstat
+        fs.foreign_mask_uid=False
+        class RootStat:
+            def __init__(self,value,uid=0):self.value=value;self.st_uid=uid
+            def __getattr__(self,name):return getattr(self.value,name)
+        def root_stat(path,*args,**kwargs):
+            value=native_stat(path,*args,**kwargs)
+            return RootStat(value,1000 if fs.foreign_mask_uid and str(path).endswith('slurmd.service') and not kwargs.get('follow_symlinks',True) else 0)
+        def root_lstat(path,*args,**kwargs):return RootStat(native_lstat(path,*args,**kwargs))
+        fs.stack.enter_context(patch.object(self.ops.os,'stat',root_stat))
+        fs.stack.enter_context(patch.object(self.ops.os,'lstat',root_lstat))
+        fs.real('/run/systemd/system').mkdir(parents=True,exist_ok=True)
+        fs.real('/etc/systemd/system').mkdir(parents=True,exist_ok=True)
+        fs.real('/etc/systemd/system/slurmd.service').symlink_to('/nix/store/unit/slurmd.service')
+        fs.state['FragmentPath']='/etc/systemd/system/slurmd.service'
+        native=fs.native
+        def selected():
+            high=fs.real('/run/systemd/system.control/slurmd.service')
+            masked=high.is_symlink()and fs.raw_readlink(high)=='/dev/null'
+            fs.state.update(LoadState='masked'if masked else'loaded',UnitFileState='masked-runtime'if masked else'enabled',FragmentPath='/run/systemd/system.control/slurmd.service'if masked else'/etc/systemd/system/slurmd.service')
+        def call(args):
+            if args[:3]==['systemctl','mask','--runtime']:
+                fs.calls.append(args);path=fs.real('/run/systemd/system/slurmd.service');path.parent.mkdir(parents=True,exist_ok=True);path.symlink_to('/dev/null');selected();return ''
+            if args[:2]==['systemctl','daemon-reload']:
+                fs.calls.append(args);selected();return ''
+            if args[:2]==['systemctl','show']:selected()
+            result=native(args)
+            if args[:2]==['systemctl','stop']:
+                # Inactive InvocationID denotes the last generation, not a live PID.
+                fs.state['InvocationID']='a'*32;selected()
+            return result
+        fs.native=call
+        return fs
+
+    def test_effective_runtime_mask_lifecycle(self):
+        fs=self.effective_fixture()
+        result=self.ops.stop_update(release(),fs.attempt,WORKER,runtime=fs.runtime,gate=fs.gate,run=fs.native,deadline=200.,enrollment_id=ENROLL_IDS[1])
+        self.assertEqual(result['systemd']['LoadState'],'masked')
+        self.assertEqual(result['systemd']['UnitFileState'],'masked-runtime')
+        self.assertEqual(result['systemd']['InvocationID'],'a'*32)
+        self.assertTrue(result['restart_inhibited'])
+        self.assertTrue(fs.real('/run/systemd/system.control/slurmd.service').is_symlink())
+
+    def stopped_fixture(self):
+        fs=self.effective_fixture()
+        self.ops.stop_update(release(),fs.attempt,WORKER,runtime=fs.runtime,gate=fs.gate,run=fs.native,deadline=200.,enrollment_id=ENROLL_IDS[1])
+        return fs
+
+    def test_foreign_inactive_invocation_is_rejected(self):
+        fs=self.stopped_fixture();fs.state['InvocationID']='b'*32
+        with self.assertRaisesRegex(ValueError,'invocation'):
+            self.ops.observe_stopped_update(release(),fs.attempt,runtime=fs.runtime,gate=fs.gate,run=fs.native,deadline=200.)
+
+    def test_runtime_mask_collision_prevents_stop(self):
+        fs=self.effective_fixture();high=fs.real(self.ops.EFFECTIVE_MASK);high.parent.mkdir(parents=True,exist_ok=True);high.symlink_to('/dev/null')
+        with self.assertRaisesRegex(ValueError,'colli'):
+            self.ops.stop_update(release(),fs.attempt,WORKER,runtime=fs.runtime,gate=fs.gate,run=fs.native,deadline=200.,enrollment_id=ENROLL_IDS[1])
+        self.assertFalse(any(a[:2]==['systemctl','stop']for a in fs.calls))
+
+    def test_foreign_mask_owner_rejects_unmask(self):
+        fs=self.stopped_fixture();fs.foreign_mask_uid=True
+        with self.assertRaisesRegex(ValueError,'inode'):
+            self.ops.remove_owned_update_mask(release(),fs.attempt,runtime=fs.runtime,gate=fs.gate,run=fs.native,budget=self.ops.UpdateScan(200.))
+        self.assertTrue(fs.real(self.ops.EFFECTIVE_MASK).is_symlink())
+
+    def test_replaced_mask_inode_is_not_removed(self):
+        fs=self.stopped_fixture();high=fs.real(self.ops.EFFECTIVE_MASK);other=high.with_name('foreign.service');other.symlink_to('/dev/null');os.replace(other,high)
+        with self.assertRaisesRegex(ValueError,'ownership'):
+            self.ops.remove_owned_update_mask(release(),fs.attempt,runtime=fs.runtime,gate=fs.gate,run=fs.native,budget=self.ops.UpdateScan(200.))
+        self.assertTrue(high.is_symlink())
+
+    def test_effective_mask_removal_preserves_blocking_marker(self):
+        fs=self.stopped_fixture()
+        self.ops.remove_owned_update_mask(release(),fs.attempt,runtime=fs.runtime,gate=fs.gate,run=fs.native,budget=self.ops.UpdateScan(200.))
+        self.assertFalse(fs.real(self.ops.EFFECTIVE_MASK).is_symlink())
+        marker=json.loads(fs.real(fs.runtime/'update-stop.json').read_text());self.assertEqual(marker['mask_phase'],'removed')
+        self.assertEqual(fs.state['FragmentPath'],'/etc/systemd/system/slurmd.service')
+        self.assertFalse(any(a[:2]in(['systemctl','start'],['systemctl','restart'])for a in fs.calls))
+
+    def test_mask_reload_failure_preserves_owned_blocker(self):
+        fs=self.effective_fixture();native=fs.native
+        def fail(args):
+            if args[:2]==['systemctl','daemon-reload']:raise RuntimeError('injected reload failure')
+            return native(args)
+        with self.assertRaisesRegex(RuntimeError,'reload'):
+            self.ops.stop_update(release(),fs.attempt,WORKER,runtime=fs.runtime,gate=fs.gate,run=fail,deadline=200.,enrollment_id=ENROLL_IDS[1])
+        marker=json.loads(fs.real(fs.runtime/'update-stop.json').read_text());self.assertEqual(marker['mask_phase'],'installed')
+        self.assertEqual(marker['effective_runtime_mask']['inode'],fs.raw_lstat(fs.real(self.ops.EFFECTIVE_MASK)).st_ino)
+        self.assertFalse(any(a[:2]==['systemctl','stop']for a in fs.calls))
+
+    def test_unmask_reload_failure_preserves_pending_blocker(self):
+        fs=self.stopped_fixture();native=fs.native
+        def fail(args):
+            if args[:2]==['systemctl','daemon-reload']:raise RuntimeError('injected removal reload failure')
+            return native(args)
+        with self.assertRaisesRegex(RuntimeError,'removal'):
+            self.ops.remove_owned_update_mask(release(),fs.attempt,runtime=fs.runtime,gate=fs.gate,run=fail,budget=self.ops.UpdateScan(200.))
+        self.assertEqual(json.loads(fs.real(fs.runtime/'update-stop.json').read_text())['mask_phase'],'remove_pending')
+        self.assertFalse(any(a[:2]in(['systemctl','start'],['systemctl','restart'])for a in fs.calls))
+
+    def legacy(self):
+        fs=self.stopped_fixture();high=fs.real(self.ops.EFFECTIVE_MASK);high.unlink()
+        old=fs.real(self.ops.LEGACY_MASK);old.symlink_to('/dev/null')
+        marker=json.loads(fs.real(fs.runtime/'update-stop.json').read_text())
+        for key in ('mask_phase','effective_runtime_mask','original_unit_origin'):marker.pop(key)
+        self.ops.publish_json(fs.runtime/'update-stop.json',marker,mode=0o600)
+        fs.native(['systemctl','daemon-reload']);raw=fs.real(fs.runtime/'update-stop.json').read_bytes()
+        origin=self.ops.runtime_mask_origin(self.ops.LEGACY_MASK,budget=self.ops.UpdateScan(200.))
+        return fs,raw,origin
+
+    def test_exact_legacy_repair_then_owned_restore(self):
+        fs,raw,origin=self.legacy()
+        result=self.ops.repair_stopped_update(release(),fs.attempt,WORKER,enrollment_id=ENROLL_IDS[1],prior_marker_sha256=self.ops.hashlib.sha256(raw).hexdigest(),legacy_mask_origin=origin,runtime=fs.runtime,gate=fs.gate,run=fs.native,deadline=200.)
+        self.assertTrue(result['restart_inhibited']);self.assertEqual(result['systemd']['InvocationID'],'a'*32)
+        marker=json.loads(fs.real(fs.runtime/'update-stop.json').read_text());self.assertEqual(fs.real(marker['legacy_marker_original']['path']).read_bytes(),raw)
+        self.ops.remove_owned_update_mask(release(),fs.attempt,runtime=fs.runtime,gate=fs.gate,run=fs.native,budget=self.ops.UpdateScan(200.))
+        self.assertFalse(fs.real(self.ops.LEGACY_MASK).is_symlink());self.assertFalse(fs.real(self.ops.EFFECTIVE_MASK).is_symlink())
+        self.assertFalse(any(a[:2]in(['systemctl','start'],['systemctl','restart'])for a in fs.calls))
+
+    def test_legacy_digest_mismatch_cannot_adopt(self):
+        fs,raw,origin=self.legacy();before=len(fs.calls)
+        with self.assertRaisesRegex(ValueError,'digest'):
+            self.ops.repair_stopped_update(release(),fs.attempt,WORKER,enrollment_id=ENROLL_IDS[1],prior_marker_sha256='0'*64,legacy_mask_origin=origin,runtime=fs.runtime,gate=fs.gate,run=fs.native,deadline=200.)
+        self.assertEqual(fs.real(fs.runtime/'update-stop.json').read_bytes(),raw);self.assertEqual(len(fs.calls),before)
+        self.assertFalse(fs.real(self.ops.EFFECTIVE_MASK).is_symlink())
+
+    def test_four_actual_sized_scans_fit_finite_cap(self):
+        fs=self.effective_fixture();budget=self.ops.UpdateScan(200.)
+        # Actual ROOT physical scan 516128 charged 10,176,000 bytes for 258 PIDs.
+        for _ in range(4):budget.reserve(10176000)
+        self.assertEqual(budget.bytes,40704000)
+        with self.assertRaisesRegex(ValueError,'cumulative'):
+            budget.reserve(64*1024*1024-budget.bytes+1)
+        self.assertEqual(budget.bytes,40704000)
+
+    def test_job_appearing_after_unmask_blocks_restart(self):
+        fs=self.stopped_fixture();native=fs.native
+        def appear(args):
+            result=native(args)
+            if args[:2]==['systemctl','daemon-reload']:
+                fs.process(456,comm='slurmstepd',uid=3000,cgroup='/jobs/job_5')
+                fs.write('/sys/fs/cgroup/jobs/job_5/cgroup.procs','456\n')
+            return result
+        with self.assertRaisesRegex(ValueError,'physical'):
+            self.ops.remove_owned_update_mask(release(),fs.attempt,runtime=fs.runtime,gate=fs.gate,run=appear,budget=self.ops.UpdateScan(200.))
+        self.assertEqual(json.loads(fs.real(fs.runtime/'update-stop.json').read_text())['mask_phase'],'remove_pending')
+        self.assertFalse(any(a[:2]in(['systemctl','start'],['systemctl','restart'])for a in fs.calls))
 
 
 class I14WholeRepairTests(unittest.TestCase):

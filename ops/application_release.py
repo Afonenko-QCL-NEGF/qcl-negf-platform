@@ -991,7 +991,7 @@ def activate(manifest_value, *, profile=PROFILE, runtime=RUNTIME, role="worker",
     if update_attempt_id and role=='worker':
         stopped=observe_stopped_update(manifest(manifest_value),update_attempt_id,runtime=runtime,gate=gate,run=run,deadline=deadline,budget=action_budget)
         bind_node_observation(identity_value(expected_node_identity),stopped['node_identity'],prior_boot=expected_node_identity['boot_id'])
-        action_budget.before();run(['systemctl','unmask','--runtime','slurmd.service'])
+        remove_owned_update_mask(manifest(manifest_value),update_attempt_id,runtime=runtime,gate=gate,run=run,budget=action_budget)
         unit=unit_state(run)
         if unit['LoadState']!='loaded' or unit['UnitFileState'].startswith('masked'):raise ValueError('Own update mask not removed')
         bound_node=stopped['node_identity']
@@ -1214,7 +1214,7 @@ STOP_PROPERTIES=('LoadState','ActiveState','SubState','MainPID','ControlGroup','
 
 class UpdateScan:
     """Charged upper bounds reserved before IO; returned bytes counted separately."""
-    CAP=32*1024*1024
+    CAP=64*1024*1024
     def __init__(self,deadline):
         duration(deadline,'Update deadline');deadline_check(deadline)
         self.deadline=deadline;self.bytes=0;self.actual_bytes=0;self.pid_entries=0;self.cgroup_entries=0
@@ -1323,7 +1323,7 @@ def daemon_scope_bound(cgroup,service_cgroup):
     return service_cgroup!='/' and Path(cgroup).is_relative_to(Path(service_cgroup))
 
 
-def public_binary_origin(budget,path):
+def public_binary_origin(budget,path,*,executable=True):
     """Resolve a bounded public Nix executable origin without running it."""
     pending=list(Path(path).parts[1:]);current=Path('/');chain=[];links=0
     if not str(path).startswith('/') or len(os.fsencode(path))>4096:raise ValueError('Invalid public executable path')
@@ -1346,7 +1346,7 @@ def public_binary_origin(budget,path):
             if pending and not stat.S_ISDIR(info.st_mode):raise ValueError('Public executable non-directory ancestor')
     else:raise ValueError('Public executable resolution bound')
     info=budget.stat(current)
-    if not str(current).startswith('/nix/store/') or not stat.S_ISREG(info.st_mode) or info.st_uid!=0 or info.st_mode&0o222 or not info.st_mode&0o111:raise ValueError('Untrusted public executable origin')
+    if not str(current).startswith('/nix/store/') or not stat.S_ISREG(info.st_mode) or info.st_uid!=0 or info.st_mode&0o222 or (executable and not info.st_mode&0o111):raise ValueError('Untrusted public executable origin')
     return {'path':str(current),'chain':chain}
 
 
@@ -1531,10 +1531,136 @@ def stopped_machine(budget):
             'hostname':socket.gethostname(),'release_config_sha256':hashlib.sha256(configuration).hexdigest(),
             'slurm_conf':conf,'slurm_conf_sha256':hashlib.sha256(budget.read(conf)).hexdigest()}
 
+EFFECTIVE_MASK='/run/systemd/system.control/slurmd.service'
+LEGACY_MASK='/run/systemd/system/slurmd.service'
+
+def json_observation(value):
+    return json.loads(json.dumps(value,sort_keys=True))
+
+def runtime_mask_origin_at(path,parent,*,budget):
+    if path not in (EFFECTIVE_MASK,LEGACY_MASK):raise ValueError('Unknown owned mask path')
+    budget.before();info=os.stat(Path(path).name,dir_fd=parent,follow_symlinks=False)
+    if not stat.S_ISLNK(info.st_mode) or info.st_uid!=0 or info.st_nlink!=1:raise ValueError('Untrusted owned mask inode')
+    budget.before();target=os.readlink(Path(path).name,dir_fd=parent)
+    budget.before();after=os.stat(Path(path).name,dir_fd=parent,follow_symlinks=False)
+    signature=lambda v:(v.st_dev,v.st_ino,v.st_uid,v.st_mode,v.st_nlink,v.st_mtime_ns,v.st_ctime_ns)
+    if target!='/dev/null' or signature(info)!=signature(after):raise ValueError('Owned mask target/inode changed')
+    return {'path':path,'device':info.st_dev,'inode':info.st_ino,'uid':info.st_uid,'mode':stat.S_IMODE(info.st_mode),'nlink':info.st_nlink,'target':target}
+
+def runtime_mask_origin(path,*,budget):
+    with protected_directory(str(Path(path).parent),budget=budget) as parent:
+        return runtime_mask_origin_at(path,parent,budget=budget)
+
+def original_unit_origin(path,*,budget):
+    if not isinstance(path,str) or not path.startswith(('/etc/systemd/','/nix/store/')):raise ValueError('Unsupported original unit origin')
+    origin=public_binary_origin(budget,path,executable=False)
+    data=immutable_public_bytes(budget,origin['path'],65536)
+    if public_binary_origin(budget,path,executable=False)!=origin:raise ValueError('Original unit namespace changed')
+    return json_observation({**origin,'selected_path':path,'sha256':hashlib.sha256(data).hexdigest(),'bytes':len(data)})
+
+def effective_mask_proof(marker,service,*,budget):
+    owned=marker.get('effective_runtime_mask');unit=marker.get('original_unit_origin')
+    if marker.get('mask_phase')!='installed' or not isinstance(owned,dict) or owned.get('path')!=EFFECTIVE_MASK or not isinstance(unit,dict):raise ValueError('Missing owned effective mask proof')
+    if runtime_mask_origin(EFFECTIVE_MASK,budget=budget)!=owned:raise ValueError('Effective mask ownership changed')
+    if marker.get('legacy_runtime_mask') is not None and runtime_mask_origin(LEGACY_MASK,budget=budget)!=marker['legacy_runtime_mask']:raise ValueError('Legacy mask ownership changed')
+    if original_unit_origin(unit['selected_path'],budget=budget)!=unit:raise ValueError('Original immutable unit changed')
+    if service['LoadState']!='masked' or service['UnitFileState']!='masked-runtime' or service['FragmentPath']!=EFFECTIVE_MASK or service['DropInPaths']:raise ValueError('Effective runtime mask not selected')
+    return {'schema':'qcl-negf-owned-effective-runtime-mask-v1','origin':owned,'original_unit_origin':unit,'effective_fragment':service['FragmentPath'],'original_invocation_id':marker['daemon']['InvocationID']}
+
+def install_owned_update_mask(path,marker,*,budget,run):
+    marker['mask_phase']='create_pending';publish_json(path,marker,mode=0o600,before=budget.before)
+    with protected_directory('/run/systemd',budget=budget) as parent:
+        budget.before()
+        try:os.mkdir('system.control',0o755,dir_fd=parent)
+        except FileExistsError:pass
+    with protected_directory('/run/systemd/system.control',budget=budget) as parent:
+        budget.before();os.symlink('/dev/null','slurmd.service',dir_fd=parent)
+        budget.before();os.fsync(parent)
+        marker['effective_runtime_mask']=runtime_mask_origin_at(EFFECTIVE_MASK,parent,budget=budget)
+    if runtime_mask_origin(EFFECTIVE_MASK,budget=budget)!=marker['effective_runtime_mask']:raise ValueError('Created mask namespace changed')
+    marker['mask_phase']='installed';publish_json(path,marker,mode=0o600,before=budget.before)
+    budget.before();run(['systemctl','daemon-reload'])
+    service=unit_state(run);effective_mask_proof(marker,service,budget=budget)
+    if unit_state(run)!=service:raise ValueError('Effective unit changed after mask reload')
+
+def remove_owned_update_mask(expected,attempt_id,*,runtime=RUNTIME,gate=GATE,run=command,budget):
+    marker=update_marker(runtime,attempt_id,expected,gate,budget=budget)
+    effective_mask_proof(marker,unit_state(run),budget=budget)
+    origins=[marker['effective_runtime_mask']]
+    if marker.get('legacy_runtime_mask') is not None:origins.append(marker['legacy_runtime_mask'])
+    for origin in origins:
+        if runtime_mask_origin(origin['path'],budget=budget)!=origin:raise ValueError('Unmask ownership changed')
+    marker['mask_phase']='remove_pending';publish_json(Path(runtime)/'update-stop.json',marker,mode=0o600,before=budget.before)
+    for origin in origins:
+        with protected_directory(str(Path(origin['path']).parent),budget=budget) as parent:
+            if runtime_mask_origin_at(origin['path'],parent,budget=budget)!=origin:raise ValueError('Unmask inode replaced')
+            budget.before();os.unlink(Path(origin['path']).name,dir_fd=parent);budget.before();os.fsync(parent)
+    budget.before();run(['systemctl','daemon-reload'])
+    service=unit_state(run)
+    if service['LoadState']!='loaded' or service['UnitFileState'].startswith('masked') or service['FragmentPath']!=marker['original_unit_origin']['selected_path'] or original_unit_origin(service['FragmentPath'],budget=budget)!=marker['original_unit_origin']:raise ValueError('Own mask removal readback incomplete')
+    if service['ActiveState']!='inactive' or service['SubState']!='dead' or service['MainPID']!='0' or service['ControlGroup'] or service['InvocationID'] not in ('',marker['daemon']['InvocationID']) or service['DropInPaths']:raise ValueError('Unmasked worker generation is not stopped')
+    scan=physical_stop_scan(budget,{**service,'ControlGroup':marker['daemon']['ControlGroup']},run=run)
+    if scan['daemon_processes'] or any(m['state'] not in ('Z','X')for m in scan['service_members']) or not scan['service_scope_complete'] or not scan['service_members_measured'] or not scan['job_processes_empty']:raise ValueError('Unmasked worker physical proof changed')
+    if unit_state(run)!=service or stopped_machine(budget)!=marker['machine'] or original_unit_origin(service['FragmentPath'],budget=budget)!=marker['original_unit_origin']:raise ValueError('Unmasked unit/machine origin raced')
+    marker['mask_phase']='removed';publish_json(Path(runtime)/'update-stop.json',marker,mode=0o600,before=budget.before)
+
+def repair_stopped_update(expected,attempt_id,expected_node_identity,*,enrollment_id,prior_marker_sha256,legacy_mask_origin,runtime=RUNTIME,gate=GATE,run=command,deadline=None,budget=None):
+    """Trusted reconciliation only: migrate one hash-bound legacy stopped marker.
+
+    No daemon start, scheduler mutation, gate opening, or release acceptance.
+    Unknown marker/mask origins remain blocking; no implicit adoption.
+    """
+    budget=budget or UpdateScan(deadline);expected=manifest(expected)
+    marker=update_marker(runtime,attempt_id,expected,gate,budget=budget)
+    path=Path(runtime)/'update-stop.json';raw=owned_marker_bytes(path,budget=budget)
+    if not re.fullmatch('[0-9a-f]{64}',str(prior_marker_sha256)) or hashlib.sha256(raw).hexdigest()!=prior_marker_sha256 or unique_json(raw,65536)!=marker:raise ValueError('Legacy marker digest changed')
+    if not re.fullmatch('[0-9a-f]{32}',str(marker.get('daemon',{}).get('InvocationID',''))) or not isinstance(marker.get('stop_window',{}).get('captured_epoch'),(int,float)) or marker['stop_window']['captured_epoch']<marker['stop_window']['requested_epoch'] or marker.get('enrollment_id')!=normalized_uuid(enrollment_id) or marker['node_identity']!=identity_value(expected_node_identity) or marker['machine']!=stopped_machine(budget) or marker.get('effective_runtime_mask') is not None or marker.get('mask_phase') is not None:raise ValueError('Legacy stopped binding changed')
+    if not isinstance(legacy_mask_origin,dict) or legacy_mask_origin.get('path')!=LEGACY_MASK or runtime_mask_origin(LEGACY_MASK,budget=budget)!=legacy_mask_origin:raise ValueError('Legacy mask exact ownership required')
+    before=unit_state(run)
+    if before['LoadState']!='loaded' or before['UnitFileState'].startswith('masked') or before['ActiveState']!='inactive' or before['SubState']!='dead' or before['MainPID']!='0' or before['ControlGroup'] or before['InvocationID'] not in ('',marker['daemon']['InvocationID']) or before['DropInPaths']:raise ValueError('Legacy stop state changed')
+    for _ in range(2):
+        scan=physical_stop_scan(budget,{**before,'ControlGroup':marker['daemon']['ControlGroup']},run=run)
+        if scan['daemon_processes'] or any(m['state'] not in ('Z','X')for m in scan['service_members']) or not scan['service_scope_complete'] or not scan['service_members_measured'] or not scan['job_processes_empty'] or unit_state(run)!=before or stopped_machine(budget)!=marker['machine']:raise ValueError('Legacy physical stop proof changed')
+    marker['original_unit_origin']=original_unit_origin(before['FragmentPath'],budget=budget)
+    marker['legacy_runtime_mask']=legacy_mask_origin
+    marker['legacy_marker_sha256']=prior_marker_sha256
+    archive=Path(runtime)/('update-stop.legacy-'+attempt_id+'-'+prior_marker_sha256+'.original.json')
+    with protected_directory(runtime,budget=budget) as parent:
+        budget.before();fd=os.open(archive.name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=parent)
+        try:
+            offset=0
+            while offset<len(raw):budget.before();offset+=os.write(fd,raw[offset:])
+            budget.before();os.fsync(fd)
+        finally:os.close(fd)
+        budget.before();os.fsync(parent)
+    if owned_marker_bytes(archive,budget=budget)!=raw:raise ValueError('Legacy marker archive changed')
+    marker['legacy_marker_original']={'path':str(archive),'sha256':prior_marker_sha256,'bytes':len(raw)}
+    if update_marker(runtime,attempt_id,expected,gate,budget=budget)!=unique_json(raw,65536) or runtime_mask_origin(LEGACY_MASK,budget=budget)!=legacy_mask_origin or unit_state(run)!=before:raise ValueError('Legacy authority changed before migration')
+    install_owned_update_mask(path,marker,budget=budget,run=run)
+    return observe_stopped_update(expected,attempt_id,runtime=runtime,gate=gate,run=run,budget=budget)
+
+def owned_marker_bytes(path,*,budget):
+    budget.reserve(65537)
+    with protected_directory(str(Path(path).parent),budget=budget) as parent:
+        budget.before();fd=os.open(Path(path).name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=parent)
+        try:
+            before=os.fstat(fd)
+            signature=lambda v:(v.st_dev,v.st_ino,v.st_uid,v.st_mode,v.st_nlink,v.st_size,v.st_mtime_ns,v.st_ctime_ns)
+            if before.st_uid!=0 or not stat.S_ISREG(before.st_mode) or stat.S_IMODE(before.st_mode)!=0o600 or before.st_nlink!=1 or before.st_size>65536:raise ValueError('Untrusted owned update marker')
+            raw=bytearray()
+            while len(raw)<=65536:
+                budget.before();chunk=os.read(fd,min(4096,65537-len(raw)));budget.actual_bytes+=len(chunk)
+                if not chunk:break
+                raw.extend(chunk)
+            budget.before();after=os.fstat(fd);selected=os.stat(Path(path).name,dir_fd=parent,follow_symlinks=False)
+            if len(raw)!=before.st_size or signature(before)!=signature(after) or signature(after)!=signature(selected):raise ValueError('Owned update marker changed')
+            return bytes(raw)
+        finally:os.close(fd)
+
 def update_marker(runtime,attempt_id,expected,gate,*,budget):
     normalized_uuid(attempt_id)
     path=Path(runtime)/'update-stop.json'
-    raw=budget.protected(path,limit=65536)
+    raw=owned_marker_bytes(path,budget=budget)
     marker=unique_json(raw,65536)
     if marker.get('schema')!=UPDATE_SCHEMA or marker.get('attempt_id')!=attempt_id or marker.get('release')!=manifest(expected):raise ValueError('Missing own update marker')
     admission=budget.admission(gate)
@@ -1548,14 +1674,17 @@ def observe_stopped_update(expected,attempt_id,*,runtime=RUNTIME,gate=GATE,run=c
     if before!=marker['machine']:raise ValueError('Stopped machine boot/config changed')
     service=unit_state(run)
     if service['LoadState']!='masked' or service['UnitFileState']!='masked-runtime' or service['ActiveState']!='inactive' or service['SubState']!='dead' or service['MainPID']!='0':raise ValueError('Worker is not measured stopped/masked')
-    if service['ControlGroup'] or service['InvocationID']:raise ValueError('Inactive daemon retains unknown invocation/cgroup')
+    if service['ControlGroup'] or service['InvocationID'] not in ('',marker['daemon']['InvocationID']):raise ValueError('Inactive daemon retains unknown invocation/cgroup')
+    proof=effective_mask_proof(marker,service,budget=budget)
     scan=physical_stop_scan(budget,{**service,'ControlGroup':marker['daemon']['ControlGroup']},run=run)
     if scan['daemon_processes'] or any(m['state'] not in ('Z','X') for m in scan['service_members']) or not scan['service_scope_complete'] or not scan['service_members_measured'] or not scan['job_processes_empty']:raise ValueError('Stopped worker retains daemon/job processes')
-    if stopped_machine(budget)!=before:raise ValueError('Stopped identity raced')
+    after_scan=physical_stop_scan(budget,{**service,'ControlGroup':marker['daemon']['ControlGroup']},run=run)
+    if after_scan['daemon_processes'] or any(m['state'] not in ('Z','X') for m in after_scan['service_members']) or not after_scan['service_scope_complete'] or not after_scan['service_members_measured'] or not after_scan['job_processes_empty']:raise ValueError('Stopped worker physical proof changed')
+    if stopped_machine(budget)!=before or unit_state(run)!=service or effective_mask_proof(marker,service,budget=budget)!=proof:raise ValueError('Stopped identity/effective mask raced')
     actual=identity_value({**marker['node_identity'],'hostname':before['hostname'],**{k:before[k] for k in ('machine_uuid','machine_id','boot_id')}})
     return {'schema':UPDATE_SCHEMA,'attempt_id':attempt_id,'enrollment_id':normalized_uuid(marker.get('enrollment_id')),'node_identity':actual,'machine':before,
             'original_config_digest':before['slurm_conf_sha256'],'systemd':service,'stop_window':marker['stop_window'],
-            **scan,'restart_inhibited':True,'forced_daemon_stop':marker['forced_daemon_stop']}
+            **scan,'restart_inhibited':True,'owned_effective_runtime_mask':proof,'forced_daemon_stop':marker['forced_daemon_stop']}
 
 def stop_update(expected,attempt_id,expected_node_identity,*,runtime=RUNTIME,gate=GATE,run=command,deadline=None,prior_attempt_id=None,enrollment_id=None,metadata_budget=None):
     normalized_uuid(attempt_id);enrollment_id=normalized_uuid(enrollment_id);expected=manifest(expected)
@@ -1576,7 +1705,7 @@ def stop_update(expected,attempt_id,expected_node_identity,*,runtime=RUNTIME,gat
     service=unit_state(run)
     if service['LoadState']!='loaded' or service['ActiveState']!='active' or service['UnitFileState'].startswith('masked') or service['DropInPaths'] or not service['ControlGroup'] or not re.fullmatch('[0-9a-f]{32}',service['InvocationID']):raise ValueError('Unsupported/colliding daemon mask or invocation')
     budget.before()
-    if os.path.lexists('/run/systemd/system/slurmd.service'):raise ValueError('Runtime unit/mask collision')
+    if os.path.lexists(LEGACY_MASK) or os.path.lexists(EFFECTIVE_MASK):raise ValueError('Runtime unit/mask collision')
     scan=physical_stop_scan(budget,service,run=run)
     if unit_state(run)!=service:raise ValueError('Service invocation changed during initial scope snapshot')
     if not scan['job_processes_empty']:raise ValueError('Worker job process cancellation incomplete')
@@ -1586,12 +1715,13 @@ def stop_update(expected,attempt_id,expected_node_identity,*,runtime=RUNTIME,gat
     if admission.get('open') is not False or admission.get('release_id')!=expected['release_id']:raise ValueError('Update stop requires matching closed gate')
     marker={'schema':UPDATE_SCHEMA,'attempt_id':attempt_id,'enrollment_id':enrollment_id,'release':expected,'node_identity':actual,
         'machine':machine,'daemon':service,'daemon_pid':captured,'forced_daemon_stop':False,
+        'original_unit_origin':original_unit_origin(service['FragmentPath'],budget=budget),
         'stop_window':{'requested_epoch':utc_epoch(run,budget),'captured_epoch':None}}
     if len(json.dumps(marker).encode())>65536:raise ValueError('Full update marker observations exceed bound')
     budget.before()
     if os.path.lexists(path) and prior is None:raise ValueError('Existing update marker requires reconciliation')
     publish_json(path,marker,mode=0o600,before=budget.before)
-    budget.before();run(['systemctl','mask','--runtime','slurmd.service'])
+    install_owned_update_mask(path,marker,budget=budget,run=run)
     budget.before();run(['systemctl','stop','--no-block','slurmd.service'])
     for _ in range(30):
         budget.before();state=unit_state(run);scan=physical_stop_scan(budget,service,run=run)
@@ -1643,7 +1773,11 @@ def verify_stop_response(value,binding,attempt_id):
     if value.get('job_processes_measured') is not True or value.get('job_processes_empty') is not True or value.get('restart_inhibited') is not True or type(value.get('forced_daemon_stop')) is not bool or value.get('daemon_processes')!=[] or value.get('service_members_measured') is not True or value.get('service_scope_complete') is not True or not isinstance(value.get('service_members'),list) or any(m.get('state') not in ('Z','X') for m in value['service_members']):raise ValueError('Incomplete physical stopped proof')
     state=value.get('systemd')
     if not isinstance(state,dict):raise ValueError('Incomplete measured stop fields')
-    if any(state.get(k)!=v for k,v in {'LoadState':'masked','UnitFileState':'masked-runtime','ActiveState':'inactive','SubState':'dead','MainPID':'0','ControlGroup':'','InvocationID':''}.items()):raise ValueError('Incomplete measured stop fields')
+    if any(state.get(k)!=v for k,v in {'LoadState':'masked','UnitFileState':'masked-runtime','ActiveState':'inactive','SubState':'dead','MainPID':'0','ControlGroup':''}.items()):raise ValueError('Incomplete measured stop fields')
+    proof=value.get('owned_effective_runtime_mask')
+    if not isinstance(proof,dict) or proof.get('schema')!='qcl-negf-owned-effective-runtime-mask-v1' or state.get('FragmentPath')!=proof.get('effective_fragment') or state.get('FragmentPath')!=EFFECTIVE_MASK or state.get('DropInPaths') or not re.fullmatch('[0-9a-f]{32}',str(proof.get('original_invocation_id',''))) or state.get('InvocationID') not in ('',proof['original_invocation_id']):raise ValueError('Missing bound effective mask/inactive generation proof')
+    origin=proof.get('origin')
+    if not isinstance(origin,dict) or origin.get('path')!=EFFECTIVE_MASK or origin.get('uid')!=0 or origin.get('nlink')!=1 or origin.get('target')!='/dev/null' or any(type(origin.get(k))is not int or origin[k]<=0 for k in ('device','inode')) or not isinstance(proof.get('original_unit_origin'),dict):raise ValueError('Incomplete effective mask ownership')
     machine=value.get('machine')
     if not isinstance(machine,dict) or any(machine.get(k)!=value['node_identity'][k] for k in ('hostname','machine_uuid','machine_id','boot_id')) or not isinstance(machine.get('slurm_conf'),str) or not machine['slurm_conf'].startswith('/') or any(not re.fullmatch('[0-9a-f]{64}',str(machine.get(k,''))) for k in ('release_config_sha256','slurm_conf_sha256')):raise ValueError('Incomplete stopped machine/config binding')
     if value.get('original_config_digest')!=machine['slurm_conf_sha256']:raise ValueError('Missing original config digest')
