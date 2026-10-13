@@ -1925,7 +1925,7 @@ def fleet_health(expected,expected_node_identity,*,runtime=RUNTIME,gate=GATE,run
     budget.before();run(['systemctl','is-active','--quiet','munged.service'])
     source=config.get('nfs_source')
     if not isinstance(source,str) or not source:raise ValueError('Missing configured NFS endpoint')
-    budget.before();data=unique_json(run(['findmnt','--json','--target',str(Path(gate).parent),'--output','TARGET,SOURCE,FSTYPE']),65536)
+    budget.before();data=unique_json(run(['findmnt','--json','--uniq','--target',str(Path(gate).parent),'--output','TARGET,SOURCE,FSTYPE']),65536)
     mounts=data.get('filesystems')
     if not isinstance(mounts,list) or len(mounts)!=1 or mounts[0].get('target')!=str(Path(gate).parent) or mounts[0].get('source')!=source or mounts[0].get('fstype') not in ('nfs','nfs4'):raise ValueError('NFS endpoint/mount mismatch')
     budget.before()

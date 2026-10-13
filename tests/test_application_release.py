@@ -2359,7 +2359,7 @@ class I14WholeRepairTests(unittest.TestCase):
                     self.ops.activate(release(),profile=fs.profile,runtime=fs.runtime,gate=fs.gate,run=fs.native,role='worker',expected_node_identity=WORKER,update_attempt_id=fs.attempt,deadline=200.)
                     writes=[];reads=[];syncs=[];unlinks=[]
                     native=fs.native
-                    mount_query=['findmnt','--json','--target',str(fs.gate.parent),'--output','TARGET,SOURCE,FSTYPE']
+                    mount_query=['findmnt','--json','--uniq','--target',str(fs.gate.parent),'--output','TARGET,SOURCE,FSTYPE']
                     if fault=='mount':
                         def mount_fault(args):
                             result=native(args)
@@ -2397,6 +2397,41 @@ class I14WholeRepairTests(unittest.TestCase):
                         result=fs.health();self.assertTrue(result['nfs_verified']);self.assertEqual(writes,[b'qcl-negf-update\n'])
                         self.assertEqual(reads,[b'qcl-negf-update\n']);self.assertEqual(len(syncs),1);self.assertEqual(len(unlinks),1)
                     self.assertEqual([a for a in fs.calls[health_calls_start:] if a[0]=='findmnt'],[mount_query])
+                finally:self.root=old
+
+    def test_nfs_automount_effective_mount_contract(self):
+        # util-linux --uniq selects the visible mount before applying matches;
+        # a filesystem-type filter could instead hide a foreign overmount.
+        for case in ('nfs_only','automount','autofs_only','foreign_top','wrong_source','wrong_target','duplicates'):
+            with self.subTest(case=case),tempfile.TemporaryDirectory() as temporary,ExitStack() as scope:
+                old=self.root;self.root=Path(temporary)
+                try:
+                    fs=self.fs();scope.callback(fs.stack.close);fs.stop()
+                    self.ops.activate(release(),profile=fs.profile,runtime=fs.runtime,gate=fs.gate,run=fs.native,role='worker',expected_node_identity=WORKER,update_attempt_id=fs.attempt,deadline=200.)
+                    target=str(fs.gate.parent)
+                    nfs={'target':target,'source':'storage.invalid:/srv/qcl-negf/jobs','fstype':'nfs4'}
+                    autofs={'target':target,'source':'systemd-1','fstype':'autofs'}
+                    effective={
+                        'nfs_only':[nfs],'automount':[nfs],'autofs_only':[autofs],
+                        'foreign_top':[{'target':target,'source':'foreign','fstype':'tmpfs'}],
+                        'wrong_source':[{**nfs,'source':'foreign:/jobs'}],
+                        'wrong_target':[{**nfs,'target':target+'/other'}],
+                        'duplicates':[nfs,nfs],
+                    }[case]
+                    native=fs.native;queries=[]
+                    def mounted(args):
+                        if args[0]!='findmnt':return native(args)
+                        queries.append(args)
+                        raw=[autofs,nfs] if case=='automount' else effective
+                        return json.dumps({'filesystems':effective if '--uniq' in args else raw})
+                    fs.native=mounted
+                    with patch.object(self.ops.tempfile,'mkstemp',wraps=self.ops.tempfile.mkstemp) as create:
+                        if case in ('nfs_only','automount'):
+                            result=fs.health();self.assertTrue(result['nfs_verified']);self.assertEqual(create.call_count,1)
+                        else:
+                            with self.assertRaisesRegex(ValueError,'^NFS endpoint/mount mismatch$'):fs.health()
+                            self.assertEqual(create.call_count,0)
+                    self.assertEqual(queries,[['findmnt','--json','--uniq','--target',target,'--output','TARGET,SOURCE,FSTYPE']])
                 finally:self.root=old
 
     def test_r1_global_classification_and_full_own_member(self):
