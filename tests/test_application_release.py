@@ -101,7 +101,8 @@ def stopped_response(actual,attempt):
         'machine':{**{k:actual[k] for k in ('hostname','machine_uuid','machine_id','boot_id')},'release_config_sha256':'c'*64,'slurm_conf':'/etc/slurm.conf','slurm_conf_sha256':'d'*64},'stop_window':{'requested_epoch':1791504120,'captured_epoch':1791504121},
         'original_config_digest':'d'*64,'job_processes_measured':True,'job_processes_empty':True,
         'daemon_processes':[],'service_members':[],'service_members_measured':True,'service_scope_complete':True,'restart_inhibited':True,'forced_daemon_stop':False,
-        'systemd':{'LoadState':'masked','UnitFileState':'masked-runtime','ActiveState':'inactive','SubState':'dead','MainPID':'0','ControlGroup':'','InvocationID':''}}
+        'owned_effective_runtime_mask':{'schema':'qcl-negf-owned-effective-runtime-mask-v1','origin':{'path':'/run/systemd/system.control/slurmd.service','uid':0,'nlink':1,'mode':0o777,'target':'/dev/null','device':25,'inode':8617},'original_unit_origin':{'selected_path':'/nix/store/unit/slurmd.service','path':'/nix/store/unit/slurmd.service','sha256':'c'*64,'bytes':64,'chain':[]},'effective_fragment':'/run/systemd/system.control/slurmd.service','original_invocation_id':'a'*32},
+        'systemd':{'LoadState':'masked','UnitFileState':'masked-runtime','ActiveState':'inactive','SubState':'dead','MainPID':'0','ControlGroup':'','InvocationID':'','FragmentPath':'/run/systemd/system.control/slurmd.service','DropInPaths':''}}
 
 def control_response(args,actual,model=None):
     words=shlex.split(args[-1])
@@ -221,7 +222,11 @@ class NativeUpdateModel:
             elif self.reason_fault=='extra':reason+=' extra'
             self.nodes[name].update(State='IDLE+DRAIN',Reason=reason)
             if self.after_drain:self.after_drain(name)
-        elif fields['State']=='RESUME':self.nodes[name].update(State='IDLE',Reason='None')
+        elif fields['State']=='RESUME':
+            # Slurm 25.11 keeps the historical reason on RESUME unless the
+            # update explicitly supplies a nonempty Reason value.
+            self.nodes[name]['State']='IDLE'
+            if fields.get('Reason'):self.nodes[name]['Reason']=fields['Reason']
         else:raise AssertionError('unauthorized synthetic state transition')
         self.transitions.append((name,dict(fields)))
         return ''
@@ -1594,7 +1599,8 @@ class I14UpdateTests(unittest.TestCase):
         attempt,_,state,native,calls=self.stop_fixture()
         result=self.ops.stop_update(release(),attempt,WORKER,runtime=self.runtime,gate=self.gate,run=native,deadline=200.,enrollment_id=ENROLL_IDS[1])
         self.assertEqual(result['systemd']['LoadState'],'masked');self.assertTrue(result['restart_inhibited'])
-        self.assertTrue(any(a[:3]==['systemctl','mask','--runtime'] for a in calls))
+        self.assertTrue(self.body_fixture.real('/run/systemd/system.control/slurmd.service').is_symlink())
+        self.assertTrue(any(a[:2]==['systemctl','daemon-reload']for a in calls))
         state['UnitFileState']='enabled'
         with self.assertRaisesRegex(ValueError,'stopped/masked'):self.ops.observe_stopped_update(release(),attempt,runtime=self.runtime,gate=self.gate,run=native,deadline=200.)
 
@@ -1665,6 +1671,9 @@ class IsolatedWorkerIO:
         self.process(123)
         if jobs:self.process(321,comm='slurmstepd',uid=3000,cgroup='/jobs/job_1');self.write('/sys/fs/cgroup/jobs/job_1/cgroup.procs','321\n')
         self.put_release()
+        self.write('/nix/store/unit/slurmd.service','[Service]\nExecStart=/nix/store/slurm/bin/slurmd\n')
+        self.real('/nix/store/unit/slurmd.service').chmod(0o444)
+        self.real('/run/systemd/system').mkdir(parents=True,exist_ok=True)
     def real(self,path):
         return self.root/str(path).lstrip('/')
     def mapped(self,path):
@@ -1744,8 +1753,12 @@ class IsolatedWorkerIO:
             own=fixture.raw_stat(fixture.root)
             fixture.trace.append(('mkdir-map',str(path),str(actual),own.st_dev,own.st_ino))
             return fixture.raw_mkdir(actual,*args,**kwargs)
-        def stat(path,*args,**kw):fixture.trace.append(('stat',str(path),fixture.charge()));return fixture.raw_stat(fixture.mapped(path),*args,**kw)
-        def lstat(path,*args,**kw):fixture.trace.append(('lstat',str(path),fixture.charge()));return fixture.raw_lstat(fixture.mapped(path),*args,**kw)
+        class RootMetadata:
+            st_uid=0
+            def __init__(self,value):self.value=value
+            def __getattr__(self,name):return getattr(self.value,name)
+        def stat(path,*args,**kw):fixture.trace.append(('stat',str(path),fixture.charge()));return RootMetadata(fixture.raw_stat(fixture.mapped(path),*args,**kw))
+        def lstat(path,*args,**kw):fixture.trace.append(('lstat',str(path),fixture.charge()));return RootMetadata(fixture.raw_lstat(fixture.mapped(path),*args,**kw))
         def readlink(path,*args,**kw):fixture.trace.append(('readlink',str(path),fixture.charge()));return fixture.raw_readlink(fixture.mapped(path),*args,**kw)
         for obj,name,value in ((os,'open',open_fd),(os,'close',close_fd),(os,'read',read_fd),(os,'fstat',fstat),
             (os,'stat',stat),(os,'lstat',lstat),(os,'readlink',readlink),(os,'scandir',scandir),
@@ -1776,7 +1789,11 @@ class IsolatedWorkerIO:
             props=[a.split('=',1)[1] for a in args if a.startswith('--property=')]
             fields={**self.state,'Environment':'SLURM_CONF=/etc/slurm.conf'}
             return '\n'.join(k+'='+fields[k] for k in props)
-        if args[:3]==['systemctl','mask','--runtime']:self.state.update(LoadState='masked',UnitFileState='masked-runtime')
+        if args[:2]==['systemctl','daemon-reload']:
+            high=self.real('/run/systemd/system.control/slurmd.service')
+            effective=high.is_symlink()and self.raw_readlink(high)=='/dev/null'
+            self.state.update(LoadState='masked'if effective else'loaded',UnitFileState='masked-runtime'if effective else'enabled',FragmentPath='/run/systemd/system.control/slurmd.service'if effective else'/nix/store/unit/slurmd.service')
+        elif args[:3]==['systemctl','mask','--runtime']:self.state.update(LoadState='masked',UnitFileState='masked-runtime')
         elif args[:2]==['systemctl','stop'] and not self.force:self.clear_scope()
         elif args[:2]==['systemctl','kill']:
             self.test.assertEqual(args,['systemctl','kill','--kill-whom=all','--signal=SIGKILL','slurmd.service']);self.clear_scope()
@@ -1800,11 +1817,171 @@ class IsolatedWorkerIO:
         return self.module.stop_update(release(),self.attempt,WORKER,runtime=self.runtime,gate=self.gate,run=self.native,deadline=200.,enrollment_id=ENROLL_IDS[1])
     def scan(self):
         self.budget=self.module.UpdateScan(200.)
-        return self.module.physical_stop_scan(self.budget,self.state)
+        return self.module.physical_stop_scan(self.budget,self.state,run=self.native)
     def health(self,*,deadline=200.):
         self.budget=self.module.UpdateScan(deadline)
         return self.module.fleet_health(release(),self.identity,runtime=self.runtime,gate=self.gate,run=self.native,deadline=deadline,metadata_budget=self.budget)
 
+
+
+class EffectiveRuntimeMaskTests(unittest.TestCase):
+    """Unit-path selection differs from the old argv-driven mask fixture."""
+    @classmethod
+    def setUpClass(cls):
+        cls.ops = importlib.util.module_from_spec(SPEC)
+        SPEC.loader.exec_module(cls.ops)
+    setUp=I14UpdateTests.setUp
+
+    def effective_fixture(self):
+        fs=IsolatedWorkerIO(self,self.ops).install();self.fs=fs
+        # Root-only ownership is an explicit IO boundary. Production rules stay real.
+        native_stat=self.ops.os.stat;native_lstat=self.ops.os.lstat
+        fs.foreign_mask_uid=False
+        class RootStat:
+            def __init__(self,value,uid=0):self.value=value;self.st_uid=uid
+            def __getattr__(self,name):return getattr(self.value,name)
+        def root_stat(path,*args,**kwargs):
+            value=native_stat(path,*args,**kwargs)
+            return RootStat(value,1000 if fs.foreign_mask_uid and str(path).endswith('slurmd.service') and not kwargs.get('follow_symlinks',True) else 0)
+        def root_lstat(path,*args,**kwargs):return RootStat(native_lstat(path,*args,**kwargs))
+        fs.stack.enter_context(patch.object(self.ops.os,'stat',root_stat))
+        fs.stack.enter_context(patch.object(self.ops.os,'lstat',root_lstat))
+        fs.real('/run/systemd/system').mkdir(parents=True,exist_ok=True)
+        fs.real('/etc/systemd/system').mkdir(parents=True,exist_ok=True)
+        fs.real('/etc/systemd/system/slurmd.service').symlink_to('/nix/store/unit/slurmd.service')
+        fs.state['FragmentPath']='/etc/systemd/system/slurmd.service'
+        native=fs.native
+        def selected():
+            high=fs.real('/run/systemd/system.control/slurmd.service')
+            masked=high.is_symlink()and fs.raw_readlink(high)=='/dev/null'
+            fs.state.update(LoadState='masked'if masked else'loaded',UnitFileState='masked-runtime'if masked else'enabled',FragmentPath='/run/systemd/system.control/slurmd.service'if masked else'/etc/systemd/system/slurmd.service')
+        def call(args):
+            if args[:3]==['systemctl','mask','--runtime']:
+                fs.calls.append(args);path=fs.real('/run/systemd/system/slurmd.service');path.parent.mkdir(parents=True,exist_ok=True);path.symlink_to('/dev/null');selected();return ''
+            if args[:2]==['systemctl','daemon-reload']:
+                fs.calls.append(args);selected();return ''
+            if args[:2]==['systemctl','show']:selected()
+            result=native(args)
+            if args[:2]==['systemctl','stop']:
+                # Inactive InvocationID denotes the last generation, not a live PID.
+                fs.state['InvocationID']='a'*32;selected()
+            return result
+        fs.native=call
+        return fs
+
+    def test_effective_runtime_mask_lifecycle(self):
+        fs=self.effective_fixture()
+        result=self.ops.stop_update(release(),fs.attempt,WORKER,runtime=fs.runtime,gate=fs.gate,run=fs.native,deadline=200.,enrollment_id=ENROLL_IDS[1])
+        self.assertEqual(result['systemd']['LoadState'],'masked')
+        self.assertEqual(result['systemd']['UnitFileState'],'masked-runtime')
+        self.assertEqual(result['systemd']['InvocationID'],'a'*32)
+        self.assertTrue(result['restart_inhibited'])
+        self.assertTrue(fs.real('/run/systemd/system.control/slurmd.service').is_symlink())
+
+    def stopped_fixture(self):
+        fs=self.effective_fixture()
+        self.ops.stop_update(release(),fs.attempt,WORKER,runtime=fs.runtime,gate=fs.gate,run=fs.native,deadline=200.,enrollment_id=ENROLL_IDS[1])
+        return fs
+
+    def test_foreign_inactive_invocation_is_rejected(self):
+        fs=self.stopped_fixture();fs.state['InvocationID']='b'*32
+        with self.assertRaisesRegex(ValueError,'invocation'):
+            self.ops.observe_stopped_update(release(),fs.attempt,runtime=fs.runtime,gate=fs.gate,run=fs.native,deadline=200.)
+
+    def test_runtime_mask_collision_prevents_stop(self):
+        fs=self.effective_fixture();high=fs.real(self.ops.EFFECTIVE_MASK);high.parent.mkdir(parents=True,exist_ok=True);high.symlink_to('/dev/null')
+        with self.assertRaisesRegex(ValueError,'colli'):
+            self.ops.stop_update(release(),fs.attempt,WORKER,runtime=fs.runtime,gate=fs.gate,run=fs.native,deadline=200.,enrollment_id=ENROLL_IDS[1])
+        self.assertFalse(any(a[:2]==['systemctl','stop']for a in fs.calls))
+
+    def test_foreign_mask_owner_rejects_unmask(self):
+        fs=self.stopped_fixture();fs.foreign_mask_uid=True
+        with self.assertRaisesRegex(ValueError,'inode'):
+            self.ops.remove_owned_update_mask(release(),fs.attempt,runtime=fs.runtime,gate=fs.gate,run=fs.native,budget=self.ops.UpdateScan(200.))
+        self.assertTrue(fs.real(self.ops.EFFECTIVE_MASK).is_symlink())
+
+    def test_replaced_mask_inode_is_not_removed(self):
+        fs=self.stopped_fixture();high=fs.real(self.ops.EFFECTIVE_MASK);other=high.with_name('foreign.service');other.symlink_to('/dev/null');os.replace(other,high)
+        with self.assertRaisesRegex(ValueError,'ownership'):
+            self.ops.remove_owned_update_mask(release(),fs.attempt,runtime=fs.runtime,gate=fs.gate,run=fs.native,budget=self.ops.UpdateScan(200.))
+        self.assertTrue(high.is_symlink())
+
+    def test_effective_mask_removal_preserves_blocking_marker(self):
+        fs=self.stopped_fixture()
+        self.ops.remove_owned_update_mask(release(),fs.attempt,runtime=fs.runtime,gate=fs.gate,run=fs.native,budget=self.ops.UpdateScan(200.))
+        self.assertFalse(fs.real(self.ops.EFFECTIVE_MASK).is_symlink())
+        marker=json.loads(fs.real(fs.runtime/'update-stop.json').read_text());self.assertEqual(marker['mask_phase'],'removed')
+        self.assertEqual(fs.state['FragmentPath'],'/etc/systemd/system/slurmd.service')
+        self.assertFalse(any(a[:2]in(['systemctl','start'],['systemctl','restart'])for a in fs.calls))
+
+    def test_mask_reload_failure_preserves_owned_blocker(self):
+        fs=self.effective_fixture();native=fs.native
+        def fail(args):
+            if args[:2]==['systemctl','daemon-reload']:raise RuntimeError('injected reload failure')
+            return native(args)
+        with self.assertRaisesRegex(RuntimeError,'reload'):
+            self.ops.stop_update(release(),fs.attempt,WORKER,runtime=fs.runtime,gate=fs.gate,run=fail,deadline=200.,enrollment_id=ENROLL_IDS[1])
+        marker=json.loads(fs.real(fs.runtime/'update-stop.json').read_text());self.assertEqual(marker['mask_phase'],'installed')
+        self.assertEqual(marker['effective_runtime_mask']['inode'],fs.raw_lstat(fs.real(self.ops.EFFECTIVE_MASK)).st_ino)
+        self.assertFalse(any(a[:2]==['systemctl','stop']for a in fs.calls))
+
+    def test_unmask_reload_failure_preserves_pending_blocker(self):
+        fs=self.stopped_fixture();native=fs.native
+        def fail(args):
+            if args[:2]==['systemctl','daemon-reload']:raise RuntimeError('injected removal reload failure')
+            return native(args)
+        with self.assertRaisesRegex(RuntimeError,'removal'):
+            self.ops.remove_owned_update_mask(release(),fs.attempt,runtime=fs.runtime,gate=fs.gate,run=fail,budget=self.ops.UpdateScan(200.))
+        self.assertEqual(json.loads(fs.real(fs.runtime/'update-stop.json').read_text())['mask_phase'],'remove_pending')
+        self.assertFalse(any(a[:2]in(['systemctl','start'],['systemctl','restart'])for a in fs.calls))
+
+    def legacy(self):
+        fs=self.stopped_fixture();high=fs.real(self.ops.EFFECTIVE_MASK);high.unlink()
+        old=fs.real(self.ops.LEGACY_MASK);old.symlink_to('/dev/null')
+        marker=json.loads(fs.real(fs.runtime/'update-stop.json').read_text())
+        for key in ('mask_phase','effective_runtime_mask','original_unit_origin'):marker.pop(key)
+        self.ops.publish_json(fs.runtime/'update-stop.json',marker,mode=0o600)
+        fs.native(['systemctl','daemon-reload']);raw=fs.real(fs.runtime/'update-stop.json').read_bytes()
+        origin=self.ops.runtime_mask_origin(self.ops.LEGACY_MASK,budget=self.ops.UpdateScan(200.))
+        return fs,raw,origin
+
+    def test_exact_legacy_repair_then_owned_restore(self):
+        fs,raw,origin=self.legacy()
+        result=self.ops.repair_stopped_update(release(),fs.attempt,WORKER,enrollment_id=ENROLL_IDS[1],prior_marker_sha256=self.ops.hashlib.sha256(raw).hexdigest(),legacy_mask_origin=origin,runtime=fs.runtime,gate=fs.gate,run=fs.native,deadline=200.)
+        self.assertTrue(result['restart_inhibited']);self.assertEqual(result['systemd']['InvocationID'],'a'*32)
+        marker=json.loads(fs.real(fs.runtime/'update-stop.json').read_text());self.assertEqual(fs.real(marker['legacy_marker_original']['path']).read_bytes(),raw)
+        self.ops.remove_owned_update_mask(release(),fs.attempt,runtime=fs.runtime,gate=fs.gate,run=fs.native,budget=self.ops.UpdateScan(200.))
+        self.assertFalse(fs.real(self.ops.LEGACY_MASK).is_symlink());self.assertFalse(fs.real(self.ops.EFFECTIVE_MASK).is_symlink())
+        self.assertFalse(any(a[:2]in(['systemctl','start'],['systemctl','restart'])for a in fs.calls))
+
+    def test_legacy_digest_mismatch_cannot_adopt(self):
+        fs,raw,origin=self.legacy();before=len(fs.calls)
+        with self.assertRaisesRegex(ValueError,'digest'):
+            self.ops.repair_stopped_update(release(),fs.attempt,WORKER,enrollment_id=ENROLL_IDS[1],prior_marker_sha256='0'*64,legacy_mask_origin=origin,runtime=fs.runtime,gate=fs.gate,run=fs.native,deadline=200.)
+        self.assertEqual(fs.real(fs.runtime/'update-stop.json').read_bytes(),raw);self.assertEqual(len(fs.calls),before)
+        self.assertFalse(fs.real(self.ops.EFFECTIVE_MASK).is_symlink())
+
+    def test_four_actual_sized_scans_fit_finite_cap(self):
+        fs=self.effective_fixture();budget=self.ops.UpdateScan(200.)
+        # Actual ROOT physical scan 516128 charged 10,176,000 bytes for 258 PIDs.
+        for _ in range(4):budget.reserve(10176000)
+        self.assertEqual(budget.bytes,40704000)
+        with self.assertRaisesRegex(ValueError,'cumulative'):
+            budget.reserve(64*1024*1024-budget.bytes+1)
+        self.assertEqual(budget.bytes,40704000)
+
+    def test_job_appearing_after_unmask_blocks_restart(self):
+        fs=self.stopped_fixture();native=fs.native
+        def appear(args):
+            result=native(args)
+            if args[:2]==['systemctl','daemon-reload']:
+                fs.process(456,comm='slurmstepd',uid=3000,cgroup='/jobs/job_5')
+                fs.write('/sys/fs/cgroup/jobs/job_5/cgroup.procs','456\n')
+            return result
+        with self.assertRaisesRegex(ValueError,'physical'):
+            self.ops.remove_owned_update_mask(release(),fs.attempt,runtime=fs.runtime,gate=fs.gate,run=appear,budget=self.ops.UpdateScan(200.))
+        self.assertEqual(json.loads(fs.real(fs.runtime/'update-stop.json').read_text())['mask_phase'],'remove_pending')
+        self.assertFalse(any(a[:2]in(['systemctl','start'],['systemctl','restart'])for a in fs.calls))
 
 
 class I14WholeRepairTests(unittest.TestCase):
@@ -1852,6 +2029,39 @@ class I14WholeRepairTests(unittest.TestCase):
         self.assertGreaterEqual(sum(a[:2]==['systemctl','show'] for a in fs.calls),30)
         for suffix in ('/cgroup.procs','/123/stat','/123/status','/release-config.json','/slurm.conf'):
             self.assertTrue(any(t[0]=='read' and t[1].endswith(suffix) for t in fs.trace),suffix)
+    def test_native_slurmd_delegated_leaf_is_bound_and_stops_without_force(self):
+        fs=self.fs();leaf=fs.state['ControlGroup']+'/slurmd'
+        fs.process(123,cgroup=leaf)
+        fs.write('/sys/fs/cgroup/system.slice/slurmd.service/cgroup.procs','')
+        fs.write('/sys/fs/cgroup'+leaf+'/cgroup.procs','123\n')
+        scan=fs.scan();captured=self.ops.singleton_scope(scan,fs.state)
+        self.assertEqual(captured['cgroup'],leaf);self.assertEqual(captured['pid'],123)
+        self.assertEqual([r['pid']for r in scan['service_members']],[123])
+        native=fs.native
+        def stop_leaf(args):
+            result=native(args)
+            if args[:2]==['systemctl','stop']:fs.write('/sys/fs/cgroup'+leaf+'/cgroup.procs','')
+            return result
+        fs.native=stop_leaf;result=fs.stop()
+        self.assertTrue(result['service_scope_complete']);self.assertEqual(result['service_members'],[])
+        self.assertTrue(result['job_processes_empty']);self.assertFalse(result['forced_daemon_stop'])
+        self.assertFalse(any(a[:2]==['systemctl','kill']for a in fs.calls))
+    def test_delegated_daemon_scope_rejects_foreign_malformed_or_membership_drift(self):
+        cases=('sibling','prefix','traversal','double_slash','dot','trailing_slash','leaf_mismatch','extra_member')
+        for case in cases:
+            with self.subTest(case=case),tempfile.TemporaryDirectory()as temporary,ExitStack()as scope:
+                old=self.root;self.root=Path(temporary)
+                try:
+                    fs=self.fs(force=True);scope.callback(fs.stack.close);root=fs.state['ControlGroup'];leaf=root+'/slurmd'
+                    paths={'sibling':'/system.slice/foreign.service/slurmd','prefix':root+'-foreign/slurmd',
+                           'traversal':root+'/../foreign','double_slash':root+'//slurmd','dot':root+'/./slurmd','trailing_slash':root+'/'}
+                    fs.process(123,cgroup=paths.get(case,leaf))
+                    if case=='extra_member':
+                        fs.write('/sys/fs/cgroup'+root+'/cgroup.procs','');fs.write('/sys/fs/cgroup'+leaf+'/cgroup.procs','123\n456\n')
+                        fs.process(456,comm='foreign-helper',cgroup=leaf,executable='/nix/store/helper/bin/helper')
+                    with self.assertRaisesRegex(ValueError,'scope|metadata|member|cgroup'):fs.stop()
+                    self.assertFalse(any(a[:2]in(['systemctl','mask'],['systemctl','stop'],['systemctl','kill'])for a in fs.calls))
+                finally:self.root=old
     def test_f1_subgroup_pid_reuse_exec_invocation_and_race_refuse(self):
         for fault in ('subgroup','ticks','exe','invocation','snapshot_member'):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temporary:
@@ -1974,6 +2184,52 @@ class I14WholeRepairTests(unittest.TestCase):
             return value
         self.model.health=stale
         result=self.deliver();self.assertFalse(result['open']);self.assertFalse(any('State=RESUME' in a for a in self.calls))
+    def test_resume_explicitly_clears_own_reason_before_opening_admission(self):
+        result=self.deliver()
+        self.assertTrue(result['open'],'RESUME must not strand the own drain reason on an idle node')
+        self.assertTrue(json.loads(self.gate.read_text())['open'])
+        for name in ('worker','second'):
+            self.assertEqual(self.model.nodes[name]['State'],'IDLE')
+            self.assertEqual(self.model.nodes[name]['Reason'],'None')
+            updates=[args for args in self.calls if 'State=RESUME' in args and 'NodeName='+name in args]
+            self.assertEqual(len(updates),1,'each proven own drain gets exactly one resume')
+            self.assertIn('Reason=None',updates[0])
+
+    def test_native_annotated_unset_reason_completes_update_without_losing_raw(self):
+        annotation='None [root@2026-10-12T15:48:11]'
+        for node in self.model.nodes.values():node['Reason']=annotation
+        command=self.model.command
+        def annotated(args):
+            text=command(args)
+            if 'State=RESUME' in args:
+                name=next(x.split('=',1)[1] for x in args if x.startswith('NodeName='))
+                self.model.nodes[name]['Reason']=annotation
+            return text
+        self.model.command=annotated
+        result=self.deliver();self.assertTrue(result['open'])
+        record=self.receipt()
+        for name in ('worker','second'):
+            original=record['slurm_before'][name]
+            self.assertEqual(original['Reason'],annotation)
+            self.assertIn('Reason='+annotation,original['_raw'])
+            self.assertEqual(self.ops.registration_fields(original['_raw']),original)
+            self.assertTrue(self.ops.retained_drain_complete(record['slurm_drain'][name]))
+            self.assertEqual(self.model.nodes[name]['Reason'],annotation)
+        self.assertTrue(json.loads(self.gate.read_text())['open'])
+
+    def test_annotated_unset_rejects_malformed_or_foreign_reason_before_mutation(self):
+        for reason in ('None extra','None [root@2026-02-30T15:48:11]',
+                       'None [root@2026-10-12T25:48:11]','None [root@2026-10-12T15:48:11] extra',
+                       'None [root@other@2026-10-12T15:48:11]',
+                       'None ['+'a'*129+'@2026-10-12T15:48:11]',
+                       'foreign maintenance [root@2026-10-12T15:48:11]'):
+            with self.subTest(reason=reason),self.isolated_delivery_case():
+                self.model.nodes['worker']['Reason']=reason
+                before=self.gate.read_bytes()
+                with self.assertRaisesRegex(ValueError,'Original Slurm state/reason'):self.deliver()
+                self.assertEqual(self.gate.read_bytes(),before)
+                self.assertFalse(self.model.transitions);self.no_later()
+
     def test_f4_postresume_wait_and_exact_idle(self):
         self.model.resume_reads['worker']=[{'State':'IDLE+NOT_RESPONDING','BootTime':'None','SlurmdStartTime':'None'}]*2
         # Responses apply only after RESUME, not during initial capture.
@@ -2103,7 +2359,7 @@ class I14WholeRepairTests(unittest.TestCase):
                     self.ops.activate(release(),profile=fs.profile,runtime=fs.runtime,gate=fs.gate,run=fs.native,role='worker',expected_node_identity=WORKER,update_attempt_id=fs.attempt,deadline=200.)
                     writes=[];reads=[];syncs=[];unlinks=[]
                     native=fs.native
-                    mount_query=['findmnt','--json','--target',str(fs.gate.parent),'--output','TARGET,SOURCE,FSTYPE']
+                    mount_query=['findmnt','--json','--uniq','--target',str(fs.gate.parent),'--output','TARGET,SOURCE,FSTYPE']
                     if fault=='mount':
                         def mount_fault(args):
                             result=native(args)
@@ -2141,6 +2397,41 @@ class I14WholeRepairTests(unittest.TestCase):
                         result=fs.health();self.assertTrue(result['nfs_verified']);self.assertEqual(writes,[b'qcl-negf-update\n'])
                         self.assertEqual(reads,[b'qcl-negf-update\n']);self.assertEqual(len(syncs),1);self.assertEqual(len(unlinks),1)
                     self.assertEqual([a for a in fs.calls[health_calls_start:] if a[0]=='findmnt'],[mount_query])
+                finally:self.root=old
+
+    def test_nfs_automount_effective_mount_contract(self):
+        # util-linux --uniq selects the visible mount before applying matches;
+        # a filesystem-type filter could instead hide a foreign overmount.
+        for case in ('nfs_only','automount','autofs_only','foreign_top','wrong_source','wrong_target','duplicates'):
+            with self.subTest(case=case),tempfile.TemporaryDirectory() as temporary,ExitStack() as scope:
+                old=self.root;self.root=Path(temporary)
+                try:
+                    fs=self.fs();scope.callback(fs.stack.close);fs.stop()
+                    self.ops.activate(release(),profile=fs.profile,runtime=fs.runtime,gate=fs.gate,run=fs.native,role='worker',expected_node_identity=WORKER,update_attempt_id=fs.attempt,deadline=200.)
+                    target=str(fs.gate.parent)
+                    nfs={'target':target,'source':'storage.invalid:/srv/qcl-negf/jobs','fstype':'nfs4'}
+                    autofs={'target':target,'source':'systemd-1','fstype':'autofs'}
+                    effective={
+                        'nfs_only':[nfs],'automount':[nfs],'autofs_only':[autofs],
+                        'foreign_top':[{'target':target,'source':'foreign','fstype':'tmpfs'}],
+                        'wrong_source':[{**nfs,'source':'foreign:/jobs'}],
+                        'wrong_target':[{**nfs,'target':target+'/other'}],
+                        'duplicates':[nfs,nfs],
+                    }[case]
+                    native=fs.native;queries=[]
+                    def mounted(args):
+                        if args[0]!='findmnt':return native(args)
+                        queries.append(args)
+                        raw=[autofs,nfs] if case=='automount' else effective
+                        return json.dumps({'filesystems':effective if '--uniq' in args else raw})
+                    fs.native=mounted
+                    with patch.object(self.ops.tempfile,'mkstemp',wraps=self.ops.tempfile.mkstemp) as create:
+                        if case in ('nfs_only','automount'):
+                            result=fs.health();self.assertTrue(result['nfs_verified']);self.assertEqual(create.call_count,1)
+                        else:
+                            with self.assertRaisesRegex(ValueError,'^NFS endpoint/mount mismatch$'):fs.health()
+                            self.assertEqual(create.call_count,0)
+                    self.assertEqual(queries,[['findmnt','--json','--uniq','--target',target,'--output','TARGET,SOURCE,FSTYPE']])
                 finally:self.root=old
 
     def test_r1_global_classification_and_full_own_member(self):
@@ -2429,3 +2720,117 @@ class I14WholeRepairTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class I14SlurmInfinityTests(I14WholeRepairTests):
+    """Own PID1 keeper is measured separately; job/unknown processes still block."""
+    PACKAGE='/nix/store/9gqliw4qwklfly65fffdz0v8qxd0l0nz-slurm-25-11-8-1'
+    SCOPE='/system.slice/slurmstepd.scope'
+    def keeper(self,fs):
+        package=self.PACKAGE;scope=self.SCOPE
+        fs.process(123,executable=package+'/bin/slurmd')
+        fs.process(1356,comm='slurmstepd',uid=0,cgroup=scope+'/system',ticks=540955,executable=package+'/bin/slurmstepd')
+        fs.write('/proc/1356/cmdline',(package+'/sbin/slurmstepd').encode()+b'\0infinity\0')
+        fs.write('/sys/fs/cgroup'+scope+'/cgroup.procs','')
+        fs.write('/sys/fs/cgroup'+scope+'/system/cgroup.procs','1356\n')
+        for name in ('slurmd','slurmstepd'):
+            fs.write(package+'/bin/'+name,'fixture selected binary');fs.real(package+'/bin/'+name).chmod(0o555)
+        fs.real(package+'/sbin').mkdir();fs.real(package+'/sbin/slurmstepd').symlink_to('../bin/slurmstepd')
+        fs.real('/run/current-system/sw/bin').mkdir(parents=True);fs.real('/run/current-system/sw/bin/slurmd').symlink_to(package+'/bin/slurmd')
+        old_stat=self.ops.UpdateScan.stat
+        def root_owned(budget,path,**kwargs):
+            value=old_stat(budget,path,**kwargs)
+            if str(path).startswith('/nix/') or str(path).startswith('/sys/fs/cgroup'+scope):
+                actual=value
+                class RootOwned:
+                    st_uid=0
+                    def __getattr__(self,name):return getattr(actual,name)
+                return RootOwned()
+            return value
+        fs.stack.enter_context(patch.object(self.ops.UpdateScan,'stat',root_owned))
+        native=fs.native
+        fs.scope_state={'ActiveState':'active','SubState':'running','Slice':'system.slice','ControlGroup':scope,'Delegate':'yes'}
+        def scope_native(args):
+            if args[:3]==['systemctl','show','slurmstepd.scope']:
+                props=[v.split('=',1)[1]for v in args if v.startswith('--property=')]
+                return '\n'.join(k+'='+fs.scope_state[k]for k in props)
+            return native(args)
+        fs.native=scope_native;return fs
+    def scan_keeper(self,fs):
+        fs.budget=self.ops.UpdateScan(200.)
+        return fs.scan()
+    def test_keeper_alias_active_stopped_and_force_survival(self):
+        fs=self.keeper(self.fs(force=True));scan=self.scan_keeper(fs)
+        self.assertTrue(scan['job_processes_empty']);self.assertEqual([r['pid']for r in scan['slurm_infinity_processes']],[1356])
+        result=fs.stop();self.assertTrue(result['job_processes_empty']);self.assertEqual(result['daemon_processes'],[])
+        self.assertEqual([r['pid']for r in result['slurm_infinity_processes']],[1356]);self.assertTrue(fs.real('/proc/1356').exists())
+        self.assertEqual(sum(a[:2]==['systemctl','kill']for a in fs.calls),1)
+        self.assertTrue(all(a[-1]=='slurmd.service'for a in fs.calls if a[:2]==['systemctl','kill']))
+    def test_keeper_negative_boundaries(self):
+        for fault in ('arguments','extra_argument','uid','executable','alias','extra_member','job_child','delegate','birth','scope_drift','scope_prefix','final_unit_drift','native_owner_writable'):
+            with self.subTest(fault=fault),tempfile.TemporaryDirectory()as temporary,ExitStack()as scope:
+                old=self.root;self.root=Path(temporary)
+                try:
+                    fs=self.keeper(self.fs());scope.callback(fs.stack.close)
+                    if fault in ('arguments','extra_argument'):
+                        fs.write('/proc/1356/cmdline',(self.PACKAGE+'/bin/slurmstepd').encode()+b'\0'+(b'123\0'if fault=='arguments'else b'infinity\0extra\0'))
+                    if fault in ('uid','executable','scope_prefix'):
+                        fs.process(1356,comm='slurmstepd',uid=3000 if fault=='uid'else 0,cgroup=self.SCOPE+('/system-extra'if fault=='scope_prefix'else '/system'),ticks=540955,executable=self.PACKAGE+('/bin/slurmd'if fault=='executable'else '/bin/slurmstepd'))
+                        fs.write('/proc/1356/cmdline',(self.PACKAGE+'/bin/slurmstepd').encode()+b'\0infinity\0')
+                    if fault=='alias':fs.real(self.PACKAGE+'/sbin/slurmstepd').unlink();fs.real(self.PACKAGE+'/sbin/slurmstepd').symlink_to('../bin/slurmd')
+                    if fault=='extra_member':
+                        fs.process(1357,comm='foreign-helper',uid=0,cgroup=self.SCOPE+'/system');fs.write('/sys/fs/cgroup'+self.SCOPE+'/system/cgroup.procs','1356\n1357\n')
+                    if fault=='job_child':fs.write('/sys/fs/cgroup'+self.SCOPE+'/job_1/cgroup.procs','')
+                    if fault=='delegate':fs.scope_state['Delegate']='no'
+                    if fault=='native_owner_writable':fs.real(self.PACKAGE+'/bin/slurmd').chmod(0o755)
+                    if fault=='final_unit_drift':
+                        original=self.ops.UpdateScan.read;reads=[0]
+                        def unit_drift(budget,path,*args,**kwargs):
+                            value=original(budget,path,*args,**kwargs)
+                            if str(path)=='/sys/fs/cgroup'+self.SCOPE+'/system/cgroup.procs':
+                                reads[0]+=1
+                                if reads[0]==2:fs.scope_state['Delegate']='no'
+                            return value
+                        scope.enter_context(patch.object(self.ops.UpdateScan,'read',unit_drift))
+                    if fault in ('birth','scope_drift'):
+                        original=self.ops.UpdateScan.read;count=[0]
+                        def drift(budget,path,*args,**kwargs):
+                            value=original(budget,path,*args,**kwargs)
+                            if str(path)==('/proc/1356/cmdline'if fault=='birth'else '/sys/fs/cgroup'+self.SCOPE+'/system/cgroup.procs'):
+                                count[0]+=1
+                                if count[0]==1:
+                                    if fault=='birth':fs.write('/proc/1356/stat','1356 (slurmstepd) S '+' '.join(['0']*18+['540956'])+'\n')
+                                    else:fs.write('/sys/fs/cgroup'+self.SCOPE+'/system/cgroup.procs','')
+                            return value
+                        scope.enter_context(patch.object(self.ops.UpdateScan,'read',drift))
+                    try:result=self.scan_keeper(fs)
+                    except (ValueError,OSError):pass
+                    else:self.assertFalse(result['job_processes_empty'],'unknown keeper cannot produce positive empty-jobs proof')
+                    self.assertFalse(any(a[:2]in(['systemctl','kill'],['systemctl','stop'],['systemctl','mask'])for a in fs.calls))
+                finally:self.root=old
+    def test_selected_wrapper_exact_grammar_and_config(self):
+        for fault in ('valid','extra_line','other_native','different_conf','ambiguous','writable','owner_writable','native_shell','conf_shell'):
+            with self.subTest(fault=fault),tempfile.TemporaryDirectory()as temporary,ExitStack()as scope:
+                old=self.root;self.root=Path(temporary)
+                try:
+                    fs=self.keeper(self.fs());scope.callback(fs.stack.close)
+                    wrapper='/nix/store/'+'a'*32+'-wrappedSlurm/bin/slurmd'
+                    native=self.PACKAGE+'/bin/slurmd';conf='/nix/store/7r5rc73h5lk36iiakc13hi187dbkplja-etc-slurm/slurm.conf'
+                    config=json.loads(fs.real('/etc/qcl-negf/release-config.json').read_text());config['slurm_conf']=conf
+                    fs.write('/etc/qcl-negf/release-config.json',json.dumps(config));fs.write(conf,'fixture selected config')
+                    text='#!/bin/sh\nif [ -z "$SLURM_CONF" ]\nthen\n  SLURM_CONF="'+conf+'" "'+native+'" "$@"\nelse\n  "'+native+'" "$@"\nfi\n'
+                    if fault=='extra_line':text+='exit 0\n'
+                    if fault=='native_shell':text=text.replace('-slurm-25-11-8-1/','-slurm-$(x)/')
+                    if fault=='conf_shell':text=text.replace('-etc-slurm/','-etc-$(x)/')
+                    if fault=='other_native':text=text.replace(native,'/nix/store/'+'b'*32+'-slurm-other/bin/slurmd')
+                    if fault=='different_conf':text=text.replace(conf,'/etc/foreign-slurm.conf')
+                    if fault=='ambiguous':text=text.replace('else\n  "'+native,'else\n  "'+self.PACKAGE+'/sbin/slurmd')
+                    fs.write(wrapper,text);fs.real(wrapper).chmod(0o777 if fault=='writable'else 0o755 if fault=='owner_writable'else 0o555)
+                    fs.real('/run/current-system/sw/bin/slurmd').unlink();fs.real('/run/current-system/sw/bin/slurmd').symlink_to(wrapper)
+                    if fault=='valid':self.assertTrue(self.scan_keeper(fs)['job_processes_empty'])
+                    else:
+                        with self.assertRaises((ValueError,OSError)):self.scan_keeper(fs)
+                finally:self.root=old
+    def test_stopped_without_keeper_scope_is_measured_empty(self):
+        fs=self.fs();fs.clear_scope();scan=self.scan_keeper(fs)
+        self.assertTrue(scan['job_processes_empty']);self.assertEqual(scan['slurm_infinity_processes'],[])
