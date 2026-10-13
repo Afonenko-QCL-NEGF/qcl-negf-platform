@@ -152,7 +152,7 @@ python3 /absolute/private/lab/application_release.py prepare-initial \
 
 После успешной подготовки controller та же команда запускается на каждом worker
 с `--role worker`. Установленный `qcl-negf-release prepare-initial` имеет тот же
-интерфейс. Defaults: runtime `/var/lib/qcl-negf/runtime`, gate
+интерфейс. Defaults: runtime `/var/lib/qcl-negf-admin/runtime`, gate
 `/srv/qcl-negf/jobs/.release-admission.json`; CLI сериализуется через локальный
 `activation.lock`. Manifest выбирает exact immutable application/solver paths и
 release ID. `nix-store --verify-path` проверяет уже доступные closures; если

@@ -12,7 +12,7 @@ controller and Linux workers; the private-site example does this. The image inst
 release/lifecycle commands, profile initialization and a slurmd boot gate. API/AiiDA/bootstrap run
 from the stable `/nix/var/nix/profiles/qcl-negf-application`; initialization sets it only when
 absent, so reboot retains the CD-selected release. Services read runtime
-`/var/lib/qcl-negf/runtime/service.env`. The solver profile is a GC root only; InstalledCode always
+`/var/lib/qcl-negf-admin/runtime/service.env`. The solver profile is a GC root only; InstalledCode always
 uses immutable `/nix/store/.../bin/qcl-negf`.
 
 OS changes require the deployment procedure again. Database schema changes are explicit maintenance
@@ -134,7 +134,7 @@ standard not-responding DOWN reason is supported only in its measured own stop w
 is followed by at most ten readonly polls; exact same-generation IDLE and zero allocations on
 every worker precede gate opening. Other state/reason/resource/generation changes remain closed. Own stop
 markers are removed after durable terminal success. Partial/unknown outcomes never auto-retry. Partial failure leaves it closed and publishes node statuses in
-`/var/lib/qcl-negf/runtime/delivery-report.json`; for a known failure, fix the cause and explicitly
+`/var/lib/qcl-negf-admin/runtime/delivery-report.json`; for a known failure, fix the cause and explicitly
 repeat the same idempotent command. An uncertain outcome requires trusted reconciliation first. A
 repeated successful activation retains profile/Code identity and repeats checks. Application and
 solver profiles are reconciled independently. An identical retry repairs a missing or wrong solver
@@ -305,7 +305,7 @@ stored in the Nix store. The following identities are synthetic examples only:
 Registry and known_hosts must be bounded root-owned regular files beneath a complete root-owned
 namespace with no group/other write or symlink components. User homes and /tmp are not production
 trust inputs. Verified bytes are frozen in unique root0700 operations beneath
-/var/lib/qcl-negf/trust-snapshots, file0600; all later SSH/Nix copies use that snapshot with strict
+/var/lib/qcl-negf-admin/trust-snapshots, file0600; all later SSH/Nix copies use that snapshot with strict
 verification and no global known_hosts/config fallback. Source pathname substitution cannot change
 the snapshot. Snapshot hashes link private receipts to bytes; they are not source revision locks.
 Snapshots are conservatively retained, including unknown attempts; operator housekeeping must
@@ -411,3 +411,32 @@ Controller fleet-health reads its own AiiDA/API/munged/NFS/profile/identity evid
 query worker slurmd/cgroup/stop markers. The source amendment declares 105 test methods (97 retained
 plus eight named bodies); none have been executed or accepted by this amendment. Absent-unit native
 failure is not measured, and no source/native/scientific-ready claim follows from the declaration.
+
+### Protected administration namespace
+
+Release runtime metadata, service environment and protected stop markers live in
+`/var/lib/qcl-negf-admin/runtime` (root-owned 0755); frozen SSH trust lives in
+`/var/lib/qcl-negf-admin/trust-snapshots` (root-owned 0700). The parent
+`/var/lib/qcl-negf-admin` is root-owned 0755. These paths are separate from the
+service-owned `/var/lib/qcl-negf` AiiDA home, including its controller DATA bind.
+Every protected ancestor must still be root-owned, non-writable by group/others
+and traversed without symlinks. Do not change the AiiDA home's ownership.
+
+Existing installations must explicitly reconcile prior runtime state before
+activating these defaults; no automatic copy, old-path fallback or trust adoption
+is performed. Initialize fresh runtime/trust state only after enrollment and
+release identities are checked. The new defaults do not migrate scientific data,
+AiiDA configuration, application or solver closures.
+
+For a fresh guest, deliver the new root-owned release command closure through Nix,
+then run its `prepare-initial` with the new runtime namespace before switching the
+NixOS system. Keep the admission gate closed; preserve an already exact profile
+and the same release identity. This prepares the new service environment before
+the changed `EnvironmentFile` and slurmd `ExecStartPre` become active. Do not copy
+old runtime files as a substitute for checked initial preparation. Existing-state
+reconciliation remains an explicit operator step.
+
+Both owning operational commands, `qcl-negf-release` and
+`qcl-negf-worker-lifecycle`, explicitly export the same generated `SLURM_CONF`
+used by the configured Slurm daemon. Their raw Slurm dependencies must not fall
+back to DNS configless discovery or a caller's unrelated configuration.
