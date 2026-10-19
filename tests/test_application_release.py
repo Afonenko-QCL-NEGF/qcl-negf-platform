@@ -1094,11 +1094,33 @@ class ApplicationReleaseTests(unittest.TestCase):
             self.assertEqual(run.prefetch_gate_snapshots, [original])
 
     def test_invalid_cache_argument_or_absent_manifest_hashes_refuses_before_commands(self):
-        for cache in (None, "", " ", "-option", "https://cache.invalid\n--option", "https://cache.invalid path",
-                      "https://user:password@cache.invalid", 123, True):
+        # Keep the literal password/argument table aligned with Root OPS04 tests.
+        # Account selectors, including an encoded colon in the username, remain valid.
+        rejected = (
+            "https://user:example-password@cache.example.invalid",
+            "https://user:@cache.example.invalid",
+            "https://:@cache.example.invalid",
+            "ssh://account:@cache.example.invalid",
+            "ssh-ng://account:@cache.example.invalid",
+            "ssh://account:%70%61%73%73@cache.example.invalid",
+            "https://user:%3A@cache.example.invalid",
+            "https://[malformed",
+            "--option",
+            "https://cache.example.invalid/ white",
+            "https://cache.example.invalid/\t",
+            "https://cache.example.invalid/\n",
+            "https://cache.example.invalid/\0",
+            "https://cache.example.invalid/\u001f",
+            "https://cache.example.invalid/\u007f",
+            "", 7, None, {},
+            # Preserve earlier nonstring and whitespace regressions as well.
+            " ", "-option", "https://cache.invalid\n--option", "https://cache.invalid path",
+            "https://user:password@cache.invalid", 123, True,
+        )
+        for index, cache in enumerate(rejected):
             value = delivery_manifest()
             value["cache_uri"] = cache
-            with self.subTest(cache=cache), tempfile.TemporaryDirectory() as temporary:
+            with self.subTest(case=index), tempfile.TemporaryDirectory() as temporary:
                 gate = Path(temporary) / "admission.json"
                 gate.write_text("unchanged")
                 run = DeliveryCommands(gate)
@@ -1110,6 +1132,38 @@ class ApplicationReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "closure"):
             self.ops.deliver_cli(release(), POOL, runtime=self.runtime, gate=self.gate, run=lambda args: calls.append(args))
         self.assertEqual(calls, [])
+
+    def test_ops04_username_only_and_local_cache_routes_preserve_literal_argv(self):
+        accepted = (
+            "https://cache.example.invalid",
+            "ssh://account@cache.example.invalid",
+            "ssh-ng://account@cache.example.invalid",
+            "ssh://account%3Aname@cache.example.invalid",
+            "file:///tmp/qcl-cache",
+            "/tmp/qcl-cache",
+            "local?root=/tmp/qcl-cache",
+        )
+        for index, cache in enumerate(accepted):
+            with self.subTest(case=index):
+                value = delivery_manifest()
+                value["cache_uri"] = cache
+                original = copy.deepcopy(value)
+                calls = []
+                def command(args):
+                    calls.append(args)
+                    if args[:3] == ["nix", "path-info", "--json"]:
+                        return json.dumps({"/nix/store/application": {"narHash": HASH},
+                                           "/nix/store/solver": {"narHash": HASH}})
+                    if args[:3] == ["nix", "copy", "--from"]:
+                        return ""
+                    raise AssertionError("Unexpected command boundary")
+                hashes = self.ops.prefetch_controller_closures(value, run=command)
+                self.assertEqual(calls, [
+                    ["nix", "copy", "--from", cache, "/nix/store/application", "/nix/store/solver"],
+                    ["nix", "path-info", "--json", "/nix/store/application", "/nix/store/solver"],
+                ])
+                self.assertEqual(hashes, {"/nix/store/application": HASH, "/nix/store/solver": HASH})
+                self.assertEqual(value, original)
 
     def test_malformed_manifest_closure_inventory_refuses_before_commands(self):
         for inventory in ([], [{"path": "/nix/store/application", "narHash": HASH}],

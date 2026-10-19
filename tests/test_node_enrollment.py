@@ -165,6 +165,230 @@ class FakeProtectedFS:
         return stack
 
 
+class BoundaryProtectedFS(FakeProtectedFS):
+    """Script syscall outcomes without creating a native FIFO or root namespace."""
+    def __init__(self, *, read_fragment=None, writes=(), fail_sync=None):
+        super().__init__()
+        self.read_fragment = read_fragment
+        self.write_results = iter(writes)
+        self.fail_sync = fail_sync
+        self.reads = []
+        self.writes = []
+        self.closed = []
+
+    def read(self, fd, size):
+        requested = size
+        result = super().read(fd, min(size, self.read_fragment) if self.read_fragment else size)
+        self.reads.append((self.fds[fd]["path"], requested, len(result)))
+        return result
+
+    def write(self, fd, raw):
+        outcome = next(self.write_results, len(raw))
+        if isinstance(outcome, Exception):
+            raise outcome
+        if not 0 <= outcome <= len(raw):
+            raise AssertionError("Invalid synthetic short write")
+        self.writes.append((len(raw), outcome))
+        super().write(fd, raw[:outcome])
+        return outcome
+
+    def close(self, fd):
+        self.closed.append(fd)
+        super().close(fd)
+
+    def fsync(self, fd):
+        super().fsync(fd)
+        if len(self.syncs) == self.fail_sync:
+            raise OSError("Synthetic fsync failure")
+
+
+class ProtectedInputBoundaryTests(unittest.TestCase):
+    def assert_readonly_opens(self, fs):
+        # Include attempted opens that fail before returning a descriptor.
+        for path, flags, _ in fs.opens:
+            with self.subTest(open_path=path):
+                self.assertEqual(flags & os.O_ACCMODE, os.O_RDONLY)
+
+    def assert_closed(self, fs):
+        self.assertEqual(fs.fds, {})
+        self.assertEqual(len(fs.closed), len(fs.opens))
+        self.assertEqual(len(fs.closed), len(set(fs.closed)))
+
+    def test_regular_empty_single_and_exact_limit_with_fragmented_reads(self):
+        for size in (0, 1, 65536):
+            for fragment in (None, 997):
+                with self.subTest(size=size, fragment=fragment):
+                    fs = BoundaryProtectedFS(read_fragment=fragment)
+                    payload = b"x" * size
+                    fs.nodes["/protected/known_hosts"]["bytes"] = payload
+                    with fs.patches():
+                        actual = ops.read_protected_file("/protected/known_hosts")
+                    self.assertEqual(actual, payload)
+                    self.assertEqual(sum(count for _, _, count in fs.reads), size)
+                    self.assertTrue(all(flags & os.O_NOFOLLOW for _, flags, _ in fs.opens))
+                    self.assertTrue(fs.opens[-1][1] & os.O_NONBLOCK)
+                    self.assert_readonly_opens(fs)
+                    self.assert_closed(fs)
+
+    def test_oversize_reads_at_most_limit_plus_one_and_closes(self):
+        for size in (65537, 65538):
+            for fragment in (None, 997):
+                with self.subTest(size=size, fragment=fragment):
+                    fs = BoundaryProtectedFS(read_fragment=fragment)
+                    fs.nodes["/protected/known_hosts"]["bytes"] = b"x" * size
+                    with fs.patches(), self.assertRaisesRegex(ValueError, "bound"):
+                        ops.read_protected_file("/protected/known_hosts")
+                    actual = 0
+                    for _, requested, delivered in fs.reads:
+                        self.assertGreater(requested, 0)
+                        self.assertLessEqual(requested, 65537 - actual)
+                        actual += delivered
+                    self.assertLessEqual(actual, 65537)
+                    self.assertEqual(actual, 65537)
+                    if size > 65537:
+                        self.assertLess(actual, size, "Independent tail must remain unread")
+                    self.assert_readonly_opens(fs)
+                    self.assert_closed(fs)
+
+    def test_fifo_socket_and_directory_are_rejected_before_any_read(self):
+        for kind in (stat.S_IFIFO, stat.S_IFSOCK, stat.S_IFDIR):
+            with self.subTest(kind=kind):
+                fs = BoundaryProtectedFS()
+                fs.nodes["/protected/known_hosts"]["mode"] = kind | 0o600
+                with fs.patches(), self.assertRaisesRegex(ValueError, "owner/mode/type"):
+                    ops.read_protected_file("/protected/known_hosts")
+                self.assertEqual(fs.reads, [])
+                self.assertEqual(fs.opens[-1][0], "/protected/known_hosts")
+                self.assertTrue(fs.opens[-1][1] & os.O_NONBLOCK)
+                self.assertTrue(all(flags & os.O_NOFOLLOW for _, flags, _ in fs.opens))
+                self.assert_readonly_opens(fs)
+                self.assert_closed(fs)
+
+    def test_root_ancestor_and_leaf_owner_and_write_modes_refuse_before_read(self):
+        for path in ("/", "/protected", "/protected/known_hosts"):
+            for change in ("uid", "group_write", "other_write"):
+                with self.subTest(path=path, change=change):
+                    fs = BoundaryProtectedFS()
+                    if change == "uid":
+                        fs.nodes[path]["uid"] = 1000
+                    else:
+                        fs.nodes[path]["mode"] |= 0o020 if change == "group_write" else 0o002
+                    with fs.patches(), self.assertRaisesRegex(ValueError, "owner/mode/type"):
+                        ops.read_protected_file("/protected/known_hosts")
+                    self.assertEqual(fs.reads, [])
+                    self.assert_readonly_opens(fs)
+                    self.assert_closed(fs)
+
+    def test_symlink_at_root_ancestor_or_leaf_requires_nofollow(self):
+        for path in ("/", "/protected", "/protected/known_hosts"):
+            with self.subTest(path=path):
+                fs = BoundaryProtectedFS()
+                fs.nodes[path]["mode"] = stat.S_IFLNK | 0o777
+                # A failed open has no descriptor; assert the attempted syscall independently.
+                def nofollow_open(name, flags, mode=0o777, *, dir_fd=None):
+                    self.assertTrue(flags & os.O_NOFOLLOW)
+                    return fs.open(name, flags, mode, dir_fd=dir_fd)
+                with fs.patches(), patch.object(ops.os, "open", nofollow_open), self.assertRaises(OSError):
+                    ops.read_protected_file("/protected/known_hosts")
+                self.assertEqual(fs.reads, [])
+                self.assertEqual(fs.fds, {})
+                self.assertEqual(len(fs.closed), len(fs.opens) - 1)
+                self.assert_readonly_opens(fs)
+
+    def test_root_and_ancestor_must_be_directories(self):
+        for path in ("/", "/protected"):
+            for kind in (stat.S_IFREG, stat.S_IFIFO, stat.S_IFSOCK):
+                with self.subTest(path=path, kind=kind):
+                    fs = BoundaryProtectedFS()
+                    fs.nodes[path]["mode"] = kind | 0o600
+                    with fs.patches(), self.assertRaises(NotADirectoryError):
+                        ops.read_protected_file("/protected/known_hosts")
+                    self.assertEqual(fs.reads, [])
+                    self.assertEqual(fs.fds, {})
+                    self.assertEqual(len(fs.closed), len(fs.opens) - 1)
+                    self.assertTrue(fs.opens[-1][1] & os.O_DIRECTORY)
+                    self.assertTrue(fs.opens[-1][1] & os.O_NOFOLLOW)
+                    self.assert_readonly_opens(fs)
+
+    def test_invalid_paths_refuse_before_open(self):
+        for path in ("", "relative", "/protected/./known_hosts", "/protected/../known_hosts",
+                     "/protected//known_hosts", "/protected/known_hosts/"):
+            with self.subTest(path=path):
+                fs = BoundaryProtectedFS()
+                with fs.patches(), self.assertRaises(ValueError):
+                    ops.read_protected_file(path)
+                self.assertEqual(fs.opens, [])
+                self.assert_readonly_opens(fs)
+
+    def test_empty_enrollment_and_known_hosts_are_rejected_by_consumer(self):
+        for raw in (b"", json.dumps(registry()).encode()):
+            with self.subTest(empty_enrollment=not raw):
+                fs = BoundaryProtectedFS()
+                fs.nodes["/protected/enrollment.json"] = {
+                    "mode": stat.S_IFREG | 0o600, "uid": 0, "bytes": raw}
+                fs.nodes["/protected/known_hosts"]["bytes"] = b""
+                with fs.patches(), self.assertRaises(ValueError):
+                    ops.load_enrollment("/protected/enrollment.json")
+                self.assert_readonly_opens(fs)
+                self.assert_closed(fs)
+
+    def test_full_and_progressing_short_writes_return_exact_durable_snapshot(self):
+        payload = b"synthetic verified trust bytes"
+        for counts in ((), (1, 2, 3, 4)):
+            with self.subTest(counts=counts):
+                fs = BoundaryProtectedFS(writes=counts)
+                with fs.patches():
+                    frozen = ops.freeze_ssh_trust(payload, snapshot_root="/protected/snapshots")
+                target = frozen["path"]
+                self.assertEqual(fs.nodes[target]["bytes"], payload)
+                self.assertEqual(frozen["sha256"], hashlib.sha256(payload).hexdigest())
+                self.assertEqual(fs.nodes[target]["mode"], stat.S_IFREG | 0o600)
+                self.assertEqual(fs.nodes[str(Path(target).parent)]["mode"], stat.S_IFDIR | 0o700)
+                self.assertEqual(fs.syncs, [target, str(Path(target).parent), "/protected/snapshots"])
+                self.assertEqual(sum(count for _, count in fs.writes), len(payload))
+                self.assertTrue(all(flags & os.O_NOFOLLOW for _, flags, _ in fs.opens))
+                self.assert_closed(fs)
+
+    def test_failed_writes_retain_original_partial_attempt_and_return_no_trust(self):
+        payload = b"synthetic verified trust bytes"
+        for counts, prefix in (((0,), b""), ((3, 0), payload[:3]),
+                               ((3, OSError("Synthetic incomplete write")), payload[:3])):
+            with self.subTest(counts=tuple(type(c).__name__ for c in counts)):
+                fs = BoundaryProtectedFS(writes=counts)
+                with fs.patches(), self.assertRaises(OSError):
+                    ops.freeze_ssh_trust(payload, snapshot_root="/protected/snapshots")
+                attempts = [node["bytes"] for path, node in fs.nodes.items()
+                            if path.startswith("/protected/snapshots/") and path.endswith("/known_hosts")]
+                self.assertEqual(attempts, [prefix])
+                self.assertEqual(fs.syncs, [])
+                self.assert_closed(fs)
+
+    def test_file_directory_and_parent_fsync_failures_retain_attempt_without_return(self):
+        payload = b"synthetic verified trust bytes"
+        for failure in (1, 2, 3):
+            with self.subTest(failure=failure):
+                fs = BoundaryProtectedFS(fail_sync=failure)
+                with fs.patches(), self.assertRaisesRegex(OSError, "fsync"):
+                    ops.freeze_ssh_trust(payload, snapshot_root="/protected/snapshots")
+                attempts = [path for path in fs.nodes
+                            if path.startswith("/protected/snapshots/") and path.endswith("/known_hosts")]
+                self.assertEqual(len(attempts), 1)
+                target = attempts[0]
+                self.assertEqual(fs.nodes[target]["bytes"], payload)
+                self.assertEqual(fs.syncs, [target, str(Path(target).parent), "/protected/snapshots"][:failure])
+                self.assert_closed(fs)
+
+    def test_invalid_frozen_input_refuses_before_namespace_mutation(self):
+        for payload in (b"", b"x" * 65537, "synthetic", bytearray(b"synthetic"), None):
+            with self.subTest(kind=type(payload).__name__, size=len(payload) if payload is not None else None):
+                fs = BoundaryProtectedFS()
+                before = copy.deepcopy(fs.nodes)
+                with fs.patches(), self.assertRaises(ValueError):
+                    ops.freeze_ssh_trust(payload, snapshot_root="/protected/snapshots")
+                self.assertEqual(fs.nodes, before)
+                self.assertEqual(fs.opens, [])
+
+
 class EnrollmentTests(unittest.TestCase):
     def test_duplicate_routes_enrollment_and_permanent_clones_are_rejected(self):
         for change in ("target", "enrollment", "uuid", "machine_id"):
