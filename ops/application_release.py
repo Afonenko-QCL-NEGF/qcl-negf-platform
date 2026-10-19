@@ -8,6 +8,7 @@ import argparse
 import base64
 from contextlib import contextmanager
 import fcntl
+import errno
 import json
 import os
 from pathlib import Path
@@ -605,11 +606,17 @@ def assert_expected_node(expected_node_identity, *, role, run=command,metadata_b
     return actual
 
 
-def unresolved_deliveries(runtime):
+def unresolved_deliveries(runtime, *, owner=None, emergency_close=False):
     attempts = Path(runtime) / "delivery-attempts"
     if attempts.exists():
         for path in attempts.glob("*.json"):
+            if _own_artifact(owner, path) or (emergency_close and owner is not None and _registered_artifact(owner, path)):
+                continue
             previous = load(path)
+            if (not isinstance(previous, dict) or path.name.endswith('.lifecycle-intent.json')
+                    or previous.get('schema') not in ('qcl-negf-delivery-attempt-v1', 'qcl-negf-admission-intent-v1')
+                    or previous.get('pending_local_mutation')):
+                raise RuntimeError('Unresolved local mutation requires trusted reconciliation')
             if previous.get('operation')=='whole_cluster_update' and previous.get('status') in ('running','failed'):
                 for drain in previous.get('slurm_drain',{}).values():
                     if isinstance(drain,dict) and drain.get('status')=='completed' and drain.get('resume_status')!='completed' and not retained_drain_complete(drain):raise RuntimeError('Unresolved causal DRAIN evidence requires trusted operator reconciliation')
@@ -679,10 +686,10 @@ def read_shutdown_intent(path, node):
     return validate_shutdown_intent(value, node)
 
 
-def lifecycle_guard(runtime, *, normal_intents=True):
+def lifecycle_guard(runtime, *, normal_intents=True, owner=None):
     """No write/clear: unrelated CR04 outcomes retain independent authority."""
     runtime = Path(runtime)
-    unresolved_deliveries(runtime)
+    unresolved_deliveries(runtime, owner=owner)
     # No I14 adapter exists here: any durable update ownership marker is unknown.
     if os.path.lexists(runtime / "cluster-update.json"):
         raise RuntimeError("Cluster update ownership requires trusted reconciliation")
@@ -698,13 +705,342 @@ def lifecycle_guard(runtime, *, normal_intents=True):
                     raise RuntimeError("Normal shutdown intent inhibits delivery until authorized new-boot startup")
 
 
+_OWNER_OPERATIONS = frozenset({'whole_update', 'activate', 'prepare_initial',
+    'shutdown_capture', 'shutdown_finalize', 'startup', 'stop_update',
+    'repair_update', 'finish_update'})
+_OWNER_RECORDS = {}
+
+
+class LifecycleOwner:
+    """An interpreter-local capability; no public constructor or transport."""
+    __slots__ = ()
+    def __new__(cls):
+        raise TypeError('Lifecycle authority is issued only by lifecycle_owner')
+    def __copy__(self):
+        raise TypeError('Lifecycle authority cannot be copied')
+    def __deepcopy__(self, memo):
+        raise TypeError('Lifecycle authority cannot be copied')
+    def __reduce_ex__(self, protocol):
+        raise TypeError('Lifecycle authority cannot be serialized')
+
+
+def _process_generation():
+    # Local metadata only; no subprocess and no caller supplied PID/boot proof.
+    pid = os.getpid()
+    with open('/proc/' + str(pid) + '/stat', 'rb') as handle:
+        raw = handle.read(8193)
+    if len(raw) > 8192:
+        raise ValueError('Process generation metadata exceeds bound')
+    fields = raw.rsplit(b')', 1)[-1].split()
+    if len(fields) < 20 or not fields[19].isdigit() or int(fields[19]) <= 0:
+        raise ValueError('Missing process start generation')
+    with open('/proc/sys/kernel/random/boot_id', 'rb') as handle:
+        boot = handle.read(129).decode().strip()
+    return pid, int(fields[19]), normalized_uuid(boot)
+
+
+def _inode(info):
+    return info.st_dev, info.st_ino
+
+
+def _finite_deadline(deadline):
+    value = time.monotonic() + 1800.0 if deadline is None else deadline
+    duration(value, 'Lifecycle deadline')
+    deadline_check(value)
+    return value
+
+
+def _require_owner(owner, *, runtime, operation, release_identity, deadline):
+    state = _OWNER_RECORDS.get(id(owner))
+    if type(owner) is not LifecycleOwner or state is None or state['object'] is not owner:
+        raise PermissionError('No live process-local lifecycle owner')
+    if state['generation'] != _process_generation():
+        raise PermissionError('Lifecycle process generation changed')
+    if (operation not in _OWNER_OPERATIONS or operation != state['operation']
+            or Path(runtime).absolute() != state['runtime']
+            or release_identity != state['identity']):
+        raise PermissionError('Lifecycle operation/runtime/release binding changed')
+    if deadline is None or deadline > state['deadline']:
+        raise PermissionError('Lifecycle deadline cannot be renewed')
+    duration(deadline, 'Lifecycle helper deadline')
+    deadline_check(deadline)
+    for name, fd, signature in state['locks']:
+        info = os.fstat(fd)
+        named = os.stat(name, dir_fd=state['directory'], follow_symlinks=False)
+        if (_inode(info) != signature or _inode(named) != signature
+                or not stat.S_ISREG(named.st_mode) or named.st_nlink != 1):
+            raise PermissionError('Lifecycle lock namespace changed')
+    if (_inode(os.fstat(state['directory'])) != state['runtime_inode']
+            or _inode(os.stat(state['runtime'], follow_symlinks=False)) != state['runtime_inode']):
+        raise PermissionError('Lifecycle runtime directory changed')
+    return state
+
+
+def _owner_before(owner, deadline=None):
+    state = _OWNER_RECORDS.get(id(owner))
+    if state is None:
+        raise PermissionError('Revoked lifecycle owner')
+    return _require_owner(owner, runtime=state['runtime'], operation=state['operation'],
+        release_identity=state['identity'], deadline=state['deadline'] if deadline is None else deadline)
+
+
+def _child_revoke_owners():
+    records = list(_OWNER_RECORDS.values())
+    _OWNER_RECORDS.clear()
+    for state in records:
+        # Never LOCK_UN: fork inherited the parent's open file description.
+        for _, fd, _ in state['locks']:
+            _close_owner_fd(fd)
+        _close_owner_fd(state['directory'])
+
+
+def _close_owner_fd(fd):
+    try:
+        os.close(fd)
+    except OSError as error:
+        if error.errno != errno.EBADF:
+            raise
+
+
+os.register_at_fork(after_in_child=_child_revoke_owners)
+
+
 @contextmanager
-def lifecycle_owner(runtime):
-    runtime = Path(runtime)
-    runtime.mkdir(parents=True, exist_ok=True)
-    with (runtime / "delivery.lock").open("w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        yield
+def lifecycle_owner(runtime, *, operation, release_id, deadline, release_identity=None):
+    deadline = _finite_deadline(deadline)
+    if operation not in _OWNER_OPERATIONS:
+        raise ValueError('Unknown lifecycle operation')
+    identity = manifest(release_identity) if release_identity is not None else None
+    if (identity is None and operation not in ('shutdown_capture', 'shutdown_finalize')) or (
+            identity is not None and release_id != identity['release_id']):
+        raise ValueError('Lifecycle owner requires exact release identity')
+    runtime = Path(runtime).absolute()
+    if any(s['runtime'] == runtime for s in _OWNER_RECORDS.values()):
+        raise BlockingIOError('Lifecycle owner is not reentrant')
+    runtime.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if runtime.resolve() != runtime:
+        raise PermissionError('Lifecycle runtime must not traverse symlinks')
+    directory = os.open(runtime, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    locks = []
+    owner = None
+    try:
+        info = os.fstat(directory)
+        if info.st_uid != os.geteuid() or info.st_mode & 0o022:
+            raise PermissionError('Lifecycle runtime is not private administrator state')
+        for name in ('delivery.lock', 'activation.lock'):
+            deadline_check(deadline)
+            fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                         0o600, dir_fd=directory)
+            try:
+                lock_info = os.fstat(fd)
+                if (not stat.S_ISREG(lock_info.st_mode) or lock_info.st_nlink != 1
+                        or lock_info.st_uid != os.geteuid() or lock_info.st_mode & 0o022):
+                    raise PermissionError('Unsupported lifecycle lock file')
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locks.append((name, fd, _inode(lock_info)))
+            except BaseException:
+                os.close(fd)
+                raise
+        owner = object.__new__(LifecycleOwner)
+        _OWNER_RECORDS[id(owner)] = dict(object=owner, runtime=runtime,
+            runtime_inode=_inode(info), directory=directory, locks=locks,
+            generation=_process_generation(), operation=operation, identity=identity,
+            deadline=deadline, artifacts={}, journal=None, gate=None)
+        _owner_before(owner)
+        parent = os.open(runtime.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            _owner_before(owner); os.fsync(parent)
+        finally:
+            os.close(parent)
+        yield owner
+    finally:
+        # Revocation precedes descriptor close, including exceptional paths.
+        if owner is not None:
+            _OWNER_RECORDS.pop(id(owner), None)
+        for _, fd, _ in locks:
+            _close_owner_fd(fd)
+        _close_owner_fd(directory)
+
+
+def _register_artifact(owner, path):
+    state = _owner_before(owner)
+    path = Path(path)
+    info = path.lstat()
+    raw = path.read_bytes()
+    if len(raw) > 1048576 or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise ValueError('Unsupported lifecycle artifact')
+    state['artifacts'][path.absolute()] = (_inode(info), raw)
+
+
+def _registered_artifact(owner, path):
+    if owner is None:
+        return False
+    state = _owner_before(owner)
+    selected = state['artifacts'].get(Path(path).absolute())
+    if selected is None:
+        return False
+    info = Path(path).lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 1048576:
+        return False
+    raw = Path(path).read_bytes()
+    if (_inode(info), raw) != selected:
+        return False
+    return True
+
+
+def _own_artifact(owner, path):
+    if not _registered_artifact(owner, path):
+        return False
+    value = unique_json(Path(path).read_bytes(), 1048576)
+    return not value.get('requires_reconciliation', False)
+
+
+def _exclusive_owned_json(path, value, *, owner, deadline):
+    before = lambda: _owner_before(owner, deadline)
+    before()
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Persist the containing attempts entry too; syncing only the new file's
+    # immediate directory cannot make a newly-created directory reachable.
+    ancestor = os.open(path.parent.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        before(); os.fsync(ancestor)
+    finally:
+        os.close(ancestor)
+    raw = (json.dumps(value, sort_keys=True) + '\n').encode()
+    before()
+    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        before()
+        fd = os.open(path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     0o600, dir_fd=directory)
+        try:
+            offset = 0
+            while offset < len(raw):
+                before()
+                count = os.write(fd, raw[offset:])
+                if count <= 0:
+                    raise OSError('Lifecycle intent short write')
+                offset += count
+            before(); os.fsync(fd)
+        finally:
+            os.close(fd)
+        before(); os.fsync(directory)
+    finally:
+        os.close(directory)
+    _register_artifact(owner, path)
+
+
+def _begin_local_mutation(owner, *, profile, gate, allowed_codes_file=None, budget=None):
+    state = _owner_before(owner)
+    deadline = min(state['deadline'], budget.deadline) if budget is not None else state['deadline']
+    _owner_before(owner, deadline)
+    if state['journal'] is not None:
+        return
+    snapshots = {}
+    for name, path in [('release', state['runtime'] / 'release.json'),
+                       ('environment', state['runtime'] / 'service.env'),
+                       ('allowlist', allowed_codes_file)]:
+        if path is None:
+            continue
+        _owner_before(owner)
+        try:
+            if budget is not None:
+                raw = budget.read(path,65536)
+            else:
+                with Path(path).open('rb') as handle:
+                    raw = handle.read(65537)
+            if len(raw) > 65536:
+                raise ValueError('Lifecycle snapshot exceeds bound')
+            snapshots[name] = {'bytes_base64': base64.b64encode(raw).decode(),
+                               'sha256': hashlib.sha256(raw).hexdigest()}
+        except FileNotFoundError:
+            snapshots[name] = None
+    roots = {}
+    if profile is not None:
+        for path in (Path(profile), Path(profile).with_name(Path(profile).name + '-solver')):
+            roots[str(path)] = os.readlink(path) if path.is_symlink() else None
+            if roots[str(path)] is not None and len(os.fsencode(roots[str(path)])) > 4096:
+                raise ValueError('Lifecycle profile target exceeds bound')
+    attempt = str(uuid.uuid4())
+    base = state['runtime'] / 'delivery-attempts'
+    intent = base / (attempt + '.lifecycle-intent.json')
+    receipt = base / (attempt + '.json')
+    state['gate'] = str(Path(gate).absolute())
+    value = dict(schema='qcl-negf-lifecycle-intent-v1', attempt_id=attempt,
+        operation=state['operation'], identity=state['identity'], runtime=str(state['runtime']),
+        process_generation=state['generation'], runtime_inode=state['runtime_inode'],
+        started_utc=datetime.now(timezone.utc).isoformat(), purpose='pending_local_mutation')
+    _exclusive_owned_json(intent, value, owner=owner, deadline=deadline)
+    state['journal'] = dict(intent=intent, receipt=receipt, deadline=deadline, value={
+        'schema': 'qcl-negf-delivery-attempt-v1', 'attempt_id': attempt,
+        'identity': state['identity'], 'operation': state['operation'], 'status': 'running',
+        'snapshots': snapshots, 'profile_targets': roots, 'pending_local_mutation': True})
+    _save_local_journal(owner)
+
+
+def _save_local_journal(owner):
+    state = _owner_before(owner)
+    journal = state['journal']
+    _owner_before(owner, journal['deadline'])
+    if (journal['receipt'].absolute() in state['artifacts'] and
+            not _registered_artifact(owner, journal['receipt'])):
+        raise PermissionError('Local receipt ownership changed')
+    publish_json(journal['receipt'], journal['value'], mode=0o600,
+                 before=lambda: _owner_before(owner, journal['deadline']))
+    _register_artifact(owner, journal['receipt'])
+
+
+def _finish_owned(owner, *, deadline):
+    state = _owner_before(owner, deadline)
+    journal = state['journal']
+    if journal is None:
+        return
+    deadline = min(deadline, journal['deadline'])
+    _owner_before(owner, deadline)
+    if not _own_artifact(owner, journal['intent']):
+        raise PermissionError('Local intent ownership changed')
+    journal['value'].update(status='completed', pending_local_mutation=False)
+    _save_local_journal(owner)
+    _owner_before(owner, deadline)
+    journal['intent'].unlink()
+    # Last fallible success action. A crash can restore this unsynced removal,
+    # conservatively requiring reconciliation; no later failing syscall can
+    # erase the only durable barrier while reporting unsuccessful cleanup.
+
+
+def _publish_admission_owned(path, value, *, owner, deadline):
+    state = _owner_before(owner, deadline)
+    if state['operation'] not in ('whole_update', 'prepare_initial', 'startup'):
+        raise PermissionError('Operation cannot publish admission')
+    if value.get('open') is True:
+        if state['operation'] != 'whole_update':
+            raise PermissionError('Only whole update may open admission')
+        lifecycle_guard(state['runtime'], owner=owner)
+    selected = str(Path(path).absolute())
+    if state['gate'] is not None and state['gate'] != selected:
+        raise PermissionError('Admission gate binding changed')
+    state['gate'] = selected
+    publish_admission(path, value, before=lambda: _owner_before(owner, deadline))
+
+
+class _OwnerScan:
+    """Preserve inherited metadata accounting and add the local owner boundary."""
+    def __init__(self, owner, budget):
+        self.owner, self.budget = owner, budget
+    def before(self):
+        _owner_before(self.owner)
+        self.budget.before()
+    def __getattr__(self, name):
+        value = getattr(self.budget, name)
+        if not callable(value):
+            return value
+        def checked(*args, **kwargs):
+            self.before()
+            result = value(*args, **kwargs)
+            self.before()
+            return result
+        return checked
 
 
 def manifest(value):
@@ -815,17 +1151,17 @@ def publish_json(path, value, *, mode=0o644, before=None):
     publish(path, json.dumps(value, sort_keys=True) + "\n", mode=mode, before=before)
 
 
-def publish_admission(path, value):
+def publish_admission(path, value, *, before=None):
     """NFS uses root_squash: publish the shared gate as the scientific UID."""
     if Path(path) != GATE or os.geteuid() != 0:
-        publish_json(path, value)
+        publish_json(path, value, before=before)
         return
     user = pwd.getpwnam("qcl-negf")
     previous_group = os.getegid()
     try:
         os.setegid(user.pw_gid)
         os.seteuid(user.pw_uid)
-        publish_json(path, value)
+        publish_json(path, value, before=before)
     finally:
         os.seteuid(0)
         os.setegid(previous_group)
@@ -916,7 +1252,20 @@ def check(manifest_value, *, profile=PROFILE, runtime=RUNTIME, role="worker", ru
 
 
 def prepare_initial(manifest_value, *, profile=PROFILE, runtime=RUNTIME, gate=GATE,
-                    role="worker", run=command):
+                    role="worker", run=command, deadline=None):
+    deadline = _finite_deadline(deadline)
+    expected = manifest(manifest_value)
+    with lifecycle_owner(runtime, operation='prepare_initial', release_id=expected['release_id'],
+                         release_identity=expected, deadline=deadline) as owner:
+        lifecycle_guard(runtime, owner=owner)
+        result = _prepare_initial_owned(manifest_value, owner=owner, profile=profile,
+            runtime=runtime, gate=gate, role=role, run=run, deadline=deadline)
+        _finish_owned(owner, deadline=deadline)
+        return result
+
+
+def _prepare_initial_owned(manifest_value, *, owner, profile=PROFILE, runtime=RUNTIME,
+                           gate=GATE, role='worker', run=command, deadline):
     """Prepare a cold role switch with closed admission, without starting services.
 
     This is initial provisioning, never a replacement for normal CD activation.
@@ -924,6 +1273,14 @@ def prepare_initial(manifest_value, *, profile=PROFILE, runtime=RUNTIME, gate=GA
     (including readiness, Code UUID and provenance) is preserved byte for byte.
     """
     expected = manifest(manifest_value)
+    _require_owner(owner, runtime=runtime, operation='prepare_initial',
+                   release_identity=expected, deadline=deadline)
+    before = lambda: _owner_before(owner, deadline)
+    original_run = run
+    def run(argv):
+        before()
+        result = original_run(argv, deadline=deadline) if original_run is command else original_run(argv)
+        before(); return result
     if role not in ("controller", "worker"):
         raise ValueError("Initial preparation role must be controller or worker")
     profile, runtime, gate = Path(profile), Path(runtime), Path(gate)
@@ -955,6 +1312,7 @@ def prepare_initial(manifest_value, *, profile=PROFILE, runtime=RUNTIME, gate=GA
         if (not isinstance(admission, dict) or admission.get("open") is not False
                 or admission.get("release_id") != expected["release_id"]):
             raise ValueError("Initial preparation requires the matching closed admission gate")
+    _begin_local_mutation(owner, profile=profile, gate=gate)
     # Verify local contents before publishing anything. Optional manifest narHash
     # receipts are checked locally too; initial provisioning never fetches a cache.
     run(["nix-store", "--verify-path", *[selected for _, selected in profiles]])
@@ -967,39 +1325,113 @@ def prepare_initial(manifest_value, *, profile=PROFILE, runtime=RUNTIME, gate=GA
     if read_admission(gate, missing=True) != gate_bytes:
         raise ValueError("Admission gate changed during initial preparation")
     if gate_bytes is None:
-        publish_admission(gate, {"open": False, "release_id": expected["release_id"]})
+        _publish_admission_owned(gate, {"open": False, "release_id": expected["release_id"]},
+                                 owner=owner, deadline=deadline)
     for path, selected in profiles:
         if not os.path.lexists(path):
             run(["nix-env", "--profile", str(path), "--set", selected])
         if path.resolve() != Path(selected):
             raise ValueError("Initial application or solver profile differs from the selected closure")
     if not os.path.lexists(environment):
-        publish(environment, service_environment)
+        publish(environment, service_environment, before=before)
     if current is None:
         current = {**expected, "ready": False}
-        publish_json(record, current)
+        publish_json(record, current, before=before)
     return current
 
 
 def activate(manifest_value, *, profile=PROFILE, runtime=RUNTIME, role="worker", run=command,
              email=None, allowed_codes_file=Path("/var/lib/qcl-negf/aiida/code-uuid"),
              expected_node_identity=None,update_attempt_id=None,gate=GATE,deadline=None,metadata_budget=None):
-    action_budget=(metadata_budget or UpdateScan(deadline)) if update_attempt_id else metadata_budget
+    deadline = _finite_deadline(deadline)
+    expected = manifest(manifest_value)
+    with lifecycle_owner(runtime, operation='activate', release_id=expected['release_id'],
+                         release_identity=expected, deadline=deadline) as owner:
+        lifecycle_guard(runtime, owner=owner)
+        if update_attempt_id is None and os.path.lexists(Path(runtime) / 'update-stop.json'):
+            raise RuntimeError('Worker update marker requires its exact protected attempt')
+        admission = load_admission(gate)
+        # Returning-worker open-gate policy is checked by the privileged CLI;
+        # the direct API deliberately requires closed selected admission.
+        if admission.get('open') is not False or admission.get('release_id') != expected['release_id']:
+            raise ValueError('Close admission for the selected release before activation')
+        result = _activate_owned(manifest_value, owner=owner, profile=profile,
+            runtime=runtime, role=role, run=run, email=email,
+            allowed_codes_file=allowed_codes_file, expected_node_identity=expected_node_identity,
+            update_attempt_id=update_attempt_id, gate=gate, deadline=deadline,
+            metadata_budget=metadata_budget)
+        _finish_owned(owner, deadline=deadline)
+        return result
+
+
+def _bind_activation_identity(owner, *, role, expected_node_identity):
+    """Pin one role/full-or-process-only assertion for this live owner."""
+    state = _owner_before(owner)
+    if role not in ('controller', 'worker'):
+        raise ValueError('Activation role must be controller or worker')
+    if expected_node_identity is None:
+        normalized = None
+    else:
+        if not isinstance(expected_node_identity, (dict, MappingProxyType)):
+            raise ValueError('Expected observed node identity')
+        normalized = identity_value(dict(expected_node_identity))
+        if normalized['role'] != role:
+            raise ValueError('Activation role conflicts with expected node')
+    if state['operation'] == 'whole_update' and normalized is None:
+        raise PermissionError('Whole update requires full node identity')
+    binding = (role, None if normalized is None else MappingProxyType(normalized))
+    if 'activation_identity' in state:
+        if state['activation_identity'] != binding:
+            raise PermissionError('Activation identity binding cannot change')
+        return state['activation_identity']
+    if normalized is not None and normalized['boot_id'] != state['generation'][2]:
+        raise ValueError('Expected node boot differs from owner process boot')
+    state['activation_identity'] = binding
+    return binding
+
+
+def _activate_owned(manifest_value, *, owner, profile=PROFILE, runtime=RUNTIME,
+                    role='worker', run=command, email=None,
+                    allowed_codes_file=Path('/var/lib/qcl-negf/aiida/code-uuid'),
+                    expected_node_identity=None, update_attempt_id=None, gate=GATE,
+                    deadline, metadata_budget=None):
+    expected = manifest(manifest_value)
+    state = _owner_before(owner, deadline)
+    if state['operation'] not in ('activate', 'whole_update'):
+        raise PermissionError('Owner cannot activate a release')
+    _require_owner(owner, runtime=runtime, operation=state['operation'],
+                   release_identity=expected, deadline=deadline)
+    if role == 'worker' and update_attempt_id is not None and expected_node_identity is None:
+        raise ValueError('Worker update requires full node identity')
+    role, expected_node_identity = _bind_activation_identity(owner, role=role,
+        expected_node_identity=expected_node_identity)
+    lifecycle_guard(runtime, owner=owner)
+    admission = load_admission(gate)
+    if (admission.get('release_id') != expected['release_id'] or
+            (admission.get('open') is not False and not (role == 'worker' and state.get('returning_worker') is True))):
+        raise ValueError('Activation requires the selected closed gate')
+    action_budget = _OwnerScan(owner, metadata_budget or UpdateScan(deadline))
     if action_budget:
         underlying_run=run
-        def run(argv):action_budget.before();result=underlying_run(argv);action_budget.before();return result
+        def run(argv):
+            action_budget.before()
+            result=underlying_run(argv,deadline=deadline) if underlying_run is command else underlying_run(argv)
+            action_budget.before();return result
     if update_attempt_id and role=='worker':
         stopped=observe_stopped_update(manifest(manifest_value),update_attempt_id,runtime=runtime,gate=gate,run=run,deadline=deadline,budget=action_budget)
-        bind_node_observation(identity_value(expected_node_identity),stopped['node_identity'],prior_boot=expected_node_identity['boot_id'])
+        bind_node_observation(dict(expected_node_identity),stopped['node_identity'],prior_boot=expected_node_identity['boot_id'])
+        bound_node=identity_value(stopped['node_identity'])
+    else:
+        bound_node = identity_value(assert_expected_node(dict(expected_node_identity), role=role,
+            run=run,metadata_budget=action_budget)) if expected_node_identity is not None else None
+    # Schema/role/boot and actual provided observation have all passed. No
+    # journal, mask removal or ready invalidation precedes those assertions.
+    _begin_local_mutation(owner, profile=profile, gate=gate,
+        allowed_codes_file=allowed_codes_file if role == 'controller' else None, budget=action_budget)
+    if update_attempt_id and role=='worker':
         remove_owned_update_mask(manifest(manifest_value),update_attempt_id,runtime=runtime,gate=gate,run=run,budget=action_budget)
         unit=unit_state(run)
         if unit['LoadState']!='loaded' or unit['UnitFileState'].startswith('masked'):raise ValueError('Own update mask not removed')
-        bound_node=stopped['node_identity']
-    else:
-        bound_node = assert_expected_node(expected_node_identity, role=role, run=run,metadata_budget=action_budget) if expected_node_identity is not None else None
-    expected = manifest(manifest_value)
-    if role not in ("controller", "worker"):
-        raise ValueError("Activation role must be controller or worker")
     profile, runtime = Path(profile), Path(runtime)
     if action_budget:action_budget.before()
     runtime.mkdir(parents=True, exist_ok=True)
@@ -1037,12 +1469,14 @@ def activate(manifest_value, *, profile=PROFILE, runtime=RUNTIME, role="worker",
         registered = json.loads(output.strip().splitlines()[-1])
         if registered.get("solver_executable") != expected["solver_executable"] or not registered.get("code_uuid"):
             raise ValueError("InstalledCode identity does not match the immutable solver")
+        if current is not None and manifest(current) == expected and current.get('code_uuid') is not None and current['code_uuid'] != registered['code_uuid']:
+            raise ValueError('Immutable InstalledCode UUID changed on identical release')
         identity["code_uuid"] = registered["code_uuid"]
         publish(allowed_codes_file, identity["code_uuid"] + "\n",before=action_budget.before if action_budget else None)
     publish(runtime / "service.env", "\n".join([
         "QCL_NEGF_RELEASE_ID=" + expected["release_id"],
         "QCL_NEGF_SOLVER_EXECUTABLE=" + expected["solver_executable"],
-        "QCL_NEGF_RELEASE_GATE=" + str(GATE),
+        "QCL_NEGF_RELEASE_GATE=" + str(gate),
     ]) + "\n",before=action_budget.before if action_budget else None)
     # A prepared configuration may start slurmd for a closed release delivery.
     # Jobs still fail the ready+shared-admission guard until health succeeds.
@@ -1050,19 +1484,25 @@ def activate(manifest_value, *, profile=PROFILE, runtime=RUNTIME, role="worker",
     units = ["slurmd.service"] if role == "worker" else ["qcl-negf-aiida.service", "qcl-negf-api.service"]
     # Fleet delivery quiesces the controller even on an identical retry.
     # Reuse the immutable profile/Code, but ensure stopped units run again.
-    if action_budget and role=='worker':
+    if update_attempt_id and role=='worker':
         marker=unique_json(action_budget.protected(runtime/'update-stop.json'),65536)
         marker['restart_window']={'requested_epoch':utc_epoch(run,action_budget),'captured_epoch':None}
         publish_json(runtime/'update-stop.json',marker,mode=0o600,before=action_budget.before)
     if action_budget:action_budget.before()
     run(["systemctl", "start" if same else "restart", *units])
-    if action_budget and role=='worker':
-        assert_expected_node(expected_node_identity,role='worker',run=run,metadata_budget=action_budget)
+    if update_attempt_id and role=='worker':
+        assert_expected_node(dict(expected_node_identity),role='worker',run=run,metadata_budget=action_budget)
         marker['restart_window']['captured_epoch']=utc_epoch(run,action_budget)
         publish_json(runtime/'update-stop.json',marker,mode=0o600,before=action_budget.before)
     for unit in units:
         run(["systemctl", "is-active", "--quiet", unit])
     solver_self_check(expected, run)
+    _bind_activation_identity(owner,role=role,
+        expected_node_identity=dict(expected_node_identity) if expected_node_identity is not None else None)
+    if expected_node_identity is not None:
+        after = identity_value(assert_expected_node(dict(expected_node_identity), role=role, run=run, metadata_budget=action_budget))
+        if after != bound_node:
+            raise ValueError('Node changed before ready publication')
     identity["ready"] = True
     publish_json(record, identity,before=action_budget.before if action_budget else None)
     return identity
@@ -1097,21 +1537,31 @@ def node_check(runtime=RUNTIME / "release.json", gate=GATE, profile=PROFILE, *, 
 def deliver_pool(manifest_value, nodes, gate=GATE, *, deliver, quiesce, admit=lambda: None,
                  deadline=None, checkpoint=None, bindings=None, authority=None, authority_run=command,
                  runtime=RUNTIME):
+    deadline = _finite_deadline(deadline)
+    expected = manifest(manifest_value)
     recheck_controller_authority(authority, run=authority_run)
     lifecycle_guard(runtime)
     deadline_check(deadline)
-    with lifecycle_owner(runtime):
+    with lifecycle_owner(runtime, operation='whole_update', release_id=expected['release_id'],
+                         release_identity=expected, deadline=deadline) as owner:
         recheck_controller_authority(authority, run=authority_run)
-        lifecycle_guard(runtime)
-        return _deliver_pool_owned(manifest_value, nodes, gate, deliver=deliver, quiesce=quiesce,
+        lifecycle_guard(runtime, owner=owner)
+        scan = _OwnerScan(owner, UpdateScan(deadline))
+        _begin_local_mutation(owner, profile=None, gate=gate, budget=scan)
+        result = _deliver_pool_owned(manifest_value, nodes, gate, owner=owner, deliver=deliver, quiesce=quiesce,
             admit=admit, deadline=deadline, checkpoint=checkpoint, bindings=bindings,
             authority=authority, authority_run=authority_run, runtime=runtime)
+        if result.get('status') == 'completed':
+            _finish_owned(owner, deadline=deadline)
+        return result
 
 
-def _deliver_pool_owned(manifest_value, nodes, gate=GATE, *, deliver, quiesce, admit=lambda: None,
+def _deliver_pool_owned(manifest_value, nodes, gate=GATE, *, owner, deliver, quiesce, admit=lambda: None,
                         deadline=None, checkpoint=None, bindings=None, authority=None,
                         authority_run=command, runtime=RUNTIME):
     expected = manifest(manifest_value)
+    _require_owner(owner, runtime=runtime, operation='whole_update',
+                   release_identity=expected, deadline=deadline)
     if not isinstance(bindings, dict) or set(bindings) != set(nodes):
         raise ValueError("Required full selected node bindings")
     observed = [bindings[node].get("identity") for node in nodes]
@@ -1121,7 +1571,7 @@ def _deliver_pool_owned(manifest_value, nodes, gate=GATE, *, deliver, quiesce, a
         if len({identity[key] for identity in observed}) != len(nodes):
             raise ValueError("Duplicate actual selected machine")
     recheck_controller_authority(authority, run=authority_run)
-    lifecycle_guard(runtime)
+    lifecycle_guard(runtime, owner=owner)
     if not nodes or len(set(nodes)) != len(nodes):
         raise ValueError("Select a nonempty pool of unique active nodes")
     report = {"release_id": expected["release_id"], "open": False, "status": "running",
@@ -1132,7 +1582,8 @@ def _deliver_pool_owned(manifest_value, nodes, gate=GATE, *, deliver, quiesce, a
             checkpoint(report)
     save("close_admission")
     deadline_check(deadline)
-    publish_admission(gate, {"open": False, "release_id": expected["release_id"]})
+    _publish_admission_owned(gate, {"open": False, "release_id": expected["release_id"]},
+                             owner=owner, deadline=deadline)
     report["gate_changed"] = True
     save("quiesce")
     deadline_check(deadline)
@@ -1149,6 +1600,8 @@ def _deliver_pool_owned(manifest_value, nodes, gate=GATE, *, deliver, quiesce, a
             report["nodes"][node] = {"status": "verified", "identity": identity,
                                       "node_identity": dict(bindings[node]["identity"])}
         except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
+            if _OWNER_RECORDS.get(id(owner), {}).get('local_pending'):
+                error.uncertain = True
             report["nodes"][node] = {"status": "failed", "reason": str(error)}
             if isinstance(error, CommandFailure):
                 report["command_failure"] = error.record
@@ -1163,7 +1616,7 @@ def _deliver_pool_owned(manifest_value, nodes, gate=GATE, *, deliver, quiesce, a
             save("admit")
             deadline_check(deadline)
             recheck_controller_authority(authority, run=authority_run)
-            lifecycle_guard(runtime)
+            lifecycle_guard(runtime, owner=owner)
             admit()
             deadline_check(deadline)
             report["admission_pending"] = True
@@ -1173,14 +1626,15 @@ def _deliver_pool_owned(manifest_value, nodes, gate=GATE, *, deliver, quiesce, a
             # The final preexisting-state guard above preceded creation of this
             # operation's CR04 admission marker under the SAME owner. That own
             # marker now inhibits retries; do not classify it as a competing attempt.
-            publish_admission(gate, {"open": True, "release_id": expected["release_id"]})
+            _publish_admission_owned(gate, {"open": True, "release_id": expected["release_id"]},
+                                     owner=owner, deadline=deadline)
             report.update(open=True, status="completed")
             save("finished")
             return report
         except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
             report["admission_error"] = str(error)
             if report.get("admission_pending"):
-                close_after_failure(report, expected, gate)
+                close_after_failure(report, expected, gate, owner=owner, deadline=deadline)
             elif getattr(error, "uncertain", False):
                 report.update(requires_reconciliation=True, remote_outcome="unknown")
     report["status"] = "failed"
@@ -1188,11 +1642,19 @@ def _deliver_pool_owned(manifest_value, nodes, gate=GATE, *, deliver, quiesce, a
     return report
 
 
-def close_after_failure(report, expected, gate):
+def close_after_failure(report, expected, gate, *, owner, deadline):
     """One recovery publication, never assume replace/fsync failure left old bytes."""
     report.update(status="failed", requires_reconciliation=True, admission_outcome="unknown")
     try:
-        publish_admission(gate, {"open": False, "release_id": expected["release_id"]})
+        state = _owner_before(owner, deadline)
+        unresolved_deliveries(state['runtime'], owner=owner, emergency_close=True)
+        if os.path.lexists(state['runtime'] / 'cluster-update.json'):
+            raise RuntimeError('Foreign cluster update inhibits recovery publication')
+        current = load_admission(gate)
+        if current.get('release_id') != expected['release_id']:
+            raise ValueError('Foreign admission gate cannot be overwritten during recovery')
+        _publish_admission_owned(gate, {"open": False, "release_id": expected["release_id"]},
+                                 owner=owner, deadline=deadline)
         report.update(open=False, admission_state="closed")
     except (ValueError, RuntimeError, OSError) as error:
         report.update(open=None, admission_state="unknown", critical_admission_failure=True,
@@ -1604,12 +2066,40 @@ def remove_owned_update_mask(expected,attempt_id,*,runtime=RUNTIME,gate=GATE,run
     if unit_state(run)!=service or stopped_machine(budget)!=marker['machine'] or original_unit_origin(service['FragmentPath'],budget=budget)!=marker['original_unit_origin']:raise ValueError('Unmasked unit/machine origin raced')
     marker['mask_phase']='removed';publish_json(Path(runtime)/'update-stop.json',marker,mode=0o600,before=budget.before)
 
+@contextmanager
+def _worker_operation(expected, *, runtime, gate, operation, deadline, budget, run):
+    deadline = _finite_deadline(deadline)
+    expected = manifest(expected)
+    with lifecycle_owner(runtime, operation=operation, release_id=expected['release_id'],
+                         release_identity=expected, deadline=deadline) as owner:
+        lifecycle_guard(runtime, owner=owner)
+        scan = _OwnerScan(owner, budget or UpdateScan(deadline))
+        _begin_local_mutation(owner, profile=None, gate=gate, budget=scan)
+        def bounded(argv):
+            scan.before()
+            result = run(argv,deadline=deadline) if run is command else run(argv)
+            scan.before(); return result
+        yield owner, scan, bounded, deadline
+        _finish_owned(owner, deadline=deadline)
+
+
 def repair_stopped_update(expected,attempt_id,expected_node_identity,*,enrollment_id,prior_marker_sha256,legacy_mask_origin,runtime=RUNTIME,gate=GATE,run=command,deadline=None,budget=None):
+    with _worker_operation(expected, runtime=runtime, gate=gate, operation='repair_update',
+            deadline=deadline, budget=budget, run=run) as (owner, scan, bounded, end):
+        return _repair_stopped_update_owned(expected,attempt_id,expected_node_identity,
+            owner=owner,
+            enrollment_id=enrollment_id,prior_marker_sha256=prior_marker_sha256,
+            legacy_mask_origin=legacy_mask_origin,runtime=runtime,gate=gate,
+            run=bounded,deadline=end,budget=scan)
+
+
+def _repair_stopped_update_owned(expected,attempt_id,expected_node_identity,*,owner,enrollment_id,prior_marker_sha256,legacy_mask_origin,runtime=RUNTIME,gate=GATE,run=command,deadline=None,budget=None):
     """Trusted reconciliation only: migrate one hash-bound legacy stopped marker.
 
     No daemon start, scheduler mutation, gate opening, or release acceptance.
     Unknown marker/mask origins remain blocking; no implicit adoption.
     """
+    _require_owner(owner, runtime=runtime, operation='repair_update', release_identity=manifest(expected), deadline=deadline)
     budget=budget or UpdateScan(deadline);expected=manifest(expected)
     marker=update_marker(runtime,attempt_id,expected,gate,budget=budget)
     path=Path(runtime)/'update-stop.json';raw=owned_marker_bytes(path,budget=budget)
@@ -1687,6 +2177,16 @@ def observe_stopped_update(expected,attempt_id,*,runtime=RUNTIME,gate=GATE,run=c
             **scan,'restart_inhibited':True,'owned_effective_runtime_mask':proof,'forced_daemon_stop':marker['forced_daemon_stop']}
 
 def stop_update(expected,attempt_id,expected_node_identity,*,runtime=RUNTIME,gate=GATE,run=command,deadline=None,prior_attempt_id=None,enrollment_id=None,metadata_budget=None):
+    with _worker_operation(expected, runtime=runtime, gate=gate, operation='stop_update',
+            deadline=deadline, budget=metadata_budget, run=run) as (owner, scan, bounded, end):
+        return _stop_update_owned(expected,attempt_id,expected_node_identity,
+            owner=owner,
+            runtime=runtime,gate=gate,run=bounded,deadline=end,prior_attempt_id=prior_attempt_id,
+            enrollment_id=enrollment_id,metadata_budget=scan)
+
+
+def _stop_update_owned(expected,attempt_id,expected_node_identity,*,owner,runtime=RUNTIME,gate=GATE,run=command,deadline=None,prior_attempt_id=None,enrollment_id=None,metadata_budget=None):
+    _require_owner(owner, runtime=runtime, operation='stop_update', release_identity=manifest(expected), deadline=deadline)
     normalized_uuid(attempt_id);enrollment_id=normalized_uuid(enrollment_id);expected=manifest(expected)
     budget=metadata_budget or UpdateScan(deadline)
     machine=stopped_machine(budget)
@@ -1921,7 +2421,7 @@ def fleet_health(expected,expected_node_identity,*,runtime=RUNTIME,gate=GATE,run
         marker=unique_json(budget.protected(Path(runtime)/'update-stop.json'),65536)
         window=marker.get('restart_window');registration=registration_tuple(final_registration(run,before['node_name'],slurm_conf=config['slurm_conf']))
         generation={'pid':record['pid'],'start_ticks':record['start_ticks'],'executable':record['executable'],'InvocationID':unit['InvocationID'],'slurm_conf_sha256':hashlib.sha256(budget.read(config['slurm_conf'])).hexdigest()}
-    budget.before();envelope=check(expected,runtime=runtime,role=role,run=run,expected_node_identity=expected_node_identity,metadata_budget=budget)
+    budget.before();envelope=check(expected,profile=PROFILE,runtime=runtime,role=role,run=run,expected_node_identity=expected_node_identity,metadata_budget=budget)
     budget.before();run(['systemctl','is-active','--quiet','munged.service'])
     source=config.get('nfs_source')
     if not isinstance(source,str) or not source:raise ValueError('Missing configured NFS endpoint')
@@ -1954,6 +2454,15 @@ def fleet_health(expected,expected_node_identity,*,runtime=RUNTIME,gate=GATE,run
 
 
 def finish_update(expected,attempt_id,expected_node_identity,*,runtime=RUNTIME,gate=GATE,run=command,deadline=None,metadata_budget=None):
+    with _worker_operation(expected, runtime=runtime, gate=gate, operation='finish_update',
+            deadline=deadline, budget=metadata_budget, run=run) as (owner, scan, bounded, end):
+        return _finish_update_owned(expected,attempt_id,expected_node_identity,
+            owner=owner,
+            runtime=runtime,gate=gate,run=bounded,deadline=end,metadata_budget=scan)
+
+
+def _finish_update_owned(expected,attempt_id,expected_node_identity,*,owner,runtime=RUNTIME,gate=GATE,run=command,deadline=None,metadata_budget=None):
+    _require_owner(owner, runtime=runtime, operation='finish_update', release_identity=manifest(expected), deadline=deadline)
     budget=metadata_budget or UpdateScan(deadline);path=Path(runtime)/'update-stop.json'
     marker=unique_json(budget.protected(path),65536)
     if marker.get('schema')!=UPDATE_SCHEMA or marker.get('attempt_id')!=attempt_id or marker.get('release')!=manifest(expected):raise ValueError('Foreign update marker cleanup forbidden')
@@ -1990,18 +2499,21 @@ def deliver_cli(expected, pool, run=command, *, enrollment, runtime=RUNTIME, gat
     deadline_check(deadline)
     runtime = Path(runtime)
     runtime.mkdir(parents=True, exist_ok=True)
-    with (runtime / "delivery.lock").open("w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with lifecycle_owner(runtime, operation='whole_update', release_id=manifest(expected)['release_id'],
+                         release_identity=manifest(expected), deadline=deadline) as owner:
         recheck_controller_authority(authority, run=run)
-        lifecycle_guard(runtime)
+        lifecycle_guard(runtime, owner=owner)
         return _deliver_cli_locked(expected, pool, run, runtime=runtime, gate=gate, authority=authority,
-            start=start, deadline=deadline, command_timeout_seconds=command_timeout_seconds,
+            owner=owner, start=start, deadline=deadline, command_timeout_seconds=command_timeout_seconds,
             command_output_bytes=command_output_bytes, delivery_output_bytes=delivery_output_bytes)
 
 
-def _deliver_cli_locked(expected, pool, run, *, runtime, gate, authority, start, deadline,
+def _deliver_cli_locked(expected, pool, run, *, owner, runtime, gate, authority, start, deadline,
                         command_timeout_seconds, command_output_bytes, delivery_output_bytes):
     runtime = Path(runtime)
+    _require_owner(owner, runtime=runtime, operation='whole_update',
+                   release_identity=manifest(expected), deadline=deadline)
+    before = lambda: _owner_before(owner, deadline)
     attempts = runtime / "delivery-attempts"
     attempts.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(attempts, 0o700)
@@ -2033,14 +2545,27 @@ def _deliver_cli_locked(expected, pool, run, *, runtime, gate, authority, start,
     def checkpoint(report=None):
         if report:
             receipt.update(report)
+        if time.monotonic() >= deadline:
+            # Retain the last durable pending boundary. Report the current
+            # in-memory outcome without manufacturing a fresh cleanup budget.
+            receipt['checkpoint_not_persisted'] = True
+            if (receipt.get('pending_command', {}).get('mutation') or
+                    receipt.get('pending_local_mutation') or receipt.get('admission_pending')):
+                receipt.update(requires_reconciliation=True, remote_outcome='unknown')
+            return
+        before()
+        if (receipt_path.absolute() in _OWNER_RECORDS[id(owner)]['artifacts'] and
+                not _registered_artifact(owner, receipt_path)):
+            raise PermissionError('Whole update receipt ownership changed')
         if receipt.get("admission_pending") and not intent_path.exists():
-            publish_json(intent_path, {"schema": "qcl-negf-admission-intent-v1",
-                "attempt_id": attempt_id, "identity": receipt["identity"]}, mode=0o600)
+            _exclusive_owned_json(intent_path, {"schema": "qcl-negf-admission-intent-v1",
+                "attempt_id": attempt_id, "identity": receipt["identity"]}, owner=owner, deadline=deadline)
         receipt["elapsed_seconds"] = time.monotonic() - start
         if receipt["status"] != "running":
             receipt["ended_utc"] = datetime.now(timezone.utc).isoformat()
-        publish_json(receipt_path, receipt, mode=0o600)
-        publish_json(runtime / "delivery-report.json", safe_summary())
+        publish_json(receipt_path, receipt, mode=0o600, before=before)
+        _register_artifact(owner, receipt_path)
+        publish_json(runtime / "delivery-report.json", safe_summary(), before=before)
     checkpoint()
     native = run is command
     original_run = run
@@ -2048,6 +2573,7 @@ def _deliver_cli_locked(expected, pool, run, *, runtime, gate, authority, start,
     stage = {"phase": "prefetch", "node": None, "remote": False, "mutation": False}
     def dispatch(args):
         nonlocal used_output
+        before()
         deadline_check(deadline)
         available = min(command_output_bytes, delivery_output_bytes - used_output)
         if available <= 0:
@@ -2141,7 +2667,7 @@ def _deliver_cli_locked(expected, pool, run, *, runtime, gate, authority, start,
         for name in selected:
             stage.update(phase='update_capability',node=name,remote=True,mutation=False)
             value=unique_json(ssh(selected[name]['target'],['sudo','-n','qcl-negf-release','update-capabilities'],run,trust_snapshot=authority['trust_snapshot']),16384)
-            if value!={'schema':'qcl-negf-local-update-capability-v1','stop_update':True,'stopped_identity':True,'fleet_health':True,'aiida_two_workflow_types':True}:
+            if value!={'schema':'qcl-negf-local-update-capability-v2','lifecycle_owner':'qcl-negf-lifecycle-owner-v1','stop_update':True,'stopped_identity':True,'fleet_health':True,'aiida_two_workflow_types':True}:
                 raise ValueError('Uninstalled update capability on '+name)
         receipt["node_bindings"] = {name: dict(binding["identity"]) for name, binding in bindings.items()}
         checkpoint()
@@ -2150,10 +2676,12 @@ def _deliver_cli_locked(expected, pool, run, *, runtime, gate, authority, start,
         # A bad cache or hash must leave both admission and current services untouched.
         prefetch_controller_closures(expected, run)
         expected = manifest(expected)
-        controller_budget=UpdateScan(deadline)
+        controller_budget=_OwnerScan(owner, UpdateScan(deadline))
         controller_config=unique_json(controller_budget.read('/etc/qcl-negf/release-config.json'),65536)
         slurm_conf=controller_config.get('slurm_conf')
         if not isinstance(slurm_conf,str) or not slurm_conf.startswith('/'):raise ValueError('Missing controller SLURM_CONF')
+        if controller_config.get('role') != 'controller' or not controller_config.get('email'):
+            raise ValueError('Protected controller role and service email are required')
         slurm_argv=['env','TZ=UTC','LC_ALL=C','SLURM_CONF='+slurm_conf,'scontrol']
         workers = [node["name"] for node in nodes if node["role"] == "worker"]
         by_name = {node["name"]: node for node in nodes}
@@ -2246,6 +2774,32 @@ def _deliver_cli_locked(expected, pool, run, *, runtime, gate, authority, start,
             if node['role']=='worker':stopped_observation(name,'stopped-identity')
             else:probe(name,prior_boot=bindings[name]['identity']['boot_id'])
             mutation_started = True
+            if node['role'] == 'controller':
+                # Route only after a full enrolled/local/remote authority match;
+                # hostname or target spelling never grants local authority.
+                verify_controller_authority(selected[name], authority['local_identity'],
+                                            dict(bindings[name]['identity']))
+                actual = observe_node_identity(run=run, controller_only=True)
+                verify_controller_authority(selected[name], actual, authority['remote_identity'])
+                if identity_value(actual) != identity_value(authority['local_identity']):
+                    raise ValueError('Controller local generation changed before helper')
+                receipt['pending_local_mutation'] = {'node': name, 'identity': value}
+                _owner_before(owner)['local_pending'] = True
+                stage.update(phase='activate', node=name, remote=False, mutation=True)
+                checkpoint()
+                _activate_owned(value, owner=owner, profile=PROFILE, runtime=runtime,
+                    role='controller', run=run, email=controller_config['email'],
+                    allowed_codes_file=Path(controller_config.get('allowed_codes_file') or '/var/lib/qcl-negf/aiida/code-uuid'),
+                    expected_node_identity=bindings[name]['identity'], gate=gate,
+                    deadline=deadline, metadata_budget=controller_budget)
+                stage.update(phase='check', mutation=False)
+                envelope = check(value, profile=PROFILE, runtime=runtime, role='controller',
+                    run=run, expected_node_identity=dict(bindings[name]['identity']), metadata_budget=controller_budget)
+                verify_node_envelope(bindings[name], envelope, value)
+                receipt.pop('pending_local_mutation', None)
+                _owner_before(owner)['local_pending'] = False
+                checkpoint()
+                return envelope
             expected_node = base64.urlsafe_b64encode(json.dumps(dict(bindings[name]["identity"])).encode()).decode()
             stage.update(phase="copy", node=name, remote=True, mutation=True)
             run(["nix", "copy", "--to", "ssh-ng://" + node["target"], value["application_path"],
@@ -2273,11 +2827,16 @@ def _deliver_cli_locked(expected, pool, run, *, runtime, gate, authority, start,
                 raise
 
         def admit():
-            lifecycle_guard(runtime)
+            lifecycle_guard(runtime, owner=owner)
             for name in selected:
                 probe(name,prior_boot=bindings[name]['identity']['boot_id'])
                 stage.update(phase='fleet_health',node=name,remote=True,mutation=False)
-                health=unique_json(ssh(selected[name]['target'],remote_args(name,'health-update'),run,trust_snapshot=authority['trust_snapshot']),65536)
+                if selected[name]['role'] == 'controller':
+                    stage.update(remote=False)
+                    health = fleet_health(expected, dict(bindings[name]['identity']), runtime=runtime,
+                        gate=gate, run=run, deadline=deadline, metadata_budget=controller_budget)
+                else:
+                    health=unique_json(ssh(selected[name]['target'],remote_args(name,'health-update'),run,trust_snapshot=authority['trust_snapshot']),65536)
                 verify_node_envelope(bindings[name],health,expected)
                 if health.get('nfs_verified') is not True or health.get('auth_verified') is not True or not health.get('nfs_source'):raise ValueError('Incomplete NFS/auth fleet health')
                 receipt['fleet_health'][name]=health;checkpoint()
@@ -2316,7 +2875,7 @@ def _deliver_cli_locked(expected, pool, run, *, runtime, gate, authority, start,
             cancellation()
             for name in selected:probe(name,prior_boot=bindings[name]['identity']['boot_id'])
 
-        report = _deliver_pool_owned(expected, list(by_name), gate, deliver=deliver, quiesce=quiesce, admit=admit,
+        report = _deliver_pool_owned(expected, list(by_name), gate, owner=owner, deliver=deliver, quiesce=quiesce, admit=admit,
                               deadline=deadline, checkpoint=checkpoint, bindings=bindings, authority=authority, authority_run=run, runtime=runtime)
         report.update(operation='whole_cluster_update',required_nodes=receipt['required_nodes'],worker_stop=receipt['worker_stop'],fleet_health=receipt['fleet_health'],cancellation_check=receipt['cancellation_check'])
         if report.get('status')=='completed':
@@ -2326,14 +2885,19 @@ def _deliver_cli_locked(expected, pool, run, *, runtime, gate, authority, start,
                     finish=unique_json(ssh(selected[worker]['target'],remote_args(worker,'finish-update'),run,trust_snapshot=authority['trust_snapshot']),4096)
                     if finish!={'attempt_id':attempt_id,'marker_removed':True}:raise ValueError('Update marker cleanup incomplete')
             except (ValueError,RuntimeError,OSError,subprocess.SubprocessError) as error:
-                close_after_failure(report,expected,gate);report['admission_error']=str(error);checkpoint(report)
+                close_after_failure(report,expected,gate,owner=owner,deadline=deadline);report['admission_error']=str(error);checkpoint(report)
+        if report.get('status') == 'completed':
+            _finish_owned(owner, deadline=deadline)
         if report.get("status") == "completed" and intent_path.exists():
             try:
                 # Last fallible success action. Crash may restore an unsynced deletion,
                 # conservatively blocking reconciliation, never erasing a pending failure.
-                deadline_check(deadline);intent_path.unlink()
+                before()
+                if not _own_artifact(owner, intent_path):
+                    raise PermissionError('Admission intent ownership changed')
+                intent_path.unlink()
             except (OSError,CommandFailure) as error:
-                close_after_failure(report, expected, gate)
+                close_after_failure(report, expected, gate, owner=owner, deadline=deadline)
                 report["admission_error"] = str(error)
                 checkpoint(report)
         return {**report, "attempt_id": attempt_id, "receipt": str(receipt_path),
@@ -2383,11 +2947,11 @@ def main():
     update_scan=UpdateScan(action_deadline) if args.action in ('stop-update','stopped-identity','update-identity','health-update','finish-update') or args.update_attempt_id else None
     def native_run(argv):
         bounds={'timeout_seconds':args.command_timeout_seconds,'output_bytes':args.command_output_bytes}
-        if args.update_attempt_id:bounds['deadline']=action_deadline
+        bounds['deadline']=action_deadline
         return command(argv,**bounds)
     if args.action=='update-capabilities':
         if not Path(__file__).with_name('aiida_update_check.py').is_file():raise ValueError('Uninstalled readonly update helper')
-        print(json.dumps({'schema':'qcl-negf-local-update-capability-v1','stop_update':True,'stopped_identity':True,'fleet_health':True,'aiida_two_workflow_types':True}))
+        print(json.dumps({'schema':'qcl-negf-local-update-capability-v2','lifecycle_owner':'qcl-negf-lifecycle-owner-v1','stop_update':True,'stopped_identity':True,'fleet_health':True,'aiida_two_workflow_types':True}))
         return
     if args.action == "identity":
         print(json.dumps(observe_node_identity(run=native_run), sort_keys=True))
@@ -2438,27 +3002,30 @@ def main():
     elif args.action == "check":
         result = check(expected, runtime=args.runtime, role=args.role, run=native_run, expected_node_identity=expected_node,metadata_budget=update_scan)
     else:
-        if update_scan:update_scan.before()
-        args.runtime.mkdir(parents=True, exist_ok=True)
-        # One finite invocation at a time. This is a local flock, not a lease
-        # service; a dead process releases it automatically.
-        lock_file = "delivery.lock" if args.action == "deliver" else "activation.lock"
-        if update_scan:update_scan.before()
-        with (args.runtime / lock_file).open("w") as lock:
-            if update_scan:update_scan.before()
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            if args.action == "prepare-initial":
-                result = prepare_initial(manifest_value, runtime=args.runtime, gate=args.gate, role=args.role, run=native_run)
-            else:
+        if args.action == 'prepare-initial':
+            result = prepare_initial(manifest_value, runtime=args.runtime, gate=args.gate,
+                role=args.role, run=native_run, deadline=action_deadline)
+        else:
+            # CLI alone retains the established returning-worker predicate.
+            # It still needs a fresh local capability and every unknown guard.
+            with lifecycle_owner(args.runtime, operation='activate', release_id=expected['release_id'],
+                    release_identity=expected, deadline=action_deadline) as owner:
+                lifecycle_guard(args.runtime, owner=owner)
+                if args.update_attempt_id is None and os.path.lexists(args.runtime / 'update-stop.json'):
+                    raise RuntimeError('Worker update marker requires its exact protected attempt')
                 admission = update_scan.admission(args.gate) if update_scan else load_admission(args.gate)
                 if admission.get("release_id") != expected["release_id"] or (
                     admission.get("open") is not False and not (args.returning_worker and args.role == "worker")
                 ):
                     raise ValueError("Close admission for the selected release before activation")
                 settings = unique_json(update_scan.read("/etc/qcl-negf/release-config.json",16384),16384) if update_scan else load("/etc/qcl-negf/release-config.json")
-                result = activate(expected, runtime=args.runtime, role=args.role, email=settings.get("email"),
+                if settings.get('role') != args.role:
+                    raise ValueError('Protected release role conflicts with requested role')
+                _owner_before(owner)['returning_worker'] = bool(args.returning_worker and args.role == 'worker')
+                result = _activate_owned(expected, owner=owner, runtime=args.runtime, role=args.role, email=settings.get("email"),
                                   run=native_run, allowed_codes_file=Path(settings.get("allowed_codes_file") or "/var/lib/qcl-negf/aiida/code-uuid"),
                                   expected_node_identity=expected_node,update_attempt_id=args.update_attempt_id,gate=args.gate,deadline=action_deadline,metadata_budget=update_scan)
+                _finish_owned(owner, deadline=action_deadline)
     print(json.dumps(result, sort_keys=True))
     if args.action in ("deliver","update") and (result.get("status") != "completed" or not result.get("open")):
         raise SystemExit(1)

@@ -14,6 +14,10 @@ import os
 import signal
 import shlex
 import base64
+import copy
+import fcntl
+import multiprocessing
+import pickle
 from contextlib import ExitStack, contextmanager
 import io
 import time
@@ -85,13 +89,39 @@ def delivery_manifest(cache=True):
     return value
 
 
+def delivery_diagnostic(report, runtime, calls=()):
+    """Bounded assertion evidence, never a substitute for the semantic oracle."""
+    summary={key:report.get(key) for key in ('status','open','phase','node',
+        'requires_reconciliation','remote_outcome','admission_error') if key in report}
+    summary['nodes']={name:{key:str(value.get(key))[:512] for key in ('status','reason') if key in value}
+        for name,value in list(report.get('nodes',{}).items())[:8] if isinstance(value,dict)}
+    try:
+        receipt=report.get('receipt')
+        if receipt is not None:
+            path=Path(receipt)
+            if path.absolute().parent != Path(runtime).absolute()/'delivery-attempts':
+                raise ValueError('Diagnostic receipt outside selected runtime')
+            with path.open('rb') as handle:raw=handle.read(65537)
+            if len(raw)>65536:raise ValueError('Diagnostic receipt exceeds 64 KiB')
+            value=json.loads(raw)
+            summary['receipt']={key:value.get(key) for key in ('status','phase','node',
+                'pending_command','pending_local_mutation','pending_stopped_observation',
+                'admission_pending','requires_reconciliation','reason') if key in value}
+            summary['receipt_commands']=[{key:item.get(key) for key in ('phase','node','executable','status')}
+                for item in value.get('commands',[])[-8:]]
+    except (OSError,ValueError,TypeError) as error:
+        summary['diagnostic_error']=str(error)[:512]
+    summary['last_command_names']=[list(argv[:3]) for argv in list(calls)[-8:]]
+    return json.dumps(summary,sort_keys=True,default=str)[:6000]
+
+
 POOL = {"schema": "qcl-negf-active-pool-v2", "nodes": [
     {"name": "controller", "target": "admin@controller.invalid", "role": "controller", "enrollment_id": ENROLL_IDS[0]},
     {"name": "worker", "target": "admin@worker.invalid", "role": "worker", "enrollment_id": ENROLL_IDS[1]}]}
 
 
 def update_capability():
-    return {'schema':'qcl-negf-local-update-capability-v1','stop_update':True,'stopped_identity':True,'fleet_health':True,'aiida_two_workflow_types':True}
+    return {'schema':'qcl-negf-local-update-capability-v2','lifecycle_owner':'qcl-negf-lifecycle-owner-v1','stop_update':True,'stopped_identity':True,'fleet_health':True,'aiida_two_workflow_types':True}
 
 def clear_aiida():
     return {'schema':'qcl-negf-aiida-update-check-v1','profile':'qcl-negf','roots_checked':True,'calcjobs_checked':True,'active_root_found':False,'active_calcjob_found':False,'root_sample':None,'calcjob_sample':None}
@@ -131,6 +161,7 @@ class DeliveryCommands:
                          "/nix/store/solver": {"narHash": HASH}}
         self.prefetch_gate_snapshots = []
         self.model = NativeUpdateModel()
+        self.local = Commands()
 
     def __call__(self, args):
         self.calls.append(args)
@@ -155,8 +186,12 @@ class DeliveryCommands:
         if args==['id','-un']:return 'operator\n'
         if args==['env','TZ=UTC','LC_ALL=C','date','+%s']:return '1791504120\n'
         if 'aiida_update_check.py' in ' '.join(args):return json.dumps(clear_aiida())
+        if args[0] == 'findmnt':
+            return json.dumps({'filesystems':[{'target':str(self.gate.parent),'source':'storage.invalid:/srv/qcl-negf/jobs','fstype':'nfs4'}]})
         if args[:2]==['systemctl','show']:return controller_stop_state()
         if 'scontrol' in args:return self.model.command(args)
+        if args[0] in ('nix-env','nix-store','systemctl','runuser','timeout'):
+            return self.local(args)
         return ""
 
 
@@ -234,7 +269,11 @@ class NativeUpdateModel:
 
 def install_controller_config_io(test,root):
     path=root/'controller-release-config.json'
-    path.write_text(json.dumps({'role':'controller','slurm_conf':'/etc/slurm.conf','nfs_source':'storage.invalid:/srv/qcl-negf/jobs'}))
+    path.write_text(json.dumps({'role':'controller','email':'service@example.invalid',
+        'allowed_codes_file':str(root/'controller-code-uuid'),
+        'slurm_conf':'/etc/slurm.conf','nfs_source':'storage.invalid:/srv/qcl-negf/jobs'}))
+    hook=patch.object(test.ops, 'PROFILE', root/'controller-profile')
+    hook.start();test.addCleanup(hook.stop)
     original=io.open
     def boundary(file,*args,**kwargs):
         return original(path if isinstance(file,(str,bytes,os.PathLike)) and os.fspath(file)=='/etc/qcl-negf/release-config.json' else file,*args,**kwargs)
@@ -253,12 +292,23 @@ class ApplicationReleaseTests(unittest.TestCase):
         self.runtime = Path(temporary.name) / "runtime"
         self.gate = Path(temporary.name) / "gate"
         install_controller_config_io(self,Path(temporary.name))
+        generation=self.ops._process_generation
+        boot=patch.object(self.ops,'_process_generation',
+            lambda:(*generation()[:2],CONTROLLER['boot_id']))
+        boot.start();self.addCleanup(boot.stop)
         # Existing CR04 regressions use handwritten enrollment/observation facts;
         # CR03 tests exercise actual authority/protected helpers independently.
         context = selected_context()
         context["bindings"] = context["bindings"][:2]
         context["registry"]["nodes"] = context["registry"]["nodes"][:2]
         original_delivery, original_pool = self.ops.deliver_cli, self.ops.deliver_pool
+        original_activate = self.ops.activate
+        def activate(value, **kwargs):
+            if 'gate' not in kwargs:
+                selected = Path(kwargs.get('runtime', self.runtime)).parent / 'activation-gate.json'
+                selected.write_text(json.dumps({'open':False,'release_id':value['release_id']}))
+                kwargs['gate'] = selected
+            return original_activate(value, **kwargs)
         def preflight(*args, **kwargs):
             if kwargs.get("before_remote"):
                 kwargs["before_remote"]()
@@ -283,6 +333,8 @@ class ApplicationReleaseTests(unittest.TestCase):
             mocker = patch.object(self.ops, name, replacement)
             mocker.start()
             self.addCleanup(mocker.stop)
+        hook = patch.object(self.ops, 'activate', activate)
+        hook.start();self.addCleanup(hook.stop)
 
 
     def test_native_bounded_prefix_and_retained_descendant_pipe(self):
@@ -339,7 +391,7 @@ class ApplicationReleaseTests(unittest.TestCase):
         run = DeliveryCommands(self.gate)
         def loss(args):
             result = run(args)
-            if args[0] == "ssh" and " activate " in args[-1]:
+            if 'register_aiida.py' in ' '.join(args):
                 raise self.ops.CommandFailure({"failure": "nonzero", "returncode": 255,
                     "stdout": "partial", "stderr": "lost", "child_started": True,
                     "cleanup_confirmed": True, "elapsed_seconds": .1, "output_truncated": False})
@@ -389,13 +441,20 @@ class ApplicationReleaseTests(unittest.TestCase):
                         self.assertIs(failure.exception.record['child_started'],True)
                 receipt_path=Path(summary['receipt']);self.assertEqual(receipt_path.parent,runtime/'delivery-attempts')
                 self.assertEqual(summary['attempt_id'],receipt_path.stem)
-                current=[p for p in (runtime/'delivery-attempts').glob('*.json') if not p.name.endswith('.admission-intent.json')]
+                current=[p for p in (runtime/'delivery-attempts').glob('*.json')
+                         if json.loads(p.read_text()).get('operation')=='whole_cluster_update']
                 self.assertEqual(current,[receipt_path]);receipt=json.loads(receipt_path.read_text())
-                self.assertEqual(receipt['attempt_id'],receipt_path.stem);self.assertEqual(receipt['status'],'failed')
-                failed=[c for c in receipt['commands'] if c['status']=='failed'];self.assertEqual(len(failed),1)
-                pending=failed[0];self.assertIs(pending['record']['child_started'],True)
+                self.assertEqual(receipt['attempt_id'],receipt_path.stem)
+                failed=[c for c in receipt['commands'] if c['status']=='failed']
+                if case=='output_limit':
+                    self.assertEqual(receipt['status'],'failed');self.assertEqual(len(failed),1)
+                    pending=failed[0];self.assertIs(pending['record']['child_started'],True)
+                else:
+                    self.assertEqual(receipt['status'],'running')
+                    self.assertEqual(failed,[])
+                    pending=receipt['pending_command']
                 self.assertEqual(pending['phase'],{'pre_gate_deadline':'slurm_original','post_gate_deadline':'quiesce','output_limit':'node_identity'}[case])
-                self.assertEqual(pending['record']['failure'],'output_limit' if case=='output_limit' else 'deadline')
+                if case=='output_limit':self.assertEqual(pending['record']['failure'],'output_limit')
                 self.assertIs(pending['mutation'],case=='post_gate_deadline')
                 self.assertFalse(any('State=DRAIN' in a or 'State=RESUME' in a or a[:3]==['nix','copy','--to'] or a[0]=='ssh' and any(word in shlex.split(a[-1]) for word in ('stop-update','activate','check','finish-update')) for a in run.calls))
                 charged_events=[event for event in events if event['after']!=event['before']]
@@ -416,19 +475,38 @@ class ApplicationReleaseTests(unittest.TestCase):
                     else:
                         self.assertEqual(json.loads(charged_events[-1]['gate']),{'open':False,'release_id':'release-a'})
                         self.assertEqual(json.loads(gate.read_bytes()),{'open':False,'release_id':'release-a'})
-                        self.assertIs(receipt['gate_changed'],True);self.assertTrue(receipt['requires_reconciliation']);self.assertEqual(receipt['remote_outcome'],'unknown')
+                        self.assertIs(receipt['gate_changed'],True)
+                        self.assertTrue(receipt['pending_command']['mutation'])
                         self.assertEqual([a for a in run.calls if a[0]=='systemctl'],[quiesce])
 
     def test_malformed_remote_check_is_unknown_and_stops_pool(self):
         self.gate.write_text(json.dumps({"open": True, "release_id": "old"}))
         run = DeliveryCommands(self.gate)
+        fired=[]
+        selected={'schema':POOL['schema'],'nodes':[*POOL['nodes'],
+            {'name':'second','target':'admin@second.invalid','role':'worker','enrollment_id':ENROLL_IDS[2]}]}
+        context=selected_context()
+        def preflight(*args,**kwargs):
+            if kwargs.get('before_remote'):kwargs['before_remote']()
+            return context
         def incomplete(args):
             result = run(args)
-            return '{"ready":' if args[0] == "ssh" and " check " in args[-1] else result
-        result = self.ops.deliver_cli(delivery_manifest(), POOL, run=incomplete,
-                                     runtime=self.runtime, gate=self.gate)
-        self.assertTrue(result["requires_reconciliation"])
-        self.assertEqual(result["nodes"]["worker"]["status"], "not_attempted")
+            if args[0] == 'ssh' and args[-2]=='admin@worker.invalid' and ' check ' in args[-1]:
+                fired.append(len(run.calls)-1)
+                return '{"ready":'
+            return result
+        with patch.object(self.ops,'preflight_controller_authority',preflight):
+            result = self.ops.deliver_cli(delivery_manifest(), selected, run=incomplete,
+                                         runtime=self.runtime, gate=self.gate)
+        diagnostic=delivery_diagnostic(result,self.runtime,run.calls)
+        self.assertEqual(len(fired),1,diagnostic)
+        self.assertTrue(result["requires_reconciliation"],diagnostic)
+        self.assertEqual(result["nodes"]["controller"]["status"],"verified",diagnostic)
+        self.assertEqual(result["nodes"]["worker"]["status"], "failed",diagnostic)
+        self.assertEqual(result["nodes"]["second"]["status"], "not_attempted",diagnostic)
+        self.assertFalse(any(a[:3]==['nix','copy','--to'] or 'State=RESUME' in a or
+            (a[0]=='ssh' and any(action in shlex.split(a[-1]) for action in ('activate','finish-update')))
+            for a in run.calls[fired[0]+1:]),diagnostic)
         self.assertFalse(any("State=RESUME" in args for args in run.calls))
         self.assertEqual(next((self.runtime / "delivery-attempts").glob("*.json")).stat().st_mode & 0o777, 0o600)
 
@@ -490,13 +568,13 @@ class ApplicationReleaseTests(unittest.TestCase):
         clock = [100.0]
         def completed_after_deadline(args):
             result = run(args)
-            if args[0] == "ssh" and " activate " in args[-1]:
+            if 'register_aiida.py' in ' '.join(args):
                 clock[0] = 111.0
             return result
         with patch.object(self.ops.time, "monotonic", lambda: clock[0]):
             result = self.ops.deliver_cli(delivery_manifest(), POOL, run=completed_after_deadline,
                 runtime=self.runtime, gate=self.gate, delivery_timeout_seconds=10)
-        self.assertTrue(any(a[0] == "ssh" and "activate" in shlex.split(a[-1]) for a in run.calls), "intended activation effect was reached")
+        self.assertTrue(any('register_aiida.py' in ' '.join(a) for a in run.calls), "intended local activation effect was reached")
         self.assertTrue(result["requires_reconciliation"])
         self.assertEqual(result["remote_outcome"], "unknown")
         self.assertTrue(result["command_failure"]["child_started"])
@@ -524,17 +602,17 @@ class ApplicationReleaseTests(unittest.TestCase):
                             fired[0] = True
                             raise OSError("terminal directory fsync failed after replace")
                     return publish(path, value, **kwargs)
-                def fail_admission(path, value):
+                def fail_admission(path, value, **kwargs):
                     if value["open"] and failure in ("gate_fsync", "close_failure"):
-                        admission(path, value)
+                        admission(path, value, **kwargs)
                         fired[0] = True
                         raise OSError("gate directory fsync failed after replace")
                     if not value["open"] and failure == "close_failure" and fired[0]:
                         raise OSError("cannot confirm closed gate")
-                    return admission(path, value)
+                    return admission(path, value, **kwargs)
                 with patch.object(self.ops, "publish_json", fail_receipt), \
                      patch.object(self.ops, "publish_admission", fail_admission):
-                    if failure == "terminal_persistent":
+                    if failure in ("terminal_persistent", "terminal_after_replace"):
                         with self.assertRaises(OSError):
                             self.ops.deliver_cli(delivery_manifest(), POOL, run=run, runtime=runtime, gate=gate)
                         result = None
@@ -609,7 +687,11 @@ class ApplicationReleaseTests(unittest.TestCase):
                  patch.object(self.ops, "node_check" if action == "node-check" else "prepare_initial", check_action), \
                  patch("builtins.print"):
                 self.ops.main()
-            self.assertEqual(observed, [{"timeout_seconds": 7, "output_bytes": 123}])
+            self.assertEqual(len(observed),1)
+            bounds=dict(observed[0]);deadline=bounds.pop('deadline')
+            self.assertEqual(bounds,{"timeout_seconds":7,"output_bytes":123})
+            self.assertGreater(deadline,time.monotonic())
+            self.assertLess(deadline,time.monotonic()+1801)
 
     def test_final_combined_cli_failure_prints_current_unknown_and_blocks_retry(self):
         self.gate.write_text(json.dumps({"open": True, "release_id": "old"}))
@@ -627,10 +709,10 @@ class ApplicationReleaseTests(unittest.TestCase):
             if Path(path).parent.name == "delivery-attempts" and value.get("phase") == "finished":
                 raise OSError("persistent terminal failure")
             return publish(path, value, **kwargs)
-        def failed_close(path, value):
+        def failed_close(path, value, **kwargs):
             if not value["open"] and opened[0]:
                 raise OSError("failed recovery close")
-            result = admission(path, value)
+            result = admission(path, value, **kwargs)
             if value["open"]:
                 opened[0] = True
             return result
@@ -686,11 +768,29 @@ class ApplicationReleaseTests(unittest.TestCase):
                 credentials["uid"] = value
             def change_gid(value):
                 credentials["gid"] = value
+            native_stat,native_fstat=os.stat,os.fstat
+            owned_paths=(record.parent,record.parent/'delivery.lock',record.parent/'activation.lock')
+            # Match only this fake root credential's controlled namespace;
+            # real inode/mode/nlink and real flock acquisition stay in use.
+            class RootOwnerStat:
+                st_uid=0
+                def __init__(self,value):self.value=value
+                def __getattr__(self,name):return getattr(self.value,name)
+            def owned_metadata(value):
+                for path in owned_paths:
+                    try:current=native_stat(path,follow_symlinks=False)
+                    except FileNotFoundError:continue
+                    if (current.st_dev,current.st_ino)==(value.st_dev,value.st_ino):
+                        return RootOwnerStat(value)
+                return value
+            def root_stat(path,*args,**kwargs):return owned_metadata(native_stat(path,*args,**kwargs))
+            def root_fstat(fd):return owned_metadata(native_fstat(fd))
             with patch.object(self.ops, "GATE", gate), \
                  patch.object(self.ops.os, "geteuid", lambda: credentials["uid"]), \
                  patch.object(self.ops.os, "getegid", lambda: credentials["gid"]), \
                  patch.object(self.ops.os, "seteuid", change_uid), \
                  patch.object(self.ops.os, "setegid", change_gid), \
+                 patch.object(self.ops.os,'stat',root_stat),patch.object(self.ops.os,'fstat',root_fstat), \
                  patch.object(self.ops.pwd, "getpwnam", lambda _: SimpleNamespace(pw_uid=3000, pw_gid=3000)), \
                  patch.object(Path, "read_bytes", nfs_read), patch.object(Path, "read_text", nfs_text):
                 try:
@@ -701,7 +801,7 @@ class ApplicationReleaseTests(unittest.TestCase):
                         gate=gate, role="worker", run=run)
                 except PermissionError as error:
                     self.fail("Shared gate must be read with UID3000 authority: " + str(error))
-            self.assertTrue(reads)
+            self.assertGreaterEqual(len(reads),4,'node-check, guard and both owned preparation gate reads reached')
             self.assertEqual(credentials, {"uid": 0, "gid": 42})
 
     def test_shared_gate_read_restores_credentials_after_missing_or_permission_error(self):
@@ -774,7 +874,9 @@ class ApplicationReleaseTests(unittest.TestCase):
                              gate=root / "gate", role="worker", run=run)
             with self.assertRaisesRegex(ValueError, "gate|controller"):
                 self.ops.prepare_initial(release(), **arguments)
-            self.assertEqual(list(root.iterdir()), [])
+            self.assertFalse((root/'profile').is_symlink())
+            self.assertFalse((root/'runtime/release.json').exists())
+            self.assertFalse((root/'gate').exists())
             self.assertEqual(run.calls, [])
             (root / "gate").write_text(json.dumps({"open": False, "release_id": "release-a"}))
             gate_bytes = (root / "gate").read_bytes()
@@ -857,7 +959,9 @@ class ApplicationReleaseTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "jobs|queued"):
                 self.ops.prepare_initial(release(), profile=root / "profile", runtime=root / "runtime",
                     gate=root / "gate", role="controller", run=run)
-            self.assertEqual(list(root.iterdir()), [])
+            self.assertFalse((root/'profile').is_symlink())
+            self.assertFalse((root/'runtime/release.json').exists())
+            self.assertFalse((root/'gate').exists())
             self.assertFalse(any(args[0] == "nix-env" for args in run.calls))
 
     def test_initial_controller_does_not_recreate_deleted_gate_for_existing_identity(self):
@@ -906,26 +1010,27 @@ class ApplicationReleaseTests(unittest.TestCase):
                 self.ops.prepare_initial(release(), profile=root / "profile", runtime=root / "runtime",
                     gate=gate, role="worker", run=racing_run)
             self.assertEqual(json.loads(gate.read_text()), {"open": True, "release_id": "other"})
-            self.assertFalse((root / "runtime").exists())
+            self.assertFalse((root / "runtime/release.json").exists())
             self.assertFalse((root / "profile").is_symlink())
 
-    def test_cli_initial_phase_runs_real_preparation_with_activation_lock(self):
+    def test_cli_initial_phase_runs_real_preparation_with_common_owner(self):
         self.assertTrue(callable(getattr(self.ops, "prepare_initial", None)))
         with tempfile.TemporaryDirectory() as temporary:
             root, run = Path(temporary), InitialCommands()
             source = root / "manifest.json"
             source.write_text(json.dumps(release()))
-            prepare = self.ops.prepare_initial
+            prepare = self.ops._prepare_initial_owned
             def initial(value, **kwargs):
                 import fcntl
-                with (root / "runtime/activation.lock").open("w") as competing:
+                with (root / "runtime/delivery.lock").open("r+") as competing:
                     with self.assertRaises(BlockingIOError):
                         fcntl.flock(competing, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 kwargs["run"] = run
-                return prepare(value, profile=root / "profile", **kwargs)
+                kwargs['profile'] = root / 'profile'
+                return prepare(value, **kwargs)
             args = ["qcl-negf-release", "prepare-initial", "--manifest", str(source),
                     "--role", "controller", "--runtime", str(root / "runtime"), "--gate", str(root / "gate")]
-            with patch.object(sys, "argv", args), patch.object(self.ops, "prepare_initial", initial), patch("builtins.print"):
+            with patch.object(sys, "argv", args), patch.object(self.ops, "_prepare_initial_owned", initial), patch("builtins.print"):
                 self.ops.main()
             self.assertEqual(json.loads((root / "runtime/release.json").read_text()), {**release(), "ready": False})
             self.assertFalse(json.loads((root / "gate").read_text())["open"])
@@ -936,9 +1041,9 @@ class ApplicationReleaseTests(unittest.TestCase):
             gate.write_text(json.dumps({"open": True, "release_id": "old"}))
             original = gate.read_bytes()
             run = DeliveryCommands(gate)
-            with patch.object(self.ops, "publish_admission", lambda _path, value: self.ops.publish_json(gate, value)):
-                report = self.ops.deliver_cli(delivery_manifest(), POOL, runtime=self.runtime, gate=self.gate, run=run)
-            self.assertTrue(report["open"])
+            runtime=Path(temporary)/'runtime'
+            report = self.ops.deliver_cli(delivery_manifest(), POOL, runtime=runtime, gate=gate, run=run)
+            self.assertTrue(report["open"],delivery_diagnostic(report,runtime,run.calls))
             self.assertEqual([args for args in run.calls if args[0] != "ssh"][:2], [
                 ["nix", "copy", "--from", "https://cache.example.invalid", "/nix/store/application", "/nix/store/solver"],
                 ["nix", "path-info", "--json", "/nix/store/application", "/nix/store/solver"]])
@@ -953,9 +1058,8 @@ class ApplicationReleaseTests(unittest.TestCase):
             gate.write_text(json.dumps({"open": True, "release_id": "old"}))
             original, run = gate.read_bytes(), DeliveryCommands(gate)
             run.failure = True
-            with patch.object(self.ops, "publish_admission", lambda _path, value: self.ops.publish_json(gate, value)):
-                with self.assertRaisesRegex(RuntimeError, "cache fetch"):
-                    self.ops.deliver_cli(delivery_manifest(), POOL, runtime=self.runtime, gate=self.gate, run=run)
+            with self.assertRaisesRegex(RuntimeError, "cache fetch"):
+                self.ops.deliver_cli(delivery_manifest(), POOL, runtime=Path(temporary)/'runtime', gate=gate, run=run)
             self.assertEqual(gate.read_bytes(), original)
             self.assertFalse(any(args[0] in ("systemctl", "scontrol") or
                                  (args[0] == "ssh" and not readonly_release_ssh(args)) for args in run.calls))
@@ -972,9 +1076,8 @@ class ApplicationReleaseTests(unittest.TestCase):
                 gate.write_text(json.dumps({"open": True, "release_id": "old"}))
                 original, run = gate.read_bytes(), DeliveryCommands(gate)
                 run.evidence = value
-                with patch.object(self.ops, "publish_admission", lambda _path, value: self.ops.publish_json(gate, value)):
-                    with self.assertRaisesRegex(ValueError, "closure|hash|evidence"):
-                        self.ops.deliver_cli(delivery_manifest(), POOL, runtime=self.runtime, gate=self.gate, run=run)
+                with self.assertRaisesRegex(ValueError, "closure|hash|evidence"):
+                    self.ops.deliver_cli(delivery_manifest(), POOL, runtime=Path(temporary)/'runtime', gate=gate, run=run)
                 self.assertEqual(gate.read_bytes(), original)
                 self.assertFalse(any(args[0] in ("systemctl", "scontrol") or
                                  (args[0] == "ssh" and not readonly_release_ssh(args)) for args in run.calls))
@@ -985,8 +1088,7 @@ class ApplicationReleaseTests(unittest.TestCase):
             gate.write_text(json.dumps({"open": True, "release_id": "old"}))
             original, run = gate.read_bytes(), DeliveryCommands(gate)
             run.evidence = [{"path": path, **value} for path, value in run.evidence.items()]
-            with patch.object(self.ops, "publish_admission", lambda _path, value: self.ops.publish_json(gate, value)):
-                self.ops.deliver_cli(delivery_manifest(False), POOL, runtime=self.runtime, gate=self.gate, run=run)
+            self.ops.deliver_cli(delivery_manifest(False), POOL, runtime=Path(temporary)/'runtime', gate=gate, run=run)
             self.assertEqual(next(args for args in run.calls if args[0] != "ssh")[:3], ["nix", "path-info", "--json"])
             self.assertFalse(any(args[:3] == ["nix", "copy", "--from"] for args in run.calls))
             self.assertEqual(run.prefetch_gate_snapshots, [original])
@@ -1000,9 +1102,8 @@ class ApplicationReleaseTests(unittest.TestCase):
                 gate = Path(temporary) / "admission.json"
                 gate.write_text("unchanged")
                 run = DeliveryCommands(gate)
-                with patch.object(self.ops, "publish_admission", lambda _path, value: self.ops.publish_json(gate, value)):
-                    with self.assertRaisesRegex(ValueError, "cache"):
-                        self.ops.deliver_cli(value, POOL, runtime=self.runtime, gate=self.gate, run=run)
+                with self.assertRaisesRegex(ValueError, "cache"):
+                    self.ops.deliver_cli(value, POOL, runtime=Path(temporary)/'runtime', gate=gate, run=run)
                 self.assertEqual(gate.read_text(), "unchanged")
                 self.assertEqual(run.calls, [])
         calls = []
@@ -1142,7 +1243,8 @@ class ApplicationReleaseTests(unittest.TestCase):
 
     def test_partial_fleet_delivery_closes_admission_until_every_selected_node_verifies(self):
         with tempfile.TemporaryDirectory() as temporary:
-            gate = Path(temporary) / "admission.json"
+            root=Path(temporary);runtime=root/'partial-runtime'
+            gate = root / "admission.json"
             gate.write_text(json.dumps({"open": True, "release_id": "old"}))
             completed = []
 
@@ -1154,15 +1256,26 @@ class ApplicationReleaseTests(unittest.TestCase):
                 return {**manifest, "ready": True}
 
             report = self.ops.deliver_pool(release(), ["worker-a", "worker-b"], gate,
-                                           deliver=deliver, quiesce=lambda: None)
+                                           deliver=deliver, quiesce=lambda: None,runtime=runtime)
             self.assertFalse(report["open"])
             self.assertEqual(report["nodes"]["worker-b"]["status"], "failed")
             self.assertFalse(json.loads(gate.read_text())["open"])
-            report = self.ops.deliver_pool(release(), ["worker-a", "worker-b"], gate,
-                                           deliver=lambda _n, m: {**m, "ready": True}, quiesce=lambda: None)
-            self.assertTrue(report["open"])
-            self.assertEqual(json.loads(gate.read_text()),
+            blockers={p:p.read_bytes() for p in (runtime/'delivery-attempts').glob('*.lifecycle-intent.json')}
+            self.assertTrue(blockers)
+            closed=gate.read_bytes();attempted=[]
+            with self.assertRaises(RuntimeError):
+                self.ops.deliver_pool(release(), ['worker-a','worker-b'], gate,runtime=runtime,
+                    deliver=lambda n,m:attempted.append(n) or {**m,'ready':True},quiesce=lambda:attempted.append('quiesce'))
+            self.assertEqual(attempted,[])
+            self.assertEqual({p:p.read_bytes() for p in blockers},blockers)
+            self.assertEqual(gate.read_bytes(),closed)
+            fresh_gate=root/'fresh-admission.json';fresh_runtime=root/'fresh-runtime'
+            report = self.ops.deliver_pool(release(), ["worker-a", "worker-b"], fresh_gate,runtime=fresh_runtime,
+                deliver=lambda _n,m:{**m,'ready':True},quiesce=lambda:None)
+            self.assertTrue(report["open"],delivery_diagnostic(report,fresh_runtime))
+            self.assertEqual(json.loads(fresh_gate.read_text()),
                              {"open": True, "release_id": "release-a"})
+            self.assertEqual({p:p.read_bytes() for p in blockers},blockers)
 
     def test_quiesce_failure_keeps_gate_closed_and_no_node_activates(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1208,7 +1321,7 @@ class ApplicationReleaseTests(unittest.TestCase):
             with self.subTest(response=response), tempfile.TemporaryDirectory() as temporary:
                 gate = Path(temporary) / "admission.json"
                 report = self.ops.deliver_pool(release(), ["worker"], gate, quiesce=lambda: None,
-                    deliver=lambda _n, _m: response)
+                    deliver=lambda _n, _m: response,runtime=Path(temporary)/'runtime')
                 self.assertFalse(report["open"])
                 self.assertEqual(report["nodes"]["worker"]["status"], "failed")
 
@@ -1358,10 +1471,16 @@ class I14UpdateTests(unittest.TestCase):
         install_controller_config_io(self,self.root)
         self.gate.write_text(json.dumps({'open':True,'release_id':'old'}))
         self.original_observer=self.ops.observe_node_identity
+        self.original_generation=self.ops._process_generation
+        generation=self.original_generation
+        boot=patch.object(self.ops,'_process_generation',
+            lambda:(*generation()[:2],CONTROLLER['boot_id']))
+        boot.start();self.addCleanup(boot.stop)
         self.context=selected_context()
         self.pool={'schema':POOL['schema'],'nodes':[*POOL['nodes'],
             {'name':'second','target':'admin@second.invalid','role':'worker','enrollment_id':ENROLL_IDS[2]}]}
         self.active=False;self.offline=None;self.stopped=set();self.calls=[];self.model=NativeUpdateModel()
+        self.local_commands = Commands()
         def preflight(_enrollment,pool,**kw):
             if kw.get('before_remote'):kw['before_remote']()
             ctx=dict(self.context);ctx['bindings']=tuple(b for b in self.context['bindings'] if b['name'] in {n['name'] for n in pool['nodes']})
@@ -1383,6 +1502,7 @@ class I14UpdateTests(unittest.TestCase):
 
     def commands(self,args):
         self.calls.append(args)
+        if args[:2] in (['systemctl','start'],['systemctl','restart']):self.restarted=True
         if args[:3]==['nix','path-info','--json']:
             return json.dumps({p:{'narHash':HASH} for p in ('/nix/store/application','/nix/store/solver')})
         if args[0]=='ssh':
@@ -1414,10 +1534,13 @@ class I14UpdateTests(unittest.TestCase):
             if getattr(self,'active_calcjob',False):value.update(active_calcjob_found=True,calcjob_sample={'uuid':'66666666-6666-6666-6666-666666666666','process_state':'waiting'})
             return json.dumps(value)
         if args[:2]==['systemctl','show']:return controller_stop_state()
+        if args[0]=='findmnt':return json.dumps({'filesystems':[{'target':str(self.gate.parent),'source':'storage.invalid:/srv/qcl-negf/jobs','fstype':'nfs4'}]})
         if 'scontrol' in args:
             if getattr(self,'bad_reason',False):
                 for value in self.model.nodes.values():value.update(State='DOWN',Reason='foreign-maintenance')
             return self.model.command(args)
+        if args[0] in ('nix-env','nix-store','systemctl','runuser','timeout'):
+            return self.local_commands(args)
         return ''
 
     def deliver(self,pool=None):
@@ -1474,7 +1597,7 @@ class I14UpdateTests(unittest.TestCase):
         self.assertTrue(json.loads(self.gate.read_text())['open'])
 
     def test_i14_final_fleet_recheck_after_all_mutations(self):
-        result=self.deliver();self.assertTrue(result['open'])
+        result=self.deliver();self.assertTrue(result['open'],delivery_diagnostic(result,self.runtime,self.calls))
         last=max(i for i,a in enumerate(self.calls) if a[0]=='ssh' and ' activate ' in a[-1])
         health=[i for i,a in enumerate(self.calls) if a[0]=='ssh' and ' health-update ' in a[-1]]
         self.assertGreaterEqual(len(health),3);self.assertTrue(all(i>last for i in health))
@@ -1521,9 +1644,9 @@ class I14UpdateTests(unittest.TestCase):
 
     def test_i14_crash_gate_write_failure_retains_intent(self):
         original=self.ops.publish_admission
-        def gate(path,value):
+        def gate(path,value,**kwargs):
             if value['open']:raise OSError('open fsync failed')
-            return original(path,value)
+            return original(path,value,**kwargs)
         with patch.object(self.ops,'publish_admission',gate):
             result=self.deliver()
         self.assertFalse(result['open']);self.assertTrue(result['requires_reconciliation'])
@@ -1701,7 +1824,7 @@ class IsolatedWorkerIO:
         base.rmdir()
     def put_release(self):
         self.write(self.runtime/'release.json',json.dumps({**release(),'ready':True}))
-        self.profile=self.module.PROFILE;self.real(self.profile).parent.mkdir(parents=True,exist_ok=True)
+        self.profile=Path('/nix/var/nix/profiles/qcl-negf-application');self.real(self.profile).parent.mkdir(parents=True,exist_ok=True)
         self.real(self.profile).symlink_to('/nix/store/application')
         self.real(self.profile.with_name(self.profile.name+'-solver')).symlink_to('/nix/store/solver')
     def install(self):
@@ -1768,6 +1891,9 @@ class IsolatedWorkerIO:
             (os,'mkdir',mkdir),
             (os,'rmdir',lambda path,*a,**kw:fixture.raw_rmdir(fixture.mapped(path),*a,**kw)),(io,'open',io_open),
             (self.module.socket,'gethostname',lambda:self.identity['hostname']),
+            (self.module,'PROFILE',self.profile),
+            (self.module,'_process_generation',lambda:(*self.test.original_generation()[:2],self.identity['boot_id'])),
+            (self.module.os,'geteuid',lambda:0),(self.module.os,'getuid',lambda:0),
             (self.module.pwd,'getpwnam',lambda name:SimpleNamespace(pw_uid=3000,pw_gid=3000)),
             (self.module.time,'monotonic',lambda:self.clock[0]),(self.module.time,'sleep',self.sleep)):
             self.stack.enter_context(patch.object(obj,name,value))
@@ -1998,7 +2124,8 @@ class I14WholeRepairTests(unittest.TestCase):
     def no_later(self):
         self.assertFalse(any(a[:3]==['nix','copy','--to'] or a[0]=='ssh' and 'activate' in shlex.split(a[-1]) or 'State=RESUME' in a for a in self.calls))
     def receipt(self):
-        files=[p for p in (self.runtime/'delivery-attempts').glob('*.json') if not p.name.endswith('.admission-intent.json')]
+        files=[p for p in (self.runtime/'delivery-attempts').glob('*.json')
+               if json.loads(p.read_text()).get('operation')=='whole_cluster_update']
         self.assertTrue(files,'actual durable attempt reached');return json.loads(files[-1].read_text())
     def test_f1_unknown_root_member_forbids_force(self):
         fs=self.fs(force=True);fs.process(456,comm='foreign-helper',executable='/nix/store/foreign/bin/helper')
@@ -2257,10 +2384,10 @@ class I14WholeRepairTests(unittest.TestCase):
                 self.assertLessEqual(self.model.shows['worker'],14)
     def test_f5_read_reservation_precedes_access_and_sentinel(self):
         fs=self.fs();fs.write('/etc/large',b'x'*65537);scan=self.ops.UpdateScan(200.);fs.budget=scan
-        scan.bytes=32*1024*1024-16;before=len(fs.trace)
+        scan.bytes=self.ops.UpdateScan.CAP-16;before=len(fs.trace)
         with self.assertRaisesRegex(ValueError,'bound|budget'):scan.read('/etc/large',65536)
         self.assertFalse(any(t[0] in ('open','io.open','read') for t in fs.trace[before:]),'reservation failure precedes actual IO')
-        scan.bytes=32*1024*1024;before=len(fs.trace)
+        scan.bytes=self.ops.UpdateScan.CAP;before=len(fs.trace)
         with self.assertRaisesRegex(ValueError,'bound|budget'):scan.read('/etc/large',1)
         self.assertEqual(len(fs.trace),before)
         scan.bytes=0
@@ -2325,8 +2452,8 @@ class I14WholeRepairTests(unittest.TestCase):
                         with self.assertRaises((ValueError,SystemExit)):self.ops.main()
                         self.assertEqual(metadata.call_count+protected.call_count,0)
     def test_f6_positive_factory_full_body_transition(self):
-        result=self.deliver();self.assertTrue(result['open']);self.assertFalse(result['requires_reconciliation'])
-        for action,count in (('identity',6),('update-capabilities',3),('stop-update',2),('stopped-identity',2),('activate',3),('check',3),('health-update',3),('finish-update',2)):
+        result=self.deliver();self.assertTrue(result['open'],delivery_diagnostic(result,self.runtime,self.calls));self.assertFalse(result['requires_reconciliation'])
+        for action,count in (('identity',6),('update-capabilities',3),('stop-update',2),('stopped-identity',2),('activate',2),('check',2),('health-update',3),('finish-update',2)):
             self.assertGreaterEqual(sum(a[0]=='ssh' and action in shlex.split(a[-1]) for a in self.calls),count,action)
         self.assertTrue(any('aiida_update_check.py' in ' '.join(a) for a in self.calls))
         self.assertEqual(sum('State=RESUME' in a for a in self.calls),2)
@@ -2590,7 +2717,7 @@ class I14WholeRepairTests(unittest.TestCase):
                     def actual_init(scan,deadline):
                         original_init(scan,deadline);captured.append(scan);fs.budget=scan
                         if case=='expired_manifest':fs.clock[0]=deadline+1
-                        if case=='cap_manifest':scan.bytes=32*1024*1024-16
+                        if case=='cap_manifest':scan.bytes=self.ops.UpdateScan.CAP-16
                     cleanup.enter_context(patch.object(self.ops.UpdateScan,'__init__',actual_init))
                     if case=='oversized_release':fs.write(fs.runtime/'release.json',b' '*65537)
                     native=fs.native
@@ -2834,3 +2961,927 @@ class I14SlurmInfinityTests(I14WholeRepairTests):
     def test_stopped_without_keeper_scope_is_measured_empty(self):
         fs=self.fs();fs.clear_scope();scan=self.scan_keeper(fs)
         self.assertTrue(scan['job_processes_empty']);self.assertEqual(scan['slurm_infinity_processes'],[])
+
+
+class OPS03LifecycleOwnerTests(unittest.TestCase):
+    """Finite OPS02 controls: real flock/process/files, closed command fake.
+
+    These tests are engineering oracles only. Neither provisioning/systemd
+    writers nor the distributed final admission commit are covered here.
+    """
+    setUpClass = classmethod(ApplicationReleaseTests.setUpClass.__func__)
+    SELF_CHECK_ARGV = ['timeout', '--kill-after=10s', '300s', 'runuser', '-u',
+                      'qcl-negf', '--', 'env', 'JULIA_NUM_THREADS=1',
+                      'OPENBLAS_NUM_THREADS=1', '/nix/store/solver/bin/qcl-negf',
+                      'self-check']
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='ops03-')
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.runtime = self.root / 'runtime'
+        self.runtime.mkdir()
+        self.profile = self.root / 'application'
+        self.gate = self.root / 'selected-gate.json'
+        self.gate.write_text(json.dumps({'open': False, 'release_id': 'release-a'}))
+        self.commands = Commands()
+        self.deadline = time.monotonic() + 30
+        self.context = selected_context()
+        self.context['bindings'] = self.context['bindings'][:2]
+        self.context['registry']['nodes'] = self.context['registry']['nodes'][:2]
+        install_controller_config_io(self, self.root)
+        for name, replacement in (
+            ('observe_node_identity', lambda **_: CONTROLLER),
+            ('preflight_controller_authority', lambda *a, **k: self.context),
+            ('recheck_controller_authority', lambda *a, **k: None),
+        ):
+            hook = patch.object(self.ops, name, replacement)
+            hook.start()
+            self.addCleanup(hook.stop)
+
+    def boundary(self, argv):
+        permitted = {'nix-store', 'nix-env', 'systemctl', 'runuser'}
+        if argv != self.SELF_CHECK_ARGV and argv[0] not in permitted:
+            raise AssertionError('Unapproved fake command: ' + repr(argv))
+        return self.commands(argv)
+
+    def activate(self, **kwargs):
+        return self.ops.activate(release(), profile=self.profile, runtime=self.runtime,
+            gate=self.gate, run=kwargs.pop('run', self.boundary), **kwargs)
+
+    def owner(self, operation='activate', **kwargs):
+        return self.ops.lifecycle_owner(self.runtime, operation=operation,
+            release_id='release-a', release_identity=release(),
+            deadline=kwargs.pop('deadline', self.deadline), **kwargs)
+
+    def required(self, name):
+        value = getattr(self.ops, name, None)
+        self.assertTrue(callable(value), 'OPS03 accepted API absent: ' + name)
+        return value
+
+    def owned_activate(self, owner, **kwargs):
+        return self.required('_activate_owned')(release(), owner=owner,
+            profile=self.profile, runtime=self.runtime, gate=self.gate,
+            run=self.boundary, deadline=kwargs.pop('deadline', self.deadline), **kwargs)
+
+    def child(self, body):
+        """One fork with explicit readiness and bounded cleanup; no sleep oracle."""
+        context = multiprocessing.get_context('fork')
+        parent, child = context.Pipe()
+        process = context.Process(target=body, args=(child,))
+        process.start()
+        child.close()
+        def cleanup():
+            if process.is_alive():
+                process.kill()
+            process.join(5)
+            parent.close()
+        self.addCleanup(cleanup)
+        self.assertTrue(parent.poll(5), 'child did not reach controlled boundary')
+        message = parent.recv()
+        self.assertEqual(message, 'held', repr(message))
+        return process, parent
+
+    def hold_delivery(self, pipe):
+        def body(*args, **kwargs):
+            pipe.send('held')
+            if not pipe.poll(5):
+                raise AssertionError('parent handshake deadline')
+            pipe.recv()
+            return {'status': 'completed'}
+        try:
+            with patch.object(self.ops, '_deliver_cli_locked', body):
+                self.ops.deliver_cli(delivery_manifest(), POOL,
+                    enrollment='/synthetic/enrollment.json', runtime=self.runtime,
+                    gate=self.gate, run=self.boundary)
+        except BaseException as error:
+            pipe.send(('child-error', type(error).__name__, str(error)))
+            raise
+
+    def test_o01_actual_update_process_blocks_public_activate_and_prepare(self):
+        process, pipe = self.child(self.hold_delivery)
+        before = self.gate.read_bytes()
+        for action in ('activate', 'prepare_initial'):
+            with self.subTest(action=action):
+                self.commands.calls.clear()
+                with self.assertRaises((BlockingIOError, RuntimeError)):
+                    if action == 'activate':
+                        self.activate()
+                    else:
+                        self.ops.prepare_initial(release(), profile=self.profile,
+                            runtime=self.runtime, gate=self.gate, run=self.boundary)
+                self.assertEqual(self.commands.calls, [], 'contender reached command boundary')
+                self.assertFalse((self.runtime / 'release.json').exists())
+                self.assertEqual(self.gate.read_bytes(), before)
+        pipe.send('release')
+        process.join(5)
+        self.assertEqual(process.exitcode, 0)
+
+    def test_o01_reverse_public_activate_process_blocks_actual_update(self):
+        def child(pipe):
+            def command(argv):
+                if argv[0] == 'nix-store':
+                    pipe.send('held')
+                    if not pipe.poll(5):
+                        raise AssertionError('parent handshake deadline')
+                    pipe.recv()
+                return self.boundary(argv)
+            try:
+                self.activate(run=command)
+            except BaseException as error:
+                pipe.send(('child-error', type(error).__name__, str(error)))
+                raise
+        process, pipe = self.child(child)
+        ledger = []
+        with patch.object(self.ops, '_deliver_cli_locked', lambda *a, **k: ledger.append('mutation')):
+            with self.assertRaises((BlockingIOError, RuntimeError)):
+                self.ops.deliver_cli(delivery_manifest(), POOL,
+                    enrollment='/synthetic/enrollment.json', runtime=self.runtime,
+                    gate=self.gate, run=self.boundary)
+        self.assertEqual(ledger, [])
+        pipe.send('release')
+        process.join(5)
+        self.assertEqual(process.exitcode, 0)
+
+    def test_o03_real_owned_helper_does_not_reacquire_or_dispatch_self_ssh(self):
+        self.required('_activate_owned')
+        original = self.ops.fcntl.flock
+        acquisitions = []
+        def flock(fd, operation):
+            if operation & fcntl.LOCK_EX:
+                acquisitions.append(os.fstat(fd).st_ino)
+            return original(fd, operation)
+        generation=self.ops._process_generation
+        with patch.object(self.ops.fcntl, 'flock', flock), patch.object(self.ops,'_process_generation',
+                lambda:(*generation()[:2],CONTROLLER['boot_id'])):
+            with self.owner('whole_update') as owner:
+                self.assertIsNotNone(owner)
+                initial = list(acquisitions)
+                self.assertEqual(len(initial), 2, 'common owner plus legacy fence')
+                result = self.owned_activate(owner,role='controller',email='service@example.invalid',
+                    allowed_codes_file=self.root/'code-uuid',expected_node_identity=CONTROLLER)
+                self.assertTrue(result['ready'])
+                self.assertEqual(acquisitions, initial, 'helper reacquired owner')
+        self.assertFalse(any(a[0] == 'ssh' or a[:2] == ['nix', 'copy'] for a in self.commands.calls))
+        self.assertFalse(json.loads(self.gate.read_text())['open'])
+        self.assertIn('QCL_NEGF_RELEASE_GATE=' + str(self.gate),
+                      (self.runtime / 'service.env').read_text())
+
+    def test_o04_forged_capabilities_rejected_before_any_mutation(self):
+        self.required('_activate_owned')
+        owner_type = getattr(self.ops, 'LifecycleOwner', None)
+        self.assertIsNotNone(owner_type, 'opaque owner type absent')
+        forged = [None, object(), {}, {'pid': os.getpid(), 'release_id': 'release-a'},
+                  object.__new__(owner_type)]
+        for token in forged:
+            with self.subTest(token=type(token).__name__):
+                with self.assertRaises((ValueError, RuntimeError, TypeError, PermissionError)):
+                    self.owned_activate(token)
+                self.assertEqual(self.commands.calls, [])
+                self.assertFalse((self.runtime / 'release.json').exists())
+
+    def test_o04_copy_does_not_create_authority_and_context_exit_revokes(self):
+        require = self.required('_require_owner')
+        with self.owner() as owner:
+            for copier in (copy.copy, copy.deepcopy):
+                try:
+                    copied = copier(owner)
+                except (TypeError, ValueError, RuntimeError):
+                    continue
+                self.assertIsNot(copied, owner, 'copy must not return the live authority')
+                with self.assertRaises((TypeError, ValueError, RuntimeError, PermissionError)):
+                    require(copied, runtime=self.runtime, operation='activate',
+                            release_identity=release(), deadline=self.deadline)
+        with self.assertRaises((ValueError, RuntimeError, TypeError, PermissionError)):
+            self.owned_activate(owner)
+        self.assertEqual(self.commands.calls, [])
+
+    def test_o05_wrong_runtime_release_operation_or_deadline_rejected(self):
+        require = self.required('_require_owner')
+        with self.owner() as owner:
+            valid = dict(runtime=self.runtime, operation='activate',
+                         release_identity=release(), deadline=self.deadline)
+            for change in ({'runtime': self.root / 'other'},
+                           {'release_identity': {**release(), 'release_id': 'foreign'}},
+                           {'operation': 'startup'}, {'deadline': self.deadline + 1},
+                           {'deadline': None}):
+                with self.subTest(change=change):
+                    with self.assertRaises((ValueError, RuntimeError, TypeError, PermissionError)):
+                        require(owner, **{**valid, **change})
+        with self.owner('shutdown_capture') as token:
+            with self.assertRaises((ValueError, RuntimeError, TypeError, PermissionError)):
+                self.owned_activate(token)
+        self.assertEqual(self.commands.calls, [])
+
+    def test_o05_replaced_common_lock_inode_revokes_live_owner(self):
+        self.required('_activate_owned')
+        with self.owner() as owner:
+            lock = self.runtime / 'delivery.lock'
+            lock.rename(self.runtime / 'retained-lock')
+            lock.write_bytes(b'foreign replacement')
+            with self.assertRaises((ValueError, RuntimeError, PermissionError, OSError)):
+                self.owned_activate(owner)
+            self.assertEqual(lock.read_bytes(), b'foreign replacement')
+            self.assertEqual(self.commands.calls, [])
+
+    def test_o06_fork_child_cannot_use_or_unlock_parent_capability(self):
+        require = self.required('_require_owner')
+        with self.owner() as owner:
+            def child(pipe):
+                try:
+                    require(owner, runtime=self.runtime, operation='activate',
+                            release_identity=release(), deadline=self.deadline)
+                except (ValueError, RuntimeError, PermissionError, TypeError):
+                    pipe.send('held')
+                    return
+                pipe.send('inherited-authority-accepted')
+            process, pipe = self.child(child)
+            process.join(5)
+            self.assertEqual(process.exitcode, 0)
+            with (self.runtime / 'delivery.lock').open('r+') as contender:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            require(owner, runtime=self.runtime, operation='activate',
+                    release_identity=release(), deadline=self.deadline)
+
+    def test_o07_expiry_after_command_stops_next_persistent_mutation(self):
+        clock = [100.0]
+        def boundary(argv):
+            output = self.boundary(argv)
+            if argv[0] == 'nix-store':
+                clock[0] = 111.0
+            return output
+        with patch.object(self.ops.time, 'monotonic', lambda: clock[0]):
+            with self.assertRaises((ValueError, RuntimeError, TimeoutError)):
+                self.activate(deadline=110.0, run=boundary)
+        self.assertFalse(self.profile.exists() or self.profile.is_symlink())
+        self.assertFalse(any(a[0] == 'systemctl' for a in self.commands.calls))
+        self.assertFalse(json.loads(self.gate.read_text())['open'])
+        self.assertTrue(list((self.runtime / 'delivery-attempts').glob('*.lifecycle-intent.json')),
+                        'expired mutation retains inhibition')
+
+    def test_o10_foreign_or_orphan_barriers_prevent_direct_api_mutation(self):
+        attempts = self.runtime / 'delivery-attempts'
+        attempts.mkdir()
+        for name, value in (
+            ('orphan.lifecycle-intent.json', {'schema': 'qcl-negf-lifecycle-intent-v1'}),
+            ('old.admission-intent.json', {'schema': 'qcl-negf-admission-intent-v1'}),
+            ('local.json', {'schema': 'qcl-negf-delivery-attempt-v1', 'status': 'running',
+                            'pending_local_mutation': {'node': 'controller'}}),
+        ):
+            with self.subTest(marker=name):
+                path = attempts / name
+                raw = json.dumps(value).encode()
+                path.write_bytes(raw)
+                self.commands.calls.clear()
+                with self.assertRaises((ValueError, RuntimeError)):
+                    self.activate()
+                self.assertEqual(self.commands.calls, [])
+                self.assertEqual(path.read_bytes(), raw)
+                path.unlink()
+        marker = self.runtime / 'cluster-update.json'
+        marker.write_bytes(b'{"unknown":"foreign"}')
+        with self.assertRaises((ValueError, RuntimeError)):
+            self.activate()
+        self.assertEqual(marker.read_bytes(), b'{"unknown":"foreign"}')
+
+    def test_o08_killed_local_publisher_retains_intent_and_blocks_retry(self):
+        # Exactly one child and one retry per named cut. Real temp profile/env/
+        # readiness publishers remain in use; only external commands are fake.
+        cuts = ('before-first-command', 'app-profile', 'solver-profile',
+                'registration', 'allowlist', 'environment', 'ready-false',
+                'service-start', 'ready-true', 'terminal')
+        for cut in cuts:
+            with self.subTest(cut=cut):
+                runtime = self.root / ('crash-' + cut)
+                runtime.mkdir()
+                profile = runtime / 'application'
+                allowlist = runtime / 'code-uuid'
+                original_record=(json.dumps({**release(),'ready':True,
+                    'code_uuid':'12345678-1234-1234-1234-123456789abc',
+                    'provenance':'retained-predecessor'})+'\n').encode()
+                (runtime/'release.json').write_bytes(original_record)
+                (runtime/'service.env').write_bytes(b'original environment\n')
+                allowlist.write_bytes(b'original allowlist\n')
+                gate = runtime / 'gate.json'
+                gate.write_text(json.dumps({'open': False, 'release_id': 'release-a'}))
+                def child(pipe):
+                    commands = Commands()
+                    def reached(name):
+                        if cut == name:
+                            pipe.send('held')
+                            if not pipe.poll(5):
+                                raise AssertionError('kill handshake deadline')
+                            pipe.recv()
+                            raise AssertionError('parent should kill at cut')
+                    def boundary(argv):
+                        if (argv != self.SELF_CHECK_ARGV
+                                and argv[0] not in {'nix-store', 'nix-env', 'systemctl', 'runuser'}):
+                            raise AssertionError('unexpected command ' + repr(argv))
+                        reached('before-first-command') if not commands.calls else None
+                        result = commands(argv)
+                        if argv[0] == 'nix-env':
+                            reached('solver-profile' if argv[-1] == '/nix/store/solver' else 'app-profile')
+                        if 'register_aiida.py' in ' '.join(argv):
+                            reached('registration')
+                        if argv[:2] in (['systemctl', 'start'], ['systemctl', 'restart']):
+                            reached('service-start')
+                        return result
+                    original_publish, original_json = self.ops.publish, self.ops.publish_json
+                    def publish(path, value, *args, **kwargs):
+                        result = original_publish(path, value, *args, **kwargs)
+                        if Path(path) == allowlist:
+                            reached('allowlist')
+                        if Path(path) == runtime / 'service.env':
+                            reached('environment')
+                        return result
+                    def publish_json(path, value, *args, **kwargs):
+                        if value.get('status')=='completed' and value.get('operation')=='activate':
+                            reached('terminal')
+                        result = original_json(path, value, *args, **kwargs)
+                        if Path(path) == runtime / 'release.json':
+                            reached('ready-true' if value.get('ready') is True else 'ready-false')
+                        return result
+                    try:
+                        with patch.object(self.ops, 'publish', publish), patch.object(self.ops, 'publish_json', publish_json):
+                            self.ops.activate(release(), profile=profile, runtime=runtime,
+                                gate=gate, role='controller', email='service@example.invalid',
+                                allowed_codes_file=allowlist, run=boundary)
+                        pipe.send('missed-cut')
+                    except BaseException as error:
+                        pipe.send(('child-error', type(error).__name__, str(error)))
+                        raise
+                process, pipe = self.child(child)
+                process.kill()
+                process.join(5)
+                self.assertEqual(process.exitcode, -signal.SIGKILL)
+                markers = list((runtime / 'delivery-attempts').glob('*.lifecycle-intent.json'))
+                self.assertTrue(markers, 'first mutation must follow a durable intent')
+                retained = {path: path.read_bytes() for path in markers}
+                receipts=[json.loads(p.read_text()) for p in (runtime/'delivery-attempts').glob('*.json')
+                          if not p.name.endswith('.lifecycle-intent.json')]
+                self.assertTrue(receipts)
+                snapshot=receipts[0]['snapshots']
+                self.assertEqual(base64.b64decode(snapshot['release']['bytes_base64']),original_record)
+                self.assertEqual(base64.b64decode(snapshot['environment']['bytes_base64']),b'original environment\n')
+                self.assertEqual(base64.b64decode(snapshot['allowlist']['bytes_base64']),b'original allowlist\n')
+                ledger = []
+                def retry(argv):
+                    ledger.append(argv)
+                    raise AssertionError('orphan retry reached command boundary')
+                with self.assertRaises((ValueError, RuntimeError)):
+                    self.ops.activate(release(), profile=profile, runtime=runtime,
+                        gate=gate, role='controller', email='service@example.invalid',
+                        allowed_codes_file=allowlist, run=retry)
+                self.assertEqual(ledger, [])
+                self.assertEqual({path: path.read_bytes() for path in retained}, retained)
+                self.assertFalse(json.loads(gate.read_text())['open'])
+
+    def test_o09_intent_fsync_failure_precedes_application_mutation(self):
+        sync=self.ops.os.fsync;fired=[]
+        def fsync(fd):
+            if os.readlink('/proc/self/fd/'+str(fd)).endswith('.lifecycle-intent.json'):
+                fired.append(True);raise OSError('injected intent durability failure')
+            return sync(fd)
+        with patch.object(self.ops.os, 'fsync', fsync):
+            with self.assertRaises(OSError):
+                self.activate()
+        self.assertTrue(fired)
+        self.assertEqual(self.commands.calls, [], 'durability failure must precede even closure command')
+        self.assertFalse(self.profile.exists() or self.profile.is_symlink())
+        self.assertFalse((self.runtime / 'service.env').exists())
+        self.assertFalse(json.loads(self.gate.read_text())['open'])
+
+    def test_o11_legacy_activation_fence_blocks_update_without_truncation(self):
+        legacy = self.runtime / 'activation.lock'
+        legacy.write_bytes(b'legacy bytes must remain')
+        with legacy.open('r+') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            ledger = []
+            with patch.object(self.ops, '_deliver_cli_locked', lambda *a, **k: ledger.append('entered')):
+                with self.assertRaises((BlockingIOError, RuntimeError)):
+                    self.ops.deliver_cli(delivery_manifest(), POOL,
+                        enrollment='/synthetic/enrollment.json', runtime=self.runtime,
+                        gate=self.gate, run=self.boundary)
+            self.assertEqual(ledger, [])
+        self.assertEqual(legacy.read_bytes(), b'legacy bytes must remain')
+        with (self.runtime / 'delivery.lock').open('r+') as common:
+            fcntl.flock(common, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_o12_completed_release_repairs_only_one_gc_root_and_closed_gate(self):
+        for damaged in ('application', 'application-solver'):
+            with self.subTest(root=damaged):
+                self.activate()
+                before = json.loads((self.runtime / 'release.json').read_text())
+                (self.root / damaged).unlink()
+                self.commands.calls.clear()
+                result = self.activate()
+                setters = [a for a in self.commands.calls if a[0] == 'nix-env']
+                self.assertEqual(len(setters), 1)
+                self.assertEqual(Path(setters[0][setters[0].index('--profile') + 1]), self.root / damaged)
+                self.assertEqual(result, before)
+                self.assertFalse(json.loads(self.gate.read_text())['open'])
+
+    def test_o14_public_activate_requires_matching_closed_selected_gate(self):
+        for gate in ({'open': True, 'release_id': 'release-a'},
+                     {'open': False, 'release_id': 'foreign'}):
+            with self.subTest(gate=gate):
+                self.gate.write_text(json.dumps(gate))
+                with self.assertRaises((ValueError, RuntimeError)):
+                    self.activate()
+                self.assertEqual(self.commands.calls, [])
+
+    def test_o18_service_environment_uses_selected_gate(self):
+        self.activate()
+        self.assertIn('QCL_NEGF_RELEASE_GATE=' + str(self.gate) + '\n',
+                      (self.runtime / 'service.env').read_text())
+
+    def test_o04_pickle_and_constructor_cannot_transport_capability(self):
+        with self.owner() as owner:
+            with self.assertRaises(TypeError):
+                pickle.dumps(owner)
+            with self.assertRaises(TypeError):
+                type(owner)()
+        self.assertEqual(self.commands.calls, [])
+
+    def test_o05_closed_fd_and_replaced_runtime_revoke_before_publish(self):
+        for fault in ('closed_fd', 'runtime_inode'):
+            with self.subTest(fault=fault):
+                runtime = self.root / fault
+                with self.ops.lifecycle_owner(runtime, operation='activate',
+                        release_id='release-a', release_identity=release(), deadline=self.deadline) as owner:
+                    state = self.ops._OWNER_RECORDS[id(owner)]
+                    if fault == 'closed_fd':
+                        fd = state['locks'][0][1]
+                        # Duplicate preserves normal context cleanup, while the
+                        # lock descriptor itself is replaced by another inode.
+                        with (self.root / 'foreign-fd').open('w+') as foreign:
+                            original = os.dup(fd)
+                            try:
+                                os.dup2(foreign.fileno(), fd)
+                                with self.assertRaises((PermissionError, OSError)):
+                                    self.ops._require_owner(owner, runtime=runtime, operation='activate',
+                                        release_identity=release(), deadline=self.deadline)
+                            finally:
+                                os.dup2(original, fd);os.close(original)
+                    else:
+                        runtime.rename(self.root / (fault + '-original'))
+                        runtime.mkdir()
+                        (runtime / 'foreign').write_bytes(b'preserve')
+                        with self.assertRaises((PermissionError, OSError)):
+                            self.ops._require_owner(owner, runtime=runtime, operation='activate',
+                                release_identity=release(), deadline=self.deadline)
+                        self.assertEqual((runtime / 'foreign').read_bytes(), b'preserve')
+        self.assertEqual(self.commands.calls, [])
+        with self.owner() as owner:
+            fd=self.ops._OWNER_RECORDS[id(owner)]['locks'][0][1]
+            os.close(fd)
+            with self.assertRaises(OSError):self.owned_activate(owner)
+        # Invalidating the common fd must not leak the legacy fence on exit.
+        with self.owner():pass
+
+    def test_o06_dead_owner_releases_flock_but_orphan_remains_inhibiting(self):
+        def child(pipe):
+            with self.owner() as owner:
+                self.ops._begin_local_mutation(owner, profile=self.profile, gate=self.gate)
+                pipe.send('held')
+                if not pipe.poll(5):
+                    raise AssertionError('dead owner handshake watchdog')
+                pipe.recv()
+        process, pipe = self.child(child)
+        process.kill();process.join(5)
+        self.assertEqual(process.exitcode, -signal.SIGKILL)
+        with self.owner():
+            pass  # Volatile lock can be acquired; it does not clear evidence.
+        with self.assertRaises(RuntimeError):
+            self.activate()
+        self.assertEqual(self.commands.calls, [])
+
+    def test_o07_deadlines_at_profiles_registration_ready_and_cleanup(self):
+        for cut in ('app', 'solver', 'registration', 'ready_false', 'ready_true', 'terminal'):
+            with self.subTest(cut=cut), tempfile.TemporaryDirectory(dir=self.root) as temporary:
+                root = Path(temporary);runtime = root / 'runtime';profile = root / 'profile'
+                gate=root/'gate';gate.write_text('{"open":false,"release_id":"release-a"}')
+                clock=[100.0];commands=Commands();fired=[]
+                def expire():clock[0]=111.;fired.append(cut)
+                def run(argv):
+                    result=commands(argv)
+                    if argv[0]=='nix-env' and cut == ('solver' if argv[-1]=='/nix/store/solver' else 'app'):expire()
+                    if cut=='registration' and 'register_aiida.py' in ' '.join(argv):expire()
+                    return result
+                publish_json=self.ops.publish_json
+                def publication(path,value,**kwargs):
+                    if Path(path)==runtime/'release.json' and cut == ('ready_true' if value.get('ready') is True else 'ready_false'):expire()
+                    if cut=='terminal' and value.get('operation')=='activate' and value.get('status')=='completed':expire()
+                    return publish_json(path,value,**kwargs)
+                with patch.object(self.ops.time,'monotonic',lambda:clock[0]), patch.object(self.ops,'publish_json',publication):
+                    with self.assertRaises(self.ops.CommandFailure):
+                        self.ops.activate(release(),profile=profile,runtime=runtime,gate=gate,
+                            role='controller',email='service@example.invalid',allowed_codes_file=root/'code',
+                            run=run,deadline=110.)
+                self.assertEqual(fired,[cut])
+                self.assertFalse(json.loads(gate.read_text())['open'])
+                self.assertTrue(list((runtime/'delivery-attempts').glob('*.lifecycle-intent.json')))
+                if cut=='registration':self.assertFalse((root/'code').exists())
+                if cut in ('app','solver','registration','ready_false'):
+                    self.assertFalse(any(a[:2] in (['systemctl','start'],['systemctl','restart']) for a in commands.calls))
+
+    def test_o09_intent_write_and_directory_fsync_faults_are_before_commands(self):
+        for fault in ('write','dir_fsync'):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory(dir=self.root) as temporary:
+                root=Path(temporary);runtime=root/'runtime';gate=root/'gate'
+                gate.write_text('{"open":false,"release_id":"release-a"}')
+                sync=self.ops.os.fsync;write=self.ops.os.write;fired=[];calls=[]
+                def fail_write(fd,data):
+                    if fault=='write' and os.readlink('/proc/self/fd/'+str(fd)).endswith('.lifecycle-intent.json'):
+                        fired.append(True);raise OSError('intent write fault')
+                    return write(fd,data)
+                def fail_sync(fd):
+                    if fault=='dir_fsync' and os.readlink('/proc/self/fd/'+str(fd)).endswith('delivery-attempts'):
+                        fired.append(True);raise OSError('intent directory durability fault')
+                    return sync(fd)
+                with patch.object(self.ops.os,'write',fail_write),patch.object(self.ops.os,'fsync',fail_sync):
+                    with self.assertRaises(OSError):
+                        self.ops.activate(release(),runtime=runtime,profile=root/'profile',gate=gate,
+                            run=lambda argv:calls.append(argv))
+                self.assertTrue(fired);self.assertEqual(calls,[])
+                self.assertFalse((root/'profile').is_symlink())
+
+    def test_o09_ready_replace_and_terminal_receipt_failure_retain_original_bytes(self):
+        self.activate()
+        original_record=(self.runtime/'release.json').read_bytes()
+        original_env=(self.runtime/'service.env').read_bytes()
+        for cut in ('ready_replace','terminal'):
+            with self.subTest(cut=cut), tempfile.TemporaryDirectory(dir=self.root) as temporary:
+                root=Path(temporary);runtime=root/'runtime';runtime.mkdir()
+                (runtime/'release.json').write_bytes(original_record)
+                (runtime/'service.env').write_bytes(original_env)
+                gate=root/'gate';gate.write_text('{"open":false,"release_id":"release-a"}')
+                commands=Commands();replace=self.ops.os.replace;publish_json=self.ops.publish_json;fired=[]
+                def replacement(source,destination,*args,**kwargs):
+                    if cut=='ready_replace' and Path(destination)==runtime/'release.json':
+                        fired.append(True);raise OSError('ready replace fault')
+                    return replace(source,destination,*args,**kwargs)
+                def terminal(path,value,**kwargs):
+                    if cut=='terminal' and value.get('operation')=='activate' and value.get('status')=='completed':
+                        fired.append(True);raise OSError('terminal durability fault')
+                    return publish_json(path,value,**kwargs)
+                with patch.object(self.ops.os,'replace',replacement),patch.object(self.ops,'publish_json',terminal):
+                    with self.assertRaises(OSError):
+                        self.ops.activate(release(),profile=root/'profile',runtime=runtime,gate=gate,run=commands)
+                self.assertTrue(fired)
+                self.assertTrue(list((runtime/'delivery-attempts').glob('*.lifecycle-intent.json')))
+                receipts=[json.loads(p.read_text()) for p in (runtime/'delivery-attempts').glob('*.json') if p.name.endswith('.json') and not p.name.endswith('.lifecycle-intent.json')]
+                self.assertTrue(receipts)
+                snapshot=receipts[0]['snapshots']
+                self.assertEqual(base64.b64decode(snapshot['release']['bytes_base64']),original_record)
+                self.assertEqual(base64.b64decode(snapshot['environment']['bytes_base64']),original_env)
+                self.assertFalse(json.loads(gate.read_text())['open'])
+
+    def test_o10_same_attempt_lookalike_and_replaced_own_intent_are_foreign(self):
+        with self.owner() as owner:
+            self.ops._begin_local_mutation(owner,profile=self.profile,gate=self.gate)
+            state=self.ops._OWNER_RECORDS[id(owner)]
+            intent=state['journal']['intent'];raw=intent.read_bytes()
+            lookalike=intent.with_name(intent.name.replace('.lifecycle-intent.json','.foreign.lifecycle-intent.json'))
+            lookalike.write_bytes(raw)
+            with self.assertRaises(RuntimeError):self.ops.lifecycle_guard(self.runtime,owner=owner)
+            self.assertEqual(lookalike.read_bytes(),raw)
+            lookalike.unlink()
+            replacement=intent.with_suffix('.replacement');replacement.write_bytes(raw)
+            os.replace(replacement,intent)
+            with self.assertRaises(PermissionError):self.ops._finish_owned(owner,deadline=self.deadline)
+            self.assertEqual(intent.read_bytes(),raw)
+
+    def test_o18_no_owner_and_expired_owner_cannot_publish_or_clean(self):
+        before=self.gate.read_bytes()
+        for owner in (None,object(),{}):
+            with self.assertRaises(PermissionError):
+                self.ops._publish_admission_owned(self.gate,{'open':True,'release_id':'release-a'},
+                    owner=owner,deadline=self.deadline)
+            with self.assertRaises(PermissionError):
+                self.ops._finish_owned(owner,deadline=self.deadline)
+        with self.owner('whole_update') as owner:
+            self.ops._begin_local_mutation(owner,profile=self.profile,gate=self.gate)
+            with patch.object(self.ops.time,'monotonic',lambda:self.deadline+1):
+                with self.assertRaises(self.ops.CommandFailure):
+                    self.ops._publish_admission_owned(self.gate,{'open':True,'release_id':'release-a'},
+                        owner=owner,deadline=self.deadline)
+                with self.assertRaises(self.ops.CommandFailure):self.ops._finish_owned(owner,deadline=self.deadline)
+        self.assertEqual(self.gate.read_bytes(),before)
+
+    def test_o17_worker_stop_invocation_serializes_foreign_activate_and_finish(self):
+        attempt='11111111-1111-4111-8111-111111111111'
+        foreign='22222222-2222-4222-8222-222222222222'
+        def child(pipe):
+            # The real public worker wrapper creates its owner and durable
+            # pending state. Scope/mask readbacks have separate full-body
+            # controls in EffectiveRuntimeMaskTests; this hook parks one call.
+            def stopped(*args,**kwargs):
+                self.ops._owner_before(kwargs['owner'])
+                pipe.send('held')
+                if not pipe.poll(5):raise AssertionError('worker race watchdog')
+                pipe.recv()
+                return {'attempt_id':attempt}
+            with patch.object(self.ops,'_stop_update_owned',stopped):
+                self.ops.stop_update(release(),attempt,WORKER,runtime=self.runtime,
+                    gate=self.gate,run=self.boundary,deadline=self.deadline,enrollment_id=ENROLL_IDS[1])
+        process,pipe=self.child(child)
+        for action in ('activate','finish'):
+            with self.subTest(action=action),self.assertRaises(BlockingIOError):
+                if action=='activate':
+                    self.activate(expected_node_identity=WORKER,update_attempt_id=foreign,deadline=self.deadline)
+                else:
+                    self.ops.finish_update(release(),foreign,WORKER,runtime=self.runtime,
+                        gate=self.gate,run=self.boundary,deadline=self.deadline)
+        self.assertEqual(self.commands.calls,[])
+        pipe.send('release');process.join(5);self.assertEqual(process.exitcode,0)
+
+    def test_o05_lock_namespace_symlink_fifo_and_hardlink_refuse(self):
+        for fault in ('symlink','fifo','hardlink'):
+            with self.subTest(fault=fault):
+                runtime=self.root/('namespace-'+fault);runtime.mkdir()
+                lock=runtime/'delivery.lock';foreign=self.root/('foreign-'+fault)
+                foreign.write_bytes(b'foreign bytes')
+                if fault=='symlink':lock.symlink_to(foreign)
+                elif fault=='fifo':os.mkfifo(lock)
+                else:os.link(foreign,lock)
+                with self.assertRaises((PermissionError,OSError)):
+                    with self.ops.lifecycle_owner(runtime,operation='activate',release_id='release-a',
+                            release_identity=release(),deadline=self.deadline):
+                        self.fail('unsupported lock acquired')
+                self.assertEqual(foreign.read_bytes(),b'foreign bytes')
+
+    def test_o09_ready_and_terminal_durable_publisher_syscall_fault_matrix(self):
+        for target in ('ready','terminal'):
+            for syscall in ('write','replace','file_fsync','dir_fsync'):
+                with self.subTest(target=target,syscall=syscall),tempfile.TemporaryDirectory(dir=self.root) as temporary:
+                    root=Path(temporary);runtime=root/'runtime';gate=root/'gate'
+                    gate.write_text('{"open":false,"release_id":"release-a"}')
+                    active=[False];fired=[];commands=Commands()
+                    publish_json=self.ops.publish_json;sync=self.ops.os.fsync;replace=self.ops.os.replace
+                    def publication(path,value,**kwargs):
+                        matched=(target=='ready' and Path(path)==runtime/'release.json') or (
+                            target=='terminal' and value.get('operation')=='activate' and value.get('status')=='completed')
+                        old=active[0];active[0]=matched
+                        try:return publish_json(path,value,**kwargs)
+                        finally:active[0]=old
+                    def fail():fired.append(True);raise OSError('injected '+target+' '+syscall)
+                    def fsync(fd):
+                        directory=self.ops.stat.S_ISDIR(os.fstat(fd).st_mode)
+                        if active[0] and syscall==('dir_fsync' if directory else 'file_fsync'):fail()
+                        return sync(fd)
+                    def replacement(source,destination,*args,**kwargs):
+                        if active[0] and syscall=='replace':fail()
+                        return replace(source,destination,*args,**kwargs)
+                    class Writer:
+                        def __init__(inner,handle):inner.handle=handle
+                        def __enter__(inner):inner.handle.__enter__();return inner
+                        def __exit__(inner,*args):return inner.handle.__exit__(*args)
+                        def __getattr__(inner,name):return getattr(inner.handle,name)
+                        def write(inner,value):
+                            if active[0] and syscall=='write':fail()
+                            return inner.handle.write(value)
+                    # NamedTemporaryFile uses _io.open, distinct from the io.open
+                    # reference replaced by common fixtures. Its native file
+                    # wrapper is the write-fault boundary below.
+                    named=self.ops.tempfile.NamedTemporaryFile
+                    def temporary_file(*args,**kwargs):
+                        handle=named(*args,**kwargs)
+                        return Writer(handle) if active[0] and syscall=='write' else handle
+                    with patch.object(self.ops,'publish_json',publication),patch.object(self.ops.os,'fsync',fsync),\
+                            patch.object(self.ops.os,'replace',replacement),patch.object(self.ops.tempfile,'NamedTemporaryFile',temporary_file):
+                        with self.assertRaises(OSError):
+                            self.ops.activate(release(),profile=root/'profile',runtime=runtime,gate=gate,run=commands)
+                    self.assertTrue(fired)
+                    self.assertTrue(list((runtime/'delivery-attempts').glob('*.lifecycle-intent.json')))
+                    self.assertFalse(json.loads(gate.read_text())['open'])
+
+
+class OPS03WholeRoutingTests(unittest.TestCase):
+    """Actual whole-update callback/local helper; all publishers remain real."""
+    setUpClass=classmethod(I14UpdateTests.setUpClass.__func__)
+    setUp=I14UpdateTests.setUp
+    commands=I14UpdateTests.commands
+    deliver=I14UpdateTests.deliver
+
+    def test_o03_whole_update_calls_real_local_helper_without_self_ssh_or_reacquire(self):
+        helper=self.ops._activate_owned;flock=self.ops.fcntl.flock
+        held=[];calls=[];pending=[]
+        def acquired(fd,operation):
+            if operation & fcntl.LOCK_EX:held.append(os.fstat(fd).st_ino)
+            return flock(fd,operation)
+        def local(value,**kwargs):
+            owner=kwargs['owner'];state=self.ops._owner_before(owner)
+            self.assertEqual(len(held),2)
+            self.assertEqual(state['operation'],'whole_update')
+            receipt_files=[p for p in (self.runtime/'delivery-attempts').glob('*.json')
+                           if not p.name.endswith('.lifecycle-intent.json')]
+            pending.extend(json.loads(p.read_text()).get('pending_local_mutation') for p in receipt_files)
+            calls.append(owner)
+            result=helper(value,**kwargs)
+            self.assertEqual(len(held),2)
+            return result
+        with patch.object(self.ops.fcntl,'flock',acquired),patch.object(self.ops,'_activate_owned',local):
+            result=self.deliver()
+        self.assertEqual(result['status'],'completed',delivery_diagnostic(result,self.runtime,self.calls))
+        self.assertTrue(result['open'],delivery_diagnostic(result,self.runtime,self.calls))
+        self.assertEqual(len(calls),1)
+        self.assertTrue(any(isinstance(p,dict) and p.get('node')=='controller' for p in pending))
+        for argv in self.calls:
+            if argv[0]=='ssh':
+                words,node=release_ssh(argv)
+                if node['role']=='controller':
+                    self.assertIn(words[3],('identity','update-capabilities'))
+            self.assertFalse(argv[:3]==['nix','copy','--to'] and argv[3]=='ssh-ng://admin@controller.invalid')
+        record=json.loads((self.runtime/'release.json').read_text())
+        self.assertEqual(record['code_uuid'],'12345678-1234-1234-1234-123456789abc')
+        self.assertEqual(record['node_identity'],CONTROLLER)
+        self.assertEqual((self.root/'controller-profile').resolve(),Path('/nix/store/application'))
+        self.assertEqual((self.root/'controller-profile-solver').resolve(),Path('/nix/store/solver'))
+        self.assertFalse(list((self.runtime/'delivery-attempts').glob('*.lifecycle-intent.json')))
+
+    def test_o14_forged_local_controller_binding_never_reaches_application(self):
+        before=self.gate.read_bytes()
+        wrong={**CONTROLLER,'boot_id':WORKER['boot_id']}
+        with patch.object(self.ops,'observe_node_identity',lambda **_:wrong):
+            with self.assertRaises(ValueError):self.deliver()
+        self.assertEqual(self.gate.read_bytes(),before)
+        self.assertFalse(any(a[0]=='nix-env' for a in self.calls))
+        self.assertFalse((self.runtime/'service.env').exists())
+
+    def test_o11_legacy_protocol_rejected_before_quiesce(self):
+        original=self.commands
+        def command(argv):
+            if argv[0]=='ssh' and shlex.split(argv[-1])[-1]=='update-capabilities':
+                return json.dumps({'schema':'qcl-negf-local-update-capability-v1',
+                    'stop_update':True,'stopped_identity':True,'fleet_health':True,
+                    'aiida_two_workflow_types':True})
+            return original(argv)
+        before=self.gate.read_bytes()
+        with self.assertRaises(ValueError):
+            self.ops.deliver_cli(delivery_manifest(),self.pool,run=command,
+                enrollment='/synthetic/enrollment.json',runtime=self.runtime,gate=self.gate)
+        self.assertEqual(self.gate.read_bytes(),before)
+        self.assertFalse(any(a[:2]==['systemctl','stop'] for a in self.calls))
+
+
+class OPS03LocalIdentityTests(unittest.TestCase):
+    """LI01–LI10: real binder/validators/publishers, explicit identity DI."""
+    setUpClass=classmethod(OPS03LifecycleOwnerTests.setUpClass.__func__)
+    setUp=OPS03LifecycleOwnerTests.setUp
+    SELF_CHECK_ARGV=OPS03LifecycleOwnerTests.SELF_CHECK_ARGV
+    boundary=OPS03LifecycleOwnerTests.boundary
+    activate=OPS03LifecycleOwnerTests.activate
+    owner=OPS03LifecycleOwnerTests.owner
+    required=OPS03LifecycleOwnerTests.required
+    owned_activate=OPS03LifecycleOwnerTests.owned_activate
+
+    @contextmanager
+    def process_boot(self, identity):
+        generation=self.ops._process_generation
+        with patch.object(self.ops,'_process_generation',
+                lambda:(*generation()[:2],identity['boot_id'])):
+            yield
+
+    def original_files(self):
+        paths={self.runtime/'release.json':(json.dumps({**release(),'ready':True,
+            'provenance':'original'})+'\n').encode(),
+            self.runtime/'service.env':b'original service environment\n',
+            self.root/'code-uuid':b'original code allowlist\n'}
+        for path,raw in paths.items():path.write_bytes(raw)
+        self.profile.symlink_to('/nix/store/application')
+        self.profile.with_name(self.profile.name+'-solver').symlink_to('/nix/store/solver')
+        return paths
+
+    def unchanged_before_journal(self, original):
+        for path,raw in original.items():self.assertEqual(path.read_bytes(),raw)
+        self.assertEqual(list((self.runtime/'delivery-attempts').glob('*.lifecycle-intent.json')),[])
+        self.assertEqual(self.commands.calls,[])
+        self.assertEqual(self.profile.resolve(),Path('/nix/store/application'))
+        self.assertEqual(self.profile.with_name(self.profile.name+'-solver').resolve(),Path('/nix/store/solver'))
+
+    def test_li01_trusted_none_roles_complete_without_full_observer_or_invented_identity(self):
+        with patch.object(self.ops,'observe_node_identity',side_effect=AssertionError('None must not probe guest')) as observer:
+            for role in ('worker','controller'):
+                with self.subTest(role=role):
+                    result=self.activate(role=role,email='service@example.invalid',allowed_codes_file=self.root/'code-uuid')
+                    self.assertTrue(result['ready'])
+                    self.assertNotIn('node_identity',result)
+                    self.assertNotIn('node_identity',json.loads((self.runtime/'release.json').read_text()))
+                    self.assertFalse(json.loads(self.gate.read_text())['open'])
+            self.assertEqual(observer.call_count,0)
+
+    def test_li02_invalid_role_and_worker_update_none_refuse_before_journal(self):
+        original=self.original_files()
+        with patch.object(self.ops,'observe_node_identity',side_effect=AssertionError('unexpected observer')),\
+                patch.object(self.ops,'remove_owned_update_mask',side_effect=AssertionError('unexpected mask removal')):
+            for kwargs in ({'role':'foreign'},{'role':'worker','update_attempt_id':'11111111-1111-4111-8111-111111111111'}):
+                with self.subTest(kwargs=kwargs),self.assertRaises(ValueError):self.activate(**kwargs)
+                self.unchanged_before_journal(original)
+
+    def test_li03_schema_role_and_process_boot_mismatch_refuse_before_journal(self):
+        original=self.original_files()
+        with self.process_boot(WORKER),patch.object(self.ops,'observe_node_identity',side_effect=AssertionError('invalid pin reached observer')):
+            for expected in ({'schema':'foreign'},CONTROLLER,{**WORKER,'boot_id':CONTROLLER['boot_id']}):
+                with self.subTest(expected=expected),self.assertRaises(ValueError):
+                    self.activate(role='worker',expected_node_identity=expected)
+                self.unchanged_before_journal(original)
+
+    def test_li04_provided_expected_never_falls_back_after_bad_actual_observation(self):
+        original=self.original_files()
+        with self.process_boot(WORKER):
+            for actual in ({**WORKER,'machine_id':SECOND['machine_id']},CONTROLLER,
+                           {**WORKER,'boot_id':CONTROLLER['boot_id']}):
+                with self.subTest(actual=actual),patch.object(self.ops,'observe_node_identity',return_value=dict(actual)):
+                    with self.assertRaises(ValueError):self.activate(expected_node_identity=dict(WORKER))
+                    self.unchanged_before_journal(original)
+
+    def test_li05_actual_final_drift_blocks_ready_and_retains_journal(self):
+        observations=[]
+        def observer(**kwargs):
+            observations.append(True)
+            return dict(WORKER if len(observations)==1 else {**WORKER,'machine_id':SECOND['machine_id']})
+        with self.process_boot(WORKER),patch.object(self.ops,'observe_node_identity',observer):
+            with self.assertRaises(ValueError):self.activate(expected_node_identity=dict(WORKER))
+        self.assertEqual(len(observations),2)
+        self.assertFalse(json.loads((self.runtime/'release.json').read_text())['ready'])
+        self.assertTrue(list((self.runtime/'delivery-attempts').glob('*.lifecycle-intent.json')))
+        self.assertFalse(json.loads(self.gate.read_text())['open'])
+
+    def test_li05_mutating_caller_dict_cannot_change_pinned_identity(self):
+        supplied=dict(WORKER);seen=[]
+        def command(argv):
+            result=self.boundary(argv)
+            if argv[0]=='nix-store':
+                supplied.update(role='controller',machine_id=SECOND['machine_id'],boot_id=SECOND['boot_id'])
+            return result
+        def observer(**kwargs):seen.append(True);return dict(WORKER)
+        with self.process_boot(WORKER),patch.object(self.ops,'observe_node_identity',observer):
+            result=self.activate(expected_node_identity=supplied,run=command)
+        self.assertGreaterEqual(len(seen),2)
+        self.assertEqual(result['node_identity'],WORKER)
+        self.assertEqual(json.loads((self.runtime/'release.json').read_text())['node_identity'],WORKER)
+        self.assertNotEqual(supplied,WORKER)
+        self.assertFalse(list((self.runtime/'delivery-attempts').glob('*.lifecycle-intent.json')))
+
+    def test_li06_whole_update_cannot_downgrade_to_process_only(self):
+        original=self.original_files()
+        with self.owner('whole_update') as owner:
+            with self.assertRaises(PermissionError):self.owned_activate(owner)
+        self.unchanged_before_journal(original)
+
+    def test_li07_binding_once_forbids_full_none_role_and_identity_rebind(self):
+        binder=self.ops._bind_activation_identity
+        cases=((WORKER,None,'worker'),(None,WORKER,'worker'),
+               (None,None,'controller'),(WORKER,{**WORKER,'machine_id':SECOND['machine_id']},'worker'))
+        with self.process_boot(WORKER):
+            for first,second,next_role in cases:
+                with self.subTest(first=first,second=second,next_role=next_role),self.owner() as owner:
+                    bound=binder(owner,role='worker',expected_node_identity=first)
+                    self.assertEqual(binder(owner,role='worker',expected_node_identity=first),bound)
+                    if bound[1] is not None:
+                        with self.assertRaises(TypeError):bound[1]['machine_id']=SECOND['machine_id']
+                    with self.assertRaises(PermissionError):
+                        self.owned_activate(owner,role=next_role,expected_node_identity=second,
+                            email='service@example.invalid',allowed_codes_file=self.root/'code-uuid')
+        self.assertFalse(list((self.runtime/'delivery-attempts').glob('*.lifecycle-intent.json')))
+        self.assertEqual(self.commands.calls,[])
+
+    def test_li08_cli_none_cannot_bypass_protected_role(self):
+        original=self.original_files();source=self.root/'manifest.json';source.write_text(json.dumps(release()))
+        argv=['release','activate','--manifest',str(source),'--role','worker',
+              '--runtime',str(self.runtime),'--gate',str(self.gate)]
+        with patch.object(sys,'argv',argv),patch.object(self.ops,'command',side_effect=AssertionError('unexpected native command')):
+            with self.assertRaisesRegex(ValueError,'Protected release role'):self.ops.main()
+        self.unchanged_before_journal(original)
+
+    def test_li10_none_cannot_bypass_changed_process_generation(self):
+        original=self.original_files();generation=self.ops._process_generation
+        with self.owner() as owner:
+            with patch.object(self.ops,'_process_generation',
+                    lambda:(generation()[0],generation()[1]+1,generation()[2])):
+                with self.assertRaises(PermissionError):self.owned_activate(owner)
+        self.unchanged_before_journal(original)
+
+
+class OPS03StoppedIdentityTests(unittest.TestCase):
+    setUpClass=classmethod(EffectiveRuntimeMaskTests.setUpClass.__func__)
+    setUp=EffectiveRuntimeMaskTests.setUp
+    effective_fixture=EffectiveRuntimeMaskTests.effective_fixture
+    stopped_fixture=EffectiveRuntimeMaskTests.stopped_fixture
+
+    def test_li09_stopped_proof_precedes_mask_removal_and_running_observer_waits_for_restart(self):
+        fs=self.stopped_fixture();observer=self.ops.observe_node_identity;observed=[]
+        def running(**kwargs):
+            self.assertEqual(fs.state['ActiveState'],'active','running observer before restart')
+            observed.append(True)
+            return observer(**kwargs)
+        with patch.object(self.ops,'observe_node_identity',running):
+            result=self.ops.activate(release(),profile=fs.profile,runtime=fs.runtime,gate=fs.gate,
+                role='worker',run=fs.native,expected_node_identity=dict(WORKER),
+                update_attempt_id=fs.attempt,deadline=200.)
+        self.assertTrue(result['ready']);self.assertEqual(result['node_identity'],WORKER)
+        self.assertGreaterEqual(len(observed),2)
+        self.assertFalse(fs.real(self.ops.EFFECTIVE_MASK).is_symlink())
+        self.assertTrue(any(a[:2] in (['systemctl','start'],['systemctl','restart']) for a in fs.calls))
