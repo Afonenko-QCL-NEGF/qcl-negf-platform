@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -113,7 +114,8 @@ class ShutdownIntentTests(unittest.TestCase):
                 value = self.intent()
                 facts.append((value["phase"], value["capture_complete"]))
             if "pause" in args:
-                with release.lifecycle_owner(self.runtime):
+                with release.lifecycle_owner(self.runtime, operation='shutdown_capture',
+                        release_id=None, deadline=time.monotonic()+30):
                     self.assertEqual(self.intent()["jobs"]["101"]["owner"], "alice")
         self.run.on_call = hook
         self.assertFalse(self.shutdown())
@@ -124,6 +126,98 @@ class ShutdownIntentTests(unittest.TestCase):
         self.assertTrue(self.shutdown())
         self.assertEqual(self.intent()["phase"], "safe_to_power_off")
         self.assertEqual(self.intent()["jobs"], {})
+
+    def test_ops03_o15_same_node_startup_contends_during_runner_wait(self):
+        # Complete real capture/finalize first, but hold the finite invocation
+        # at its return boundary while shutdown_step still owns the node lock.
+        # An awaiting-jobs fixture would let startup refuse incomplete scope
+        # before exposing its missing node-lock acquisition on the baseline.
+        context = multiprocessing.get_context('fork')
+        ready = context.Event()
+        finish = context.Event()
+        def client():
+            original = worker._shutdown_owned_poll
+            def finalized(*args, **kwargs):
+                result = original(*args, **kwargs)
+                if result is not True:
+                    raise AssertionError('fixture did not reach complete safe-stop scope')
+                ready.set()
+                if not finish.wait(5):
+                    raise AssertionError('finite shutdown-return wait watchdog')
+                return result
+            with patch.object(worker, '_shutdown_owned_poll', finalized):
+                self.shutdown()
+        process = context.Process(target=client)
+        process.start()
+        try:
+            self.assertTrue(ready.wait(5), 'shutdown did not finalize safe-stop scope')
+            self.assertEqual(self.intent()['phase'], 'safe_to_power_off')
+            self.assertTrue(self.intent()['capture_complete'])
+            self.assertEqual(self.intent()['jobs'], {})
+            before = (self.state / 'worker.json').read_bytes()
+            self.run.identity = {**WORKER, 'boot_id': NEW_BOOT}
+            # Contention must be the reason; pending intent alone is not a
+            # substitute for holding the node lock across the Runner wait.
+            with self.assertRaises(BlockingIOError):
+                self.startup()
+            self.assertEqual((self.state / 'worker.json').read_bytes(), before)
+            self.no_resume()
+            self.assertFalse(any(' activate ' in a[-1] for a in self.run.calls if a[0] == 'ssh'))
+        finally:
+            finish.set()
+            process.join(5)
+            if process.is_alive():
+                process.kill()
+                process.join(5)
+        self.assertEqual(process.exitcode, 0)
+
+    def test_ops03_o16_startup_node_lock_released_after_failed_preflight(self):
+        path = self.runtime / 'shutdown-worker.lock'
+        path.write_bytes(b'original lock bytes')
+        with path.open('r+') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaises(BlockingIOError):
+                self.startup()
+        self.assertEqual(path.read_bytes(), b'original lock bytes')
+        # The fake startup owns no scientific job and submits no recovery job.
+        self.run.calls.clear()
+        self.startup()
+        self.assertFalse(any(a[0] in ('sbatch', 'scancel') for a in self.run.calls))
+
+    def test_ops03_o15_other_node_progresses_while_runner_waits_and_update_is_inhibited(self):
+        from test_worker_lifecycle import job
+        self.run.lines=[job('101','alice')]
+        context=multiprocessing.get_context('fork');ready=context.Event();finish=context.Event()
+        def client():
+            def on_call(argv):
+                if 'pause' in argv:
+                    ready.set()
+                    if not finish.wait(5):raise AssertionError('Runner wait watchdog')
+            self.run.on_call=on_call
+            self.shutdown()
+        process=context.Process(target=client);process.start()
+        try:
+            self.assertTrue(ready.wait(5))
+            self.assertEqual(self.intent()['phase'],'awaiting_jobs')
+            second=FakeCommands();second.identity=dict(SECOND)
+            self.assertTrue(worker.shutdown_step('second',self.state,enrollment=self.enrollment,
+                target='admin@second.invalid',run=second))
+            self.assertEqual(json.loads((self.state/'second.json').read_text())['phase'],'safe_to_power_off')
+            before=list(self.run.calls)
+            with self.assertRaises(RuntimeError):
+                release.deliver_cli(manifest_fixture(),pool(),run=self.run,enrollment=self.enrollment,
+                    runtime=self.runtime,gate=self.gate)
+            self.assertEqual(self.run.calls,before)
+            profile=self.runtime/'profile'
+            with self.assertRaises(RuntimeError):
+                release.activate(manifest_fixture(),profile=profile,runtime=self.runtime,
+                    gate=self.gate,run=self.run)
+            self.assertEqual(self.run.calls,before)
+            self.no_resume()
+        finally:
+            finish.set();process.join(5)
+            if process.is_alive():process.kill();process.join(5)
+        self.assertEqual(process.exitcode,0)
 
     def test_same_boot_denied_new_boot_authorized_and_idempotent(self):
         self.assertTrue(self.shutdown())
@@ -176,10 +270,10 @@ class ShutdownIntentTests(unittest.TestCase):
 
     def test_orphan_capture_empty_retry_and_new_boot_never_clear(self):
         real = worker._state_write
-        def crash(path, value):
+        def crash(path, value, **kwargs):
             if value["phase"] == "awaiting_jobs":
                 raise OSError("crash before durable capture")
-            real(path, value)
+            real(path, value, **kwargs)
         with patch.object(worker, "_state_write", crash), self.assertRaises(OSError):
             self.shutdown()
         self.assertFalse(self.intent()["capture_complete"])
@@ -209,7 +303,8 @@ class ShutdownIntentTests(unittest.TestCase):
         self.no_resume()
 
     def test_global_busy_lock_cannot_mutate_shutdown(self):
-        with release.lifecycle_owner(self.runtime), self.assertRaises(BlockingIOError):
+        with release.lifecycle_owner(self.runtime, operation='shutdown_capture',
+                release_id=None, deadline=time.monotonic()+30), self.assertRaises(BlockingIOError):
             self.shutdown()
         self.assertFalse((self.state / "worker.json").exists())
         self.assertTrue(all(args[0] == "ssh" and args[-1].endswith(" identity") for args in self.run.calls))
@@ -238,11 +333,11 @@ class ShutdownIntentTests(unittest.TestCase):
         self.shutdown()
         self.run.identity = {**WORKER, "boot_id": NEW_BOOT}
         real = worker._state_write
-        def broken_terminal(path, value):
+        def broken_terminal(path, value, **kwargs):
             if value["phase"] in ("resumed", "reconciliation_required"):
-                real(path, value)  # Model replace succeeds, directory fsync then fails.
+                real(path, value, **kwargs)  # Model replace succeeds, directory fsync then fails.
                 raise OSError("synthetic terminal directory fsync failed after replace")
-            real(path, value)
+            real(path, value, **kwargs)
         with patch.object(worker, "_state_write", broken_terminal), self.assertRaises(OSError):
             self.startup()
         self.assertEqual(sum("State=RESUME" in args for args in self.run.calls), 1)
@@ -289,7 +384,8 @@ class ShutdownIntentTests(unittest.TestCase):
             child.join(3)
             self.assertFalse(child.is_alive(), "OWN fake child must be reaped")
             self.assertEqual(child.exitcode, 0)
-            with release.lifecycle_owner(self.runtime):
+            with release.lifecycle_owner(self.runtime, operation='shutdown_capture',
+                    release_id=None, deadline=time.monotonic()+30):
                 with self.assertRaises(RuntimeError):
                     release.lifecycle_guard(self.runtime)
             with self.assertRaises(RuntimeError):

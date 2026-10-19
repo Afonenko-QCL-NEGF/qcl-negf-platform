@@ -103,6 +103,8 @@ def _shutdown_budget(authority, run, *, timeout_seconds, command_timeout_seconds
     used = authority["used_output_bytes"] if initial else 0
     def bounded(args):
         nonlocal used
+        if getattr(bounded, 'owner', None) is not None:
+            release._owner_before(bounded.owner, deadline)
         release.deadline_check(deadline)
         available = min(command_output_bytes, delivery_output_bytes - used)
         if available <= 0:
@@ -114,7 +116,10 @@ def _shutdown_budget(authority, run, *, timeout_seconds, command_timeout_seconds
         if count > available or used > delivery_output_bytes:
             raise ValueError("Shutdown step output budget exceeded")
         release.deadline_check(deadline)
+        if getattr(bounded, 'owner', None) is not None:
+            release._owner_before(bounded.owner, deadline)
         return output
+    bounded.deadline = deadline
     return bounded
 
 
@@ -140,7 +145,7 @@ def _shutdown_preflight(node, target, enrollment, runtime, run, *, timeout_secon
     return authority, record, bounded
 
 
-def _durable_directory_namespace(path):
+def _durable_directory_namespace(path, before=None):
     """Confirm every containing entry, even on retry after prior fsync failure.
 
     The filesystem root is the reachable anchor. Each ancestor is opened without
@@ -151,24 +156,25 @@ def _durable_directory_namespace(path):
     contract (later path publication is not a capability-safe filesystem API).
     """
     path = Path(path).absolute()
+    before = before or (lambda: None)
     if ".." in path.parts or path == Path("/"):
         raise ValueError("Private lifecycle namespace needs an absolute non-root path")
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    parent = os.open("/", flags)
+    before(); parent = os.open("/", flags)
     try:
         for index, name in enumerate(path.parts[1:]):
             try:
-                os.mkdir(name, mode=0o700, dir_fd=parent)
+                before(); os.mkdir(name, mode=0o700, dir_fd=parent)
             except FileExistsError:
                 pass
-            child = os.open(name, flags, dir_fd=parent)
+            before(); child = os.open(name, flags, dir_fd=parent)
             try:
                 if index == len(path.parts) - 2:
-                    os.fchmod(child, 0o700)
-                os.fsync(child)
+                    before(); os.fchmod(child, 0o700)
+                before(); os.fsync(child)
                 # Existing entries also require this barrier: a previous call
                 # may have created them but failed before syncing their parent.
-                os.fsync(parent)
+                before(); os.fsync(parent)
             except BaseException:
                 os.close(child)
                 raise
@@ -178,9 +184,10 @@ def _durable_directory_namespace(path):
         os.close(parent)
 
 
-def _state_write(path, value):
-    _durable_directory_namespace(path.parent)
-    publish_json(path, value, mode=0o600)
+def _state_write(path, value, *, owner=None):
+    before = (lambda: release._owner_before(owner)) if owner is not None else None
+    _durable_directory_namespace(path.parent, before=before)
+    publish_json(path, value, mode=0o600, before=before)
 
 
 def _pending_jobs(value):
@@ -231,9 +238,11 @@ def _merge_scope(pending, active):
 
 def _shutdown_owned_poll(node, state, authority, record, bounded):
     runtime, path = Path(state).parent, Path(state) / (node + ".json")
-    with release.lifecycle_owner(runtime):
+    with release.lifecycle_owner(runtime, operation='shutdown_capture', release_id=None,
+                                 deadline=bounded.deadline) as owner:
+        bounded.owner = owner
         release.recheck_controller_authority(authority, run=bounded)
-        release.lifecycle_guard(runtime, normal_intents=False)
+        release.lifecycle_guard(runtime, normal_intents=False, owner=owner)
         observation = release.identity_probe(record["target"], trust_snapshot=authority["trust_snapshot"], run=bounded)
         bound = release.bind_node_observation(record, observation)
         value = None
@@ -248,7 +257,7 @@ def _shutdown_owned_poll(node, state, authority, record, bounded):
                 migrated.update(origin="legacy_v1", boot_id=None, phase="reconciliation_required",
                     capture_complete=False, jobs=old_jobs, requires_reconciliation=True,
                     reason="legacy_missing_boot_and_scope_authority", legacy_evidence_base64=base64.b64encode(raw).decode())
-                _state_write(path, migrated)
+                _state_write(path, migrated, owner=owner)
                 raise RuntimeError("Legacy shutdown evidence retained; trusted reconciliation required")
             release.validate_shutdown_intent(value, node)
             _pending_jobs(value["jobs"])
@@ -260,21 +269,22 @@ def _shutdown_owned_poll(node, state, authority, record, bounded):
                 if value.get("capture_complete") is not True:
                     value.update(phase="reconciliation_required", requires_reconciliation=True,
                                  reason="orphan_capture_unknown_scope")
-                    _state_write(path, value)
+                    _state_write(path, value, owner=owner)
                     raise RuntimeError("Orphan capture cannot become idle/safe on empty retry")
         if value is None or value["phase"] == "resumed":
             value = _new_shutdown_intent(node, record, bound, authority, runtime)
-            _state_write(path, value)
+            _state_write(path, value, owner=owner)
         shutdown_id = value["shutdown_id"]
         value.update(phase="capture_pending", capture_complete=False, pending_action="drain_capture")
-        _state_write(path, value)
+        _state_write(path, value, owner=owner)
         bounded(["scontrol", "update", "NodeName=" + node, "State=DRAIN", "Reason=windows-shutdown"])
         active = jobs(node, bounded)
         pending = copy.deepcopy(value["jobs"])
         _merge_scope(pending, active)
         value.update(phase="awaiting_jobs", capture_complete=True, pending_action=None, jobs=pending)
-        _state_write(path, value)
+        _state_write(path, value, owner=owner)
     # Scoped Runner waits are deliberately outside common owner, under per-node flock.
+    bounded.owner = None
     verified = []
     for job_id, descriptor in pending.items():
         try:
@@ -283,9 +293,11 @@ def _shutdown_owned_poll(node, state, authority, record, bounded):
             verified.append(job_id)
         except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
             print(f"Waiting for job {job_id} ({descriptor['execution_id']} attempt {descriptor['attempt']}): {error}", file=sys.stderr)
-    with release.lifecycle_owner(runtime):
+    with release.lifecycle_owner(runtime, operation='shutdown_finalize', release_id=None,
+                                 deadline=bounded.deadline) as owner:
+        bounded.owner = owner
         release.recheck_controller_authority(authority, run=bounded)
-        release.lifecycle_guard(runtime, normal_intents=False)
+        release.lifecycle_guard(runtime, normal_intents=False, owner=owner)
         value = release.read_shutdown_intent(path, node)
         if value["shutdown_id"] != shutdown_id or value["phase"] != "awaiting_jobs":
             raise RuntimeError("Shutdown ownership changed during stop verification")
@@ -299,13 +311,32 @@ def _shutdown_owned_poll(node, state, authority, record, bounded):
                 if job_id not in final_active:
                     remaining.pop(job_id, None)
             value.update(jobs=remaining, phase="awaiting_jobs" if remaining else "safe_to_power_off")
-            _state_write(path, value)
+            _state_write(path, value, owner=owner)
         except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
             value.update(phase="reconciliation_required", requires_reconciliation=True,
                          reason="capture_finalize_unknown")
-            _state_write(path, value)
+            _state_write(path, value, owner=owner)
             raise
     return value["phase"] == "safe_to_power_off"
+
+
+@release.contextmanager
+def _normal_node_owner(node, runtime, deadline):
+    release.deadline_check(deadline)
+    if not IDENTIFIER.fullmatch(node):
+        raise ValueError('Invalid normal lifecycle node')
+    path = Path(runtime) / ('shutdown-' + node + '.lock')
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not release.stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise PermissionError('Unsupported normal lifecycle lock')
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        release.deadline_check(deadline)
+        yield
+    finally:
+        os.close(fd)
 
 
 def shutdown_step(node, state=RUNTIME / "shutdown", *, enrollment, target, run=command,
@@ -317,8 +348,7 @@ def shutdown_step(node, state=RUNTIME / "shutdown", *, enrollment, target, run=c
         timeout_seconds=timeout_seconds, command_timeout_seconds=command_timeout_seconds,
         command_output_bytes=command_output_bytes, delivery_output_bytes=delivery_output_bytes)
     state.parent.mkdir(parents=True, exist_ok=True)
-    with (state.parent / ("shutdown-" + node + ".lock")).open("w") as owner:
-        fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with _normal_node_owner(node, state.parent, bounded.deadline):
         return _shutdown_owned_poll(node, state, authority, record, bounded)
 
 
@@ -349,23 +379,24 @@ def _public_startup(actual, node, bound, value):
             "shutdown_id": value.get("shutdown_id"), "phase": "resumed"}
 
 
-def _exclusive_attempt_json(path, value):
+def _exclusive_attempt_json(path, value, *, owner=None):
     """New immutable owner evidence only: never replace any preexisting CR04 bytes."""
-    _durable_directory_namespace(path.parent)
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    before = (lambda: release._owner_before(owner)) if owner is not None else (lambda: None)
+    _durable_directory_namespace(path.parent, before=before)
+    before(); descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     try:
         raw = memoryview((json.dumps(value, sort_keys=True) + "\n").encode())
         while raw:
-            count = os.write(descriptor, raw)
+            before(); count = os.write(descriptor, raw)
             if count <= 0:
                 raise OSError("Startup evidence write made no progress")
             raw = raw[count:]
-        os.fsync(descriptor)
+        before(); os.fsync(descriptor)
     finally:
         os.close(descriptor)
-    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    before(); directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        os.fsync(directory)
+        before(); os.fsync(directory)
     finally:
         os.close(directory)
 
@@ -373,6 +404,17 @@ def _exclusive_attempt_json(path, value):
 def startup(node, target, *, enrollment, runtime=RUNTIME, gate=GATE, run=command,
             delivery_timeout_seconds=1800.0, command_timeout_seconds=360.0,
             command_output_bytes=1048576, delivery_output_bytes=8388608):
+    deadline = time.monotonic() + release.duration(delivery_timeout_seconds, 'Startup timeout')
+    with _normal_node_owner(node, runtime, deadline):
+        return _startup_node_owned(node, target, enrollment=enrollment, runtime=runtime,
+            gate=gate, run=run, delivery_timeout_seconds=delivery_timeout_seconds,
+            command_timeout_seconds=command_timeout_seconds, command_output_bytes=command_output_bytes,
+            delivery_output_bytes=delivery_output_bytes, deadline=deadline)
+
+
+def _startup_node_owned(node, target, *, enrollment, runtime, gate, run,
+                        delivery_timeout_seconds, command_timeout_seconds,
+                        command_output_bytes, delivery_output_bytes, deadline):
     """Same enrolled machine/boot and controller authority, no recovery submission."""
     if not IDENTIFIER.fullmatch(node) or not TARGET.fullmatch(target):
         raise ValueError("Use a valid Slurm node and explicit SSH target")
@@ -381,7 +423,6 @@ def startup(node, target, *, enrollment, runtime=RUNTIME, gate=GATE, run=command
             raise ValueError("Startup timeout must exceed cleanup reserve")
     release.output_bound(command_output_bytes)
     release.output_bound(delivery_output_bytes)
-    deadline = time.monotonic() + delivery_timeout_seconds
     authority = release.preflight_controller_authority(enrollment, run=run, deadline=deadline,
         command_timeout_seconds=command_timeout_seconds, command_output_bytes=command_output_bytes,
         delivery_output_bytes=delivery_output_bytes, before_remote=lambda: release.lifecycle_guard(runtime, normal_intents=False))
@@ -394,6 +435,8 @@ def startup(node, target, *, enrollment, runtime=RUNTIME, gate=GATE, run=command
     mutation_started = False
     def bounded(args):
         nonlocal used
+        if getattr(bounded, 'owner', None) is not None:
+            release._owner_before(bounded.owner, deadline)
         release.deadline_check(deadline)
         available = min(command_output_bytes, delivery_output_bytes - used)
         if available <= 0:
@@ -411,18 +454,25 @@ def startup(node, target, *, enrollment, runtime=RUNTIME, gate=GATE, run=command
             error.uncertain = mutation_started
             raise error
         release.deadline_check(deadline)
+        if getattr(bounded, 'owner', None) is not None:
+            release._owner_before(bounded.owner, deadline)
         return output
     def probe(prior_boot=None):
         actual = release.identity_probe(target, trust_snapshot=authority["trust_snapshot"], run=bounded)
         return release.bind_node_observation(binding, actual, prior_boot=prior_boot)
     runtime = Path(runtime)
     runtime.mkdir(parents=True, exist_ok=True)
-    with (runtime / "delivery.lock").open("w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    snapshot = manifest(load(runtime / 'release.json'))
+    with release.lifecycle_owner(runtime, operation='startup', release_id=snapshot['release_id'],
+            release_identity=snapshot, deadline=deadline) as owner:
+        bounded.owner = owner
         release.recheck_controller_authority(authority, run=bounded)
-        release.lifecycle_guard(runtime, normal_intents=False)
+        release.lifecycle_guard(runtime, normal_intents=False, owner=owner)
         bound = probe()
         expected = manifest(load(runtime / "release.json"))
+        if expected != snapshot:
+            raise ValueError('Release changed before startup acquired common owner')
+        release._owner_before(owner)['gate'] = str(Path(gate).absolute())
         guard(expected["release_id"], expected["solver_executable"], runtime / "release.json", gate)
         state_path = runtime / "shutdown" / (node + ".json")
         value = release.read_shutdown_intent(state_path, node) if state_path.exists() else None
@@ -443,7 +493,8 @@ def startup(node, target, *, enrollment, runtime=RUNTIME, gate=GATE, run=command
         expected_node = base64.urlsafe_b64encode(json.dumps(dict(bound["identity"])).encode()).decode()
         flags = ["--expected-node-identity-base64", expected_node,
                  "--command-timeout-seconds", str(command_timeout_seconds),
-                 "--command-output-bytes", str(command_output_bytes)]
+                 "--command-output-bytes", str(command_output_bytes),
+                 "--delivery-timeout-seconds", str(max(0, deadline-time.monotonic()-2))]
         if value is not None and value["phase"] == "resumed":
             raw = ssh(target, ["sudo", "-n", "qcl-negf-release", "check", "--manifest-base64", encoded,
                               "--role", "worker", *flags], bounded, trust_snapshot=authority["trust_snapshot"])
@@ -462,7 +513,7 @@ def startup(node, target, *, enrollment, runtime=RUNTIME, gate=GATE, run=command
         value.update(phase="returning", pending_action="drain_health_activation", startup_event=event,
             pending_return_boot_id=bound["identity"]["boot_id"], requires_reconciliation=False,
             startup_authority_context=_authority_reference(authority))
-        _state_write(state_path, value)
+        _state_write(state_path, value, owner=owner)
         resume_marker = None
         try:
             mutation_started = True
@@ -491,7 +542,7 @@ def startup(node, target, *, enrollment, runtime=RUNTIME, gate=GATE, run=command
                 raise
             guard(expected["release_id"], expected["solver_executable"], runtime / "release.json", gate)
             release.deadline_check(deadline)
-            release.lifecycle_guard(runtime, normal_intents=False)
+            release.lifecycle_guard(runtime, normal_intents=False, owner=owner)
             current = release.read_shutdown_intent(state_path, node)
             if current.get("startup_event", {}).get("event_id") != event["event_id"] or current["phase"] != "returning":
                 raise RuntimeError("Startup intent ownership changed")
@@ -500,21 +551,25 @@ def startup(node, target, *, enrollment, runtime=RUNTIME, gate=GATE, run=command
             resume_marker = runtime / "delivery-attempts" / (str(uuid.uuid4()) + ".startup-admission-intent.json")
             _exclusive_attempt_json(resume_marker, {"schema": "qcl-negf-admission-intent-v1",
                 "attempt_id": resume_marker.name.split(".")[0], "identity": expected, "node": node,
-                "startup_event_id": event["event_id"]})
+                "startup_event_id": event["event_id"]}, owner=owner)
+            release._register_artifact(owner, resume_marker)
             value.update(return_boot_id=bound["identity"]["boot_id"], pending_action="resume")
-            _state_write(state_path, value)
+            _state_write(state_path, value, owner=owner)
             bounded(["scontrol", "update", "NodeName=" + node, "State=RESUME"])
             value.update(phase="resumed", pending_action=None, requires_reconciliation=False)
-            _state_write(state_path, value)
+            _state_write(state_path, value, owner=owner)
             result = _public_startup(actual, node, bound, value)
+            release._owner_before(owner)
+            if not release._own_artifact(owner, resume_marker):
+                raise PermissionError('Startup terminal marker changed')
             resume_marker.unlink()  # Only our new marker; last fallible success action.
             return result
         except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
             value.update(phase="reconciliation_required", requires_reconciliation=True,
                          reason="startup_outcome_unknown", pending_action=value.get("pending_action") or "startup")
             try:
-                _state_write(state_path, value)
-            except OSError:
+                _state_write(state_path, value, owner=owner)
+            except (ValueError, RuntimeError, OSError):
                 # A separate marker, when created, is never cleared on failure.
                 pass
             if getattr(error, "uncertain", False) or mutation_started or isinstance(error, (RuntimeError, OSError, subprocess.SubprocessError)):
@@ -522,9 +577,12 @@ def startup(node, target, *, enrollment, runtime=RUNTIME, gate=GATE, run=command
                           "requires_reconciliation": True, "remote_outcome": "unknown", "open": False,
                           "manifest": expected, "node_identity": dict(bound["identity"]),
                           "trust_snapshot": dict(authority["trust_snapshot"])}
-                release.close_after_failure(report, expected, gate)
+                release.close_after_failure(report, expected, gate, owner=owner, deadline=deadline)
                 attempts = runtime / "delivery-attempts"
-                _exclusive_attempt_json(attempts / (str(uuid.uuid4()) + ".json"), report)
+                try:
+                    _exclusive_attempt_json(attempts / (str(uuid.uuid4()) + ".json"), report, owner=owner)
+                except (ValueError, RuntimeError, OSError):
+                    pass  # Original pending intent remains; never renew cleanup budget.
             raise
 
 
