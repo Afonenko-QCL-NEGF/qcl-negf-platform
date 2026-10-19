@@ -689,30 +689,115 @@ class EnrollmentTests(unittest.TestCase):
                         self.assertEqual(before, run.calls)
 
     def test_source_trust_substitution_does_not_change_late_transport_snapshot(self):
+        # Import only at test execution: this module also supplies enrollment facts
+        # to the release tests. Reuse their independent current-update model.
+        from test_application_release import (Commands, NativeUpdateModel, clear_aiida,
+            control_response, controller_stop_state, install_controller_config_io)
         fs = FakeProtectedFS()
         original = b"independent synthetic key bytes"
         with fs.patches():
             verified = ops.read_protected_file("/protected/known_hosts")
             frozen = ops.freeze_ssh_trust(verified, snapshot_root="/protected/snapshots")
         opened_source = sum(path == "/protected/known_hosts" for path, _, _ in fs.opens)
-        run = SyntheticCommands()
+        model, local = NativeUpdateModel(), Commands()
+        calls, remote_actions = [], []
+        observations = {"admin@controller.invalid": CONTROLLER,
+                        "admin@worker.invalid": WORKER, "admin@second.invalid": SECOND}
+        selected = ops.manifest(manifest_fixture())
         def transport(args, **kwargs):
+            calls.append(args)
             fs.nodes["/protected/known_hosts"]["bytes"] = b"late source substitution"
             if args[0] == "ssh":
                 self.assertIn("-oUserKnownHostsFile=" + frozen["path"], args)
+                self.assertIn("-oStrictHostKeyChecking=yes", args)
+                self.assertIn("-oGlobalKnownHostsFile=/dev/null", args)
             if args[:2] == ["nix", "copy"]:
-                self.assertIn(frozen["path"], kwargs["env"]["NIX_SSHOPTS"])
+                self.assertIn("-oUserKnownHostsFile=" + frozen["path"],
+                              shlex.split(kwargs["env"]["NIX_SSHOPTS"]))
             self.assertEqual(fs.nodes[frozen["path"]]["bytes"], original)
             self.assertEqual(frozen["sha256"], hashlib.sha256(original).hexdigest())
-            return run(args, **kwargs)
-        with tempfile.TemporaryDirectory() as temporary, \
+            if args[0] == "ssh":
+                self.assertIn(args[-2], observations)
+                actual = observations[args[-2]]
+                words = shlex.split(args[-1])
+                self.assertEqual(words[:3], ["sudo", "-n", "qcl-negf-release"])
+                action = words[3]
+                self.assertIn(action, ("identity", "update-capabilities", "update-identity",
+                    "stop-update", "stopped-identity", "activate", "check", "health-update", "finish-update"))
+                remote_actions.append((actual["node_name"], action))
+                if action == "identity":
+                    return json.dumps(actual)
+                if action not in ("update-capabilities", "update-identity"):
+                    def argument(name):
+                        return words[words.index(name) + 1]
+                    self.assertEqual(json.loads(base64.urlsafe_b64decode(argument("--manifest-base64"))), selected)
+                    self.assertEqual(json.loads(base64.urlsafe_b64decode(argument("--expected-node-identity-base64"))), actual)
+                    self.assertTrue(argument("--update-attempt-id"))
+                if action == "activate":
+                    model.activate(actual["node_name"])
+                    return ""
+                if action == "check":
+                    return json.dumps({"schema": "qcl-negf-node-release-check-v1",
+                                       "node_identity": actual, "release": {**selected, "ready": True}})
+                response = control_response(args, actual, model=model)
+                self.assertIsNotNone(response, "Unmodelled update action")
+                return response
+            if args[:3] == ["nix", "path-info", "--json"]:
+                self.assertEqual(args[3:], ["/nix/store/application", "/nix/store/solver"])
+                return json.dumps({item["path"]: {"narHash": item["narHash"]}
+                                   for item in manifest_fixture()["closures"]})
+            if args[:3] == ["nix", "copy", "--to"]:
+                self.assertIn(args[3], ("ssh-ng://admin@worker.invalid", "ssh-ng://admin@second.invalid"))
+                self.assertEqual(args[4:], ["/nix/store/application", "/nix/store/solver"])
+                self.assertEqual({name for name, action in remote_actions if action == "stop-update"}, {"worker", "second"})
+                return ""
+            if "scontrol" in args:
+                return model.command(args)
+            if args == ["id", "-u"]:return "1000\n"
+            if args == ["id", "-un"]:return "operator\n"
+            if args == ["env", "TZ=UTC", "LC_ALL=C", "date", "+%s"]:return "1791504120\n"
+            if args == ["squeue", "--all", "--noheader", "--format", "%i"]:return ""
+            if args[:2] == ["systemctl", "show"]:return controller_stop_state()
+            if args[0] == "findmnt":
+                return json.dumps({"filesystems": [{"target": str(gate.parent),
+                    "source": "storage.invalid:/srv/qcl-negf/jobs", "fstype": "nfs4"}]})
+            if args[0] == "runuser" and any(Path(word).name == "aiida_update_check.py" for word in args):
+                return json.dumps(clear_aiida())
+            if args[0] == "nix-env":
+                self.assertEqual(Path(args[2]).parent, Path(temporary))
+                return local(args)
+            if args[0] == "nix-store" and args[1:] == ["--verify-path", "/nix/store/application", "/nix/store/solver"]:
+                return ""
+            if args[0] == "systemctl" and args[1] in ("stop", "start", "restart", "is-active"):
+                self.assertTrue(set(args[2:]) <= {"--quiet", "qcl-negf-api.service", "qcl-negf-aiida.service", "munged.service"})
+                return ""
+            if ((args[0] == "runuser" and any(Path(word).name == "register_aiida.py" for word in args))
+                    or (args[0] == "timeout" and args[-2:] == [selected["solver_executable"], "self-check"])):
+                return local(args)
+            raise AssertionError("Unmodelled local command: " + args[0])
+        generation = ops._process_generation
+        with tempfile.TemporaryDirectory() as temporary, ExitStack() as scope, \
              patch.object(ops, "load_enrollment", lambda _: {"registry": registry(), "registry_sha256": "e" * 64, "known_hosts_bytes": original}), \
              patch.object(ops, "observe_node_identity", lambda **_: CONTROLLER), \
+             patch.object(ops, "_process_generation", lambda: (*generation()[:2], CONTROLLER["boot_id"])), \
+             patch.object(ops, "read_protected_file", side_effect=AssertionError("Frozen source must not be reread")), \
              patch.object(ops, "freeze_ssh_trust", lambda *a, **k: frozen), patch.object(ops, "command", transport):
+            install_controller_config_io(SimpleNamespace(ops=ops, addCleanup=scope.callback), Path(temporary))
             runtime, gate = Path(temporary) / "runtime", Path(temporary) / "gate"
             gate.write_text(json.dumps({"open": True, "release_id": "old"}))
             result = ops.deliver_cli(manifest_fixture(), pool(), run=transport, enrollment="/protected/registry.json", runtime=runtime, gate=gate)
-            self.assertTrue(result["open"])
+            self.assertTrue(result["open"], result)
+            self.assertEqual(result["status"], "completed")
+            self.assertFalse(result["requires_reconciliation"])
+            record = json.loads(Path(result["receipt"]).read_text())
+            self.assertEqual(record["controller_authority"]["trust_snapshot"], dict(frozen))
+            self.assertEqual(set(record["worker_stop"]), {"worker", "second"})
+            self.assertEqual(set(record["fleet_health"]), {"controller", "worker", "second"})
+            for name in ("worker", "second"):
+                for action in ("update-capabilities", "stop-update", "stopped-identity", "activate", "check", "health-update", "finish-update"):
+                    self.assertIn((name, action), remote_actions)
+                self.assertEqual(record["worker_stop"][name]["attempt_id"], result["attempt_id"])
+            self.assertEqual(sum(args[:3] == ["nix", "copy", "--to"] for args in calls), 2)
         self.assertEqual(sum(path == "/protected/known_hosts" for path, _, _ in fs.opens), opened_source)
         self.assertNotEqual(fs.nodes["/protected/known_hosts"]["bytes"], original)
 
