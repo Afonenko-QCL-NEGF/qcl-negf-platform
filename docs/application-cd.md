@@ -379,7 +379,7 @@ maintenance gate; `requires_os_maintenance` candidates are refused by this appli
 Source fakes/stdlib tests do not establish native QueryBuilder NULL semantics, mask/proc/cgroup
 permissions, NFS durability, installed runtime, guest/restore, CI or scientific acceptance.
 
-Update metadata bytes are conservatively precharged upper bounds (32 MiB per action), not
+Update metadata bytes are conservatively precharged upper bounds (64 MiB per action), not
 server IO measurements. Actual returned bytes are separate. Reads include sentinel reservations;
 iterator caps charge before each access, including skipped names. Health, marker cleanup and
 update activation share finite action deadlines. Expired probes/publications retain own cleanup
