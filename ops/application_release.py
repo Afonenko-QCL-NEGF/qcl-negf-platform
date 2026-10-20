@@ -1608,8 +1608,9 @@ def _deliver_pool_owned(manifest_value, nodes, gate=GATE, *, owner, deliver, qui
             if getattr(error, "uncertain", False):
                 report.update(requires_reconciliation=True, remote_outcome="unknown")
             save("node_failed")
-            if isinstance(error, CommandFailure) or getattr(error, "uncertain", False):
-                break
+            # Every selected node is required. A known negative is still a
+            # stop-dispatch boundary; uncertainty only changes reconciliation.
+            break
         save("node_finished")
     if all(item["status"] == "verified" for item in report["nodes"].values()):
         try:
@@ -2884,10 +2885,13 @@ def _deliver_cli_locked(expected, pool, run, *, owner, runtime, gate, authority,
                     stage.update(phase='finish_update',node=worker,remote=True,mutation=True)
                     finish=unique_json(ssh(selected[worker]['target'],remote_args(worker,'finish-update'),run,trust_snapshot=authority['trust_snapshot']),4096)
                     if finish!={'attempt_id':attempt_id,'marker_removed':True}:raise ValueError('Update marker cleanup incomplete')
+                # Local journal publication and own-intent removal are fallible
+                # completion steps after admission opened, just like worker cleanup.
+                _finish_owned(owner, deadline=deadline)
             except (ValueError,RuntimeError,OSError,subprocess.SubprocessError) as error:
+                if isinstance(error, CommandFailure):
+                    report['command_failure'] = error.record
                 close_after_failure(report,expected,gate,owner=owner,deadline=deadline);report['admission_error']=str(error);checkpoint(report)
-        if report.get('status') == 'completed':
-            _finish_owned(owner, deadline=deadline)
         if report.get("status") == "completed" and intent_path.exists():
             try:
                 # Last fallible success action. Crash may restore an unsynced deletion,
