@@ -169,6 +169,7 @@ class AdoptedDomainSpec:
     inode_ceiling: int
     consumers: tuple
     inventory_ref: str
+    owner_uid: int = 3000
 
 
 def collect_bound_domain(specs):
@@ -191,7 +192,7 @@ def collect_bound_domain(specs):
         root = os.fstat(spec.root_fd); carrier = os.fstat(spec.carrier_fd)
         _need(stat.S_ISDIR(root.st_mode) and
               (root.st_dev, root.st_ino, root.st_uid) == spec.root_identity and
-              root.st_uid == 3000 and stat.S_ISBLK(carrier.st_mode) and
+              root.st_uid == _uint(spec.owner_uid) and stat.S_ISBLK(carrier.st_mode) and
               root.st_dev == carrier.st_rdev, 'native root/carrier identity changed')
         row = mounts.get(spec.mount_id)
         _need(row and row[2] == str(os.major(root.st_dev)) + ':' + str(os.minor(root.st_dev)),
@@ -294,6 +295,12 @@ class NativeBinding:
         # Must authenticate live S via the credentialled retained channel/pidfd;
         # worker need not read root-only /proc/S/exe.
         raise ProviderRefusal('live root issuer channel unavailable')
+
+    def prepare_launch(self, consume):
+        """Legacy test adapters have no Linux setup; Site overrides before fork."""
+
+    def prepare_child(self, control_fd):
+        """Site closes Root custody and contains the child before credential drop."""
 
     def authenticate_consume(self, record):
         raise ProviderRefusal('Root consume backend unavailable')
@@ -471,6 +478,7 @@ class FixedRootSupervisor:
         consume = self.backend.authenticate_consume(consume_record)
         _need(type(consume) is bytes and consume, 'authenticated consume record required')
         self._used = True  # no retry, even after uncertain fork/send
+        self.backend.prepare_launch(consume)
         parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         parent.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
         child.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
@@ -482,6 +490,7 @@ class FixedRootSupervisor:
                 # Linux PR_SET_PDEATHSIG, then close fork/parent-death race.
                 import ctypes
                 libc = ctypes.CDLL(None, use_errno=True)
+                self.backend.prepare_child(child.fileno())
                 os.setgroups([]); os.setgid(3000); os.setuid(3000)
                 # Credential changes clear PDEATHSIG, so install it AFTER drop.
                 _need(libc.prctl(1, 9, 0, 0, 0) == 0 and os.getppid() == parent_pid,
