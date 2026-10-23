@@ -29,6 +29,11 @@
       };
     lib.mkApplication = { system, workspaceRoot }:
       self.lib.mkPythonEnvironment { inherit system workspaceRoot; };
+    lib.mkB0Helper = { system, solverPackage, controllerPackage, nativeKit }:
+      import ./nix/scientific-b0-helper.nix {
+        pkgs = nixpkgs.legacyPackages.${system};
+        inherit solverPackage controllerPackage nativeKit;
+      };
     lib.mkLocalLab = { site, system ? "x86_64-linux" }:
       import ./nix/local-lab.nix { inherit nixpkgs site system; platform = self; };
     lib.mkImages = { configurations }:

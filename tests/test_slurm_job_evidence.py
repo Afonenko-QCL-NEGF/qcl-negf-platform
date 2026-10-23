@@ -119,4 +119,39 @@ class JobEvidenceTests(unittest.TestCase):
 
 
 
-if __name__ == '__main__': unittest.main()
+class RegisteredSupervisorControls(JobEvidenceTests):
+    def retained(self):
+        snapshot = copy.deepcopy(sample())
+        exe = '/nix/store/' + '0' * 32 + '-python/bin/python3'
+        group = JOB_ROOT + '/step_batch/user/supervisor'
+        process = dict(pid=103, start_ticks=12, uids=[0]*4, exe=exe, cgroup=group,
+                       executable_identity=[8, 91], command_digest='a'*64, error=None)
+        snapshot['processes'].append(process)
+        snapshot['listpids']['rows'].append({'pid': 103, 'job_id': '7', 'step_id': 'batch'})
+        registered = self.ops.SupervisorIdentity(103, 12, IDENTITY['boot_id'], '7', group,
+                                                exe, (8, 91), 'a'*64, 'nonce1', 'root-launch-receipt')
+        return snapshot, registered
+
+    def test_only_exact_registered_root_supervisor_is_accepted(self):
+        snapshot, registered = self.retained()
+        self.assertEqual(self.ops.classify_before(snapshot, EXPECTED, registered)['status'],
+                         'pass_live_job_membership')
+        with self.assertRaises(ValueError):
+            self.ops.classify_before(snapshot, EXPECTED)
+        for key, value in (('start_ticks', 99), ('exe', '/nix/store/foreign/bin/python3'),
+                           ('executable_identity', [8, 92]), ('command_digest', 'b'*64)):
+            changed = copy.deepcopy(snapshot); changed['processes'][-1][key] = value
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                self.ops.classify_before(changed, EXPECTED, registered)
+
+    def test_registered_supervisor_does_not_allow_second_root_process(self):
+        snapshot, registered = self.retained()
+        foreign = copy.deepcopy(snapshot['processes'][-1]); foreign.update(pid=104, start_ticks=13)
+        snapshot['processes'].append(foreign)
+        snapshot['listpids']['rows'].append({'pid': 104, 'job_id': '7', 'step_id': 'batch'})
+        with self.assertRaises(ValueError):
+            self.ops.classify_before(snapshot, EXPECTED, registered)
+
+
+if __name__ == '__main__':
+    unittest.main()

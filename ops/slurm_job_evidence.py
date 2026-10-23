@@ -1,5 +1,6 @@
 """Read-only Slurm job PID/cgroup evidence. Never submit, cancel or signal jobs."""
 import argparse
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -13,6 +14,25 @@ from uuid import UUID
 
 TERMINAL = {'CANCELLED', 'COMPLETED', 'FAILED', 'TIMEOUT', 'OUT_OF_MEMORY', 'NODE_FAIL'}
 STORE_EXE = re.compile(r'/nix/store/[0-9abcdfghijklmnpqrsvwxyz]{32}-[^/]+/bin/slurmstepd\Z')
+
+
+@dataclass(frozen=True)
+class SupervisorIdentity:
+    """Exact retained S record from authenticated Root launch, never UID allowlist.
+
+    This classifier consumes native captures; constructing this record alone
+    does not authenticate a launcher or grant B0 authority.
+    """
+    pid: int
+    start_ticks: int
+    boot_id: str
+    job_id: str
+    cgroup: str
+    executable: str
+    executable_identity: tuple
+    command_digest: str
+    launch_nonce: str
+    launch_ref: str
 
 
 def need(value, message):
@@ -38,7 +58,8 @@ def same_identity(snapshot, expected):
          'Machine/boot changed during observation')
 
 
-def classify_before(snapshot, expected):
+def classify_before(snapshot, expected, supervisor=None):
+    need(supervisor is None or type(supervisor) is SupervisorIdentity, 'Typed supervisor identity required')
     root = expected_job(expected)
     same_identity(snapshot, expected)
     listing = snapshot['listpids']
@@ -64,6 +85,19 @@ def classify_before(snapshot, expected):
         if p.get('uids') == [3000] * 4:
             need(group != prefix + 'slurm' and isinstance(p.get('exe'), str) and p['exe'].startswith('/'),
                  'Task must have an observed executable and task cgroup')
+        elif supervisor is not None and p['pid'] == supervisor.pid:
+            need(type(supervisor) is SupervisorIdentity and p.get('uids') == [0] * 4
+                 and supervisor.start_ticks == p['start_ticks']
+                 and supervisor.boot_id == expected['identity']['boot_id']
+                 and supervisor.job_id == expected['job_id']
+                 and supervisor.cgroup == group and group != prefix + 'slurm'
+                 and p.get('exe') == supervisor.executable
+                 and tuple(p.get('executable_identity', ())) == supervisor.executable_identity
+                 and p.get('command_digest') == supervisor.command_digest
+                 and re.fullmatch(r'[0-9a-f]{64}', supervisor.command_digest)
+                 and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,95}', supervisor.launch_nonce)
+                 and isinstance(supervisor.launch_ref, str) and supervisor.launch_ref,
+                 'Unregistered privileged supervisor')
         else:
             need(p.get('uids') == [0] * 4 and p.get('exe') == expected['slurmstepd_executable']
                  and group == prefix + 'slurm', 'Unknown privileged/foreign job process')
@@ -72,7 +106,7 @@ def classify_before(snapshot, expected):
             'job_cgroup': root, 'processes': processes, 'listpids_rows': rows}
 
 
-def validate_before(before, expected):
+def validate_before(before, expected, supervisor=None):
     root = expected_job(expected)
     need(before['schema'] == 'qcl-negf.slurm-job-before.v1'
          and before['status'] == 'pass_live_job_membership' and before['identity'] == expected['identity']
@@ -80,13 +114,13 @@ def validate_before(before, expected):
          and before['owner_uid'] == 3000, 'Actual matching before proof required')
     classify_before({'identity_before': before['identity'], 'identity_after': before['identity'],
                      'listpids': {'rc': 0, 'rows': before['listpids_rows']},
-                     'processes': before['processes']}, expected)
+                     'processes': before['processes']}, expected, supervisor)
 
 
-def verify_after(before, current, expected):
+def verify_after(before, current, expected, supervisor=None):
     root = expected_job(expected)
     same_identity(current, expected)
-    validate_before(before, expected)
+    validate_before(before, expected, supervisor)
     old = before['processes']
     need(old and all(type(p.get('start_ticks')) is int and p['start_ticks'] > 0 for p in old),
          'Missing original start ticks')
