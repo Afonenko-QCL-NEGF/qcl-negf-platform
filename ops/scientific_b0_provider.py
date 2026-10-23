@@ -129,7 +129,7 @@ def validate_domains(proofs, placements):
           'domain backend unavailable')
     domains = {}; backings = set(); roles = set()
     for proof in proofs:
-        _need(type(proof) is DomainProof and proof.kind == 'fixed_thick', 'unbounded backing')
+        _need(type(proof) is DomainProof and proof.kind in ('fixed_thick','memory_snapshot'), 'unbounded backing')
         _need(type(proof.domain) is str and proof.domain and proof.domain not in domains,
               'duplicate domain')
         _need(type(proof.backing) is tuple and proof.backing and proof.backing not in backings,
@@ -250,6 +250,17 @@ class CapturedContent:
     publication_digest: str
     sealed_fds: tuple
     verification_ref: str
+    snapshots: tuple = ()
+    metadata: tuple | None = None
+
+
+@dataclass(frozen=True)
+class NativeOperationAdmission:
+    operation_id: str
+    descriptor_digest: str
+    profile_digest: str
+    resident: tuple
+    reference: str
 
 
 @dataclass(frozen=True)
@@ -325,6 +336,9 @@ class NativeBinding:
 
     def verify_descriptor(self, capsule, descriptor):
         raise ProviderRefusal('capture profile backend unavailable')
+
+    def register_permit(self, capsule, permit, descriptor):
+        """Legacy fixtures need no wire mapping; native client binds exact handle."""
 
     def verify_capture(self, capsule, descriptor, captured):
         raise ProviderRefusal('sealed snapshot backend unavailable')
@@ -672,6 +686,7 @@ class SingleB0Authority:
                       'capture must have reserved delegate')
                 self._ledger.reserve(descriptor.inclusive)
                 permit = CapturePermit()
+                self._backend.register_permit(self._capsule,permit,descriptor)
                 self._permits[permit] = [descriptor, 'reserved', set(), {}]
                 self._seen.add(descriptor.digest); self._sequence = _uint(self._sequence + 1)
                 return permit

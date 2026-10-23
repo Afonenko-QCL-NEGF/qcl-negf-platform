@@ -27,6 +27,7 @@ from scientific_b0_provider import (
     NativeBinding, ProviderRefusal, ProcessIdentity, AdoptedDomainSpec,
     AuthenticatedCapsule, Budget, CaptureDescriptor, CapturedContent,
     NativeDelegation, Settlement, StopResult, ChildTerminalReceipt,
+    NativeOperationAdmission,
     FixedRootSupervisor, _need, _uint, _fits, _plus, _Ledger,
     _capsule_bytes, _received_rights, _close_rights, live_identity,
     collect_bound_domain as observe_domains, validate_domains,
@@ -44,8 +45,8 @@ STATES = ('PRECONSUMED', 'CONTROLLER_BOUND', 'NODES_BOUND', 'WORKER_CLAIMED',
 EDGES = {state: (STATES[index + 1], 'SPENT_UNKNOWN') for index, state in enumerate(STATES[:-3])}
 EDGES['PAYLOAD_QUIESCENT'] = ('TERMINAL_VERIFIED', 'TERMINAL_FAILED', 'SPENT_UNKNOWN')
 EDGES['TERMINAL_VERIFIED'] = EDGES['TERMINAL_FAILED'] = EDGES['SPENT_UNKNOWN'] = ()
-# These are implementation coverage, not caller configuration booleans. B1 and
-# Runner native attach need their own reviewed source before this can change.
+# B1 still needs owning source. Legacy M1 fixture constant is not an M2 gate;
+# M2 requires the concrete retained registry plus actual kit qualification.
 CONTROLLER_IMPLEMENTED = False
 NATIVE_ATTACH_IMPLEMENTED = False
 
@@ -158,13 +159,19 @@ class DescriptorCustody:
         self.entries = {}
         self.state = 'empty'
         self.reason = None
+        self.capacity = 256
+        self.resources = {}
+        self.history = []
 
     def adopt(self, descriptors):
         _need(self.state in ('empty', 'owned') and
-              len(self.entries) + len(descriptors) <= 256, 'custody capacity/state')
+              len(self.entries) + len(self.history) + len(descriptors) <= self.capacity, 'custody capacity/state')
         for fd in descriptors:
-            _need(type(fd) is int and fd >= 0 and fd not in self.entries, 'custody duplicate fd')
+            _need(type(fd) is int and fd >= 0 and (fd not in self.entries or
+                  self.entries[fd]['state'] in ('closed','close_unknown')),'custody duplicate live fd')
         for fd in descriptors:
+            if fd in self.entries:
+                self.history.append(dict(self.entries[fd]))  # old lifetime, never retried
             self.entries[fd] = dict(fd=fd, state='owned', error=None)
         self.state = 'owned'
 
@@ -176,7 +183,20 @@ class DescriptorCustody:
 
     def receipt(self):
         return dict(state=self.state, reason=self.reason,
-                    descriptors=tuple(dict(row) for row in self.entries.values()))
+                    descriptors=tuple(dict(row) for row in self.entries.values()),
+                    resources=tuple(self.resources),history=tuple(dict(row) for row in self.history))
+
+    def retain_resource(self,label,resource):
+        _need(type(label) is str and label not in self.resources and len(self.resources)<1024*3+1,
+              'bounded native custody resource registry')
+        self.resources[label]=resource
+
+    def handoff(self,target,descriptors):
+        _need(all(fd in self.entries and self.entries[fd]['state']=='owned' for fd in descriptors),
+              'receive custody handoff not owned')
+        target.adopt(tuple(descriptors))
+        for fd in descriptors:
+            self.entries[fd]['state']='transferred'
 
     def close(self):
         if self.state == 'retained_unknown':
@@ -192,9 +212,22 @@ class DescriptorCustody:
                 row['error'] = type(error).__name__
             else:
                 row['state'] = 'closed'
-        self.state = ('close_unknown' if any(row['state'] != 'closed'
+        self.state = ('close_unknown' if any(row['state'] not in ('closed','transferred')
                       for row in self.entries.values()) else 'closed')
         return self.receipt()
+
+    def close_one(self,fd):
+        row=self.entries.get(fd)
+        _need(row is not None and row['state']=='owned','unowned/repeated descriptor close')
+        row['state']='close_dispatched'
+        try:
+            os.close(fd)
+        except BaseException as error:
+            row['state']='close_unknown'; row['error']=type(error).__name__
+            self.state='close_unknown'
+            return False
+        row['state']='closed'
+        return True
 
 
 def _custody_note(primary, owner):
@@ -464,15 +497,23 @@ class SiteNativeBinding(NativeBinding):
         self.primary = None; self.sequence = 0; self._rpc_sequence = 0; self.stop_reserved = False
         self._scheduler_calls = 0
         self._registry = {}; self._descriptors = {}; self._terminal = None
+        self._native_operations={}; self._native_permits={}
         self._ledger = _Ledger(budget_record(self.intent['total']), budget_record(self.intent['stop']))
         ceiling = Budget(read=4*1024**4, write=2*1024**4, log=1024**3,
                          resident=128*1024**3, memory=128*1024**3,
                          wall_ns=72*3600*1_000_000_000, inodes=(1 << 64)-1,
                          calls=(1 << 64)-1, scopes=1024)
         _need(_fits(self._ledger.total, ceiling), 'consumed slot exceeds fixed B0 ceilings')
+        self.native = None
+        if 'native_registration' in self.admission:
+            from scientific_b0_m2 import NativeRegistry
+            self.native = NativeRegistry(self,self.admission['native_registration'])
 
     def close(self, primary=None):
         owner = self.custody.owner
+        native=getattr(self,'native',None)
+        if native is not None and not self._launch_started:
+            native.close_mappings()
         if self._launch_started:
             # Even a failed fork/handshake may have uncertain descendants. This
             # one bounded owner is retained by the Root caller, never abandoned
@@ -490,13 +531,15 @@ class SiteNativeBinding(NativeBinding):
                     'native_kit', 'release', 'code', 'profiles_digest', 'domains', 'placements',
                     'capacity', 'scheduler', 'cgroups', 'writable_mounts', 'approved_argv',
                     'approved_env', 'worker_executable', 'controller_receipt', 'operation_profiles')
+        if self.admission.get('schema')=='qcl-b0-worker-admission.v2':
+            required=required+('native_registration',)
         exact(self.admission, required)
         exact(self.intent, ('schema', 'consume_ref', 'cp_revision', 'slot_id', 'attempt_id', 'nonce',
                             'admission_sha256', 'source_graph', 'model', 'plan', 'criteria', 'runtime',
                             'native_kit', 'release', 'code', 'profiles_digest', 'total', 'stop',
                             'root_boot', 'root_deadline_ns'))
         a, i = self.admission, self.intent
-        _need(a['schema'] == 'qcl-b0-worker-admission.v1' and
+        _need(a['schema'] in ('qcl-b0-worker-admission.v1','qcl-b0-worker-admission.v2') and
               i['schema'] == 'qcl-b0-consumed-intent.v1', 'manifest schema')
         # No self-referential hash: admission digest covers its body excluding
         # intent_sha256; intent independently includes that body digest.
@@ -531,7 +574,7 @@ class SiteNativeBinding(NativeBinding):
         _need(type(record) is bytes and record == self.intent_raw, 'foreign consumed intent')
         # Mandatory implementation gates cannot be caller-supplied receipts.
         _need(CONTROLLER_IMPLEMENTED, 'controller_induced_bound_missing')
-        _need(NATIVE_ATTACH_IMPLEMENTED, 'qualified_native_attach_missing')
+        _need(self.native is not None, 'qualified_native_attach_missing')
         return self.intent_raw
 
     def prepare_launch(self, consume):
@@ -609,6 +652,9 @@ class SiteNativeBinding(NativeBinding):
                   'visible mount alias coverage changed')
             specs.append(spec)
         proofs = observe_domains(tuple(specs))
+        native=getattr(self,'native',None)
+        if native is not None:
+            proofs=proofs+(native.memory_proof(),)
         validate_domains(proofs, tuple(tuple(row) for row in self.admission['placements']))
         return proofs
 
@@ -732,7 +778,7 @@ class SiteNativeBinding(NativeBinding):
         self._scheduler(blocked_child)
         domains = self._domain_readback(); self._cgroup_readback()
         # This remains compulsory even if worker-only tests exercise readbacks.
-        _need(CONTROLLER_IMPLEMENTED and NATIVE_ATTACH_IMPLEMENTED,
+        _need(CONTROLLER_IMPLEMENTED and self.native is not None,
               'controller/native coverage missing; no full capsule')
         self.once.advance('NODES_BOUND', 'WORKER_CLAIMED',
                           dict(issuer=asdict(issuer), worker=asdict(blocked_child),
@@ -747,6 +793,7 @@ class SiteNativeBinding(NativeBinding):
         self.raw = canonical(row)
         self.worker = blocked_child
         self.capsule = capsule_record(self.raw)
+        self.native.bind(self.capsule)
         # Durable CAPSULE_SENT precedes sendmsg in FixedRootSupervisor. A lost
         # send or response never returns this record to fresh/retry state.
         self.once.advance('WORKER_CLAIMED', 'CAPSULE_SENT', dict(capsule=self.capsule.digest))
@@ -790,6 +837,17 @@ class SiteNativeBinding(NativeBinding):
         return Settlement(0, capsule.stop, Budget(), (), 'root-registry:stop-reservation')
 
     def verify_descriptor(self, capsule, descriptor):
+        native=getattr(self,'native',None)
+        if native is not None:
+            self.check_current(capsule)
+            args=descriptor if type(descriptor) is dict else native.capture_descriptor(descriptor)
+            result=native.reserve(dict(digest=capsule.digest,operation_kind=native._profile(args['profile_digest'])['kind'],
+                profile_digest=args['profile_digest'],descriptor=args))
+            self._native_operations[args['digest']]=result['operation_id']
+            if type(descriptor) is CaptureDescriptor:
+                return descriptor
+            return NativeOperationAdmission(result['operation_id'],args['digest'],args['profile_digest'],
+                tuple(sorted(result['resident']['lease'].items())),'native-operation:'+result['operation_id'])
         self.check_current(capsule)
         _need(type(descriptor) is CaptureDescriptor and descriptor.digest not in self._descriptors and
               len(self._registry) + len(descriptor.delegates) + 1 <= 1024, 'descriptor replay/capacity')
@@ -800,7 +858,22 @@ class SiteNativeBinding(NativeBinding):
         self._descriptors[descriptor.digest] = descriptor
         return descriptor
 
+    def register_permit(self,capsule,permit,descriptor):
+        _need(capsule==self.capsule and descriptor.digest in self._native_operations and
+              permit not in self._native_permits,'unregistered/duplicate native capture permit')
+        self._native_permits[permit]=self._native_operations[descriptor.digest]
+
     def verify_capture(self, capsule, descriptor, captured):
+        native=getattr(self,'native',None)
+        if native is not None:
+            _need(capsule==self.capsule and type(captured) is CapturedContent and captured.metadata is not None,
+                  'typed captured metadata/actual fds required')
+            operation_id=self._native_operations[descriptor.digest]
+            args=dict(digest=capsule.digest,operation_id=operation_id,descriptor_digest=descriptor.digest,
+                content_digest=captured.content_digest,publication_digest=captured.publication_digest,
+                snapshots=[dict(row) for row in captured.snapshots],metadata=dict(captured.metadata))
+            native.capture(args,captured.sealed_fds)
+            return captured
         self.check_current(capsule)
         _need(type(captured) is CapturedContent and self._descriptors.get(descriptor.digest) == descriptor,
               'unregistered capture')
@@ -809,13 +882,23 @@ class SiteNativeBinding(NativeBinding):
         raise ProviderRefusal('qualified native snapshot custody unavailable')
 
     def delegate(self, capsule, permit, index, bound):
-        self.check_current(capsule)
-        self.freeze_normal(capsule, 'qualified native attach unavailable')
-        raise ProviderRefusal('qualified native attach unavailable')
+        _need(capsule==self.capsule and self.native is not None and permit in self._native_permits,
+              'native installation/permit binding missing')
+        operation_id=self._native_permits[permit]
+        result,descriptors=self.native.delegate(dict(digest=capsule.digest,operation_id=operation_id,index=index))
+        _need(Budget(**result['bound'])==bound,'native child bound mismatch')
+        return NativeDelegation(capsule.attempt_id,self.native.operations[operation_id]['descriptor']['digest'],
+            index,bound,(result['delegate_id'],descriptors),'native-delegate:'+result['delegate_id'])
 
     def settle_delegate(self, capsule, permit, index, receipt):
-        self.freeze_normal(capsule, 'native settlement unknown')
-        raise ProviderRefusal('native settlement unknown; debt retained')
+        _need(capsule==self.capsule and self.native is not None and permit in self._native_permits,
+              'native settlement permit binding missing')
+        operation=self.native.operations[self._native_permits[permit]]
+        record=operation['delegates'].get(index)
+        _need(record is not None and type(receipt) is dict,'actual terminal locator required')
+        row=self.native.settle(dict(digest=capsule.digest,operation_id=operation['id'],delegate_id=record['id'],
+                                    index=index,native_receipt=receipt))
+        return settlement_record(row)
 
     def freeze_normal(self, capsule, primary):
         _need(capsule == self.capsule, 'foreign freeze')
@@ -823,6 +906,9 @@ class SiteNativeBinding(NativeBinding):
             self.primary = str(primary)[:512] or 'unknown failure'
             self._ledger.freeze(self.primary)
             try:
+                native=getattr(self,'native',None)
+                if native is not None:
+                    native.freeze(self.primary)
                 if self.once.state in ('NORMAL', 'AUTHORITY_CLAIMED', 'CAPSULE_SENT'):
                     # Early failure skips normal successors, never back to fresh.
                     if self.once.state == 'NORMAL':
@@ -855,11 +941,59 @@ class SiteNativeBinding(NativeBinding):
     def quiesce_job(self, capsule, stop_permit, primary):
         _need(capsule == self.capsule and self.stop_reserved and self.primary == primary,
               'foreign STOP')
-        # No fabricated checkpoint/generation or successful fd drain. Native kit
-        # has not supplied a verified generation and terminal I/O remains unknown.
+        if self.native is not None:
+            pending=self.native.stop(dict(digest=capsule.digest,stop_id=self.native.config['stop_profile']['stop_id'],primary=primary))
+            return StopResult('unknown',self.primary,None,None,
+                Settlement(0,capsule.stop,None,('awaiting_quiescence',),pending['request_id']))
         return StopResult('unknown', self.primary, None, None,
             Settlement(0, capsule.stop, None, ('native_stop', 'payload_quiescence',
                        'outer_job_terminal'), 'root-registry:stop-unknown'))
+
+    def _kill_owned_payload(self):
+        """One cgroup-v2 actuator on the retained exclusive payload subtree.
+
+        A successful write is an attempted kill, never population/reap proof.
+        S and all ancestors are excluded by fresh identity/enclosure readback.
+        """
+        self._cgroup_readback()
+        index=next(i for i,row in enumerate(self.admission['cgroups']) if row['role']=='payload')
+        path=self.admission['cgroups'][index]['path']; own=cgroup_of(os.getpid())
+        _need(own!=path and not own.startswith(path+'/'),'payload actuator includes S')
+        fd=os.open('cgroup.kill',os.O_WRONLY|os.O_CLOEXEC|os.O_NOFOLLOW,
+                   dir_fd=self.custody.cgroup_fds[index])
+        self.custody.owner.adopt((fd,))
+        try:
+            _need(os.write(fd,b'1\n')==2,'payload kill write unknown')
+        finally:
+            _need(self.custody.owner.close_one(fd),'payload actuator close unknown')
+
+    def _receive_rpc(self,raw,ancillary,flags,pid):
+        installed=_received_rights(ancillary)
+        receiver=DescriptorCustody(); receiver.capacity=1024
+        receiver.adopt(tuple(installed))
+        try:
+            _need(flags & ~socket.MSG_CMSG_CLOEXEC==0 and raw and 1<=len(ancillary)<=2,
+                  'RPC peer/EOF/rights')
+            credentials=[]; ordered=[]
+            for level,kind,payload in ancillary:
+                _need(level==socket.SOL_SOCKET,'unknown RPC ancillary')
+                if kind==socket.SCM_CREDENTIALS:
+                    _need(len(payload)==12,'RPC credential layout')
+                    credentials.append(struct.unpack('3i',payload))
+                elif kind==socket.SCM_RIGHTS:
+                    values=array.array('i'); _need(len(payload)%values.itemsize==0,'RPC rights layout')
+                    values.frombytes(payload); ordered.extend(values)
+                else:
+                    raise ProviderRefusal('unknown RPC ancillary')
+            _need(credentials==[(pid,3000,3000)] and len(ordered)==len(installed),'RPC credentials/rights')
+            self._receive_owner=receiver
+            return self.dispatch(decode(raw),tuple(ordered))
+        finally:
+            self._receive_owner=None
+            receipt=receiver.close()
+            if receipt['state']=='close_unknown':
+                self.custody.owner.retain_resource('rpc-close-unknown:'+str(self._rpc_sequence),receiver)
+                self.custody.owner.retain_unknown('unvalidated_rpc_right_close_unknown')
 
     def supervise_child(self, pid, pidfd, capsule_fd, control_channel):
         _need(self.worker is not None and (pid, self.worker.start_ticks) ==
@@ -867,34 +1001,46 @@ class SiteNativeBinding(NativeBinding):
         control_channel.settimeout(1)
         end = self.capsule.deadline_ns
         grace = _uint(self.capsule.stop.wall_ns)
-        _need(0 < grace <= 60_000_000_000, 'finite prepaid STOP grace required')
+        _need(0 < grace <= self.capsule.total.wall_ns, 'finite prepaid STOP grace required')
         status = None
+        timer=None
         try:
+            if getattr(self,'native',None) is not None:
+                timer=os.timerfd_create(time.CLOCK_MONOTONIC,flags=os.TFD_CLOEXEC|os.TFD_NONBLOCK)
+                self.custody.owner.adopt((timer,))
+                os.timerfd_settime_ns(timer,flags=os.TFD_TIMER_ABSTIME,initial=end)
             while time.monotonic_ns() < end:
                 waited, status = os.waitpid(pid, os.WNOHANG)
                 if waited == pid:
                     break
+                if timer is not None:
+                    ready,_,_=select.select([control_channel,timer],[],[],min(1,max(0,(end-time.monotonic_ns())/1e9)))
+                    _need(timer not in ready,'worker native deadline')
+                    if control_channel not in ready:
+                        continue
                 try:
                     raw, ancillary, flags, _ = control_channel.recvmsg(PACKET_MAX,
                         socket.CMSG_SPACE(4096), socket.MSG_CMSG_CLOEXEC)
                 except socket.timeout:
                     continue
-                delivered = _received_rights(ancillary)
-                try:
-                    _need(flags & ~socket.MSG_CMSG_CLOEXEC == 0 and raw and not delivered and
-                          len(ancillary) == 1 and ancillary[0][:2] ==
-                          (socket.SOL_SOCKET, socket.SCM_CREDENTIALS) and
-                          struct.unpack('3i', ancillary[0][2]) == (pid, 3000, 3000), 'RPC peer/EOF/rights')
-                    reply = self.dispatch(decode(raw))
-                    encoded = canonical(reply); _need(len(encoded) <= PACKET_MAX, 'RPC reply cap')
-                    _need(control_channel.send(encoded) == len(encoded), 'RPC short reply')
-                    if self.primary is not None:
-                        end = min(end, time.monotonic_ns() + grace)
-                finally:
-                    _close_rights(delivered)
+                reply=self._receive_rpc(raw,ancillary,flags,pid)
+                encoded = canonical(reply); _need(len(encoded) <= PACKET_MAX, 'RPC reply cap')
+                outbound=getattr(self,'_reply_rights',())
+                ancillary_out=[(socket.SOL_SOCKET,socket.SCM_RIGHTS,array.array('i',outbound))] if outbound else []
+                _need(control_channel.sendmsg([encoded],ancillary_out)==len(encoded),'RPC short reply')
+                if self.primary is not None:
+                    end = min(end, time.monotonic_ns() + grace)
+                    if timer is not None:
+                        os.timerfd_settime_ns(timer,flags=os.TFD_TIMER_ABSTIME,initial=end)
             else:
                 raise ProviderRefusal('worker deadline')
             _need(status is not None, 'child reap unknown')
+            native=getattr(self,'native',None)
+            if native is not None:
+                terminal=native.observe_terminal(status)
+                _need(terminal['status']=='PAYLOAD_QUIESCENT','native payload custody unknown')
+                return ChildTerminalReceipt(pid,self.worker.start_ticks,status,
+                                            'payload-quiescent:'+hashlib.sha256(canonical(terminal)).hexdigest())
             counters = self._cgroup_readback()
             self._write_receipt(dict(status='SPENT_UNKNOWN', primary=self.primary or 'worker exited',
                 worker=asdict(self.worker), issuer=asdict(self.issuer), wait_status=status,
@@ -912,11 +1058,20 @@ class SiteNativeBinding(NativeBinding):
                 # Always attempt owned-child cleanup, even if durable freeze or
                 # secondary bookkeeping fails. Never replace the thrown primary.
                 try:
-                    _cleanup_owned_child(pid, pidfd, self.worker.start_ticks,
-                                         time.monotonic_ns() + grace)
-                except BaseException as cleanup_error:
-                    _secondary(error, 'payload cleanup unknown', cleanup_error)
+                    if getattr(self,'native',None) is not None:
+                        self._kill_owned_payload()
+                except BaseException as actuator_error:
+                    _secondary(error,'payload actuator unknown',actuator_error)
+                finally:
+                    try:
+                        _cleanup_owned_child(pid, pidfd, self.worker.start_ticks,
+                                             time.monotonic_ns() + grace)
+                    except BaseException as cleanup_error:
+                        _secondary(error, 'payload cleanup unknown', cleanup_error)
             raise
+        finally:
+            if timer is not None:
+                self.custody.owner.close_one(timer)
 
     def _write_receipt(self, receipt):
         raw = canonical(receipt)
@@ -927,7 +1082,7 @@ class SiteNativeBinding(NativeBinding):
             done += count
         os.fsync(self.custody.receipt_fd)
 
-    def dispatch(self, packet):
+    def dispatch(self, packet, rights=()):
         exact(packet, ('sequence', 'opcode', 'slot', 'attempt', 'nonce', 'args'))
         _need(type(packet['sequence']) is int and packet['sequence'] == self._rpc_sequence and
               (packet['slot'], packet['attempt'], packet['nonce']) ==
@@ -936,6 +1091,28 @@ class SiteNativeBinding(NativeBinding):
         opcode, args = packet['opcode'], packet['args']
         _need(type(args) is dict, 'RPC args')
         try:
+            self._reply_rights=()
+            native=getattr(self,'native',None)
+            if native is not None:
+                native.dispatch_cost(opcode,args)
+            if opcode in ('reserve_operation','verify_capture','delegate','settle','stop') or \
+               (opcode=='current' and 'projection' in args):
+                _need(native is not None,'M2 native installation missing')
+                _need(opcode=='verify_capture' or not rights,'unexpected M2 rights')
+                if opcode=='reserve_operation':
+                    result=native.reserve(args)
+                elif opcode=='verify_capture':
+                    result=native.capture(args,rights)
+                elif opcode=='delegate':
+                    result,self._reply_rights=native.delegate(args)
+                elif opcode=='settle':
+                    result=native.settle(args)
+                elif opcode=='stop':
+                    result=native.stop(args)
+                else:
+                    result=native.current(args)
+                return dict(sequence=packet['sequence'],result=result,error=None)
+            _need(not rights,'unexpected control RPC rights')
             if opcode == 'issuer':
                 exact(args, ()); result = asdict(self.issuer_identity())
             elif opcode == 'verify':
@@ -987,13 +1164,19 @@ def capsule_record(raw):
     return AuthenticatedCapsule(**values)
 
 
+def settlement_record(row):
+    exact(row,('sequence','requested','actual','unknown','reference'))
+    return Settlement(_uint(row['sequence']),budget_record(row['requested']),
+        None if row['actual'] is None else budget_record(row['actual']),tuple(row['unknown']),row['reference'])
+
+
 class WorkerNativeBindingClient(NativeBinding):
     """Synchronous client of the retained issuer, never a new allowance issuer.
 
     Every packet is credentialled by Linux. Duplicating this object/fd restarts
     sequence0 and the retained S rejects it. C only learns S identity via channel.
     """
-    def __init__(self, control_fd, slot, attempt, nonce):
+    def __init__(self, control_fd, slot, attempt, nonce, operation_profiles=None):
         self.channel = socket.socket(fileno=os.dup(control_fd))
         _need(self.channel.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) == socket.SOCK_SEQPACKET,
               'seqpacket control required')
@@ -1001,8 +1184,13 @@ class WorkerNativeBindingClient(NativeBinding):
         self.channel.settimeout(5)
         self.slot, self.attempt, self.nonce = token(slot), token(attempt), token(nonce)
         self.sequence = 0; self.capsule = None; self.issuer = None; self.failed = False
+        self.operation_profiles={} if operation_profiles is None else operation_profiles
+        _need(type(self.operation_profiles) is dict,'fixed operation profile table required')
+        self._operations={}; self._permits={}; self._delegates={}; self._received_owner=DescriptorCustody()
+        self._received_owner.capacity=256+1024*70
+        self._last_rights=()
 
-    def _call(self, opcode, args):
+    def _call(self, opcode, args, send_rights=(), accept_rights=False):
         _need(not self.failed, 'client frozen')
         sequence = self.sequence; self.sequence = _uint(sequence + 1)
         packet = canonical(dict(sequence=sequence, opcode=opcode, slot=self.slot,
@@ -1010,17 +1198,45 @@ class WorkerNativeBindingClient(NativeBinding):
         _need(len(packet) <= PACKET_MAX, 'RPC request cap')
         installed = set()
         try:
-            _need(self.channel.send(packet) == len(packet), 'RPC short send')
+            outgoing=[(socket.SOL_SOCKET,socket.SCM_RIGHTS,array.array('i',send_rights))] if send_rights else []
+            _need(self.channel.sendmsg([packet],outgoing) == len(packet), 'RPC short send')
             raw, ancillary, flags, _ = self.channel.recvmsg(PACKET_MAX,
                 socket.CMSG_SPACE(4096), socket.MSG_CMSG_CLOEXEC)
             installed = _received_rights(ancillary)
-            _need(flags & ~socket.MSG_CMSG_CLOEXEC == 0 and not installed and len(ancillary) == 1 and
-                  ancillary[0][:2] == (socket.SOL_SOCKET, socket.SCM_CREDENTIALS), 'RPC ancillary/EOF')
-            credentials = struct.unpack('3i', ancillary[0][2])
-            _need(credentials == (os.getppid(), 0, 0), 'RPC root parent mismatch')
+            _need(flags & ~socket.MSG_CMSG_CLOEXEC == 0 and 1<=len(ancillary)<=2,'RPC ancillary/EOF')
+            credentials=[]; ordered=[]
+            for level,kind,payload in ancillary:
+                _need(level==socket.SOL_SOCKET,'unknown RPC ancillary')
+                if kind==socket.SCM_CREDENTIALS:
+                    credentials.append(struct.unpack('3i',payload))
+                elif kind==socket.SCM_RIGHTS:
+                    values=array.array('i'); _need(len(payload)%values.itemsize==0,'RPC rights layout')
+                    values.frombytes(payload); ordered.extend(values)
+                else:
+                    raise ProviderRefusal('unknown RPC ancillary')
+            _need(credentials==[(os.getppid(),0,0)] and len(ordered)==len(installed),'RPC root parent mismatch')
             reply = exact(decode(raw), ('sequence', 'result', 'error'))
             _need(type(reply['sequence']) is int and reply['sequence'] == sequence and reply['error'] is None,
                   'RPC refused/sequence mismatch')
+            if installed:
+                _need(accept_rights and opcode=='delegate','unexpected RPC rights')
+                table=reply['result']['fd_table']
+                _need(type(table) is list and len(table)==len(ordered),'grant rights/table count')
+                for index,(fd,row) in enumerate(zip(ordered,table)):
+                    exact(row,('index','role','dev','ino','access','length','domain_id','file_id'))
+                    info=os.fstat(fd)
+                    _need(row['index']==index and (info.st_dev,info.st_ino,info.st_size)==
+                          (row['dev'],row['ino'],row['length']),'grant actual fd identity')
+                grants=[ordered[index] for index,row in enumerate(table) if row['role']=='grant']
+                _need(len(grants)==1,'exact sealed grant required')
+                grant=decode(_capsule_bytes(grants[0]))
+                _need(grant['capsule_digest']==self.capsule.digest and grant['operation_id']==args['operation_id'] and
+                      grant['fd_table']==table,'native grant registry/capsule binding')
+                self._received_owner.adopt(tuple(ordered)); self._last_rights=tuple(ordered)
+                installed.clear()
+            else:
+                _need(not accept_rights,'missing native grant rights')
+                self._last_rights=()
             return reply['result']
         except BaseException:
             self.failed = True
@@ -1072,8 +1288,69 @@ class WorkerNativeBindingClient(NativeBinding):
     def freeze_normal(self, capsule, primary):
         return self._call('freeze', dict(digest=capsule.digest, primary=str(primary)[:512]))
 
-    # Native methods inherit fail-closed refusals; M1 does not impersonate the
-    # qualified native kit or infer a successful settlement from caller JSON.
+    def reserve_operation(self,capsule,kind,descriptor):
+        _need(capsule==self.capsule,'foreign native operation')
+        result=self._call('reserve_operation',dict(digest=capsule.digest,operation_kind=kind,
+            profile_digest=descriptor['profile_digest'],descriptor=descriptor))
+        self._operations[descriptor['digest']]=result['operation_id']
+        return NativeOperationAdmission(result['operation_id'],descriptor['digest'],descriptor['profile_digest'],
+            tuple(sorted(result['resident']['lease'].items())),'native-operation:'+result['operation_id'])
+
+    def verify_descriptor(self,capsule,descriptor):
+        if type(descriptor) is dict:
+            profile=self.operation_profiles.get(descriptor['profile_digest'])
+            _need(profile is not None,'fixed native producer profile missing')
+            return self.reserve_operation(capsule,profile['kind'],descriptor)
+        _need(type(descriptor) is CaptureDescriptor,'typed capture descriptor')
+        profile=self.operation_profiles.get(descriptor.profile_digest)
+        _need(profile is not None and profile['descriptor']['digest']==descriptor.digest,'fixed capture/native profile missing')
+        native=decode(canonical(profile['descriptor']))
+        observed=self._call('current',dict(digest=capsule.digest,projection=dict(action='snapshot',
+            profile_digest=descriptor.profile_digest,inventory=native['resident']['inventory'])))
+        native['resident']['expected_revision']=observed['projection']['data']['revision']
+        self.reserve_operation(capsule,profile['kind'],native)
+        return descriptor
+
+    def register_permit(self,capsule,permit,descriptor):
+        _need(capsule==self.capsule and permit not in self._permits and descriptor.digest in self._operations,
+              'unregistered/replayed capture permit')
+        self._permits[permit]=self._operations[descriptor.digest]
+
+    def verify_capture(self,capsule,descriptor,captured):
+        _need(capsule==self.capsule and type(captured) is CapturedContent and captured.metadata is not None,
+              'actual capture metadata/fds required')
+        self._call('verify_capture',dict(digest=capsule.digest,operation_id=self._operations[descriptor.digest],
+            descriptor_digest=descriptor.digest,content_digest=captured.content_digest,
+            publication_digest=captured.publication_digest,snapshots=[dict(row) for row in captured.snapshots],
+            metadata=dict(captured.metadata)),captured.sealed_fds)
+        return captured
+
+    def delegate(self,capsule,permit,index,bound):
+        _need(capsule==self.capsule and permit in self._permits,'native delegate permit binding')
+        result=self._call('delegate',dict(digest=capsule.digest,operation_id=self._permits[permit],index=index),accept_rights=True)
+        _need(budget_record(result['bound'])==bound,'native delegate bound mismatch')
+        self._delegates[(permit,index)]=result['delegate_id']
+        descriptor=next(key for key,value in self._operations.items() if value==self._permits[permit])
+        return NativeDelegation(capsule.attempt_id,descriptor,index,bound,
+            (result['delegate_id'],self._last_rights),'native-delegate:'+result['delegate_id'])
+
+    def settle_delegate(self,capsule,permit,index,receipt):
+        _need(capsule==self.capsule and (permit,index) in self._delegates and type(receipt) is dict,
+              'native terminal locator/permit required')
+        return settlement_record(self._call('settle',dict(digest=capsule.digest,operation_id=self._permits[permit],
+            delegate_id=self._delegates[(permit,index)],index=index,native_receipt=receipt)))
+
+    def quiesce_job(self,capsule,stop_binding,primary):
+        _need(capsule==self.capsule,'foreign STOP capsule')
+        stop_ids={profile['stop_id'] for profile in self.operation_profiles.values() if 'stop_id' in profile}
+        _need(len(stop_ids)==1,'exact prebooked STOP ID required')
+        pending=self._call('stop',dict(digest=capsule.digest,stop_id=next(iter(stop_ids)),primary=primary))
+        exact(pending,('schema','status','stop_id','request_id','ack_ref','primary_ref','deadline_ns','quiescence','final_result_ref'))
+        _need(pending['schema']=='qcl.b0.stop-pending.v1' and pending['status']=='pending' and
+              pending['quiescence'] is None and pending['final_result_ref'] is None,'live caller cannot self-certify quiescence')
+        return StopResult('unknown',primary,None,None,
+            Settlement(0,capsule.stop,None,('awaiting_quiescence',),pending['request_id']))
+
 
 
 def fixed_read_command(argv, profile):

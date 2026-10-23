@@ -290,7 +290,7 @@ class ReviewRoundOneControls(unittest.TestCase):
         binding = object.__new__(site.SiteNativeBinding)
         worker = b0.ProcessIdentity(27, 28, 3000, 'boot1', (5, 6), 3, 4)
         binding.worker = worker
-        binding.capsule = MagicMock(deadline_ns=1000, stop=b0.Budget(wall_ns=100))
+        binding.capsule = MagicMock(deadline_ns=1000, stop=b0.Budget(wall_ns=100),total=b0.Budget(wall_ns=1000))
         channel = MagicMock()
         # Invalid peer packet creates original ProviderRefusal before dispatch.
         channel.recvmsg.return_value = (b'', [], 0, None)
