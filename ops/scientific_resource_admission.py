@@ -50,6 +50,28 @@ class ScienceCapacityFacts:
 
 
 @dataclass(frozen=True)
+class AggregateStorageProof:
+    """Authenticated backend simultaneous attempt/owner/campaign proof, not a flag.
+
+    Included inside facts returned by the trusted verifier. Domains are canonical
+    backing identities; placements cover exactly USED roles, including controller
+    ORM/repository/WAL/spool when used. Shared backing aliases use one domain.
+    """
+    binding: Mapping
+    baseline_id: str
+    operation_id: str
+    operation_digest: str
+    domain_backing: tuple
+    placements: tuple
+    scopes: tuple
+    evidence: tuple
+
+    def __post_init__(self):
+        for name in ('binding', 'domain_backing', 'placements', 'scopes', 'evidence'):
+            object.__setattr__(self, name, _freeze(getattr(self, name)))
+
+
+@dataclass(frozen=True)
 class ScienceCapacityDecision:
     cpu_ids: tuple
     workers: int
@@ -263,9 +285,9 @@ def _storage(value, request, authority, epoch):
           c1.get('atomic_all_scopes') is True and c1.get('reconcile_required_on_unknown') is True,
           'C1_unavailable', 'needs_admission')
     domains = set(request['storage_growth'])
-    # This pure candidate has no independently checked simultaneous aggregate
-    # campaign/owner peak proof. Per-domain C1 coverage is not that inequality.
-    _need(len(domains) <= 1, 'aggregate_capacity_proof_unavailable')
+    aggregate = authority.get('aggregate_storage')
+    _need(len(domains) <= 1 or type(aggregate) is AggregateStorageProof,
+          'aggregate_capacity_proof_unavailable')
     _need(domains and domains <= set(c1['domains']), 'C1_domain_coverage', 'needs_admission')
     enforcer = authority.get('enforcer')
     _need(isinstance(enforcer, Mapping) and enforcer.get('id') and enforcer.get('evidence') and
@@ -319,7 +341,51 @@ def _storage(value, request, authority, epoch):
         result.append(bounds)
     _need(all(scopes == {'attempt', 'owner', 'filesystem', 'campaign'} for scopes in covered.values()),
           'missing_scope', 'needs_admission')
+    if len(domains) > 1:
+        _aggregate_storage(aggregate, value, request, authority, backing, epoch)
     return tuple(result)
+
+
+def _aggregate_storage(proof, value, request, authority, backing, epoch):
+    _binding(proof.binding, authority['binding'])
+    _need(proof.evidence and proof.baseline_id == value['baseline_id'] and
+          proof.operation_id == request['operation_id'] and
+          proof.operation_digest == request['operation_digest'], 'aggregate_binding', 'needs_admission')
+    pairs = dict(proof.domain_backing)
+    _need(len(pairs) == len(proof.domain_backing) and pairs == backing and
+          len(set(pairs.values())) == len(pairs), 'aggregate_backing_alias', 'needs_admission')
+    actual = tuple(sorted((root['role'], root['domain']) for root in value['roots']))
+    _need(tuple(sorted(proof.placements)) == actual and len(set(proof.placements)) == len(actual),
+          'aggregate_USED_placement_coverage', 'needs_admission')
+    covered = set()
+    for scope in _sequence(proof.scopes):
+        kind = scope['scope']
+        _need(kind in ('attempt', 'owner', 'campaign') and kind not in covered and
+              scope['epoch'] == epoch and scope['baseline_id'] == value['baseline_id'] and
+              scope['scope_id'] and set(scope['views']) == set(_VIEWS),
+              'aggregate_scope_binding', 'needs_admission')
+        if kind == 'attempt':
+            _need(scope['scope_id'] == authority['binding']['attempt_id'] and
+                  scope['units'] == 'logical_bytes;physical_bytes;inodes',
+                  'aggregate_attempt_identity', 'needs_admission')
+        covered.add(kind)
+        rows = [row for row in value['scopes'] if row['scope'] == kind]
+        _need(len(rows) == len(backing), 'aggregate_domain_coverage', 'needs_admission')
+        for name in _VIEWS:
+            row = scope['views'][name]
+            # No anonymous extra copies: backend's simultaneous E/U/S must equal
+            # exact deduplicated USED per-domain accounting at the same baseline.
+            for key in ('E', 'U', 'S'):
+                _need(_int(row[key]) == _sum(item['views'][name][key] for item in rows),
+                      'aggregate_counter_mismatch', 'needs_admission')
+            _need(_int(row['P']) == 0, 'descriptor_already_charged')
+            pending = _sum(growth[name] for growth in request['storage_growth'].values())
+            growth = _sum((row['U'], pending, row['S']))
+            if kind == 'attempt' and name in ('logical_bytes', 'physical_bytes'):
+                _need(_int(row['A']) <= 128 * 1024 ** 3, 'aggregate_attempt_slot_ceiling')
+            _need(_sum((row['E'], growth)) <= _int(row['A']), 'aggregate_total_capacity')
+            _need(growth <= _headroom(row, scope), 'aggregate_remaining_headroom')
+    _need(covered == {'attempt', 'owner', 'campaign'}, 'aggregate_scope_coverage', 'needs_admission')
 
 
 def admit_scientific_capacity(facts, request, *, expected, now_ns, verify_authority):
