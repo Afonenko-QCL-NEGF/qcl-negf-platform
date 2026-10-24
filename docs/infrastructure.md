@@ -238,6 +238,10 @@ removing them. Reconcile only the rehearsal state after manual lifecycle work.
 
 ## Existing Arch host
 
+The [Linux worker onboarding guide](linux-workers.md) connects the existing Arch/libvirt route
+to exact artifact delivery, private site inputs, first-boot quarantine, protected enrollment and
+native smoke/shutdown receipts. It distinguishes source support from actual target acceptance.
+
 The optional `ansible/arch-libvirt.yml` installs libvirt/QEMU, starts libvirt, prepares a dedicated
 image directory, grants explicitly named operators libvirt access, and verifies KVM and the selected
 Linux bridge. Install the pinned `community.general` collection first:

@@ -22,6 +22,10 @@ workers run calculations under `/scratch/qcl-negf`. Storage and control remain s
 availability. See [infrastructure](docs/infrastructure.md) for resource budgets, OpenTofu image
 provisioning, disk protection and recovery boundaries.
 
+For the first external Linux worker, use the [Arch/libvirt onboarding guide](docs/linux-workers.md):
+artifact/trust inputs, initial DRAIN, protected enrollment and bounded native smoke. Other Linux
+host distributions require their own adapter acceptance.
+
 | Module                | Responsibility                                                                  |
 | --------------------- | ------------------------------------------------------------------------------- |
 | `qclNegf.cluster`     | Slurm controller/workers, cgroup CPU/RAM limits and shared job mounts           |
