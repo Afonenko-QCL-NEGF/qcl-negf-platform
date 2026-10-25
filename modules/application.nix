@@ -1,5 +1,19 @@
 { config, lib, pkgs, ... }:
 let cfg = config.qclNegf.application;
+    configurator = cfg.api.configurator;
+    configuratorEnabled = configurator.enable;
+    packageCatalogRoot = cfg.package.configuratorCatalogRoot or null;
+    solver = config.qclNegf.cluster.solverPackage;
+    configuratorBound = configuratorEnabled && solver != null &&
+      packageCatalogRoot != null && configurator.catalogRoot != null &&
+      configurator.catalogRoot == packageCatalogRoot && configurator.catalogSourceId != null;
+    apiSlice = config.systemd.services.qcl-negf-api.serviceConfig.Slice or "system.slice";
+    sliceParts = lib.splitString "-" (lib.removeSuffix ".slice" apiSlice);
+    slicePath = if apiSlice == "-.slice" then "" else
+      lib.concatStringsSep "/" (lib.imap0 (index: _:
+        lib.concatStringsSep "-" (lib.take (index + 1) sliceParts) + ".slice") sliceParts);
+    configuratorCgroupRoot = "/sys/fs/cgroup/" +
+      lib.optionalString (slicePath != "") (slicePath + "/") + "qcl-negf-api.service";
     applicationProfile = "/nix/var/nix/profiles/qcl-negf-application";
     exportSpoolDirectory = "/var/lib/qcl-negf/exports";
     bootstrapUnits = lib.optional cfg.bootstrap.enable "qcl-negf-bootstrap.service";
@@ -14,6 +28,21 @@ let cfg = config.qclNegf.application;
     apiStart = pkgs.writeShellScript "qcl-negf-api-start" ''
       set -eu
       export PATH=${applicationProfile}/bin:$PATH
+      # EnvironmentFile may describe a newer CD release. Never inherit an old
+      # or site-injected configurator binding when this unit has no exact match.
+      unset QCL_NEGF_CONFIGURATOR_EXECUTABLE QCL_NEGF_CONFIGURATOR_CATALOG_ROOT
+      unset QCL_NEGF_CONFIGURATOR_CATALOG_SOURCE_ID QCL_NEGF_CONFIGURATOR_CGROUP_ROOT
+      ${lib.optionalString configuratorBound ''
+        if [ "$(${pkgs.coreutils}/bin/readlink -f ${applicationProfile})" = ${lib.escapeShellArg (toString cfg.package)} ] \
+          && [ "''${QCL_NEGF_SOLVER_EXECUTABLE:-}" = ${lib.escapeShellArg "${solver}/bin/qcl-negf"} ] \
+          && [ -x ${lib.escapeShellArg "${solver}/bin/qcl-negf"} ] \
+          && [ -r ${lib.escapeShellArg "${configurator.catalogRoot}/config/configurator-catalog.json"} ]; then
+          export QCL_NEGF_CONFIGURATOR_EXECUTABLE=${lib.escapeShellArg "${solver}/bin/qcl-negf"}
+          export QCL_NEGF_CONFIGURATOR_CATALOG_ROOT=${lib.escapeShellArg configurator.catalogRoot}
+          export QCL_NEGF_CONFIGURATOR_CATALOG_SOURCE_ID=${lib.escapeShellArg configurator.catalogSourceId}
+          export QCL_NEGF_CONFIGURATOR_CGROUP_ROOT=${lib.escapeShellArg configuratorCgroupRoot}
+        fi
+      ''}
       ${lib.optionalString (cfg.api.allowedCodesFile != null) ''
         export QCL_NEGF_ALLOWED_CODES="$(cat ${lib.escapeShellArg cfg.api.allowedCodesFile})"
         test -n "$QCL_NEGF_ALLOWED_CODES"
@@ -45,6 +74,18 @@ in {
       maxMemoryKiB = lib.mkOption { type = lib.types.ints.positive; default = 7168000; description = "Maximum RAM KiB per API submission; align with Slurm RealMemory."; };
       defaultMemoryKiB = lib.mkOption { type = lib.types.ints.positive; default = 4194304; description = "Default RAM KiB per API submission."; };
       port = lib.mkOption { type = lib.types.port; default = 8080; description = "Loopback API port for an authenticated TLS proxy."; };
+      configurator = {
+        enable = lib.mkEnableOption "bounded source-bound Runner catalog/preview in the existing API unit";
+        catalogRoot = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = if cfg.enable then packageCatalogRoot else null;
+          description = "Immutable Research root from the selected application package passthru; explicit overrides must match it exactly.";
+        };
+        catalogSourceId = lib.mkOption {
+          type = lib.types.nullOr lib.types.str; default = null;
+          description = "Exact Research source identity from the same release Git graph as package/catalog/solver; never a guessed version or latest alias.";
+        };
+      };
       tls = {
         enable = lib.mkEnableOption "loopback-only TLS API proxy with runtime credentials";
         port = lib.mkOption { type = lib.types.port; default = 443; description = "Loopback TLS proxy port."; };
@@ -57,6 +98,11 @@ in {
   config = lib.mkIf cfg.enable {
     qclNegf.enable = true;
     assertions = [
+      { assertion = !configuratorEnabled || (cfg.api.enable && solver != null); message = "Configurator requires the existing API and selected immutable cluster solver package."; }
+      { assertion = !configuratorEnabled || (packageCatalogRoot != null && configurator.catalogRoot != null && configurator.catalogRoot == packageCatalogRoot && lib.hasPrefix "/nix/store/" configurator.catalogRoot); message = "Configurator catalog must match the selected application's immutable Research passthru."; }
+      { assertion = !configuratorEnabled || (configurator.catalogSourceId != null && builtins.match "[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}" configurator.catalogSourceId != null); message = "Configurator requires an explicit exact Research source identity from the release Git graph."; }
+      { assertion = !configuratorEnabled || lib.versionAtLeast config.systemd.package.version "254"; message = "Configurator DelegateSubgroup requires systemd >= 254."; }
+      { assertion = !configuratorEnabled || (builtins.match "[A-Za-z0-9_.:-]+[.]slice" apiSlice != null); message = "Configurator requires an ordinary explicitly bound systemd slice name."; }
       { assertion = config.qclNegf.cluster.submit || config.qclNegf.cluster.controller; message = "AiiDA requires the local Slurm submission configuration."; }
       { assertion = !cfg.bootstrap.enable || (cfg.profile == "qcl-negf" && cfg.bootstrap.email != "" && config.qclNegf.cluster.solverPackage != null); message = "Automatic bootstrap requires profile qcl-negf, a service email and the immutable cluster solver package."; }
       { assertion = !cfg.api.enable || (lib.hasPrefix "/" cfg.api.tokenFile && !(lib.hasPrefix "/nix/store/" cfg.api.tokenFile)); message = "API token requires a runtime absolute path outside the store."; }
@@ -180,6 +226,11 @@ in {
         QCL_NEGF_EXPORT_DISK_BYTES = toString cfg.api.exportDiskBytes;
         QCL_NEGF_EXPORT_TTL_SECONDS = toString cfg.api.exportTtlSeconds;
         TMPDIR = exportSpoolDirectory;
+      } // lib.optionalAttrs configuratorBound {
+        QCL_NEGF_CONFIGURATOR_EXECUTABLE = "${solver}/bin/qcl-negf";
+        QCL_NEGF_CONFIGURATOR_CATALOG_ROOT = configurator.catalogRoot;
+        QCL_NEGF_CONFIGURATOR_CATALOG_SOURCE_ID = configurator.catalogSourceId;
+        QCL_NEGF_CONFIGURATOR_CGROUP_ROOT = configuratorCgroupRoot;
       };
       serviceConfig = {
         User = "qcl-negf"; Group = "qcl-negf";
@@ -191,6 +242,10 @@ in {
         NoNewPrivileges = true;
         ProtectSystem = "strict";
         ReadWritePaths = [ "/var/lib/qcl-negf" ];
+      } // lib.optionalAttrs configuratorEnabled {
+        Delegate = "cpu memory pids";
+        DelegateSubgroup = "api";
+        KillMode = "control-group";
       };
     };
   };

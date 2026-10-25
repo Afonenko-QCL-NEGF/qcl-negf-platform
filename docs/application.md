@@ -112,3 +112,68 @@ nix build .#application
 The `build` dependency group supplies build backends from the shared lock for the Python build command. Nix builds use the same root workspace plus pinned Nix build tooling. Keep generated wheels and Nix closures in CI artifact storage or the binary cache, outside source history.
 
 Julia is a separate numerical environment owned by `QCLNEGF.jl` and its runtime adapter, `QCLNEGFRunner.jl`. Changing API or result-view code does not require rebuilding the Julia dependency environment. Install the same solver closure on submission and execution nodes.
+
+## Optional bounded configuration preview
+
+The existing API unit can opt into the Runner `configure` catalog/preview command.
+It is disabled by default. No scheduler, planner service or sudo grant is added.
+Runner owns parsing and scientific resolution; preview does not submit a run or
+establish convergence or scientific acceptance.
+
+`mkApplication` exposes `configuratorCatalogRoot` in package passthru. It is the
+exact immutable `${workspaceRoot}/components/qcl-negf-research` tree and retains
+its catalog and referenced sources in the application closure. The existing Git
+source graph remains authoritative; this is not a second revision lock. The
+trusted release caller must take the exact Research source identity from that
+same graph and select the matching application and solver closures. A package
+path by itself does not independently prove the Research commit or installed
+Runner identity. Leave enable false when that correspondence is not established.
+
+The private site can then set:
+
+```nix
+qclNegf.application.api.configurator = {
+  enable = true;
+  # Supply this value from the selected release's existing Git graph.
+  catalogSourceId = selectedResearchSourceId;
+};
+```
+
+`catalogRoot` defaults from the selected application's passthru; an explicit root
+must match it exactly and be in `/nix/store/`. Source ID is required, finite and
+never inferred from a version, PATH, root HEAD or `latest`. Opt-in also requires
+an enabled API, the selected `qclNegf.cluster.solverPackage` and systemd >=254.
+The executable is fixed to that solver package's `/bin/qcl-negf`; there is no
+arbitrary executable option. A missing package passthru, source identity or
+mismatched catalog root fails module assertions. The prepared Runner wrapper and
+its immutable offline depot remain unchanged.
+
+The same `qcl-negf-api.service` gains `Delegate=cpu memory pids`,
+`DelegateSubgroup=api` and `KillMode=control-group`. Its existing non-root user,
+NoNewPrivileges, ProtectSystem, writable data paths, authentication and nginx
+configuration stay in force. The cgroup root is derived from the unit's actual
+Slice (including ordinary nested slice names), with the API in its `api`
+subgroup and a separate per-request leaf under the empty delegated parent.
+The adapter requires runtime unified v2/controllers/permissions, performs cap
+readback and owns child cleanup; Nix wiring alone cannot advertise readiness.
+A read-only or mismatched cgroup stays unavailable without remounting `/sys`.
+
+Four fixed unit variables bind the adapter:
+`QCL_NEGF_CONFIGURATOR_EXECUTABLE`, `QCL_NEGF_CONFIGURATOR_CATALOG_ROOT`,
+`QCL_NEGF_CONFIGURATOR_CATALOG_SOURCE_ID`, and
+`QCL_NEGF_CONFIGURATOR_CGROUP_ROOT`. The API launch script first clears inherited
+values, including values in an old runtime `service.env`. It exports the selected
+binding only if the current stable application profile resolves to the configured
+application package, runtime `QCL_NEGF_SOLVER_EXECUTABLE` matches the selected
+solver, the executable exists and the catalog asset is readable. Missing or
+foreign CD bindings leave all four unset and still start the API: existing read
+routes remain usable while `/config.configurator` reports unavailable. Normal
+CD does not silently enable a new configurator binding from an old OS unit;
+coordinate an explicit reviewed unit binding update when adopting a new pair.
+
+Before enabling on a real installation, retain the exact release graph and
+application/solver closures, perform the separately budgeted module evaluation
+and runtime delegated-v2/Runner readiness checks, and confirm the API advertises
+the intended source identity. No live activation, hard child network isolation
+or scientific acceptance follows from these source controls. The source-owned
+one-shot Runner contract uses fixed no-URI/offline inputs, not a network sandbox.
