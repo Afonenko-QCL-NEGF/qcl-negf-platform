@@ -2,6 +2,42 @@
 let cfg = config.qclNegf.application;
     configurator = cfg.api.configurator;
     configuratorEnabled = configurator.enable;
+    savedResults = cfg.api.savedResults or { enable = false; };
+    savedEnabled = savedResults.enable;
+    savedRoot = config.qclNegf.cluster.jobDirectory;
+    savedAlias = "/run/qcl-negf-saved";
+    savedMount = config.fileSystems.${savedRoot} or {};
+    finiteIdentity = value: value != null &&
+      builtins.match "[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}" value != null;
+    runtimePath = value: value != null &&
+      builtins.match "/[A-Za-z0-9_./-]+" value != null &&
+      !(lib.hasPrefix "/nix/store/" value) &&
+      lib.all (part: part != "" && part != "." && part != "..")
+        (lib.tail (lib.splitString "/" value));
+    savedBound = savedEnabled && cfg.api.enable &&
+      savedResults.namespaceId != null &&
+      builtins.match "[A-Za-z0-9][A-Za-z0-9._-]{0,127}" savedResults.namespaceId != null &&
+      finiteIdentity savedResults.storageIdentity &&
+      runtimePath savedResults.storageIdentityFile && runtimePath savedRoot &&
+      finiteIdentity savedResults.retentionPolicyId && finiteIdentity savedResults.retentionOwnerId &&
+      finiteIdentity savedResults.holdRef && finiteIdentity savedResults.accessBindingRef &&
+      savedResults.allowedComputerUuids != [] && builtins.length savedResults.allowedComputerUuids <= 64 &&
+      lib.unique savedResults.allowedComputerUuids == savedResults.allowedComputerUuids &&
+      lib.all (value: builtins.match "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}" value != null)
+        savedResults.allowedComputerUuids &&
+      (savedMount.fsType or null) == "nfs4" &&
+      (savedMount.device or null) == "${config.qclNegf.cluster.storageHost}:/srv/qcl-negf/jobs" &&
+      lib.elem "hard" (savedMount.options or []);
+    savedBinding = pkgs.writeText "qcl-negf-saved-results-binding.json" (builtins.toJSON {
+      namespace_id = savedResults.namespaceId;
+      storage_identity = savedResults.storageIdentity;
+      root = savedAlias;
+      allowed_computer_uuids = savedResults.allowedComputerUuids;
+      retention_policy_id = savedResults.retentionPolicyId;
+      retention_owner_id = savedResults.retentionOwnerId;
+      hold_ref = savedResults.holdRef;
+      access_binding_ref = savedResults.accessBindingRef;
+    });
     packageCatalogRoot = cfg.package.configuratorCatalogRoot or null;
     solver = config.qclNegf.cluster.solverPackage;
     configuratorBound = configuratorEnabled && solver != null &&
@@ -32,6 +68,29 @@ let cfg = config.qclNegf.application;
       # or site-injected configurator binding when this unit has no exact match.
       unset QCL_NEGF_CONFIGURATOR_EXECUTABLE QCL_NEGF_CONFIGURATOR_CATALOG_ROOT
       unset QCL_NEGF_CONFIGURATOR_CATALOG_SOURCE_ID QCL_NEGF_CONFIGURATOR_CGROUP_ROOT
+      unset QCL_NEGF_SAVED_RESULTS_BINDING_FILE
+      ${lib.optionalString savedBound ''
+        # Both paths must still be exact NFS mounts in this unit's namespace.
+        # A missing automount or an empty local directory is never a provider.
+        if [ "$(${pkgs.coreutils}/bin/readlink -f ${applicationProfile})" = ${lib.escapeShellArg (toString cfg.package)} ] \
+          && [ "$(${pkgs.coreutils}/bin/readlink -e ${lib.escapeShellArg savedRoot})" = ${lib.escapeShellArg savedRoot} ] \
+          && [ "$(${pkgs.coreutils}/bin/readlink -e ${savedAlias})" = ${savedAlias} ] \
+          && [ "$(${pkgs.util-linux}/bin/findmnt -rn -M ${lib.escapeShellArg savedRoot} -o FSTYPE)" = nfs4 ] \
+          && [ "$(${pkgs.util-linux}/bin/findmnt -rn -M ${lib.escapeShellArg savedRoot} -o SOURCE)" = ${lib.escapeShellArg savedMount.device} ] \
+          && [ "$(${pkgs.util-linux}/bin/findmnt -rn -M ${savedAlias} -o FSTYPE)" = nfs4 ] \
+          && [ "$(${pkgs.util-linux}/bin/findmnt -rn -M ${savedAlias} -o SOURCE)" = ${lib.escapeShellArg savedMount.device} ] \
+          && [ -r ${savedAlias} ] && [ -x ${savedAlias} ] \
+          && [ -f ${lib.escapeShellArg savedResults.storageIdentityFile} ] \
+          && [ "$(${pkgs.coreutils}/bin/readlink -e ${lib.escapeShellArg savedResults.storageIdentityFile})" = ${lib.escapeShellArg savedResults.storageIdentityFile} ] \
+          && [ "$(${pkgs.coreutils}/bin/stat -c %u ${lib.escapeShellArg savedResults.storageIdentityFile})" = 0 ] \
+          && [ "$(${pkgs.coreutils}/bin/stat -c %s ${lib.escapeShellArg savedResults.storageIdentityFile})" -le 257 ] \
+          && [ "$((0$(${pkgs.coreutils}/bin/stat -c %a ${lib.escapeShellArg savedResults.storageIdentityFile}) & 022))" -eq 0 ] \
+          && [ "$(${pkgs.coreutils}/bin/cat ${lib.escapeShellArg savedResults.storageIdentityFile})" = ${lib.escapeShellArg savedResults.storageIdentity} ]; then
+          case ",$(${pkgs.util-linux}/bin/findmnt -rn -M ${savedAlias} -o OPTIONS)," in
+            *,ro,*) export QCL_NEGF_SAVED_RESULTS_BINDING_FILE=${lib.escapeShellArg (toString savedBinding)} ;;
+          esac
+        fi
+      ''}
       ${lib.optionalString configuratorBound ''
         if [ "$(${pkgs.coreutils}/bin/readlink -f ${applicationProfile})" = ${lib.escapeShellArg (toString cfg.package)} ] \
           && [ "''${QCL_NEGF_SOLVER_EXECUTABLE:-}" = ${lib.escapeShellArg "${solver}/bin/qcl-negf"} ] \
@@ -74,6 +133,17 @@ in {
       maxMemoryKiB = lib.mkOption { type = lib.types.ints.positive; default = 7168000; description = "Maximum RAM KiB per API submission; align with Slurm RealMemory."; };
       defaultMemoryKiB = lib.mkOption { type = lib.types.ints.positive; default = 4194304; description = "Default RAM KiB per API submission."; };
       port = lib.mkOption { type = lib.types.port; default = 8080; description = "Loopback API port for an authenticated TLS proxy."; };
+      savedResults = {
+        enable = lib.mkEnableOption "registered retained NFS results through a read-only API alias";
+        namespaceId = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; description = "Finite site namespace ID; never reuse it for another storage identity."; };
+        storageIdentity = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; description = "Measured site storage/export identity, not a hostname guess."; };
+        storageIdentityFile = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; description = "Root-owned readable runtime file with the admitted storage identity; site maintains its binding to the actual NFS export."; };
+        allowedComputerUuids = lib.mkOption { type = lib.types.listOf lib.types.str; default = []; description = "Explicit AiiDA Computer UUID allowlist; each source must match one exact Computer."; };
+        retentionPolicyId = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; description = "Site policy for indefinite retention until explicit owner disposition."; };
+        retentionOwnerId = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; description = "Named site retention owner."; };
+        holdRef = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; description = "Site namespace hold evidence reference; not per-attempt proof of quiescence or closure."; };
+        accessBindingRef = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; description = "Private site admission receipt reference for storage, numeric identity and read access."; };
+      };
       configurator = {
         enable = lib.mkEnableOption "bounded source-bound Runner catalog/preview in the existing API unit";
         catalogRoot = lib.mkOption {
@@ -98,6 +168,7 @@ in {
   config = lib.mkIf cfg.enable {
     qclNegf.enable = true;
     assertions = [
+      { assertion = !savedEnabled || savedBound; message = "Saved results require an enabled API, explicit finite namespace/storage/retention/access binding, canonical runtime identity path, Computer UUIDs and the existing hard NFSv4 jobs mount."; }
       { assertion = !configuratorEnabled || (cfg.api.enable && solver != null); message = "Configurator requires the existing API and selected immutable cluster solver package."; }
       { assertion = !configuratorEnabled || (packageCatalogRoot != null && configurator.catalogRoot != null && configurator.catalogRoot == packageCatalogRoot && lib.hasPrefix "/nix/store/" configurator.catalogRoot); message = "Configurator catalog must match the selected application's immutable Research passthru."; }
       { assertion = !configuratorEnabled || (configurator.catalogSourceId != null && builtins.match "[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}" configurator.catalogSourceId != null); message = "Configurator requires an explicit exact Research source identity from the release Git graph."; }
@@ -211,7 +282,8 @@ in {
       requires = [ "qcl-negf-aiida.service" "qcl-negf-application-profile.service" ] ++ bootstrapUnits ++ config.qclNegf.runtimeSecretUnits;
       partOf = bootstrapUnits;
       after = [ "qcl-negf-aiida.service" "qcl-negf-application-profile.service" ] ++ bootstrapUnits ++ config.qclNegf.runtimeSecretUnits;
-      unitConfig.RequiresMountsFor = [ "/var/lib/qcl-negf" cfg.api.tokenFile ];
+      unitConfig.RequiresMountsFor = [ "/var/lib/qcl-negf" cfg.api.tokenFile ] ++
+        lib.optionals savedBound [ savedRoot savedResults.storageIdentityFile ];
       unitConfig.ConditionPathExists = "/var/lib/qcl-negf/aiida/.aiida/config.json";
       environment = {
         AIIDA_PATH = "/var/lib/qcl-negf/aiida";
@@ -226,6 +298,8 @@ in {
         QCL_NEGF_EXPORT_DISK_BYTES = toString cfg.api.exportDiskBytes;
         QCL_NEGF_EXPORT_TTL_SECONDS = toString cfg.api.exportTtlSeconds;
         TMPDIR = exportSpoolDirectory;
+      } // lib.optionalAttrs savedBound {
+        QCL_NEGF_SAVED_RESULTS_BINDING_FILE = savedBinding;
       } // lib.optionalAttrs configuratorBound {
         QCL_NEGF_CONFIGURATOR_EXECUTABLE = "${solver}/bin/qcl-negf";
         QCL_NEGF_CONFIGURATOR_CATALOG_ROOT = configurator.catalogRoot;
@@ -242,6 +316,9 @@ in {
         NoNewPrivileges = true;
         ProtectSystem = "strict";
         ReadWritePaths = [ "/var/lib/qcl-negf" ];
+      } // lib.optionalAttrs savedBound {
+        BindReadOnlyPaths = [ "${savedRoot}:${savedAlias}" ];
+        ReadOnlyPaths = [ savedRoot savedResults.storageIdentityFile ];
       } // lib.optionalAttrs configuratorEnabled {
         Delegate = "cpu memory pids";
         DelegateSubgroup = "api";

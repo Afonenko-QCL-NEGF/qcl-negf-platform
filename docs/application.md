@@ -177,3 +177,94 @@ and runtime delegated-v2/Runner readiness checks, and confirm the API advertises
 the intended source identity. No live activation, hard child network isolation
 or scientific acceptance follows from these source controls. The source-owned
 one-shot Runner contract uses fixed no-URI/offline inputs, not a network sandbox.
+
+## Optional retained NFS saved-results mapping (L1)
+
+`qclNegf.application.api.savedResults.enable` defaults to false. L1 exposes
+registered closed results from the existing `qclNegf.cluster.jobDirectory` NFS
+mount to the existing API unit at `/run/qcl-negf-saved`. There is no arbitrary
+request path/root option. The producer's hard NFSv4 mount and daemon write
+access stay unchanged. The API gains `RequiresMountsFor` for that mount and the
+site identity file, `BindReadOnlyPaths` for the alias, and `ReadOnlyPaths` for
+the original path and identity file. Its writable state paths remain unchanged.
+A missing required source is not an optional bind; do not prefix it with `-`.
+
+Enable only after private site admission supplies all of these options:
+
+- `namespaceId`: 1–128 characters, alphanumeric first, then alphanumeric,
+  dot, underscore or hyphen. Never reuse an admitted namespace for a different
+  disk/export identity.
+- `storageIdentity`: measured disk/export binding identity; `storageIdentityFile`:
+  canonical absolute runtime path outside the store to its root-owned readable
+  witness file. No symlink ancestors or group/other write permission; at most
+  257 bytes containing the exact identity, optionally a trailing newline.
+- `allowedComputerUuids`: 1–64 distinct canonical lowercase AiiDA Computer UUIDs.
+- `retentionPolicyId`, `retentionOwnerId`, `holdRef`, `accessBindingRef`: explicit
+  site policy, named owner and evidence references. These and storage identity
+  are nonempty finite identifiers, at most 256 characters; no defaults invent
+  admission or a retention owner. They must not contain secrets.
+
+The site witness is an admitted statement maintained by the storage owner,
+not discovery or cryptographic proof of the backing disk. Before enabling,
+measure actual NFS export/source and disk identity and bind the witness to that
+receipt. Replacing a disk behind the same server/export requires a new identity
+and reviewed binding. Neither an equal hostname nor the witness alone proves
+that the actual backing disk is still the admitted one.
+
+The generated store JSON is named by `QCL_NEGF_SAVED_RESULTS_BINDING_FILE`.
+Its exact fields are `namespace_id`, `storage_identity`, `root` (always
+`/run/qcl-negf-saved`), `allowed_computer_uuids`, `retention_policy_id`,
+`retention_owner_id`, `hold_ref`, and `access_binding_ref`. References are private
+site metadata; this file is not a browser DTO. The wrapper clears any inherited
+binding file setting, including a stale `service.env`, and exports the generated
+path only when the current application profile matches the declared package,
+both original root and alias are exact NFSv4 mounts with the declared source,
+the alias is read-only and readable/searchable, and the site witness matches.
+Missing mounts, local directories, symlinked roots, foreign exports, wrong
+identity or a foreign application leave the provider binding unset. There is
+no `mkdir`, empty local root or repository fallback for a registered NFS source.
+The API can still serve its other routes when its wrapper withholds the binding;
+a missing mandatory bind/mount may prevent the unit from starting at all.
+
+Consumers must explicitly match each source's `namespace_id` and
+`storage_identity` to this mapping and its singular AiiDA `computer_uuid` to one
+member of `allowed_computer_uuids`. The Platform mapping supplies no CalcJob,
+result path, `remote_root`, `registration_source_id` or per-child `admissions`.
+AiiDA must obtain those through its exact owner graph and independently admitted
+closed attempt. A global `hold_ref` does not prove scheduler stop, absence of
+writers/pruning, exact point/commit identity or a hold for any particular root.
+Do not synthesize per-child admission from this global file.
+
+Retention policy is indefinite for closed registered roots until a separate
+explicit disposition by the named owner. The hold covers negative results,
+metadata and the complete declared dependency closure, including borrowed
+checkpoint/import source roots. The owner must confirm no automatic cleanup,
+AiiDA remote-clean operation, workdir cleanup or export TTL applies to held
+roots. Live recovery pruning remains writer-owned before registration. No new
+service, timer, TTL, migration, hardlink, deduplication or cleanup is installed.
+This operational policy does not promise protection from every administrator.
+Backup/restore and capacity accounting remain separate gates; historical
+repository mirrors, retry imports, scratch and backups are counted separately.
+
+Before native use, verify actual numeric service UID/GID, directory ancestry,
+ACLs and file modes against Runner directory02750/file0640 and jobs0750;
+matching usernames and `root_squash` are insufficient. Do not grant world read
+or producer-wide read-only remounts. Readable root metadata does not prove access
+to every registered payload. Actual storage/export identity, per-attempt hold,
+closed ownership, package binding, read access and finite child-resource checks
+remain private native acceptance evidence. This source wiring does not prove
+L2 delivery without repository mirrors, R04 completion, backup or scientific
+acceptance. Active scientific jobs must not be used as access fixtures.
+
+The authored offline controls are `tests/infrastructure/application-saved-results.nix`
+and `tests/test_application_saved_results.py`. The former directly imports only
+the owning application module with synthetic package/file constructors; it does
+not evaluate many NixOS configurations. A separately dispatched focused packet
+can run only this Python file in the existing locked environment with
+`QCL_TEST_NIXPKGS` set to the selected source. Its module-scoped fixture performs
+one strict source-specific evaluation with a 60-second timeout; wrapper cases
+use tiny stand-ins for mount facts and do not prove native NFS behavior. Keep the
+shared finite budget (2 CPU, 1 GiB, 10 min, 128 MiB tmp, 32 MiB output); do not
+include the multi-configuration `application-release.nix` evaluation under this
+memory bound. Exceeding a bound is a failed/pending gate, not permission for an
+automatic rerun or larger budget.
