@@ -38,23 +38,26 @@ worker. До изменения гипервизора нужны следующ
 
 У publisher запросите release-specific handoff directory или его byte-identical copy.
 Контракт worker distribution предусматривает `worker-distribution.json`, `SHA256SUMS`,
-`images/worker-root.qcow2`, public source/release/build records и recipes. Этот layout
-и schema `qcl-negf-worker-distribution-v1` — контракт доставки; выбранный baseline
-ещё не предоставляет `ops/worker_distribution.py` или установленную команду проверки.
-Не выполняйте будущий CLI из проектных описаний как существующий инструмент.
+`images/worker-root.qcow2`, nonsecret source/release/build records и recipes.
+Локальные assembler/verifier находятся в [worker_distribution.py](../ops/worker_distribution.py);
+точный контракт входов и publisher boundary — [worker distribution](worker-distribution.md).
+Это source tool для private engineering candidate; его наличие не означает, что
+реальный image уже подготовлен, выдан или принят на native host.
 
 Если publisher передаёт такой bundle, он обязан приложить проверку schema/source/
 closure/backend binding и actual delivery receipt. Получатель сверяет полный исходный
 manifest с independently supplied hash, затем его file references и `SHA256SUMS`.
-Например, из **уже проверенного по составу** каталога без links и посторонних paths:
+Используйте verifier из отдельно полученного доверенного Platform source/hash;
+не запускайте его копию из ещё не проверенного bundle:
 
 ```sh
-cd "$BUNDLE"
-printf '%s  worker-distribution.json\n' "$EXPECTED_MANIFEST_SHA256" | sha256sum --check --strict
-sha256sum --check --strict SHA256SUMS
+python3 "$TRUSTED_PLATFORM/ops/worker_distribution.py" verify "$BUNDLE" \
+  --expected-manifest-sha256 "$EXPECTED_MANIFEST_SHA256" --timeout-seconds 600
 ```
 
-`BUNDLE` и `EXPECTED_MANIFEST_SHA256` — реальные входы handoff, не значения из guide.
+`TRUSTED_PLATFORM`, `BUNDLE` и `EXPECTED_MANIFEST_SHA256` — реальные входы handoff,
+не значения из guide. Timeout относится только к этой локальной проверке; full-image
+read требует отдельно измеренного конечного I/O бюджета до начала операции.
 Состав checksums должен совпадать с manifest: относительные payload paths, bytes и
 SHA256, без `..`, absolute paths, links и устройств. Проверка checksum не устанавливает
 доверие к самому manifest и не доказывает boot, отсутствие secrets или уникальность
@@ -296,6 +299,29 @@ smoke budget не разрешает force poweroff. Если ожидание �
 той же permanent machine повторяют штатный `startup` с protected enrollment.
 Fault/power-loss recovery и сохранность staged результатов проверяются отдельно;
 не имитируйте их на занятом worker без отдельного scope.
+
+## Обновление, rollback и чистая переустановка
+
+Обновление следует [application CD](application-cd.md) и барьеру I14 для всего pool.
+Оператор сначала вручную останавливает принадлежащие ему AiiDA workflows и retries,
+затем соответствующие Slurm jobs, сохраняет доказательство пустого pool и останавливает
+всех workers. Только после этого выполняются штатные deliver → fleet health → admission.
+Новый image/toolkit и успешный один worker не разрешают обойти этот барьер.
+Во время занятого исследования onboarding, controller/NFS reload и новая activation
+ждут отдельного безопасного maintenance window.
+
+Rollback требует exact previous application/solver closure identities и совместимого
+OS/runtime, а также повторного whole-pool health/admission. Откат OS не откатывает
+PostgreSQL, AiiDA repository или schema. При несовместимом DB/state schema требуется
+отдельный согласованный isolated restore и проверка согласованности dataset;
+не запускайте старое приложение поверх несовместимых данных.
+
+Чистая переустановка заменяет только назначенный root по измеренной disk identity.
+Постоянный отдельный scratch и data сохраняют свои serial/ownership и `prevent_destroy`.
+После первого форматирования доказанно пустого scratch выключите format flag;
+не переносите initial format в routine reinstall. Новые UUID/machine-id/SSH host keys
+снова проходят quarantine и protected enrollment. Это процедура, а не выполненный
+rollback/reinstall receipt; native проверки остаются отдельными клетками.
 
 ## Что считается завершённым
 
