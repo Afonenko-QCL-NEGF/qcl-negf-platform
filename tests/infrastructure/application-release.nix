@@ -110,6 +110,9 @@ assert api.serviceConfig.DelegateSubgroup == "api";
 assert api.serviceConfig.KillMode == "control-group";
 assert api.serviceConfig.User == "qcl-negf";
 assert api.serviceConfig.NoNewPrivileges;
+# Namespace admission is held by the existing unit, including the non-configurator API.
+assert api.serviceConfig.RestrictNamespaces;
+assert disabledApi.serviceConfig.RestrictNamespaces;
 assert api.serviceConfig.ProtectSystem == "strict";
 assert api.serviceConfig.ReadWritePaths == disabledApi.serviceConfig.ReadWritePaths;
 assert builtins.attrNames configured.systemd.services == builtins.attrNames controller.systemd.services;
