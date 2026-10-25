@@ -3,7 +3,7 @@
 let
   pkgs = import nixpkgs { system = "x86_64-linux"; };
   lib = pkgs.lib;
-  make = role: import (nixpkgs + "/nixos/lib/eval-config.nix") {
+  make = role: extra: import (nixpkgs + "/nixos/lib/eval-config.nix") {
     system = "x86_64-linux";
     modules = [ ../../modules ({ ... }: {
       system.stateVersion = "26.05";
@@ -33,13 +33,86 @@ let
       # Render upstream's actual configuration as a string, without a build.
       services.nginx.enableReload = role == "controller";
       services.nginx.validateConfigFile = false;
-    }) ];
+    }) extra ];
   };
-  controller = (make "controller").config;
-  worker = (make "worker").config;
+  controller = (make "controller" {}).config;
+  catalogRoot = "/nix/store/synthetic-research";
+  application = pkgs.hello.overrideAttrs (old: {
+    passthru = (old.passthru or {}) // { configuratorCatalogRoot = catalogRoot; };
+  });
+  configurator = extra: (make "controller" {
+    imports = [ {
+      qclNegf.application.package = lib.mkOverride 60 application;
+      qclNegf.application.api.configurator = {
+        enable = lib.mkDefault true;
+        catalogSourceId = lib.mkDefault "synthetic-research-source";
+      };
+    } extra ];
+  }).config;
+  configured = configurator {};
+  missingSource = configurator {
+    qclNegf.application.package = lib.mkForce application;
+    qclNegf.application.api.configurator = { enable = true; catalogSourceId = null; };
+  };
+  mismatchedCatalog = configurator {
+    qclNegf.application.package = lib.mkForce application;
+    qclNegf.application.api.configurator = {
+      enable = true; catalogSourceId = "synthetic-research-source";
+      catalogRoot = "/nix/store/foreign-research";
+    };
+  };
+  missingBundle = configurator {
+    qclNegf.application.package = lib.mkForce pkgs.hello;
+  };
+  missingSolver = configurator {
+    qclNegf.cluster.solverPackage = lib.mkForce null;
+  };
+  malformedSource = configurator {
+    qclNegf.application.api.configurator.catalogSourceId = "unbound source";
+  };
+  nested = configurator {
+    systemd.services.qcl-negf-api.serviceConfig.Slice = "research-api.slice";
+  };
+  configuratorFailures = cfg:
+    let
+      failedAssertions = builtins.filter (entry: !entry.assertion) cfg.assertions;
+    in builtins.filter (entry: lib.hasPrefix "Configurator" entry.message) failedAssertions;
+  api = configured.systemd.services.qcl-negf-api;
+  disabledApi = controller.systemd.services.qcl-negf-api;
+  worker = (make "worker" {}).config;
   nginxText = controller.environment.etc."nginx/nginx.conf".source.text;
   listeners = lib.filter (line: builtins.match "[[:space:]]*listen[[:space:]].*" line != null) (lib.splitString "\n" nginxText);
 in
+# A successful assertion may have an error-only diagnostic that must stay lazy.
+assert map (entry: entry.message) (configuratorFailures {
+  assertions = [
+    { assertion = true; message = throw "successful diagnostic was forced"; }
+    { assertion = false; message = "Configurator sentinel"; }
+    { assertion = false; message = "Unrelated sentinel"; }
+  ];
+}) == [ "Configurator sentinel" ];
+assert !controller.qclNegf.application.api.configurator.enable;
+assert !(disabledApi.environment ? QCL_NEGF_CONFIGURATOR_EXECUTABLE);
+assert !(disabledApi.serviceConfig ? DelegateSubgroup);
+assert configuratorFailures configured == [];
+assert configuratorFailures missingSource != [];
+assert configuratorFailures mismatchedCatalog != [];
+assert configuratorFailures missingBundle != [];
+assert configuratorFailures missingSolver != [];
+assert configuratorFailures malformedSource != [];
+assert api.environment.QCL_NEGF_CONFIGURATOR_EXECUTABLE == "${pkgs.hello}/bin/qcl-negf";
+assert api.environment.QCL_NEGF_CONFIGURATOR_CATALOG_ROOT == catalogRoot;
+assert api.environment.QCL_NEGF_CONFIGURATOR_CATALOG_SOURCE_ID == "synthetic-research-source";
+assert api.environment.QCL_NEGF_CONFIGURATOR_CGROUP_ROOT == "/sys/fs/cgroup/system.slice/qcl-negf-api.service";
+assert nested.systemd.services.qcl-negf-api.environment.QCL_NEGF_CONFIGURATOR_CGROUP_ROOT == "/sys/fs/cgroup/research.slice/research-api.slice/qcl-negf-api.service";
+assert api.serviceConfig.Delegate == "cpu memory pids";
+assert api.serviceConfig.DelegateSubgroup == "api";
+assert api.serviceConfig.KillMode == "control-group";
+assert api.serviceConfig.User == "qcl-negf";
+assert api.serviceConfig.NoNewPrivileges;
+assert api.serviceConfig.ProtectSystem == "strict";
+assert api.serviceConfig.ReadWritePaths == disabledApi.serviceConfig.ReadWritePaths;
+assert builtins.attrNames configured.systemd.services == builtins.attrNames controller.systemd.services;
 assert controller.qclNegf.release.enable;
 assert worker.qclNegf.release.enable;
 assert lib.hasPrefix "/nix/store/" controller.systemd.services.qcl-negf-aiida.serviceConfig.ExecStart;

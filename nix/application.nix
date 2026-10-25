@@ -27,6 +27,11 @@ let
 in
 assert lib.hasPrefix "3.14." pkgs.python314.version;
 environment.overrideAttrs (old: {
+  # Retain the exact selected immutable Research tree in the application closure.
+  # The caller supplies its source ID from the existing release Git graph.
+  passthru = (old.passthru or {}) // {
+    configuratorCatalogRoot = "${workspaceRoot}/components/qcl-negf-research";
+  };
   postInstall = (old.postInstall or "") + ''
     # AiiDA imports initialize configuration directories even without a profile.
     # Keep the integrity check's mutable state in the build sandbox.
