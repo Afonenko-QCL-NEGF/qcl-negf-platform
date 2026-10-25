@@ -134,6 +134,16 @@ def stopped_response(actual,attempt):
         'owned_effective_runtime_mask':{'schema':'qcl-negf-owned-effective-runtime-mask-v1','origin':{'path':'/run/systemd/system.control/slurmd.service','uid':0,'nlink':1,'mode':0o777,'target':'/dev/null','device':25,'inode':8617},'original_unit_origin':{'selected_path':'/nix/store/unit/slurmd.service','path':'/nix/store/unit/slurmd.service','sha256':'c'*64,'bytes':64,'chain':[]},'effective_fragment':'/run/systemd/system.control/slurmd.service','original_invocation_id':'a'*32},
         'systemd':{'LoadState':'masked','UnitFileState':'masked-runtime','ActiveState':'inactive','SubState':'dead','MainPID':'0','ControlGroup':'','InvocationID':'','FragmentPath':'/run/systemd/system.control/slurmd.service','DropInPaths':''}}
 
+def selected_release_response(words):
+    # Remote activation/check consume the full encoded envelope, as the real CLI
+    # now does. Tests must not fabricate a four-key response that erases evidence.
+    if '--manifest-base64' not in words:
+        return release()
+    value = json.loads(base64.urlsafe_b64decode(words[words.index('--manifest-base64') + 1]))
+    return {key: value[key] for key in ('schema', 'release_id', 'application_path',
+        'solver_executable', 'sources', 'closures', 'solver_build') if key in value}
+
+
 def control_response(args,actual,model=None):
     words=shlex.split(args[-1])
     if words[-1]=='update-capabilities':return json.dumps(update_capability())
@@ -143,7 +153,7 @@ def control_response(args,actual,model=None):
         if any(a in words for a in ('stop-update','stopped-identity')):return json.dumps(stopped_response(actual,attempt))
         if 'finish-update' in words:return json.dumps({'attempt_id':attempt,'marker_removed':True})
         if 'health-update' in words:
-            value={'schema':'qcl-negf-node-release-check-v1','node_identity':actual,'release':{**release(),'ready':True},'auth_verified':True,'nfs_verified':True,'nfs_source':'storage.invalid:/srv/qcl-negf/jobs'}
+            value={'schema':'qcl-negf-node-release-check-v1','node_identity':actual,'release':{**selected_release_response(words),'ready':True},'auth_verified':True,'nfs_verified':True,'nfs_source':'storage.invalid:/srv/qcl-negf/jobs'}
             if actual['role']=='worker':value.update((model or NativeUpdateModel()).health(actual['node_name']))
             return json.dumps(value)
     return None
@@ -181,7 +191,7 @@ class DeliveryCommands:
             if extra is not None:return extra
             if " check " in args[-1]:
                 return json.dumps({"schema": "qcl-negf-node-release-check-v1", "node_identity": observed,
-                                   "release": {**release(), "ready": True}})
+                                   "release": {**selected_release_response(words), "ready": True}})
         if args==['id','-u']:return '1000\n'
         if args==['id','-un']:return 'operator\n'
         if args==['env','TZ=UTC','LC_ALL=C','date','+%s']:return '1791504120\n'
@@ -847,7 +857,7 @@ class ApplicationReleaseTests(unittest.TestCase):
             profile, runtime, gate = root / "profile", root / "runtime", root / "admission.json"
             result = self.ops.prepare_initial(delivery_manifest(False), profile=profile,
                 runtime=runtime, gate=gate, role="controller", run=run)
-            self.assertEqual(result, {**release(), "ready": False})
+            self.assertEqual(result, {**delivery_manifest(False), "ready": False})
             self.assertEqual(json.loads(gate.read_text()), {"open": False, "release_id": "release-a"})
             self.assertEqual(profile.resolve(), Path("/nix/store/application"))
             self.assertEqual((root / "profile-solver").resolve(), Path("/nix/store/solver"))

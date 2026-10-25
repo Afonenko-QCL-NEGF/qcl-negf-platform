@@ -68,6 +68,9 @@ let cfg = config.qclNegf.application;
       # or site-injected configurator binding when this unit has no exact match.
       unset QCL_NEGF_CONFIGURATOR_EXECUTABLE QCL_NEGF_CONFIGURATOR_CATALOG_ROOT
       unset QCL_NEGF_CONFIGURATOR_CATALOG_SOURCE_ID QCL_NEGF_CONFIGURATOR_CGROUP_ROOT
+      quantum_context_sha256="''${QCL_NEGF_QUANTUM_RUNTIME_CONTEXT_SHA256:-}"
+      unset QCL_NEGF_QUANTUM_RUNTIME_CONTEXT_SHA256 QCL_NEGF_QUANTUM_RUNTIME_RELEASE_FILE
+      unset QCL_NEGF_QUANTUM_RUNTIME_CONTEXT
       unset QCL_NEGF_SAVED_RESULTS_BINDING_FILE
       ${lib.optionalString savedBound ''
         # Both paths must still be exact NFS mounts in this unit's namespace.
@@ -100,6 +103,15 @@ let cfg = config.qclNegf.application;
           export QCL_NEGF_CONFIGURATOR_CATALOG_ROOT=${lib.escapeShellArg configurator.catalogRoot}
           export QCL_NEGF_CONFIGURATOR_CATALOG_SOURCE_ID=${lib.escapeShellArg configurator.catalogSourceId}
           export QCL_NEGF_CONFIGURATOR_CGROUP_ROOT=${lib.escapeShellArg configuratorCgroupRoot}
+          # The getter validates ready/profile/solver and this digest against
+          # the existing root-owned release record before building child env.
+          case "$quantum_context_sha256" in
+            ""|*[!0-9a-f]*) ;;
+            *) if [ "''${#quantum_context_sha256}" -eq 64 ]; then
+                 export QCL_NEGF_QUANTUM_RUNTIME_CONTEXT_SHA256="$quantum_context_sha256"
+                 export QCL_NEGF_QUANTUM_RUNTIME_RELEASE_FILE=/var/lib/qcl-negf-admin/runtime/release.json
+               fi ;;
+          esac
         fi
       ''}
       ${lib.optionalString (cfg.api.allowedCodesFile != null) ''

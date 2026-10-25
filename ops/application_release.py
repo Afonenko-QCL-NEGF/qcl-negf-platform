@@ -592,8 +592,11 @@ def verify_node_envelope(binding, envelope, expected):
         error.uncertain = True
         raise
     value = envelope.get("release")
-    if not isinstance(value, dict) or value.get("ready") is not True or manifest(value) != expected:
+    if not isinstance(value, dict) or value.get("ready") is not True or release_envelope(value) != release_envelope(expected):
         raise ValueError("Node release verification failed")
+    context = quantum_context(expected)
+    if context is not None and value.get("quantum_runtime_context") != context:
+        raise ValueError("Node quantum runtime context differs")
     return value
 
 
@@ -1056,6 +1059,138 @@ def manifest(value):
     return {key: value[key] for key in ("schema", "release_id", "application_path", "solver_executable")}
 
 
+# Public IDs only. These new digests use recursive ASCII key order; the historical
+# release_id algorithm remains owned by the assembler and is never recomputed.
+SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
+SOURCE_REVISION = re.compile(r"[0-9a-f]{40}\Z")
+SOURCE_COMPONENT = re.compile(r"components/[A-Za-z0-9][A-Za-z0-9.-]*\Z")
+SOURCE_URL = re.compile(r"https://github\.com/[A-Za-z0-9-]+/[A-Za-z0-9_.-]+\Z")
+RELEASE_METADATA = ("sources", "closures", "solver_build")
+
+
+def sorted_ascii_json(value):
+    return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode('utf-8')
+
+
+def source_graph(value):
+    if (not isinstance(value, dict) or set(value) != {'format', 'revision', 'components'}
+            or value.get('format') != 'qcl-negf.git-graph.v1'
+            or not isinstance(value.get('revision'), str) or not SOURCE_REVISION.fullmatch(value['revision'])):
+        raise ValueError('Invalid release source graph')
+    rows = value['components']
+    if not isinstance(rows, list) or not 1 <= len(rows) <= 64:
+        raise ValueError('Source graph requires bounded components')
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {'path', 'revision', 'url'}:
+            raise ValueError('Unknown source component fields')
+        for key, pattern in (('path', SOURCE_COMPONENT), ('revision', SOURCE_REVISION), ('url', SOURCE_URL)):
+            if not isinstance(row[key], str) or len(row[key]) > 256 or not pattern.fullmatch(row[key]):
+                raise ValueError('Invalid ASCII source component ' + key)
+        if row['path'] in seen:
+            raise ValueError('Duplicate source component path')
+        seen.add(row['path'])
+    return value
+
+
+def release_metadata(value):
+    """Bounded additive projection; lifecycle identity stays the four-key manifest."""
+    metadata = {key: value[key] for key in RELEASE_METADATA if key in value}
+    if len(sorted_ascii_json(metadata)) > 49152:
+        raise ValueError('Release metadata exceeds bound')
+    if 'sources' in metadata:
+        source_graph(metadata['sources'])
+    if 'closures' in metadata:
+        prefetch_controller_closures(value, validate_only=True)
+    if 'solver_build' in metadata:
+        build = metadata['solver_build']
+        if (not isinstance(build, dict) or set(build) != {'source_graph_sha256', 'julia_manifest_sha256', 'drv_path', 'output_path'}
+                or 'sources' not in metadata or 'closures' not in metadata):
+            raise ValueError('Solver build requires exact source and closure metadata')
+        for key in ('source_graph_sha256', 'julia_manifest_sha256'):
+            if not isinstance(build[key], str) or not SHA256_HEX.fullmatch(build[key]):
+                raise ValueError('Invalid solver build digest')
+        if build['source_graph_sha256'] != hashlib.sha256(sorted_ascii_json(metadata['sources'])).hexdigest():
+            raise ValueError('Source graph digest differs')
+        output = value['solver_executable'][:-len('/bin/qcl-negf')]
+        if (build['output_path'] != output or not isinstance(build['drv_path'], str)
+                or not STORE_PATH.fullmatch(build['drv_path']) or not build['drv_path'].endswith('.drv')):
+            raise ValueError('Solver derivation/output binding differs')
+        refs = {row['path'] for row in metadata['sources']['components']}
+        if not {'components/QCLNEGF.jl', 'components/QCLNEGFRunner.jl'} <= refs:
+            raise ValueError('Solver build requires Core and Runner source identities')
+    return metadata
+
+
+def release_envelope(value):
+    return {**manifest(value), **release_metadata(value)}
+
+
+def require_same_metadata(current, expected):
+    if manifest(current) == manifest(expected) and release_metadata(current) != release_metadata(expected):
+        raise ValueError('Same release identity has different delivery metadata')
+
+
+def quantum_context(value):
+    envelope = release_envelope(value)
+    if 'solver_build' not in envelope:
+        return None
+    build = envelope['solver_build']
+    refs = {row['path']: row['revision'] for row in envelope['sources']['components']}
+    hashes = {row['path']: row['narHash'] for row in envelope['closures']}
+    context = {
+        'release_id': envelope['release_id'], 'solver_executable': envelope['solver_executable'],
+        'solver_output': build['output_path'], 'nar_hash': hashes[build['output_path']],
+        'drv_path': build['drv_path'], 'source_graph_sha256': build['source_graph_sha256'],
+        'julia_manifest_sha256': build['julia_manifest_sha256'],
+        'runner_source_id': refs['components/QCLNEGFRunner.jl'],
+        'core_source_id': refs['components/QCLNEGF.jl'],
+    }
+    context['context_sha256'] = hashlib.sha256(sorted_ascii_json(context)).hexdigest()
+    return context
+
+
+def installed_manifest_sha256(output):
+    # This is a delivery-time bounded file read, never a per-request depot scan.
+    path = Path(output) / 'share/qcl-negf/julia/Manifest.toml'
+    with path.open('rb') as handle:
+        raw = handle.read(1048577)
+    if len(raw) > 1048576:
+        raise ValueError('Installed Julia Manifest exceeds bound')
+    return hashlib.sha256(raw).hexdigest()
+
+
+def verify_solver_build(value, run, evidence):
+    envelope = release_envelope(value)
+    if 'solver_build' not in envelope:
+        return
+    build = envelope['solver_build']
+    # The trusted assembler captures actual drv/output from the same builder
+    # receipt. A substituted runtime output need not carry its build derivation
+    # or build dependencies. Verify available deriver metadata, never infer it
+    # from the store name, and verify local derivation outputs only if present.
+    observed_deriver = evidence[build['output_path']].get('deriver')
+    if observed_deriver not in (None, 'unknown-deriver', build['drv_path']):
+        raise ValueError('Installed solver deriver differs from build receipt')
+    if Path(build['drv_path']).exists():
+        outputs = run(['nix-store', '--query', '--outputs', build['drv_path']]).splitlines()
+        if build['output_path'] not in outputs:
+            raise ValueError('Build derivation does not produce selected solver output')
+    if installed_manifest_sha256(build['output_path']) != build['julia_manifest_sha256']:
+        raise ValueError('Installed Julia Manifest differs from build receipt')
+
+
+def service_environment(expected, gate, runtime):
+    lines = ['QCL_NEGF_RELEASE_ID=' + expected['release_id'],
+             'QCL_NEGF_SOLVER_EXECUTABLE=' + expected['solver_executable'],
+             'QCL_NEGF_RELEASE_GATE=' + str(gate)]
+    context = quantum_context(expected)
+    if context is not None:
+        lines.extend(['QCL_NEGF_QUANTUM_RUNTIME_CONTEXT_SHA256=' + context['context_sha256'],
+                      'QCL_NEGF_QUANTUM_RUNTIME_RELEASE_FILE=' + str(Path(runtime) / 'release.json')])
+    return '\n'.join(lines) + '\n'
+
+
 def prefetch_controller_closures(value, run=command, *, validate_only=False):
     """Fetch and verify immutable release evidence before maintenance begins."""
     expected = manifest(value)
@@ -1111,6 +1246,7 @@ def prefetch_controller_closures(value, run=command, *, validate_only=False):
     for path, digest in hashes.items():
         if not isinstance(evidence[path], dict) or evidence[path].get("narHash") != digest:
             raise ValueError("Local closure narHash differs from the manifest")
+    verify_solver_build(value, run, evidence)
     return hashes
 
 
@@ -1228,11 +1364,14 @@ def check(manifest_value, *, profile=PROFILE, runtime=RUNTIME, role="worker", ru
         if metadata_budget:metadata_budget.before()
     before()
     bound_before = assert_expected_node(expected_node_identity,role=role,run=run,metadata_budget=metadata_budget) if expected_node_identity is not None else None
-    expected = manifest(manifest_value)
-    current = unique_json(metadata_budget.read(Path(runtime)/"release.json"),65536) if metadata_budget else load(Path(runtime) / "release.json")
+    expected = release_envelope(manifest_value)
+    current = unique_json(metadata_budget.read(Path(runtime)/"release.json"),65536) if metadata_budget else unique_json((Path(runtime) / "release.json").read_bytes())
     before()
-    if current.get("ready") is not True or manifest(current) != expected or Path(profile).resolve() != Path(expected["application_path"]):
+    if current.get("ready") is not True or release_envelope(current) != expected or Path(profile).resolve() != Path(expected["application_path"]):
         raise ValueError("Installed application profile or runtime release identity differs")
+    context = quantum_context(expected)
+    if context is not None and current.get("quantum_runtime_context") != context:
+        raise ValueError("Runtime quantum context differs from delivery metadata")
     solver_profile = Path(profile).with_name(Path(profile).name + "-solver")
     before()
     if solver_profile.resolve() != Path(expected["solver_executable"]).parents[1]:
@@ -1242,6 +1381,8 @@ def check(manifest_value, *, profile=PROFILE, runtime=RUNTIME, role="worker", ru
     units = ["slurmd.service"] if role == "worker" else ["qcl-negf-aiida.service", "qcl-negf-api.service"]
     for unit in units:
         before();run(["systemctl", "is-active", "--quiet", unit])
+    if "solver_build" in expected:
+        before();prefetch_controller_closures(expected, run)
     before();solver_self_check(expected, run)
     if bound_before is not None:
         bound_after = assert_expected_node(expected_node_identity, role=role, run=run,metadata_budget=metadata_budget) if metadata_budget else assert_expected_node(expected_node_identity, role=role, run=run)
@@ -1272,9 +1413,9 @@ def _prepare_initial_owned(manifest_value, *, owner, profile=PROFILE, runtime=RU
     Only absent profiles/runtime files are initialized; existing exact evidence
     (including readiness, Code UUID and provenance) is preserved byte for byte.
     """
-    expected = manifest(manifest_value)
+    expected = release_envelope(manifest_value)
     _require_owner(owner, runtime=runtime, operation='prepare_initial',
-                   release_identity=expected, deadline=deadline)
+                   release_identity=manifest(expected), deadline=deadline)
     before = lambda: _owner_before(owner, deadline)
     original_run = run
     def run(argv):
@@ -1286,8 +1427,8 @@ def _prepare_initial_owned(manifest_value, *, owner, profile=PROFILE, runtime=RU
     profile, runtime, gate = Path(profile), Path(runtime), Path(gate)
     record, environment = runtime / "release.json", runtime / "service.env"
     record_exists = os.path.lexists(record)
-    current = load(record) if record_exists else None
-    if record_exists and (manifest(current) != expected or
+    current = unique_json(record.read_bytes()) if record_exists else None
+    if record_exists and (release_envelope(current) != expected or
             not (current.get("ready") is True or current.get("ready") is False)):
         raise ValueError("Existing release identity conflicts; use normal CD activation")
     profiles = [(profile, expected["application_path"]),
@@ -1296,12 +1437,8 @@ def _prepare_initial_owned(manifest_value, *, owner, profile=PROFILE, runtime=RU
     for path, selected in profiles:
         if os.path.lexists(path) and path.resolve() != Path(selected):
             raise ValueError("Existing application or solver profile conflicts; use normal CD activation")
-    service_environment = "\n".join([
-        "QCL_NEGF_RELEASE_ID=" + expected["release_id"],
-        "QCL_NEGF_SOLVER_EXECUTABLE=" + expected["solver_executable"],
-        "QCL_NEGF_RELEASE_GATE=" + str(gate),
-    ]) + "\n"
-    if os.path.lexists(environment) and environment.read_text() != service_environment:
+    environment_text = service_environment(expected, gate, runtime)
+    if os.path.lexists(environment) and environment.read_text() != environment_text:
         raise ValueError("Existing runtime environment conflicts; use normal CD activation")
     gate_bytes = read_admission(gate, missing=True)
     if gate_bytes is None:
@@ -1333,9 +1470,12 @@ def _prepare_initial_owned(manifest_value, *, owner, profile=PROFILE, runtime=RU
         if path.resolve() != Path(selected):
             raise ValueError("Initial application or solver profile differs from the selected closure")
     if not os.path.lexists(environment):
-        publish(environment, service_environment, before=before)
+        publish(environment, environment_text, before=before)
     if current is None:
         current = {**expected, "ready": False}
+        context = quantum_context(expected)
+        if context is not None:
+            current["quantum_runtime_context"] = context
         publish_json(record, current, before=before)
     return current
 
@@ -1395,12 +1535,12 @@ def _activate_owned(manifest_value, *, owner, profile=PROFILE, runtime=RUNTIME,
                     allowed_codes_file=Path('/var/lib/qcl-negf/aiida/code-uuid'),
                     expected_node_identity=None, update_attempt_id=None, gate=GATE,
                     deadline, metadata_budget=None):
-    expected = manifest(manifest_value)
+    expected = release_envelope(manifest_value)
     state = _owner_before(owner, deadline)
     if state['operation'] not in ('activate', 'whole_update'):
         raise PermissionError('Owner cannot activate a release')
     _require_owner(owner, runtime=runtime, operation=state['operation'],
-                   release_identity=expected, deadline=deadline)
+                   release_identity=manifest(expected), deadline=deadline)
     if role == 'worker' and update_attempt_id is not None and expected_node_identity is None:
         raise ValueError('Worker update requires full node identity')
     role, expected_node_identity = _bind_activation_identity(owner, role=role,
@@ -1439,7 +1579,9 @@ def _activate_owned(manifest_value, *, owner, profile=PROFILE, runtime=RUNTIME,
     if action_budget:action_budget.before()
     current = (unique_json(action_budget.read(record),65536) if action_budget else load(record)) if record.exists() else None
     if action_budget:action_budget.before()
-    same = current is not None and current.get("ready") is True and manifest(current) == expected and profile.resolve() == Path(expected["application_path"])
+    if current is not None:
+        require_same_metadata(current, expected)
+    same = current is not None and current.get("ready") is True and release_envelope(current) == expected and profile.resolve() == Path(expected["application_path"])
     # An interrupted activation cannot leave a local ready marker for new jobs.
     if action_budget:action_budget.before()
     record.unlink(missing_ok=True)
@@ -1456,7 +1598,12 @@ def _activate_owned(manifest_value, *, owner, profile=PROFILE, runtime=RUNTIME,
         if action_budget:action_budget.before()
         if path.resolve() != Path(selected):
             raise ValueError("Installed application or solver profile differs from the selected closure")
+    if "solver_build" in expected:
+        prefetch_controller_closures(expected, run)
     identity = dict(expected)
+    context = quantum_context(expected)
+    if context is not None:
+        identity["quantum_runtime_context"] = context
     if bound_node is not None:
         identity["node_identity"] = bound_node
     if role == "controller":
@@ -1469,15 +1616,12 @@ def _activate_owned(manifest_value, *, owner, profile=PROFILE, runtime=RUNTIME,
         registered = json.loads(output.strip().splitlines()[-1])
         if registered.get("solver_executable") != expected["solver_executable"] or not registered.get("code_uuid"):
             raise ValueError("InstalledCode identity does not match the immutable solver")
-        if current is not None and manifest(current) == expected and current.get('code_uuid') is not None and current['code_uuid'] != registered['code_uuid']:
+        if current is not None and manifest(current) == manifest(expected) and current.get('code_uuid') is not None and current['code_uuid'] != registered['code_uuid']:
             raise ValueError('Immutable InstalledCode UUID changed on identical release')
         identity["code_uuid"] = registered["code_uuid"]
         publish(allowed_codes_file, identity["code_uuid"] + "\n",before=action_budget.before if action_budget else None)
-    publish(runtime / "service.env", "\n".join([
-        "QCL_NEGF_RELEASE_ID=" + expected["release_id"],
-        "QCL_NEGF_SOLVER_EXECUTABLE=" + expected["solver_executable"],
-        "QCL_NEGF_RELEASE_GATE=" + str(gate),
-    ]) + "\n",before=action_budget.before if action_budget else None)
+    publish(runtime / "service.env", service_environment(expected, gate, runtime),
+            before=action_budget.before if action_budget else None)
     # A prepared configuration may start slurmd for a closed release delivery.
     # Jobs still fail the ready+shared-admission guard until health succeeds.
     publish_json(record, {**identity, "ready": False},before=action_budget.before if action_budget else None)
@@ -1524,7 +1668,11 @@ def guard(release_id, solver_executable, runtime=RUNTIME / "release.json", gate=
 
 def node_check(runtime=RUNTIME / "release.json", gate=GATE, profile=PROFILE, *, run=command):
     """slurmd boot gate: selected immutable identity; job guard checks admission."""
-    current, admission = manifest(load(runtime)), load_admission(gate)
+    current, admission = unique_json(Path(runtime).read_bytes()), load_admission(gate)
+    release_envelope(current)
+    context = quantum_context(current)
+    if context is not None and current.get("quantum_runtime_context") != context:
+        raise ValueError("Worker quantum runtime context differs")
     if current["release_id"] != admission.get("release_id"):
         raise ValueError("Worker release differs from the selected release")
     if Path(profile).resolve() != Path(current["application_path"]):
@@ -1559,9 +1707,9 @@ def deliver_pool(manifest_value, nodes, gate=GATE, *, deliver, quiesce, admit=la
 def _deliver_pool_owned(manifest_value, nodes, gate=GATE, *, owner, deliver, quiesce, admit=lambda: None,
                         deadline=None, checkpoint=None, bindings=None, authority=None,
                         authority_run=command, runtime=RUNTIME):
-    expected = manifest(manifest_value)
+    expected = release_envelope(manifest_value)
     _require_owner(owner, runtime=runtime, operation='whole_update',
-                   release_identity=expected, deadline=deadline)
+                   release_identity=manifest(expected), deadline=deadline)
     if not isinstance(bindings, dict) or set(bindings) != set(nodes):
         raise ValueError("Required full selected node bindings")
     observed = [bindings[node].get("identity") for node in nodes]
@@ -2489,6 +2637,7 @@ def deliver_cli(expected, pool, run=command, *, enrollment, runtime=RUNTIME, gat
     output_bound(command_output_bytes)
     output_bound(delivery_output_bytes)
     deadline = start + delivery_timeout_seconds
+    release_envelope(expected)
     prefetch_controller_closures(expected, validate_only=True)
     authority = preflight_controller_authority(enrollment, pool, run=run, deadline=deadline,
         command_timeout_seconds=command_timeout_seconds, command_output_bytes=command_output_bytes,
@@ -2638,6 +2787,7 @@ def _deliver_cli_locked(expected, pool, run, *, owner, runtime, gate, authority,
             if path.name.endswith('.admission-intent.json') or path==receipt_path:continue
             previous=unique_json(local_metadata(path,1048576),1048576)
             if previous.get('status')=='failed' and not previous.get('requires_reconciliation') and not previous.get('pending_command') and not previous.get('pending_stopped_observation') and previous.get('identity')==manifest(expected) and previous.get('operation')=='whole_cluster_update':
+                require_same_metadata(previous.get('manifest', previous['identity']), expected)
                 for name,drain in previous.get('slurm_drain',{}).items():
                     if drain.get('status')=='completed' and name in selected and all(previous.get('node_bindings',{}).get(name,{}).get(k)==selected[name].get(k) for k in ('machine_uuid','machine_id','hostname','node_name','role')):
                         prior_drain[name]=(previous.get('slurm_before',{}).get(name),drain,previous['node_bindings'][name])
@@ -2676,7 +2826,7 @@ def _deliver_cli_locked(expected, pool, run, *, owner, runtime, gate, authority,
         # The controller initially receives only the manifest, never CI's local store.
         # A bad cache or hash must leave both admission and current services untouched.
         prefetch_controller_closures(expected, run)
-        expected = manifest(expected)
+        expected = release_envelope(expected)
         controller_budget=_OwnerScan(owner, UpdateScan(deadline))
         controller_config=unique_json(controller_budget.read('/etc/qcl-negf/release-config.json'),65536)
         slurm_conf=controller_config.get('slurm_conf')
@@ -2972,8 +3122,8 @@ def main():
         return
     if bool(args.manifest) == bool(args.manifest_base64):
         parser.error("Provide exactly one --manifest or --manifest-base64")
-    manifest_value = (unique_json(update_scan.read(args.manifest,65536),65536) if update_scan else load(args.manifest)) if args.manifest else unique_json(base64.urlsafe_b64decode(args.manifest_base64),65536)
-    expected = manifest(manifest_value)
+    manifest_value = (unique_json(update_scan.read(args.manifest,65536),65536) if update_scan else unique_json(Path(args.manifest).read_bytes(),65536)) if args.manifest else unique_json(base64.urlsafe_b64decode(args.manifest_base64),65536)
+    expected = release_envelope(manifest_value)
     expected_node = unique_json(base64.urlsafe_b64decode(args.expected_node_identity_base64), 16384) if args.expected_node_identity_base64 else None
     if args.action == "activate" and expected_node is not None and not args.update_attempt_id:
         assert_expected_node(expected_node, role=args.role, run=native_run)
