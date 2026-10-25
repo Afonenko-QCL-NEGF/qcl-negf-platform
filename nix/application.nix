@@ -22,6 +22,11 @@ let
       (workspace.mkPyprojectOverlay { sourcePreference = "wheel"; })
       sourceBuilds
     ]);
+  # Share the locked PythonSet while selecting only the Results CLI and its
+  # dependencies. Passthru is lazy: solver capture never requires the API,
+  # AiiDA or frontend application output.
+  captureRuntime = pythonSet.mkVirtualEnv "qcl-negf-capture-${project.version}"
+    { "qcl-negf-results" = []; };
   environment = pythonSet.mkVirtualEnv "qcl-negf-application-${project.version}"
     (if includeTests then workspace.deps.all else workspace.deps.default);
 in
@@ -30,6 +35,7 @@ environment.overrideAttrs (old: {
   # Retain the exact selected immutable Research tree in the application closure.
   # The caller supplies its source ID from the existing release Git graph.
   passthru = (old.passthru or {}) // {
+    inherit captureRuntime;
     configuratorCatalogRoot = "${workspaceRoot}/components/qcl-negf-research";
   };
   postInstall = (old.postInstall or "") + ''

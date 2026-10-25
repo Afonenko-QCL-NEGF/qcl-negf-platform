@@ -326,6 +326,9 @@ in {
         ExecStart = apiStart;
         Restart = "on-failure";
         NoNewPrivileges = true;
+        # Hold the memory-admission namespace assumptions across child spawn.
+        # Ordinary fork/exec remains available; no new namespace or setns.
+        RestrictNamespaces = true;
         ProtectSystem = "strict";
         ReadWritePaths = [ "/var/lib/qcl-negf" ];
       } // lib.optionalAttrs savedBound {
