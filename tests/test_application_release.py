@@ -11,6 +11,7 @@ import tempfile
 import unittest
 import sys
 import os
+import errno
 import signal
 import shlex
 import base64
@@ -1814,6 +1815,57 @@ class I14UpdateTests(unittest.TestCase):
             with self.assertRaises(PermissionError):fs.scan()
         self.assertTrue(reached)
         self.assertFalse(any(a[:2]==['systemctl','kill'] for a in fs.calls))
+
+    def test_i14_vanished_enumerated_pids_are_bounded_evidence(self):
+        fs=IsolatedWorkerIO(self,self.ops)
+        for pid in range(1600,1617):fs.process(pid,comm='short-lived',uid=0,cgroup='/other.slice')
+        fs.install()
+        original=self.ops.process_classification;seen=[]
+        def classify(budget,path):
+            if 1600<=int(path.name)<1617:
+                seen.append(int(path.name))
+                fs.remove_process(int(path.name))
+                raise FileNotFoundError(errno.ENOENT,'vanished',str(path/'comm'))
+            return original(budget,path)
+        with patch.object(self.ops,'process_classification',side_effect=classify):
+            proof=fs.scan()
+        self.assertTrue(proof['job_processes_empty'])
+        self.assertEqual(proof['vanished_pid_count'],17)
+        self.assertEqual(proof['vanished_pids'],seen[:16])
+        self.assertEqual(set(seen),set(range(1600,1617)))
+        self.assertTrue(proof['vanished_pids_truncated'])
+
+    def test_i14_vanished_metadata_with_existing_pid_fails_closed(self):
+        fs=IsolatedWorkerIO(self,self.ops)
+        fs.process(1676,comm='short-lived',uid=0,cgroup='/other.slice')
+        fs.install()
+        original=self.ops.process_classification
+        def classify(budget,path):
+            if path.name=='1676':raise FileNotFoundError(errno.ENOENT,'metadata vanished',str(path/'comm'))
+            return original(budget,path)
+        with patch.object(self.ops,'process_classification',side_effect=classify):
+            with self.assertRaisesRegex(ValueError,'Incomplete process generation'):fs.scan()
+        original_stat=self.ops.UpdateScan.stat
+        def denied(budget,path,**kwargs):
+            if str(path)=='/proc/1676':raise PermissionError(errno.EACCES,'denied')
+            return original_stat(budget,path,**kwargs)
+        with patch.object(self.ops,'process_classification',side_effect=classify),patch.object(self.ops.UpdateScan,'stat',denied):
+            with self.assertRaises(PermissionError):fs.scan()
+        def no_process(budget,path,**kwargs):
+            if str(path)=='/proc/1676':raise ProcessLookupError(errno.ESRCH,'unknown')
+            return original_stat(budget,path,**kwargs)
+        with patch.object(self.ops,'process_classification',side_effect=classify),patch.object(self.ops.UpdateScan,'stat',no_process):
+            with self.assertRaises(ProcessLookupError):fs.scan()
+        def foreign(budget,path):
+            if path.name=='1676':raise FileNotFoundError(errno.ENOENT,'foreign metadata','/proc/9999/comm')
+            return original(budget,path)
+        with patch.object(self.ops,'process_classification',side_effect=foreign):
+            with self.assertRaises(FileNotFoundError):fs.scan()
+        for name,bad in [('status','Uid:\tbroken\n'),('cgroup','bad\n'),('stat','1676 (short-lived) S 0\n')]:
+            fs.write('/proc/1676/'+name,bad)
+            with self.subTest(metadata=name):
+                with self.assertRaises(ValueError):fs.scan()
+            fs.process(1676,comm='short-lived',uid=0,cgroup='/other.slice')
 
 
 class IsolatedWorkerIO:

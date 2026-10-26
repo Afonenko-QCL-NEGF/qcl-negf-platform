@@ -1915,9 +1915,19 @@ def slurm_infinity_proof(budget,records,run):
 def physical_stop_scan(budget,service,*,run=command):
     budget.read('/sys/fs/cgroup/cgroup.controllers')
     uid=pwd.getpwnam('qcl-negf').pw_uid;records={};jobs=[];daemon=[]
+    vanished_pid_count=0;vanished_pids=[]
     for path in budget.entries('/proc','pid'):
         try:record=process_classification(budget,path)
-        except (FileNotFoundError,ProcessLookupError) as error:raise ValueError('Incomplete process generation') from error
+        except (FileNotFoundError,ProcessLookupError) as error:
+            if error.errno not in (errno.ENOENT,errno.ESRCH):raise
+            if error.filename is not None and (not isinstance(error.filename,str) or
+                    Path(error.filename) not in {path/key for key in ('comm','status','cgroup','stat')}):raise
+            try:budget.stat(path,follow_symlinks=False)
+            except FileNotFoundError:
+                vanished_pid_count+=1
+                if len(vanished_pids)<16:vanished_pids.append(int(path.name))
+                continue
+            raise ValueError('Incomplete process generation') from error
         records[record['pid']]=record
         if record['state'] in ('Z','X'):continue
         if record['comm']=='slurmd':
@@ -1974,6 +1984,7 @@ def physical_stop_scan(budget,service,*,run=command):
             if (initial.st_dev,initial.st_ino)!=(final.st_dev,final.st_ino):raise ValueError('Service scope generation changed')
     return {'job_processes_measured':True,'job_processes_empty':not jobs,'job_pids':jobs,'daemon_processes':daemon,
             'service_members':members,'service_members_measured':True,'service_scope_complete':True,'slurm_infinity_processes':keepers,
+            'vanished_pid_count':vanished_pid_count,'vanished_pids':vanished_pids,'vanished_pids_truncated':vanished_pid_count>16,
             'metadata_bytes':budget.bytes,'metadata_actual_bytes':budget.actual_bytes,'pid_entries':budget.pid_entries,'cgroup_entries':budget.cgroup_entries}
 
 
