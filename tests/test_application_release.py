@@ -11,6 +11,7 @@ import tempfile
 import unittest
 import sys
 import os
+import errno
 import signal
 import shlex
 import base64
@@ -1824,6 +1825,57 @@ class I14UpdateTests(unittest.TestCase):
             with self.assertRaises(PermissionError):fs.scan()
         self.assertTrue(reached)
         self.assertFalse(any(a[:2]==['systemctl','kill'] for a in fs.calls))
+
+    def test_i14_vanished_enumerated_pids_are_bounded_evidence(self):
+        fs=IsolatedWorkerIO(self,self.ops)
+        for pid in range(1600,1617):fs.process(pid,comm='short-lived',uid=0,cgroup='/other.slice')
+        fs.install()
+        original=self.ops.process_classification;seen=[]
+        def classify(budget,path):
+            if 1600<=int(path.name)<1617:
+                seen.append(int(path.name))
+                fs.remove_process(int(path.name))
+                raise FileNotFoundError(errno.ENOENT,'vanished',str(path/'comm'))
+            return original(budget,path)
+        with patch.object(self.ops,'process_classification',side_effect=classify):
+            proof=fs.scan()
+        self.assertTrue(proof['job_processes_empty'])
+        self.assertEqual(proof['vanished_pid_count'],17)
+        self.assertEqual(proof['vanished_pids'],seen[:16])
+        self.assertEqual(set(seen),set(range(1600,1617)))
+        self.assertTrue(proof['vanished_pids_truncated'])
+
+    def test_i14_vanished_metadata_with_existing_pid_fails_closed(self):
+        fs=IsolatedWorkerIO(self,self.ops)
+        fs.process(1676,comm='short-lived',uid=0,cgroup='/other.slice')
+        fs.install()
+        original=self.ops.process_classification
+        def classify(budget,path):
+            if path.name=='1676':raise FileNotFoundError(errno.ENOENT,'metadata vanished',str(path/'comm'))
+            return original(budget,path)
+        with patch.object(self.ops,'process_classification',side_effect=classify):
+            with self.assertRaisesRegex(ValueError,'Incomplete process generation'):fs.scan()
+        original_stat=self.ops.UpdateScan.stat
+        def denied(budget,path,**kwargs):
+            if str(path)=='/proc/1676':raise PermissionError(errno.EACCES,'denied')
+            return original_stat(budget,path,**kwargs)
+        with patch.object(self.ops,'process_classification',side_effect=classify),patch.object(self.ops.UpdateScan,'stat',denied):
+            with self.assertRaises(PermissionError):fs.scan()
+        def no_process(budget,path,**kwargs):
+            if str(path)=='/proc/1676':raise ProcessLookupError(errno.ESRCH,'unknown')
+            return original_stat(budget,path,**kwargs)
+        with patch.object(self.ops,'process_classification',side_effect=classify),patch.object(self.ops.UpdateScan,'stat',no_process):
+            with self.assertRaises(ProcessLookupError):fs.scan()
+        def foreign(budget,path):
+            if path.name=='1676':raise FileNotFoundError(errno.ENOENT,'foreign metadata','/proc/9999/comm')
+            return original(budget,path)
+        with patch.object(self.ops,'process_classification',side_effect=foreign):
+            with self.assertRaises(FileNotFoundError):fs.scan()
+        for name,bad in [('status','Uid:\tbroken\n'),('cgroup','bad\n'),('stat','1676 (short-lived) S 0\n')]:
+            fs.write('/proc/1676/'+name,bad)
+            with self.subTest(metadata=name):
+                with self.assertRaises(ValueError):fs.scan()
+            fs.process(1676,comm='short-lived',uid=0,cgroup='/other.slice')
 
 
 class IsolatedWorkerIO:
@@ -3949,3 +4001,56 @@ class OPS03StoppedIdentityTests(unittest.TestCase):
         self.assertGreaterEqual(len(observed),2)
         self.assertFalse(fs.real(self.ops.EFFECTIVE_MASK).is_symlink())
         self.assertTrue(any(a[:2] in (['systemctl','start'],['systemctl','restart']) for a in fs.calls))
+
+
+class OriginalUnitOriginEquivalenceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.ops = importlib.util.module_from_spec(SPEC)
+        SPEC.loader.exec_module(cls.ops)
+
+    @staticmethod
+    def origin():
+        directory = [11, 22, 0o40755, 0, 4096, 100, 101]
+        leaf = [11, 33, 0o100444, 0, 512, 200, 201]
+        return {'path': '/nix/store/pkg/slurmd.service',
+                'selected_path': '/etc/systemd/system/slurmd.service',
+                'sha256': 'a' * 64, 'bytes': 512,
+                'chain': [['/etc', directory[:], None],
+                          ['/nix', directory[:], None],
+                          ['/nix/store', directory[:], None],
+                          ['/nix/store/pkg', directory[:], None],
+                          ['/nix/store/pkg/slurmd.service', leaf[:], None]]}
+
+    def test_only_store_directory_timestamp_drift_is_equivalent_without_mutation(self):
+        expected = self.origin()
+        actual = copy.deepcopy(expected)
+        actual['chain'][2][1][5:] = [999, 1000]
+        before_expected, before_actual = copy.deepcopy(expected), copy.deepcopy(actual)
+        self.assertTrue(self.ops.origin_equivalent(expected, actual))
+        self.assertEqual(expected, before_expected)
+        self.assertEqual(actual, before_actual)
+
+    def test_other_drift_and_malformed_shapes_are_rejected(self):
+        expected = self.origin()
+        changes = [
+            lambda x: x.update(sha256='b' * 64),
+            lambda x: x.update(bytes=513),
+            lambda x: x.update(selected_path='/etc/systemd/system/other.service'),
+            lambda x: x.update(path='/nix/store/other/slurmd.service'),
+            lambda x: x['chain'][1][1].__setitem__(5, 999),
+            lambda x: x['chain'][3][1].__setitem__(6, 999),
+            lambda x: x['chain'][2].__setitem__(0, '/nix/elsewhere'),
+            lambda x: x['chain'][2][1].__setitem__(0, 99),
+            lambda x: x['chain'][2][1].__setitem__(1, 99),
+            lambda x: x['chain'][2][1].__setitem__(2, 0o100444),
+            lambda x: x['chain'][2][1].__setitem__(3, 1),
+            lambda x: x['chain'][2][1].__setitem__(4, 4097),
+            lambda x: x['chain'][2].__setitem__(2, '/other'),
+            lambda x: x['chain'].__setitem__(2, ['/nix/store', [1], None]),
+        ]
+        for change in changes:
+            with self.subTest(change=changes.index(change)):
+                actual = copy.deepcopy(expected)
+                change(actual)
+                self.assertFalse(self.ops.origin_equivalent(expected, actual))

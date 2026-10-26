@@ -6,6 +6,7 @@ The command boundary is injectable for local fault-injection tests.
 """
 import argparse
 import base64
+import copy
 from contextlib import contextmanager
 import fcntl
 import errno
@@ -2062,9 +2063,19 @@ def slurm_infinity_proof(budget,records,run):
 def physical_stop_scan(budget,service,*,run=command):
     budget.read('/sys/fs/cgroup/cgroup.controllers')
     uid=pwd.getpwnam('qcl-negf').pw_uid;records={};jobs=[];daemon=[]
+    vanished_pid_count=0;vanished_pids=[]
     for path in budget.entries('/proc','pid'):
         try:record=process_classification(budget,path)
-        except (FileNotFoundError,ProcessLookupError) as error:raise ValueError('Incomplete process generation') from error
+        except (FileNotFoundError,ProcessLookupError) as error:
+            if error.errno not in (errno.ENOENT,errno.ESRCH):raise
+            if error.filename is not None and (not isinstance(error.filename,str) or
+                    Path(error.filename) not in {path/key for key in ('comm','status','cgroup','stat')}):raise
+            try:budget.stat(path,follow_symlinks=False)
+            except FileNotFoundError:
+                vanished_pid_count+=1
+                if len(vanished_pids)<16:vanished_pids.append(int(path.name))
+                continue
+            raise ValueError('Incomplete process generation') from error
         records[record['pid']]=record
         if record['state'] in ('Z','X'):continue
         if record['comm']=='slurmd':
@@ -2121,6 +2132,7 @@ def physical_stop_scan(budget,service,*,run=command):
             if (initial.st_dev,initial.st_ino)!=(final.st_dev,final.st_ino):raise ValueError('Service scope generation changed')
     return {'job_processes_measured':True,'job_processes_empty':not jobs,'job_pids':jobs,'daemon_processes':daemon,
             'service_members':members,'service_members_measured':True,'service_scope_complete':True,'slurm_infinity_processes':keepers,
+            'vanished_pid_count':vanished_pid_count,'vanished_pids':vanished_pids,'vanished_pids_truncated':vanished_pid_count>16,
             'metadata_bytes':budget.bytes,'metadata_actual_bytes':budget.actual_bytes,'pid_entries':budget.pid_entries,'cgroup_entries':budget.cgroup_entries}
 
 
@@ -2169,12 +2181,35 @@ def original_unit_origin(path,*,budget):
     if public_binary_origin(budget,path,executable=False)!=origin:raise ValueError('Original unit namespace changed')
     return json_observation({**origin,'selected_path':path,'sha256':hashlib.sha256(data).hexdigest(),'bytes':len(data)})
 
+def origin_equivalent(expected,observed):
+    """Ignore timestamp drift only for the /nix/store directory across captures."""
+    def valid(value):
+        if not isinstance(value,dict) or set(value)!={'path','chain','selected_path','sha256','bytes'}:return False
+        if not isinstance(value['path'],str) or not value['path'].startswith('/nix/store/') or not isinstance(value['selected_path'],str):return False
+        if not isinstance(value['sha256'],str) or not re.fullmatch('[0-9a-f]{64}',value['sha256']):return False
+        if type(value['bytes']) is not int or value['bytes']<0 or not isinstance(value['chain'],list) or not value['chain']:return False
+        for row in value['chain']:
+            if not isinstance(row,list) or len(row)!=3 or not isinstance(row[0],str) or not row[0].startswith('/'):return False
+            signature,target=row[1:]
+            if not isinstance(signature,list) or len(signature)!=7 or any(type(x)is not int for x in signature):return False
+            if target is not None and not isinstance(target,str):return False
+            if stat.S_ISLNK(signature[2])!=(target is not None):return False
+            if row[0]=='/nix/store' and not stat.S_ISDIR(signature[2]):return False
+        return value['chain'][-1][0]==value['path'] and stat.S_ISREG(value['chain'][-1][1][2])
+    if not valid(expected) or not valid(observed):return False
+    def projected(value):
+        result=copy.deepcopy(value)
+        for path,signature,_ in result['chain']:
+            if path=='/nix/store':signature[5:7]=[0,0]
+        return result
+    return projected(expected)==projected(observed)
+
 def effective_mask_proof(marker,service,*,budget):
     owned=marker.get('effective_runtime_mask');unit=marker.get('original_unit_origin')
     if marker.get('mask_phase')!='installed' or not isinstance(owned,dict) or owned.get('path')!=EFFECTIVE_MASK or not isinstance(unit,dict):raise ValueError('Missing owned effective mask proof')
     if runtime_mask_origin(EFFECTIVE_MASK,budget=budget)!=owned:raise ValueError('Effective mask ownership changed')
     if marker.get('legacy_runtime_mask') is not None and runtime_mask_origin(LEGACY_MASK,budget=budget)!=marker['legacy_runtime_mask']:raise ValueError('Legacy mask ownership changed')
-    if original_unit_origin(unit['selected_path'],budget=budget)!=unit:raise ValueError('Original immutable unit changed')
+    if not origin_equivalent(original_unit_origin(unit['selected_path'],budget=budget),unit):raise ValueError('Original immutable unit changed')
     if service['LoadState']!='masked' or service['UnitFileState']!='masked-runtime' or service['FragmentPath']!=EFFECTIVE_MASK or service['DropInPaths']:raise ValueError('Effective runtime mask not selected')
     return {'schema':'qcl-negf-owned-effective-runtime-mask-v1','origin':owned,'original_unit_origin':unit,'effective_fragment':service['FragmentPath'],'original_invocation_id':marker['daemon']['InvocationID']}
 
@@ -2208,11 +2243,11 @@ def remove_owned_update_mask(expected,attempt_id,*,runtime=RUNTIME,gate=GATE,run
             budget.before();os.unlink(Path(origin['path']).name,dir_fd=parent);budget.before();os.fsync(parent)
     budget.before();run(['systemctl','daemon-reload'])
     service=unit_state(run)
-    if service['LoadState']!='loaded' or service['UnitFileState'].startswith('masked') or service['FragmentPath']!=marker['original_unit_origin']['selected_path'] or original_unit_origin(service['FragmentPath'],budget=budget)!=marker['original_unit_origin']:raise ValueError('Own mask removal readback incomplete')
+    if service['LoadState']!='loaded' or service['UnitFileState'].startswith('masked') or service['FragmentPath']!=marker['original_unit_origin']['selected_path'] or not origin_equivalent(original_unit_origin(service['FragmentPath'],budget=budget),marker['original_unit_origin']):raise ValueError('Own mask removal readback incomplete')
     if service['ActiveState']!='inactive' or service['SubState']!='dead' or service['MainPID']!='0' or service['ControlGroup'] or service['InvocationID'] not in ('',marker['daemon']['InvocationID']) or service['DropInPaths']:raise ValueError('Unmasked worker generation is not stopped')
     scan=physical_stop_scan(budget,{**service,'ControlGroup':marker['daemon']['ControlGroup']},run=run)
     if scan['daemon_processes'] or any(m['state'] not in ('Z','X')for m in scan['service_members']) or not scan['service_scope_complete'] or not scan['service_members_measured'] or not scan['job_processes_empty']:raise ValueError('Unmasked worker physical proof changed')
-    if unit_state(run)!=service or stopped_machine(budget)!=marker['machine'] or original_unit_origin(service['FragmentPath'],budget=budget)!=marker['original_unit_origin']:raise ValueError('Unmasked unit/machine origin raced')
+    if unit_state(run)!=service or stopped_machine(budget)!=marker['machine'] or not origin_equivalent(original_unit_origin(service['FragmentPath'],budget=budget),marker['original_unit_origin']):raise ValueError('Unmasked unit/machine origin raced')
     marker['mask_phase']='removed';publish_json(Path(runtime)/'update-stop.json',marker,mode=0o600,before=budget.before)
 
 @contextmanager
