@@ -3939,3 +3939,56 @@ class OPS03StoppedIdentityTests(unittest.TestCase):
         self.assertGreaterEqual(len(observed),2)
         self.assertFalse(fs.real(self.ops.EFFECTIVE_MASK).is_symlink())
         self.assertTrue(any(a[:2] in (['systemctl','start'],['systemctl','restart']) for a in fs.calls))
+
+
+class OriginalUnitOriginEquivalenceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.ops = importlib.util.module_from_spec(SPEC)
+        SPEC.loader.exec_module(cls.ops)
+
+    @staticmethod
+    def origin():
+        directory = [11, 22, 0o40755, 0, 4096, 100, 101]
+        leaf = [11, 33, 0o100444, 0, 512, 200, 201]
+        return {'path': '/nix/store/pkg/slurmd.service',
+                'selected_path': '/etc/systemd/system/slurmd.service',
+                'sha256': 'a' * 64, 'bytes': 512,
+                'chain': [['/etc', directory[:], None],
+                          ['/nix', directory[:], None],
+                          ['/nix/store', directory[:], None],
+                          ['/nix/store/pkg', directory[:], None],
+                          ['/nix/store/pkg/slurmd.service', leaf[:], None]]}
+
+    def test_only_store_directory_timestamp_drift_is_equivalent_without_mutation(self):
+        expected = self.origin()
+        actual = copy.deepcopy(expected)
+        actual['chain'][2][1][5:] = [999, 1000]
+        before_expected, before_actual = copy.deepcopy(expected), copy.deepcopy(actual)
+        self.assertTrue(self.ops.origin_equivalent(expected, actual))
+        self.assertEqual(expected, before_expected)
+        self.assertEqual(actual, before_actual)
+
+    def test_other_drift_and_malformed_shapes_are_rejected(self):
+        expected = self.origin()
+        changes = [
+            lambda x: x.update(sha256='b' * 64),
+            lambda x: x.update(bytes=513),
+            lambda x: x.update(selected_path='/etc/systemd/system/other.service'),
+            lambda x: x.update(path='/nix/store/other/slurmd.service'),
+            lambda x: x['chain'][1][1].__setitem__(5, 999),
+            lambda x: x['chain'][3][1].__setitem__(6, 999),
+            lambda x: x['chain'][2].__setitem__(0, '/nix/elsewhere'),
+            lambda x: x['chain'][2][1].__setitem__(0, 99),
+            lambda x: x['chain'][2][1].__setitem__(1, 99),
+            lambda x: x['chain'][2][1].__setitem__(2, 0o100444),
+            lambda x: x['chain'][2][1].__setitem__(3, 1),
+            lambda x: x['chain'][2][1].__setitem__(4, 4097),
+            lambda x: x['chain'][2].__setitem__(2, '/other'),
+            lambda x: x['chain'].__setitem__(2, ['/nix/store', [1], None]),
+        ]
+        for change in changes:
+            with self.subTest(change=changes.index(change)):
+                actual = copy.deepcopy(expected)
+                change(actual)
+                self.assertFalse(self.ops.origin_equivalent(expected, actual))
