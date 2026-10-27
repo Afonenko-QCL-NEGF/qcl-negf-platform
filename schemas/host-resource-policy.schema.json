@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Afonenko-QCL-NEGF/qcl-negf-platform/schemas/host-resource-policy.schema.json",
+  "title": "Per-host resident resource policy declarations v1",
+  "description": "Structural declaration only. ops/host_resource_policy.py additionally checks ownership, resident bounds and physical/owned-pool arithmetic. Evidence references and administrator assurances require independent native verification.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "host_id",
+    "owner_id",
+    "physical_ram_bytes",
+    "capacity_evidence_ref",
+    "reserves",
+    "owned_pool",
+    "active_grant",
+    "timeouts",
+    "vms"
+  ],
+  "properties": {
+    "schema": { "const": "qcl.host-resource-policy.v1" },
+    "host_id": { "$ref": "#/$defs/text" },
+    "owner_id": { "$ref": "#/$defs/text" },
+    "physical_ram_bytes": { "$ref": "#/$defs/positiveInteger" },
+    "capacity_evidence_ref": { "$ref": "#/$defs/text" },
+    "reserves": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "host_services_bytes",
+        "control_plane_bytes",
+        "safety_bytes",
+        "foreign_max_bytes",
+        "evidence_ref"
+      ],
+      "properties": {
+        "host_services_bytes": { "$ref": "#/$defs/nonnegativeInteger" },
+        "control_plane_bytes": { "$ref": "#/$defs/nonnegativeInteger" },
+        "safety_bytes": { "$ref": "#/$defs/nonnegativeInteger" },
+        "foreign_max_bytes": { "$ref": "#/$defs/nonnegativeInteger" },
+        "evidence_ref": { "$ref": "#/$defs/text" }
+      }
+    },
+    "owned_pool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "capacity_bytes",
+        "agreement_ref",
+        "enforceable",
+        "foreign_growth_bounded",
+        "active_grants_protected"
+      ],
+      "properties": {
+        "capacity_bytes": { "$ref": "#/$defs/positiveInteger" },
+        "agreement_ref": { "$ref": "#/$defs/text" },
+        "enforceable": { "const": true },
+        "foreign_growth_bounded": { "const": true },
+        "active_grants_protected": { "const": true }
+      }
+    },
+    "active_grant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mechanism", "qualification_ref"],
+      "properties": {
+        "mechanism": { "enum": ["conservative_reservation", "qualified_dynamic"] },
+        "qualification_ref": { "$ref": "#/$defs/text" }
+      }
+    },
+    "timeouts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request_seconds", "grow_seconds", "shrink_seconds", "reconcile_seconds"],
+      "properties": {
+        "request_seconds": { "$ref": "#/$defs/positiveInteger" },
+        "grow_seconds": { "$ref": "#/$defs/positiveInteger" },
+        "shrink_seconds": { "$ref": "#/$defs/positiveInteger" },
+        "reconcile_seconds": { "$ref": "#/$defs/positiveInteger" }
+      }
+    },
+    "vms": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "vm_id",
+          "owner_id",
+          "resident",
+          "minimum_bytes",
+          "startup_bytes",
+          "maximum_bytes",
+          "overhead_bytes",
+          "overhead_evidence_ref",
+          "cpu_weight",
+          "memory_weight"
+        ],
+        "properties": {
+          "vm_id": { "$ref": "#/$defs/text" },
+          "owner_id": { "$ref": "#/$defs/text" },
+          "resident": { "const": true },
+          "minimum_bytes": { "$ref": "#/$defs/positiveInteger" },
+          "startup_bytes": { "$ref": "#/$defs/positiveInteger" },
+          "maximum_bytes": { "$ref": "#/$defs/positiveInteger" },
+          "overhead_bytes": { "$ref": "#/$defs/nonnegativeInteger" },
+          "overhead_evidence_ref": { "$ref": "#/$defs/text" },
+          "cpu_weight": { "$ref": "#/$defs/positiveInteger" },
+          "memory_weight": { "$ref": "#/$defs/positiveInteger" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^\\s\\u0000](?:[^\\u0000]*[^\\s\\u0000])?$"
+    },
+    "nonnegativeInteger": { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 },
+    "positiveInteger": { "type": "integer", "minimum": 1, "maximum": 9223372036854775807 }
+  }
+}
