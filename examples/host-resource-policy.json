@@ -1,0 +1,57 @@
+{
+  "schema": "qcl.host-resource-policy.v1",
+  "host_id": "synthetic-host-a",
+  "owner_id": "synthetic-qcl-team",
+  "physical_ram_bytes": 137438953472,
+  "capacity_evidence_ref": "synthetic-fixture:128-GiB-physical-not-a-site-measurement",
+  "reserves": {
+    "host_services_bytes": 4294967296,
+    "control_plane_bytes": 2147483648,
+    "safety_bytes": 2147483648,
+    "foreign_max_bytes": 34359738368,
+    "evidence_ref": "synthetic-fixture:foreign-bound-includes-future-growth-and-overhead"
+  },
+  "owned_pool": {
+    "capacity_bytes": 94489280512,
+    "agreement_ref": "synthetic-fixture:administrator-enforced-capacity-and-grant-protection",
+    "enforceable": true,
+    "foreign_growth_bounded": true,
+    "active_grants_protected": true
+  },
+  "active_grant": {
+    "mechanism": "conservative_reservation",
+    "qualification_ref": "synthetic-fixture:maximum-reservations-reviewed-no-dynamic-qualification"
+  },
+  "timeouts": {
+    "request_seconds": 30,
+    "grow_seconds": 120,
+    "shrink_seconds": 120,
+    "reconcile_seconds": 180
+  },
+  "vms": [
+    {
+      "vm_id": "synthetic-ci",
+      "owner_id": "synthetic-qcl-team",
+      "resident": true,
+      "minimum_bytes": 2147483648,
+      "startup_bytes": 4294967296,
+      "maximum_bytes": 17179869184,
+      "overhead_bytes": 2147483648,
+      "overhead_evidence_ref": "synthetic-fixture:ci-qemu-upper-bound",
+      "cpu_weight": 100,
+      "memory_weight": 100
+    },
+    {
+      "vm_id": "synthetic-worker",
+      "owner_id": "synthetic-qcl-team",
+      "resident": true,
+      "minimum_bytes": 8589934592,
+      "startup_bytes": 17179869184,
+      "maximum_bytes": 68719476736,
+      "overhead_bytes": 4294967296,
+      "overhead_evidence_ref": "synthetic-fixture:worker-qemu-upper-bound",
+      "cpu_weight": 200,
+      "memory_weight": 300
+    }
+  ]
+}
