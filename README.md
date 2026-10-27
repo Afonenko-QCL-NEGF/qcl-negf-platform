@@ -1,8 +1,8 @@
 # QCL-NEGF platform
 
 NixOS modules, VM definitions and typed deployment commands for a scientific Slurm cluster. The
-[qcl-negf superproject](https://github.com/Afonenko-QCL-NEGF/qcl-negf) selects eight component revisions
-with Git submodules and runs integration CI on one self-hosted GitHub Actions runner. This
+[qcl-negf superproject](https://github.com/Afonenko-QCL-NEGF/qcl-negf) selects eight component
+revisions with Git submodules and runs integration CI on one self-hosted GitHub Actions runner. This
 repository owns infrastructure and deployment; AiiDA owns workflow provenance and Slurm assigns
 compute resources.
 
@@ -26,17 +26,21 @@ For the first external Linux worker, use the [Arch/libvirt onboarding guide](doc
 artifact/trust inputs, initial DRAIN, protected enrollment and bounded native smoke. Other Linux
 host distributions require their own adapter acceptance.
 
-| Module                | Responsibility                                                                  |
-| --------------------- | ------------------------------------------------------------------------------- |
-| `qclNegf.cluster`     | Slurm controller/workers, cgroup CPU/RAM limits and shared job mounts           |
-| `qclNegf.storage`     | Dedicated NFS server and client allowlist                                       |
-| `qclNegf.stateDisk`   | Persistent controller application and scheduler state                           |
-| `qclNegf.application` | AiiDA, PostgreSQL and optional authenticated HTTP API                           |
-| `qclNegf.builder`     | Shared daemon/admin/jobs slice and standard/burst resource profiles             |
-| `qclNegf.runner`      | Isolated persistent root-repository runner with controller-issued registration |
-| `qclNegf.cache`       | Signed, read-only Nix binary cache endpoint                                     |
-| `qclNegf.stateArchive` | Manual coordinated controller archive, verification and empty-state restore |
-| `ops/`                | TypeScript commands for build, activation, clean installation and profile setup |
+The [19–27 October 2026 session report](docs/reports/session-2026-10-19--2026-10-27/README.md)
+records reviewed source work, scientific attempts, resource evidence and outstanding release gates
+at its stated checkpoint. It is a historical report, not a deployment status endpoint.
+
+| Module                 | Responsibility                                                                  |
+| ---------------------- | ------------------------------------------------------------------------------- |
+| `qclNegf.cluster`      | Slurm controller/workers, cgroup CPU/RAM limits and shared job mounts           |
+| `qclNegf.storage`      | Dedicated NFS server and client allowlist                                       |
+| `qclNegf.stateDisk`    | Persistent controller application and scheduler state                           |
+| `qclNegf.application`  | AiiDA, PostgreSQL and optional authenticated HTTP API                           |
+| `qclNegf.builder`      | Shared daemon/admin/jobs slice and standard/burst resource profiles             |
+| `qclNegf.runner`       | Isolated persistent root-repository runner with controller-issued registration  |
+| `qclNegf.cache`        | Signed, read-only Nix binary cache endpoint                                     |
+| `qclNegf.stateArchive` | Manual coordinated controller archive, verification and empty-state restore     |
+| `ops/`                 | TypeScript commands for build, activation, clean installation and profile setup |
 
 ## Development and validation
 
@@ -62,13 +66,13 @@ nix develop --no-update-lock-file --command deno task check
 nix build --no-link --no-update-lock-file .#checks.x86_64-linux.slurm-vm
 ```
 
-The shared operations/devShell environment declares Python 3.14 and ansible-core 2.21.1,
-with community.general 13.4.0 and community.library_inventory_filtering_v1 1.1.5 from
-fixed upstream archives. Versions are checked against [Ansible requirements](ansible/requirements.yml).
-The storage, cutover and swap fixtures require this environment and verify the actual
-interpreter, engine files and collection resolver origins before running YAML; missing or
-foreign dependencies fail setup. Collection unpacking belongs to the Nix dependency derivation.
-These recording fixtures do not establish native host enforcement, boot or scientific acceptance.
+The shared operations/devShell environment declares Python 3.14 and ansible-core 2.21.1, with
+community.general 13.4.0 and community.library_inventory_filtering_v1 1.1.5 from fixed upstream
+archives. Versions are checked against [Ansible requirements](ansible/requirements.yml). The
+storage, cutover and swap fixtures require this environment and verify the actual interpreter,
+engine files and collection resolver origins before running YAML; missing or foreign dependencies
+fail setup. Collection unpacking belongs to the Nix dependency derivation. These recording fixtures
+do not establish native host enforcement, boot or scientific acceptance.
 
 The Slurm test boots storage, controller and worker VMs, submits a batch job, checks shared output
 ownership and verifies result persistence across controller restart. It needs a Linux builder with
@@ -77,10 +81,10 @@ and image checks are described in [infrastructure](docs/infrastructure.md).
 
 ## Deployment
 
-For the first CI/build host, use the [platform-only bootstrap](docs/bootstrap.md)
-from official installation media. It has no application, solver or Julia-depot
-dependency. [The host policy](docs/host-network.md) declaratively creates the
-isolated guest bridges while retaining the existing management bridge.
+For the first CI/build host, use the [platform-only bootstrap](docs/bootstrap.md) from official
+installation media. It has no application, solver or Julia-depot dependency.
+[The host policy](docs/host-network.md) declaratively creates the isolated guest bridges while
+retaining the existing management bridge.
 
 Create a private site flake from `examples/private-site/`, set measured resources, hardware, network
 and runtime secrets, and attach the root application's and solver's immutable packages. Copy
@@ -115,8 +119,8 @@ or set a root password. Provision SSH access in the site configuration. See
 
 ## Repository boundaries
 
-Numerical algorithms belong to [QCLNEGF.jl](https://github.com/Afonenko-QCL-NEGF/QCLNEGF.jl); frozen-plan
-execution and scratch staging belong to
+Numerical algorithms belong to [QCLNEGF.jl](https://github.com/Afonenko-QCL-NEGF/QCLNEGF.jl);
+frozen-plan execution and scratch staging belong to
 [QCLNEGFRunner.jl](https://github.com/Afonenko-QCL-NEGF/QCLNEGFRunner.jl). Shared formats belong to
 [qcl-negf-contracts](https://github.com/Afonenko-QCL-NEGF/qcl-negf-contracts), result tools to
 [qcl-negf-results](https://github.com/Afonenko-QCL-NEGF/qcl-negf-results), workflows to
