@@ -4,10 +4,38 @@ let
   inherit (pkgs) lib;
   workspace = uv2nix.lib.workspace.loadWorkspace { inherit workspaceRoot; };
   project = (builtins.fromTOML (builtins.readFile (workspaceRoot + "/pyproject.toml"))).project;
-  members = [ "qcl-negf-contracts" "qcl-negf-results" "aiida-qcl-negf" "qcl-negf-api" ];
+  memberDirectories = {
+    qcl-negf-contracts = "qcl-negf-contracts";
+    qcl-negf-results = "qcl-negf-results";
+    aiida-qcl-negf = "qcl-negf-aiida";
+    qcl-negf-api = "qcl-negf-portal";
+  };
+  members = builtins.attrNames memberDirectories;
+  # loadWorkspace accepts a contextual store string, so retain that contract.
+  # cleanSourceWith produces a new filtered store input without discarding context.
+  ownedSource = root: names: lib.cleanSourceWith {
+    src = root;
+    filter = path: type: let
+      relative = lib.removePrefix (toString root + "/") (toString path);
+      top = builtins.head (lib.splitString "/" relative);
+    in (toString path == toString root || builtins.elem top names)
+      && !(top == "frontend" && builtins.elem (baseNameOf path) [ "node_modules" "dist" ])
+      && lib.cleanSourceFilter path type;
+  };
+  memberSource = name: ownedSource
+    (workspaceRoot + "/components/${memberDirectories.${name}}")
+    ([ "pyproject.toml" "README.md" "LICENSE" "src" ]
+      ++ lib.optionals (name == "qcl-negf-api") [ "hatch_build.py" "frontend" ]);
+  catalogSource = ownedSource (workspaceRoot + "/components/qcl-negf-research")
+    [ "config" "literature" "docs" "README.md" "LICENSE" ];
+  compatibilityCheck = builtins.path {
+    path = ../ops/application_compatibility.py;
+    name = "qcl-application-compatibility.py";
+  };
   frontend = import (workspaceRoot + "/components/qcl-negf-portal/nix/frontend.nix") { inherit pkgs; };
   sourceBuilds = final: prev: lib.genAttrs members (name:
     prev.${name}.overrideAttrs (old: {
+      src = memberSource name;
       nativeBuildInputs = (old.nativeBuildInputs or [])
         ++ final.resolveBuildSystem { hatchling = []; };
       postPatch = (old.postPatch or "") + lib.optionalString (name == "qcl-negf-api") ''
@@ -40,7 +68,7 @@ environment.overrideAttrs (old: {
     cat > "$out/share/qcl-negf/runtime.json" <<'JSON'
     ${builtins.toJSON {
       schema = "qcl-negf-application-runtime-v1";
-      configurator.catalog_root = "${workspaceRoot}/components/qcl-negf-research";
+      configurator.catalog_root = "${catalogSource}";
     }}
     JSON
     # AiiDA imports initialize configuration directories even without a profile.
@@ -49,7 +77,7 @@ environment.overrideAttrs (old: {
     import runpy
     import aiida_qcl_negf, qcl_negf_api, qcl_negf_contracts, qcl_negf_results
     from aiida.plugins import CalculationFactory, ParserFactory, WorkflowFactory
-    runpy.run_path("${../ops/application_compatibility.py}", run_name="__main__")
+    runpy.run_path("${compatibilityCheck}", run_name="__main__")
     CalculationFactory("qcl_negf.execution")
     ParserFactory("qcl_negf.execution")
     WorkflowFactory("qcl_negf.plan")
