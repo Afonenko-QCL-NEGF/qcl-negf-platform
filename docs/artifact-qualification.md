@@ -126,3 +126,11 @@ P12/P23 владеют будущим явным переходом привяз
 native-загрузку, установленную службу, фактическое восстановление, готовность provider или научную
 готовность. Синтетические тесты проверяют поведение файлов, профилей и подтверждений с замкнутыми
 подменами команд; они не запускают службу, VM, задание или расчёт.
+
+
+P23-A [controller delivery service](delivery-operations.md) хранит request/attempt/commit evidence
+отдельно от qualification. Её completed operation не заменяет artifact proof, current activation
+health или научную приёмку. В P23-A hook восстановления ещё не интегрирован с state_archive: это
+явная зависимость будущего synthetic restore drill на существующей CI VM, без экспорта старых
+результатов/массивов/history/checkpoint. Boot reconcile классифицирует pending delivery, но не
+вызывает restore, invalidate или автоматическую повторную активацию.

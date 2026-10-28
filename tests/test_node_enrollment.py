@@ -656,26 +656,50 @@ class EnrollmentTests(unittest.TestCase):
             self.assertEqual(run.calls, [])
             self.assertEqual(snapshots, [])
 
-    def test_wrong_local_cli_does_not_create_runtime_or_flock_or_read_unresolved(self):
-        calls, snapshots, unresolved = [], [], []
+    def test_wrong_local_engine_does_not_create_runtime_or_flock_or_read_unresolved(self):
+        calls,snapshots,unresolved=[],[],[]
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            source, selected = root / "manifest.json", root / "pool.json"
-            source.write_text(json.dumps(manifest_fixture()))
-            selected.write_text(json.dumps(pool()))
-            runtime = root / "not-created"
-            args = ["release", "deliver", "--manifest", str(source), "--pool", str(selected),
-                    "--enrollment", "/protected/registry.json", "--runtime", str(runtime)]
-            with patch.object(sys, "argv", args), patch.object(ops, "load_enrollment", lambda _: {"registry": registry(), "registry_sha256": "e" * 64, "known_hosts_bytes": b"synthetic"}), \
-                 patch.object(ops, "observe_node_identity", lambda **_: WORKER), \
-                 patch.object(ops, "freeze_ssh_trust", lambda *a, **k: snapshots.append(True)), \
-                 patch.object(ops, "unresolved_deliveries", lambda _: unresolved.append(True)), \
-                 patch.object(ops.fcntl, "flock", lambda *a: calls.append("lock")), patch("builtins.print"):
-                with self.assertRaises(SystemExit) as caught:
-                    ops.main()
-            self.assertEqual(caught.exception.code, 1)
+            runtime=Path(temporary)/'not-created'
+            with patch.object(ops,'load_enrollment',lambda _:{'registry':registry(),'registry_sha256':'e'*64,'known_hosts_bytes':b'synthetic'}), \
+                 patch.object(ops,'observe_node_identity',lambda **_:WORKER), \
+                 patch.object(ops,'freeze_ssh_trust',lambda *a,**k:snapshots.append(True)), \
+                 patch.object(ops,'unresolved_deliveries',lambda _:unresolved.append(True)), \
+                 patch.object(ops.fcntl,'flock',lambda *a:calls.append('lock')):
+                with self.assertRaises(ValueError):
+                    ops.deliver_cli(manifest_fixture(),pool(),enrollment='/protected/registry.json',
+                        runtime=runtime,run=lambda args:calls.append(args))
             self.assertFalse(runtime.exists())
-            self.assertEqual(calls + snapshots + unresolved, [])
+            self.assertEqual(calls+snapshots+unresolved,[])
+
+    def test_complete_public_request_on_worker_refuses_before_request_store_or_service(self):
+        import delivery_requests
+        calls,snapshots,unresolved=[],[],[]
+        submit=delivery_requests.submit_update
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);runtime=root/'not-created'
+            source,selected=root/'manifest.json',root/'pool.json'
+            source.write_text(json.dumps(manifest_fixture()));selected.write_text(json.dumps(pool()))
+            args=['release','update','--manifest',str(source),'--pool',str(selected),
+                '--enrollment','/protected/registry.json','--runtime',str(runtime),
+                '--request-id','d3986590-cf69-4ca8-af7c-c3e065241ad2','--procedure','maintenance']
+            def dispatch(value,**kwargs):
+                return submit(value,run=lambda *a,**k:calls.append(a),**kwargs)
+            with patch.object(sys,'argv',args),patch.object(ops,'RUNTIME',runtime), \
+                 patch.object(ops,'read_protected_file',return_value=json.dumps(registry()).encode()), \
+                 patch.object(delivery_requests.trust,'read_protected_file',return_value=b'{"role":"worker"}'), \
+                 patch.object(delivery_requests,'submit_update',dispatch), \
+                 patch.object(ops,'observe_node_identity',lambda **_:WORKER), \
+                 patch.object(ops,'freeze_ssh_trust',lambda *a,**k:snapshots.append(True)), \
+                 patch.object(ops,'unresolved_deliveries',lambda _:unresolved.append(True)), \
+                 patch.object(ops.fcntl,'flock',lambda *a:calls.append('lock')):
+                with patch('builtins.print') as printed, self.assertRaises(SystemExit) as caught:
+                    ops.main()
+                self.assertEqual(caught.exception.code,1)
+                response=json.loads(printed.call_args.args[0])
+                self.assertEqual(response,{'schema':'qcl-negf-delivery-response-error-v1',
+                    'request_id':'d3986590-cf69-4ca8-af7c-c3e065241ad2','error_class':'ValueError'})
+            self.assertFalse(runtime.exists())
+            self.assertEqual(calls+snapshots+unresolved,[])
 
     def test_bound_release_check_before_after_boot_is_required(self):
         from test_application_release import Commands
