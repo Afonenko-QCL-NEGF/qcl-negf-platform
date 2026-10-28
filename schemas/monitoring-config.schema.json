@@ -1,0 +1,459 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "enum": [
+        "qcl.monitoring-config.v1"
+      ]
+    },
+    "role": {
+      "enum": [
+        "controller",
+        "native_host",
+        "worker"
+      ]
+    },
+    "reader_uid": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+    },
+    "observer_uid": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+    },
+    "tools": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sudo": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 1024,
+          "pattern": "^/[^\\n\\r\\u0000]+$"
+        },
+        "systemctl": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 1024,
+          "pattern": "^/[^\\n\\r\\u0000]+$"
+        },
+        "journalctl": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 1024,
+          "pattern": "^/[^\\n\\r\\u0000]+$"
+        },
+        "pvesh": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 1024,
+          "pattern": "^/[^\\n\\r\\u0000]+$"
+        },
+        "virsh": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 1024,
+          "pattern": "^/[^\\n\\r\\u0000]+$"
+        }
+      },
+      "required": [
+        "sudo",
+        "systemctl",
+        "journalctl",
+        "pvesh",
+        "virsh"
+      ]
+    },
+    "targets": {
+      "type": "array",
+      "maxItems": 128,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "host_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+          },
+          "target": {
+            "type": "string",
+            "maxLength": 256
+          },
+          "helper": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 1024,
+            "pattern": "^/[^\\n\\r\\u0000]+$"
+          },
+          "known_hosts": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 1024,
+            "pattern": "^/[^\\n\\r\\u0000]+$"
+          },
+          "identity_file": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 1024,
+            "pattern": "^/[^\\n\\r\\u0000]+$"
+          }
+        },
+        "required": [
+          "host_id",
+          "target",
+          "helper",
+          "known_hosts",
+          "identity_file"
+        ]
+      }
+    },
+    "scopes": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "host_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        },
+        "machine_id": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{32}$"
+        },
+        "backend": {
+          "enum": [
+            "disabled",
+            "pve",
+            "libvirt"
+          ]
+        },
+        "node": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "version": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "vms": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "vm_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+              },
+              "native_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+              },
+              "uuid": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+              }
+            },
+            "required": [
+              "vm_id",
+              "native_id",
+              "uuid"
+            ]
+          }
+        },
+        "services": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "service_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+              },
+              "unit": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.@-]*\\.service$",
+                "maxLength": 128
+              }
+            },
+            "required": [
+              "service_id",
+              "unit"
+            ]
+          }
+        },
+        "cgroups": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "vm_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+              },
+              "workload": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+              },
+              "path": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 1024,
+                "pattern": "^/[^\\n\\r\\u0000]+$"
+              },
+              "generation": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+              }
+            },
+            "required": [
+              "vm_id",
+              "workload",
+              "path",
+              "generation"
+            ]
+          }
+        },
+        "journal": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "host_id",
+        "machine_id",
+        "backend",
+        "node",
+        "version",
+        "vms",
+        "services",
+        "cgroups",
+        "journal"
+      ]
+    },
+    "bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "command_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60
+        },
+        "sample_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 300
+        },
+        "fresh_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400
+        },
+        "output_bytes": {
+          "type": "integer",
+          "minimum": 16384,
+          "maximum": 1048576
+        },
+        "journal_bytes": {
+          "type": "integer",
+          "minimum": 4096,
+          "maximum": 262144
+        },
+        "journal_events": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256
+        },
+        "lookback_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3600
+        },
+        "retention_entries": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        }
+      },
+      "required": [
+        "command_seconds",
+        "sample_seconds",
+        "fresh_seconds",
+        "output_bytes",
+        "journal_bytes",
+        "journal_events",
+        "lookback_seconds",
+        "retention_entries"
+      ]
+    },
+    "storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "binding": {
+          "enum": [
+            "unqualified",
+            "dedicated_mount",
+            "project_quota"
+          ]
+        },
+        "directory": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 1024,
+          "pattern": "^/[^\\n\\r\\u0000]+$"
+        },
+        "maximum_bytes": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9223372036854775807
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "keep_free_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "retention_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 31536000
+        },
+        "minimum_inodes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000
+        },
+        "device": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "quota_project": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "binding",
+        "directory",
+        "maximum_bytes",
+        "keep_free_bytes",
+        "retention_seconds",
+        "minimum_inodes",
+        "device",
+        "quota_project"
+      ]
+    },
+    "graph_links": {
+      "type": "array",
+      "maxItems": 128,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "host_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+          },
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+          },
+          "href": {
+            "type": "string",
+            "maxLength": 2048
+          },
+          "origin": {
+            "type": "string",
+            "maxLength": 2048
+          }
+        },
+        "required": [
+          "host_id",
+          "label",
+          "href",
+          "origin"
+        ]
+      }
+    }
+  },
+  "required": [
+    "schema",
+    "role",
+    "reader_uid",
+    "observer_uid",
+    "tools",
+    "targets",
+    "scopes",
+    "bounds",
+    "storage",
+    "graph_links"
+  ],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qcl.invalid/schemas/monitoring-config.schema.json"
+}

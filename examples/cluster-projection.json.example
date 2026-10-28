@@ -1,0 +1,108 @@
+{
+  "schema": "qcl.cluster-projection.v1",
+  "read_at": 100,
+  "status": "partial",
+  "registry_generation": "registry-synthetic",
+  "hosts": [
+    {
+      "host_id": "host-a",
+      "resource": {
+        "schema": "qcl.host-resource-projection.v1",
+        "observed_at": 100,
+        "state_generation": "state-synthetic",
+        "status": "ok",
+        "host": {
+          "host_id": "host-a",
+          "physical_ram_bytes": 34359738368,
+          "H_bytes": 4294967296,
+          "F_bytes": 8589934592,
+          "owned_pool_bytes": 17179869184,
+          "charged_guest_bytes": 8589934592,
+          "overhead_bytes": 1073741824,
+          "native_freshness": {
+            "status": "not_measured",
+            "observed_at": null
+          }
+        },
+        "vms": [],
+        "operations": [],
+        "complete": true,
+        "next_cursor": null
+      },
+      "native": {
+        "schema": "qcl.native-status.v1",
+        "observed_at": 100,
+        "host_id": "host-a",
+        "host_boot_id": "boot-synthetic",
+        "sample_generation": "sample-synthetic",
+        "host_memory": {
+          "total_bytes": 34359738368,
+          "available_bytes": 17179869184
+        },
+        "vms": [],
+        "oom": {
+          "events": [],
+          "coverage": {
+            "source_id": "host-a",
+            "status": "not_measured",
+            "observed_at": null,
+            "host_boot_id": null,
+            "generation": null,
+            "complete": false,
+            "reasons": []
+          },
+          "next_cursor": null
+        },
+        "coverage": {
+          "source_id": "host-a",
+          "status": "fresh",
+          "observed_at": 100,
+          "host_boot_id": "boot-synthetic",
+          "generation": "sample-synthetic",
+          "complete": true,
+          "reasons": []
+        },
+        "complete": true,
+        "next_cursor": null
+      },
+      "services": [],
+      "storage": {
+        "schema": "qcl.telemetry-storage.v1",
+        "status": "unknown",
+        "binding_kind": "unqualified",
+        "maximum_bytes": null,
+        "used_bytes": null,
+        "available_bytes": null,
+        "keep_free_bytes": null,
+        "inodes_available": null,
+        "retention_seconds": null,
+        "persist_enabled": false,
+        "observed_at": 100,
+        "reasons": [
+          {
+            "code": "capacity_not_qualified",
+            "source_id": "telemetry"
+          }
+        ]
+      },
+      "graph_links": [],
+      "reasons": []
+    }
+  ],
+  "complete": true,
+  "next_cursor": null,
+  "coverage": {
+    "sources": [
+      {
+        "source_id": "host-a",
+        "status": "fresh",
+        "observed_at": 100,
+        "host_boot_id": "boot-synthetic",
+        "generation": "sample-synthetic",
+        "complete": true,
+        "reasons": []
+      }
+    ],
+    "reasons": []
+  }
+}
