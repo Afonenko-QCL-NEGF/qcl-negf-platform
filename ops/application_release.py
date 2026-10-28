@@ -30,6 +30,12 @@ from datetime import datetime, timezone
 import tempfile
 from urllib.parse import urlsplit
 
+from release_identity import identity_value, normalized_uuid, bind_node_observation
+from release_trust import protected_parts, trusted_stat, protected_directory, read_protected_file
+from release_qualification import (qualification_key, qualification_receipt, require_qualification,
+    qualification_digest, environment_value)
+from release_health import check_role_services, activation_health, require_activation_health
+
 
 ADMIN_STATE = Path("/var/lib/qcl-negf-admin")
 RUNTIME = ADMIN_STATE / "runtime"
@@ -203,35 +209,6 @@ def unique_json(raw, limit=65536):
     return json.loads(raw, object_pairs_hook=object_pairs)
 
 
-def normalized_uuid(value):
-    if not isinstance(value, str):
-        raise ValueError("Missing UUID")
-    try:
-        result = uuid.UUID(value)
-    except (ValueError, AttributeError) as error:
-        raise ValueError("Invalid UUID") from error
-    if result.int == 0:
-        raise ValueError("Nil UUID")
-    return str(result)
-
-
-def identity_value(value):
-    if not isinstance(value, dict) or value.get("schema") != IDENTITY_SCHEMA:
-        raise ValueError("Expected observed node identity")
-    result = {key: value.get(key) for key in ("schema", "role", "hostname", "node_name", "machine_uuid", "machine_id", "boot_id")}
-    if result["role"] not in ("controller", "worker") or not isinstance(result["hostname"], str) or not TARGET.fullmatch(result["hostname"]) or "@" in result["hostname"]:
-        raise ValueError("Invalid observed role/hostname")
-    if result["role"] == "controller":
-        if result["node_name"] is not None:
-            raise ValueError("Controller must have node_name null")
-    elif not isinstance(result["node_name"], str) or not IDENTIFIER.fullmatch(result["node_name"]):
-        raise ValueError("Invalid observed NodeName")
-    for key in ("machine_uuid", "boot_id"):
-        result[key] = normalized_uuid(result[key])
-    if not isinstance(result["machine_id"], str) or not re.fullmatch(r"[0-9a-f]{32}", result["machine_id"]) or int(result["machine_id"], 16) == 0:
-        raise ValueError("Missing/invalid observed machine-id")
-    return result
-
 
 def enrollment_records(registry):
     if not isinstance(registry, dict) or registry.get("schema") != "qcl-negf-node-enrollment-v1":
@@ -308,15 +285,6 @@ def validate_enrollment(pool, registry):
     return tuple(selected)
 
 
-def bind_node_observation(binding, observation, *, prior_boot=None):
-    actual = identity_value(observation)
-    for key in ("role", "hostname", "node_name", "machine_uuid", "machine_id"):
-        if actual[key] != binding.get(key):
-            raise ValueError("Node identity " + key + " mismatch: expected " + str(binding.get(key)) + ", observed " + str(actual[key]))
-    if prior_boot is not None and actual["boot_id"] != normalized_uuid(prior_boot):
-        raise ValueError("Node boot_id changed")
-    return MappingProxyType({**binding, "identity": MappingProxyType(actual)})
-
 
 def verify_controller_authority(controller_binding, local_observation, remote_observation):
     if controller_binding.get("role") != "controller" or controller_binding.get("node_name") is not None:
@@ -325,64 +293,6 @@ def verify_controller_authority(controller_binding, local_observation, remote_ob
     bind_node_observation(controller_binding, remote_observation, prior_boot=local["identity"]["boot_id"])
     return local
 
-
-def protected_parts(path):
-    if not isinstance(path, (str, Path)):
-        raise ValueError("Protected path must be absolute")
-    path = str(path)
-    if not path.startswith("/") or any(part in ("", ".", "..") for part in path.split("/")[1:]):
-        raise ValueError("Protected path must be absolute without traversal")
-    return path.split("/")[1:]
-
-
-def trusted_stat(info, *, directory):
-    if info.st_uid != 0 or info.st_mode & 0o022 or not (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)):
-        raise ValueError("Unprotected namespace owner/mode/type")
-
-
-@contextmanager
-def protected_directory(path, *, budget=None):
-    parts = [] if str(path) == "/" else protected_parts(path)
-    if budget:budget.before()
-    descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        if budget:budget.before()
-        trusted_stat(os.fstat(descriptor), directory=True)
-        for part in parts:
-            if budget:budget.before()
-            following = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
-            os.close(descriptor)
-            descriptor = following
-            if budget:budget.before()
-            trusted_stat(os.fstat(descriptor), directory=True)
-        yield descriptor
-    finally:
-        os.close(descriptor)
-
-
-def read_protected_file(path, limit=65536, *, budget=None):
-    if budget:budget.reserve(min(4096,limit+1))
-    parts = protected_parts(path)
-    first_read=True
-    with protected_directory("/" + "/".join(parts[:-1]),budget=budget) as parent:
-        if budget:budget.before()
-        descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
-        try:
-            if budget:budget.before()
-            trusted_stat(os.fstat(descriptor), directory=False)
-            chunks = bytearray()
-            while len(chunks) <= limit:
-                n=min(4096,limit+1-len(chunks))
-                if budget and not first_read:budget.reserve(n)
-                first_read=False
-                chunk = os.read(descriptor,n)
-                if budget:budget.actual_bytes+=len(chunk);budget.before()
-                if not chunk:
-                    return bytes(chunks)
-                chunks.extend(chunk)
-            raise ValueError("Protected metadata exceeds bound")
-        finally:
-            os.close(descriptor)
 
 
 def load_enrollment(path):
@@ -711,7 +621,7 @@ def lifecycle_guard(runtime, *, normal_intents=True, owner=None):
 
 _OWNER_OPERATIONS = frozenset({'whole_update', 'activate', 'prepare_initial',
     'shutdown_capture', 'shutdown_finalize', 'startup', 'stop_update',
-    'repair_update', 'finish_update'})
+    'repair_update', 'finish_update', 'qualify', 'invalidate_qualification'})
 _OWNER_RECORDS = {}
 
 
@@ -1192,7 +1102,7 @@ def service_environment(expected, gate, runtime):
     return '\n'.join(lines) + '\n'
 
 
-def prefetch_controller_closures(value, run=command, *, validate_only=False):
+def prefetch_controller_closures(value, run=command, *, validate_only=False, verify_solver=True):
     """Fetch and verify immutable release evidence before maintenance begins."""
     expected = manifest(value)
     paths = [expected["application_path"], str(Path(expected["solver_executable"]).parents[1])]
@@ -1247,7 +1157,8 @@ def prefetch_controller_closures(value, run=command, *, validate_only=False):
     for path, digest in hashes.items():
         if not isinstance(evidence[path], dict) or evidence[path].get("narHash") != digest:
             raise ValueError("Local closure narHash differs from the manifest")
-    verify_solver_build(value, run, evidence)
+    if verify_solver:
+        verify_solver_build(value, run, evidence)
     return hashes
 
 
@@ -1359,8 +1270,215 @@ def solver_self_check(expected, run):
     return receipt
 
 
+def observe_qualification_environment(*, runtime=RUNTIME, metadata_budget=None):
+    """Cheap kernel/modules/restore binding, never a store traversal or self-check."""
+    read = metadata_budget.read if metadata_budget else local_metadata
+    epoch = unique_json(read_protected_file(Path(runtime) / 'qualification-epoch.json',
+                                            budget=metadata_budget))
+    if (not isinstance(epoch, dict) or set(epoch) != {'schema', 'restore_epoch', 'reason'}
+            or epoch.get('schema') != 'qcl-negf-qualification-epoch-v1'
+            or epoch.get('reason') not in ('initial', 'restore', 'corruption', 'environment', 'receipt-loss')):
+        raise ValueError('Invalid protected qualification epoch')
+    if metadata_budget: metadata_budget.before()
+    kernel = str(Path('/run/booted-system/kernel').resolve(strict=True))
+    modules = str(Path('/run/booted-system/kernel-modules').resolve(strict=True))
+    return environment_value({'kernel_release': read('/proc/sys/kernel/osrelease', 256).decode().strip(),
+        'kernel_path': kernel, 'modules_path': modules, 'restore_epoch': epoch['restore_epoch']})
+
+
+def _qualification_keys(expected, node, enrollment_id, environment):
+    hashes = prefetch_controller_closures(expected, validate_only=True)
+    solver = str(Path(expected['solver_executable']).parents[1])
+    result = {}
+    for kind, path in (('application', expected['application_path']), ('solver', solver)):
+        drv = expected.get('solver_build', {}).get('drv_path') if kind == 'solver' else None
+        result[kind] = qualification_key(node, {'kind': kind, 'path': path,
+            'nar_hash': hashes[path], 'drv_path': drv}, environment, enrollment_id=enrollment_id)
+    return result
+
+
+def _qualification_reference(key):
+    return 'qualifications/' + qualification_digest(key) + '.json'
+
+
+def _read_qualification(runtime, reference, key, *, metadata_budget=None):
+    if reference != _qualification_reference(key):
+        raise ValueError('Artifact qualification reference differs from expected identity')
+    raw = read_protected_file(Path(runtime) / reference, budget=metadata_budget)
+    return require_qualification(unique_json(raw), key)
+
+
+def _require_artifact_qualifications(expected, current, node, *, runtime,
+                                     enrollment_id=None, metadata_budget=None):
+    selected = current.get('qualification_enrollment_id')
+    if enrollment_id is None:
+        # Local check may use its protected installed enrollment binding. Fleet
+        # callers pass the fresh authoritative enrollment and cannot inherit it.
+        enrollment_id = selected
+    if selected != normalized_uuid(enrollment_id):
+        raise ValueError('Installed qualification enrollment differs')
+    environment = observe_qualification_environment(runtime=runtime, metadata_budget=metadata_budget)
+    keys = _qualification_keys(expected, node, enrollment_id, environment)
+    references = current.get('artifact_qualifications')
+    if not isinstance(references, dict) or set(references) != set(keys):
+        raise ValueError('Missing artifact qualification receipts')
+    for kind, key in keys.items():
+        _read_qualification(runtime, references[kind], key, metadata_budget=metadata_budget)
+    return references
+
+
+def _prepare_qualification_directory(owner, *, deadline):
+    """Only this public metadata directory gets explicit traversal permissions.
+
+    Anchor creation/open to the already owned runtime, then validate the opened
+    inode before chmod. Never follow or chmod an unverified pathname/owner.
+    """
+    state = _owner_before(owner, deadline)
+    parent = state['directory']
+    before = lambda: _owner_before(owner, deadline)
+    before()
+    parent_info = os.fstat(parent)
+    if parent_info.st_uid != os.geteuid() or parent_info.st_mode & 0o022:
+        raise PermissionError('Qualification runtime ownership/mode changed')
+    try:
+        before(); os.mkdir('qualifications', 0o755, dir_fd=parent)
+    except FileExistsError:
+        pass
+    before()
+    descriptor = os.open('qualifications', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         dir_fd=parent)
+    try:
+        def observed():
+            before()
+            info = os.fstat(descriptor)
+            named = os.stat('qualifications', dir_fd=parent, follow_symlinks=False)
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+                    or info.st_mode & 0o7022 or _inode(info) != _inode(named)):
+                raise PermissionError('Untrusted qualification directory owner/mode/namespace')
+            return info
+        info = observed()
+        if stat.S_IMODE(info.st_mode) != 0o755:
+            before(); os.fchmod(descriptor, 0o755)
+        if stat.S_IMODE(observed().st_mode) != 0o755:
+            raise PermissionError('Qualification directory mode was not established')
+        before(); os.fsync(descriptor)
+        before(); os.fsync(parent)
+    finally:
+        os.close(descriptor)
+
+
+def _prepare_artifact_qualification(expected, node, enrollment_id, *, owner, runtime, run,
+                                    deadline, metadata_budget=None, integrity_audit=False):
+    """Verify missing contents before profiles, registration or service execution."""
+    before = lambda: _owner_before(owner, deadline)
+    before()
+    _prepare_qualification_directory(owner, deadline=deadline)
+    epoch_path = Path(runtime) / 'qualification-epoch.json'
+    if not os.path.lexists(epoch_path):
+        publish_json(epoch_path, {'schema': 'qcl-negf-qualification-epoch-v1',
+            'restore_epoch': str(uuid.uuid4()), 'reason': 'initial'}, mode=0o644, before=before)
+    environment = observe_qualification_environment(runtime=runtime, metadata_budget=metadata_budget)
+    keys = _qualification_keys(expected, node, enrollment_id, environment)
+    missing = {}
+    for kind, key in keys.items():
+        reference = _qualification_reference(key)
+        if integrity_audit:
+            before(); (Path(runtime) / reference).unlink(missing_ok=True)
+        try:
+            _read_qualification(runtime, reference, key, metadata_budget=metadata_budget)
+        except FileNotFoundError:
+            missing[kind] = key
+    if missing:
+        # Nix path-info is metadata; the full content verify is only for outputs
+        # whose own proof is absent. An APP change never verifies solver again.
+        prefetch_controller_closures(expected, run, verify_solver='solver' in missing)
+        for key in missing.values():
+            before(); run(['nix-store', '--verify-path', key['artifact']['path']])
+    before()
+    return {'keys': keys, 'missing': missing, 'environment': environment}
+
+
+def _complete_artifact_qualification(prepared, expected, node, enrollment_id, *, owner,
+                                     runtime, run, deadline, metadata_budget=None):
+    """Publish measured proof after the current node/environment is re-observed."""
+    before = lambda: _owner_before(owner, deadline)
+    before()
+    keys, environment = prepared['keys'], prepared['environment']
+    if _qualification_keys(expected, node, enrollment_id, environment) != keys:
+        raise ValueError('Qualification identity changed between integrity and execution')
+    if 'solver' in prepared['missing']:
+        before(); solver_self_check(expected, run)
+    before()
+    if observe_qualification_environment(runtime=runtime, metadata_budget=metadata_budget) != environment:
+        raise ValueError('Qualification environment changed during measurement')
+    after = assert_expected_node(node, role=node['role'], run=run, metadata_budget=metadata_budget)
+    if identity_value(after) != identity_value(node):
+        raise ValueError('Node changed during artifact qualification')
+    for kind, key in prepared['missing'].items():
+        path = Path(runtime) / _qualification_reference(key)
+        publish_json(path, qualification_receipt(key, {'integrity': True,
+            'solver_self_check': kind == 'solver'}), mode=0o644, before=before)
+    return {'artifact_qualifications': {kind: _qualification_reference(key) for kind, key in keys.items()},
+            'qualification_enrollment_id': normalized_uuid(enrollment_id)}
+
+
+def qualify(manifest_value, *, profile=PROFILE, runtime=RUNTIME, role='worker', run=command,
+            expected_node_identity=None, enrollment_id=None, deadline=None, integrity_audit=False):
+    """Explicit qualification/audit: measure engineering evidence, never open admission."""
+    expected = release_envelope(manifest_value)
+    node = assert_expected_node(expected_node_identity, role=role, run=run)
+    normalized_uuid(enrollment_id)
+    deadline = _finite_deadline(deadline)
+    with lifecycle_owner(runtime, operation='qualify', release_id=expected['release_id'],
+            release_identity=manifest(expected), deadline=deadline) as owner:
+        lifecycle_guard(runtime, owner=owner)
+        _begin_local_mutation(owner, profile=profile, gate=GATE)
+        record = Path(runtime) / 'release.json'
+        if os.path.lexists(record):
+            current = unique_json(read_protected_file(record))
+            if release_envelope(current) != expected:
+                raise ValueError('Explicit qualification differs from installed release')
+            # Audit begins by withdrawing ready, before deleting any old proof.
+            publish_json(record, {**current, 'ready': False}, before=lambda: _owner_before(owner, deadline))
+        def bounded(argv):
+            _owner_before(owner, deadline)
+            output = run(argv, deadline=deadline) if run is command else run(argv)
+            _owner_before(owner, deadline)
+            return output
+        prepared = _prepare_artifact_qualification(expected, node, enrollment_id, owner=owner,
+            runtime=runtime, run=bounded, deadline=deadline, integrity_audit=integrity_audit)
+        proof = _complete_artifact_qualification(prepared, expected, node, enrollment_id, owner=owner,
+            runtime=runtime, run=bounded, deadline=deadline)
+        _finish_owned(owner, deadline=deadline)
+        return {'schema': 'qcl-negf-local-artifact-qualification-v1', **proof, 'ready': False}
+
+
+def invalidate_qualification(*, runtime=RUNTIME, reason, deadline=None):
+    """Restore/corruption hook: rotate trust epoch before any ready/admission path."""
+    if reason not in ('restore', 'corruption', 'environment', 'receipt-loss'):
+        raise ValueError('Qualification invalidation requires a known reason')
+    deadline = _finite_deadline(deadline)
+    record = Path(runtime) / 'release.json'
+    captured = read_protected_file(record)
+    current = unique_json(captured)
+    expected = release_envelope(current)
+    with lifecycle_owner(runtime, operation='invalidate_qualification', release_id=expected['release_id'],
+            release_identity=manifest(expected), deadline=deadline) as owner:
+        lifecycle_guard(runtime, owner=owner)
+        if read_protected_file(record) != captured:
+            raise ValueError('Release changed before qualification invalidation')
+        _begin_local_mutation(owner, profile=None, gate=GATE)
+        before = lambda: _owner_before(owner, deadline)
+        # Withdraw readiness first; an interrupted rotation stays fail-closed.
+        publish_json(record, {**current, 'ready': False}, before=before)
+        result = {'schema': 'qcl-negf-qualification-epoch-v1', 'restore_epoch': str(uuid.uuid4()), 'reason': reason}
+        publish_json(Path(runtime) / 'qualification-epoch.json', result, mode=0o644, before=before)
+        _finish_owned(owner, deadline=deadline)
+        return result
+
+
 def check(manifest_value, *, profile=PROFILE, runtime=RUNTIME, role="worker", run=command,
-          expected_node_identity=None,metadata_budget=None):
+          expected_node_identity=None,metadata_budget=None,enrollment_id=None):
     def before():
         if metadata_budget:metadata_budget.before()
     before()
@@ -1377,14 +1495,25 @@ def check(manifest_value, *, profile=PROFILE, runtime=RUNTIME, role="worker", ru
     before()
     if solver_profile.resolve() != Path(expected["solver_executable"]).parents[1]:
         raise ValueError("Installed solver profile differs from the selected closure")
-    before();run(["nix-store", "--verify-path", expected["application_path"],
-         str(Path(expected["solver_executable"]).parents[1])])
-    units = ["slurmd.service"] if role == "worker" else ["qcl-negf-aiida.service", "qcl-negf-api.service"]
-    for unit in units:
-        before();run(["systemctl", "is-active", "--quiet", unit])
-    if "solver_build" in expected:
-        before();prefetch_controller_closures(expected, run)
-    before();solver_self_check(expected, run)
+    qualified = 'closures' in expected
+    if qualified:
+        protected = unique_json(read_protected_file(Path(runtime) / 'release.json', budget=metadata_budget))
+        if protected != current:
+            raise ValueError('Protected release record changed during health observation')
+        node = bound_before or assert_expected_node(current.get('node_identity'), role=role, run=run, metadata_budget=metadata_budget)
+        if current.get('node_identity') != identity_value(node):
+            raise ValueError('Activation health belongs to another node or boot generation')
+        require_activation_health(current.get('activation_health'), node)
+        _require_artifact_qualifications(expected, current, node, runtime=runtime,
+            enrollment_id=enrollment_id, metadata_budget=metadata_budget)
+    else:
+        if enrollment_id is not None or 'artifact_qualifications' in current:
+            raise ValueError('Reusable qualification requires full artifact and node metadata')
+        # Explicit legacy compatibility: no reusable proof is claimed.
+        before();run(['nix-store', '--verify-path', expected['application_path'],
+            str(Path(expected['solver_executable']).parents[1])])
+        before();solver_self_check(expected, run)
+    check_role_services(role, run, before=before)
     if bound_before is not None:
         bound_after = assert_expected_node(expected_node_identity, role=role, run=run,metadata_budget=metadata_budget) if metadata_budget else assert_expected_node(expected_node_identity, role=role, run=run)
         if bound_before != bound_after:
@@ -1483,9 +1612,19 @@ def _prepare_initial_owned(manifest_value, *, owner, profile=PROFILE, runtime=RU
 
 def activate(manifest_value, *, profile=PROFILE, runtime=RUNTIME, role="worker", run=command,
              email=None, allowed_codes_file=Path("/var/lib/qcl-negf/aiida/code-uuid"),
-             expected_node_identity=None,update_attempt_id=None,gate=GATE,deadline=None,metadata_budget=None):
+             expected_node_identity=None,update_attempt_id=None,gate=GATE,deadline=None,metadata_budget=None,enrollment_id=None):
     deadline = _finite_deadline(deadline)
-    expected = manifest(manifest_value)
+    envelope = release_envelope(manifest_value)
+    expected = manifest(envelope)
+    if 'closures' in envelope:
+        if expected_node_identity is None or enrollment_id is None:
+            raise ValueError('Modern activation requires full node identity and enrollment')
+        normalized_uuid(enrollment_id)
+    if expected_node_identity is not None and update_attempt_id is None:
+        proposed = identity_value(dict(expected_node_identity))
+        if proposed['role'] != role or proposed['boot_id'] != _process_generation()[2]:
+            raise ValueError('Activation role/boot conflicts with expected node')
+        assert_expected_node(proposed, role=role, run=run, metadata_budget=metadata_budget)
     with lifecycle_owner(runtime, operation='activate', release_id=expected['release_id'],
                          release_identity=expected, deadline=deadline) as owner:
         lifecycle_guard(runtime, owner=owner)
@@ -1500,7 +1639,7 @@ def activate(manifest_value, *, profile=PROFILE, runtime=RUNTIME, role="worker",
             runtime=runtime, role=role, run=run, email=email,
             allowed_codes_file=allowed_codes_file, expected_node_identity=expected_node_identity,
             update_attempt_id=update_attempt_id, gate=gate, deadline=deadline,
-            metadata_budget=metadata_budget)
+            metadata_budget=metadata_budget, enrollment_id=enrollment_id)
         _finish_owned(owner, deadline=deadline)
         return result
 
@@ -1535,7 +1674,7 @@ def _activate_owned(manifest_value, *, owner, profile=PROFILE, runtime=RUNTIME,
                     role='worker', run=command, email=None,
                     allowed_codes_file=Path('/var/lib/qcl-negf/aiida/code-uuid'),
                     expected_node_identity=None, update_attempt_id=None, gate=GATE,
-                    deadline, metadata_budget=None):
+                    deadline, metadata_budget=None, enrollment_id=None):
     expected = release_envelope(manifest_value)
     state = _owner_before(owner, deadline)
     if state['operation'] not in ('activate', 'whole_update'):
@@ -1546,6 +1685,10 @@ def _activate_owned(manifest_value, *, owner, profile=PROFILE, runtime=RUNTIME,
         raise ValueError('Worker update requires full node identity')
     role, expected_node_identity = _bind_activation_identity(owner, role=role,
         expected_node_identity=expected_node_identity)
+    if 'closures' in expected:
+        if expected_node_identity is None or enrollment_id is None:
+            raise ValueError('Modern activation requires full node identity and enrollment')
+        normalized_uuid(enrollment_id)
     lifecycle_guard(runtime, owner=owner)
     admission = load_admission(gate)
     if (admission.get('release_id') != expected['release_id'] or
@@ -1586,8 +1729,15 @@ def _activate_owned(manifest_value, *, owner, profile=PROFILE, runtime=RUNTIME,
     # An interrupted activation cannot leave a local ready marker for new jobs.
     if action_budget:action_budget.before()
     record.unlink(missing_ok=True)
-    run(["nix-store", "--verify-path", expected["application_path"],
-         str(Path(expected["solver_executable"]).parents[1])])
+    qualified = 'closures' in expected and bound_node is not None and enrollment_id is not None
+    if not qualified:
+        if enrollment_id is not None:
+            raise ValueError('Reusable qualification requires full artifact and node metadata')
+        run(['nix-store', '--verify-path', expected['application_path'],
+             str(Path(expected['solver_executable']).parents[1])])
+    else:
+        prepared_qualification = _prepare_artifact_qualification(expected, bound_node, enrollment_id,
+            owner=owner, runtime=runtime, run=run, deadline=deadline, metadata_budget=action_budget)
     # Each profile is an independent GC root; an identical release can lose one.
     profiles = [(profile, expected["application_path"]),
                 (profile.with_name(profile.name + "-solver"),
@@ -1599,7 +1749,7 @@ def _activate_owned(manifest_value, *, owner, profile=PROFILE, runtime=RUNTIME,
         if action_budget:action_budget.before()
         if path.resolve() != Path(selected):
             raise ValueError("Installed application or solver profile differs from the selected closure")
-    if "solver_build" in expected:
+    if 'solver_build' in expected and not qualified:
         prefetch_controller_closures(expected, run)
     identity = dict(expected)
     context = quantum_context(expected)
@@ -1641,7 +1791,12 @@ def _activate_owned(manifest_value, *, owner, profile=PROFILE, runtime=RUNTIME,
         publish_json(runtime/'update-stop.json',marker,mode=0o600,before=action_budget.before)
     for unit in units:
         run(["systemctl", "is-active", "--quiet", unit])
-    solver_self_check(expected, run)
+    if qualified:
+        identity['activation_health'] = activation_health(bound_node, str(uuid.uuid4()))
+        identity.update(_complete_artifact_qualification(prepared_qualification, expected, bound_node,
+            enrollment_id, owner=owner, runtime=runtime, run=run, deadline=deadline, metadata_budget=action_budget))
+    else:
+        solver_self_check(expected, run)
     _bind_activation_identity(owner,role=role,
         expected_node_identity=dict(expected_node_identity) if expected_node_identity is not None else None)
     if expected_node_identity is not None:
@@ -1663,7 +1818,16 @@ def guard(release_id, solver_executable, runtime=RUNTIME / "release.json", gate=
         raise ValueError("Job or worker release differs from the selected release")
     if solver_executable != current.get("solver_executable"):
         raise ValueError("Job solver executable differs from the immutable solver identity")
-    manifest(current)
+    expected = release_envelope(current)
+    if 'closures' in expected:
+        protected = unique_json(read_protected_file(runtime))
+        if protected != current:
+            raise ValueError('Protected release record changed during job admission')
+        node = identity_value(current.get('node_identity'))
+        if node['boot_id'] != _process_generation()[2]:
+            raise ValueError('Job admission requires current activation boot generation')
+        require_activation_health(current.get('activation_health'), node)
+        _require_artifact_qualifications(expected, current, node, runtime=Path(runtime).parent)
     return current
 
 
@@ -2592,7 +2756,7 @@ def utc_epoch(run,budget=None,*,deadline=None):
     return int(raw)
 
 
-def fleet_health(expected,expected_node_identity,*,runtime=RUNTIME,gate=GATE,run=command,deadline=None,metadata_budget=None):
+def fleet_health(expected,expected_node_identity,*,runtime=RUNTIME,gate=GATE,run=command,deadline=None,metadata_budget=None,enrollment_id=None):
     budget=metadata_budget or UpdateScan(deadline);admission=budget.admission(gate)
     if admission.get('open') is not False or admission.get('release_id')!=expected['release_id']:raise ValueError('Fleet health requires closed selected gate')
     role=identity_value(expected_node_identity)['role']
@@ -2605,7 +2769,7 @@ def fleet_health(expected,expected_node_identity,*,runtime=RUNTIME,gate=GATE,run
         marker=unique_json(budget.protected(Path(runtime)/'update-stop.json'),65536)
         window=marker.get('restart_window');registration=registration_tuple(final_registration(run,before['node_name'],slurm_conf=config['slurm_conf']))
         generation={'pid':record['pid'],'start_ticks':record['start_ticks'],'executable':record['executable'],'InvocationID':unit['InvocationID'],'slurm_conf_sha256':hashlib.sha256(budget.read(config['slurm_conf'])).hexdigest()}
-    budget.before();envelope=check(expected,profile=PROFILE,runtime=runtime,role=role,run=run,expected_node_identity=expected_node_identity,metadata_budget=budget)
+    budget.before();envelope=check(expected,profile=PROFILE,runtime=runtime,role=role,run=run,expected_node_identity=expected_node_identity,metadata_budget=budget,enrollment_id=enrollment_id)
     budget.before();run(['systemctl','is-active','--quiet','munged.service'])
     source=config.get('nfs_source')
     if not isinstance(source,str) or not source:raise ValueError('Missing configured NFS endpoint')
@@ -2853,7 +3017,7 @@ def _deliver_cli_locked(expected, pool, run, *, owner, runtime, gate, authority,
         for name in selected:
             stage.update(phase='update_capability',node=name,remote=True,mutation=False)
             value=unique_json(ssh(selected[name]['target'],['sudo','-n','qcl-negf-release','update-capabilities'],run,trust_snapshot=authority['trust_snapshot']),16384)
-            if value!={'schema':'qcl-negf-local-update-capability-v2','lifecycle_owner':'qcl-negf-lifecycle-owner-v1','stop_update':True,'stopped_identity':True,'fleet_health':True,'aiida_two_workflow_types':True}:
+            if value!={'schema':'qcl-negf-local-update-capability-v3','lifecycle_owner':'qcl-negf-lifecycle-owner-v1','stop_update':True,'stopped_identity':True,'fleet_health':True,'aiida_two_workflow_types':True,'artifact_qualification':True}:
                 raise ValueError('Uninstalled update capability on '+name)
         receipt["node_bindings"] = {name: dict(binding["identity"]) for name, binding in bindings.items()}
         checkpoint()
@@ -2977,10 +3141,10 @@ def _deliver_cli_locked(expected, pool, run, *, owner, runtime, gate, authority,
                     role='controller', run=run, email=controller_config['email'],
                     allowed_codes_file=Path(controller_config.get('allowed_codes_file') or '/var/lib/qcl-negf/aiida/code-uuid'),
                     expected_node_identity=bindings[name]['identity'], gate=gate,
-                    deadline=deadline, metadata_budget=controller_budget)
+                    deadline=deadline, metadata_budget=controller_budget, enrollment_id=selected[name]['enrollment_id'])
                 stage.update(phase='check', mutation=False)
                 envelope = check(value, profile=PROFILE, runtime=runtime, role='controller',
-                    run=run, expected_node_identity=dict(bindings[name]['identity']), metadata_budget=controller_budget)
+                    run=run, expected_node_identity=dict(bindings[name]['identity']), metadata_budget=controller_budget, enrollment_id=selected[name]['enrollment_id'])
                 verify_node_envelope(bindings[name], envelope, value)
                 receipt.pop('pending_local_mutation', None)
                 _owner_before(owner)['local_pending'] = False
@@ -2995,13 +3159,14 @@ def _deliver_cli_locked(expected, pool, run, *, owner, runtime, gate, authority,
                                 "--role", node["role"], "--command-timeout-seconds", str(command_timeout_seconds),
                                 "--command-output-bytes", str(command_output_bytes),
                                 "--expected-node-identity-base64", expected_node,
+                                "--qualification-enrollment-id", selected[name]["enrollment_id"],
                                 "--update-attempt-id",attempt_id,"--delivery-timeout-seconds",str(max(0,deadline-time.monotonic()-2))], run,
                                 trust_snapshot=authority["trust_snapshot"])
             stage.update(phase="check", mutation=False)
             result = ssh(node["target"], ["sudo", "-n", "qcl-negf-release", "check", "--manifest-base64", encoded,
                                          "--role", node["role"], "--command-timeout-seconds", str(command_timeout_seconds),
                                 "--command-output-bytes", str(command_output_bytes),
-                                "--expected-node-identity-base64", expected_node,"--update-attempt-id",attempt_id,
+                                "--expected-node-identity-base64", expected_node,"--qualification-enrollment-id", selected[name]["enrollment_id"],"--update-attempt-id",attempt_id,
                                 "--delivery-timeout-seconds",str(max(0,deadline-time.monotonic()-2))], run,
                                 trust_snapshot=authority["trust_snapshot"])
             try:
@@ -3020,7 +3185,7 @@ def _deliver_cli_locked(expected, pool, run, *, owner, runtime, gate, authority,
                 if selected[name]['role'] == 'controller':
                     stage.update(remote=False)
                     health = fleet_health(expected, dict(bindings[name]['identity']), runtime=runtime,
-                        gate=gate, run=run, deadline=deadline, metadata_budget=controller_budget)
+                        gate=gate, run=run, deadline=deadline, metadata_budget=controller_budget, enrollment_id=selected[name]['enrollment_id'])
                 else:
                     health=unique_json(ssh(selected[name]['target'],remote_args(name,'health-update'),run,trust_snapshot=authority['trust_snapshot']),65536)
                 verify_node_envelope(bindings[name],health,expected)
@@ -3107,10 +3272,12 @@ def _deliver_cli_locked(expected, pool, run, *, owner, runtime, gate, authority,
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["update","update-identity","update-capabilities","stop-update","stopped-identity","health-update","finish-update","prepare-initial", "activate", "check", "guard", "node-check", "bootstrap-identity", "identity", "deliver"])
+    parser.add_argument("action", choices=["update","update-identity","update-capabilities","stop-update","stopped-identity","health-update","finish-update","prepare-initial", "qualify", "integrity-audit", "invalidate-qualification", "activate", "check", "guard", "node-check", "bootstrap-identity", "identity", "deliver"])
     parser.add_argument("--update-attempt-id")
     parser.add_argument("--prior-update-attempt-id")
     parser.add_argument("--update-enrollment-id")
+    parser.add_argument("--qualification-enrollment-id")
+    parser.add_argument("--invalidation-reason", choices=["restore", "corruption", "environment", "receipt-loss"])
     parser.add_argument("--manifest")
     parser.add_argument("--manifest-base64")
     parser.add_argument("--role", choices=["controller", "worker"], default="worker")
@@ -3138,9 +3305,17 @@ def main():
         bounds={'timeout_seconds':args.command_timeout_seconds,'output_bytes':args.command_output_bytes}
         bounds['deadline']=action_deadline
         return command(argv,**bounds)
+    if (args.qualification_enrollment_id is not None and args.update_enrollment_id is not None
+            and args.qualification_enrollment_id != args.update_enrollment_id):
+        raise ValueError('Conflicting enrollment identity assertions')
+    qualification_enrollment = args.qualification_enrollment_id or args.update_enrollment_id
+    if args.action == 'invalidate-qualification':
+        result = invalidate_qualification(runtime=args.runtime, reason=args.invalidation_reason, deadline=action_deadline)
+        print(json.dumps(result, sort_keys=True))
+        return
     if args.action=='update-capabilities':
         if not Path(__file__).with_name('aiida_update_check.py').is_file():raise ValueError('Uninstalled readonly update helper')
-        print(json.dumps({'schema':'qcl-negf-local-update-capability-v2','lifecycle_owner':'qcl-negf-lifecycle-owner-v1','stop_update':True,'stopped_identity':True,'fleet_health':True,'aiida_two_workflow_types':True}))
+        print(json.dumps({'schema':'qcl-negf-local-update-capability-v3','lifecycle_owner':'qcl-negf-lifecycle-owner-v1','stop_update':True,'stopped_identity':True,'fleet_health':True,'aiida_two_workflow_types':True,'artifact_qualification':True}))
         return
     if args.action == "identity":
         print(json.dumps(observe_node_identity(run=native_run), sort_keys=True))
@@ -3186,10 +3361,14 @@ def main():
             result=observe_stopped_update(expected,args.update_attempt_id,runtime=args.runtime,gate=args.gate,run=native_run,deadline=action_deadline,budget=budget)['node_identity'] if state['UnitFileState']=='masked-runtime' else observe_node_identity(run=native_run,metadata_budget=budget)
             if result!=marker['node_identity']:raise ValueError('Prior own update identity changed')
         elif args.action=='stopped-identity':result=observe_stopped_update(expected,args.update_attempt_id,runtime=args.runtime,gate=args.gate,run=native_run,deadline=action_deadline,budget=update_scan)
-        elif args.action=='health-update':result=fleet_health(expected,expected_node,runtime=args.runtime,gate=args.gate,run=native_run,deadline=action_deadline,metadata_budget=update_scan)
+        elif args.action=='health-update':result=fleet_health(expected,expected_node,runtime=args.runtime,gate=args.gate,run=native_run,deadline=action_deadline,metadata_budget=update_scan,enrollment_id=qualification_enrollment)
         else:result=finish_update(expected,args.update_attempt_id,expected_node,runtime=args.runtime,gate=args.gate,run=native_run,deadline=action_deadline,metadata_budget=update_scan)
     elif args.action == "check":
-        result = check(expected, runtime=args.runtime, role=args.role, run=native_run, expected_node_identity=expected_node,metadata_budget=update_scan)
+        result = check(expected, runtime=args.runtime, role=args.role, run=native_run, expected_node_identity=expected_node,metadata_budget=update_scan,enrollment_id=qualification_enrollment)
+    elif args.action in ('qualify', 'integrity-audit'):
+        result = qualify(expected, runtime=args.runtime, role=args.role, run=native_run,
+            expected_node_identity=expected_node, enrollment_id=qualification_enrollment,
+            deadline=action_deadline, integrity_audit=args.action == 'integrity-audit')
     else:
         if args.action == 'prepare-initial':
             result = prepare_initial(manifest_value, runtime=args.runtime, gate=args.gate,
@@ -3213,7 +3392,7 @@ def main():
                 _owner_before(owner)['returning_worker'] = bool(args.returning_worker and args.role == 'worker')
                 result = _activate_owned(expected, owner=owner, runtime=args.runtime, role=args.role, email=settings.get("email"),
                                   run=native_run, allowed_codes_file=Path(settings.get("allowed_codes_file") or "/var/lib/qcl-negf/aiida/code-uuid"),
-                                  expected_node_identity=expected_node,update_attempt_id=args.update_attempt_id,gate=args.gate,deadline=action_deadline,metadata_budget=update_scan)
+                                  expected_node_identity=expected_node,update_attempt_id=args.update_attempt_id,gate=args.gate,deadline=action_deadline,metadata_budget=update_scan,enrollment_id=qualification_enrollment)
                 _finish_owned(owner, deadline=action_deadline)
     print(json.dumps(result, sort_keys=True))
     if args.action in ("deliver","update") and (result.get("status") != "completed" or not result.get("open")):

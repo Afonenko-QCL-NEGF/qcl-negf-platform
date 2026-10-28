@@ -73,6 +73,9 @@ class SyntheticCommands:
         self.kwargs = []
         self.mismatch = mismatch
         self.copy_started = False
+        from test_application_release import NativeUpdateModel, Commands
+        self.model, self.local = NativeUpdateModel(), Commands()
+        self.local.registered = 'synthetic-code'
         self.observations = {"admin@controller.invalid": dict(CONTROLLER),
                              "admin@controller-alias.invalid": dict(CONTROLLER),
                              "admin@worker.invalid": dict(WORKER),
@@ -88,23 +91,41 @@ class SyntheticCommands:
                 if self.mismatch == "boot_after_copy" and self.copy_started and actual["role"] == "worker":
                     actual["boot_id"] = CONTROLLER["boot_id"]
                 return json.dumps(actual)
+            from test_application_release import control_response
             if "activate" in remote:
+                self.model.activate(actual['node_name'])
                 return ""
+            response = control_response(args, actual, model=self.model)
+            if response is not None:
+                return response
             if "check" in remote:
                 if self.mismatch == "legacy":
                     return json.dumps({**manifest_fixture(), "ready": True})
                 if self.mismatch == "partial":
                     return '{"schema":'
+                from test_application_release import selected_release_response
                 return json.dumps({"schema": "qcl-negf-node-release-check-v1", "node_identity": actual,
-                                   "release": {**manifest_fixture(), "ready": True, "code_uuid": "synthetic-code"}})
+                                   "release": {**selected_release_response(remote), "ready": True, "code_uuid": "synthetic-code"}})
             raise AssertionError("Unexpected synthetic SSH action")
         if args[:3] == ["nix", "path-info", "--json"]:
             return json.dumps({item["path"]: {"narHash": item["narHash"]} for item in manifest_fixture()["closures"]})
         if args[:3] == ["nix", "copy", "--to"]:
             self.copy_started = True
             return ""
-        if args[0] in ("systemctl", "scontrol", "squeue") or args[:3] == ["nix", "copy", "--from"]:
-            return ""
+        from test_application_release import clear_aiida, controller_stop_state
+        if args == ['id', '-u']: return '1000\n'
+        if args == ['id', '-un']: return 'operator\n'
+        if args == ['env', 'TZ=UTC', 'LC_ALL=C', 'date', '+%s']: return '1791504120\n'
+        if 'aiida_update_check.py' in ' '.join(args): return json.dumps(clear_aiida())
+        if args[:2] == ['systemctl', 'show']: return controller_stop_state()
+        if args[0] == 'findmnt':
+            return json.dumps({'filesystems': [{'target': args[args.index('--target')+1],
+                'source': 'storage.invalid:/srv/qcl-negf/jobs', 'fstype': 'nfs4'}]})
+        if args[0] == 'scontrol': return ''
+        if 'scontrol' in args: return self.model.command(args)
+        if args[0] in ('nix-env', 'nix-store', 'systemctl', 'runuser', 'timeout'):
+            return self.local(args)
+        if args[0] == 'squeue' or args[:3] == ['nix', 'copy', '--from']: return ''
         raise AssertionError("Unexpected real boundary: " + args[0])
 
 
@@ -390,6 +411,25 @@ class ProtectedInputBoundaryTests(unittest.TestCase):
 
 
 class EnrollmentTests(unittest.TestCase):
+    def setUp(self):
+        from test_application_release import install_controller_config_io
+        temporary = tempfile.TemporaryDirectory(prefix='p11-enrollment-')
+        self.addCleanup(temporary.cleanup)
+        self.ops = ops
+        install_controller_config_io(self, Path(temporary.name))
+        generation = ops._process_generation
+        hook = patch.object(ops, '_process_generation', lambda: (*generation()[:2], CONTROLLER['boot_id']))
+        hook.start(); self.addCleanup(hook.stop)
+        protected = ops.read_protected_file
+        def receipt_read(path, limit=65536, **kwargs):
+            if Path(path).parent.name == 'qualifications' and str(path).startswith('/tmp/'):
+                raw = Path(path).read_bytes()
+                if len(raw) > limit: raise ValueError('Synthetic receipt exceeds bound')
+                return raw
+            return protected(path, limit, **kwargs)
+        hook = patch.object(ops, 'read_protected_file', receipt_read)
+        hook.start(); self.addCleanup(hook.stop)
+
     def test_duplicate_routes_enrollment_and_permanent_clones_are_rejected(self):
         for change in ("target", "enrollment", "uuid", "machine_id"):
             r, p = registry(), pool()
@@ -503,7 +543,7 @@ class EnrollmentTests(unittest.TestCase):
             self.assertTrue(result["open"])
             self.assertEqual(result["nodes"]["controller"]["identity"]["code_uuid"], "synthetic-code")
             resume = [args for args in run.calls if "State=RESUME" in args]
-            self.assertEqual([args[2] for args in resume], ["NodeName=worker", "NodeName=second"])
+            self.assertEqual([next(word for word in args if word.startswith("NodeName=")) for args in resume], ["NodeName=worker", "NodeName=second"])
             first_mutation = next(i for i, args in enumerate(run.calls) if args[0] == "systemctl")
             before = run.calls[:first_mutation]
             self.assertTrue(all(any(args[0] == "ssh" and args[-2] == target for args in before)
@@ -703,7 +743,7 @@ class EnrollmentTests(unittest.TestCase):
         calls, remote_actions = [], []
         observations = {"admin@controller.invalid": CONTROLLER,
                         "admin@worker.invalid": WORKER, "admin@second.invalid": SECOND}
-        selected = ops.manifest(manifest_fixture())
+        selected = ops.release_envelope(manifest_fixture())
         def transport(args, **kwargs):
             calls.append(args)
             fs.nodes["/protected/known_hosts"]["bytes"] = b"late source substitution"
@@ -766,8 +806,8 @@ class EnrollmentTests(unittest.TestCase):
             if args[0] == "nix-env":
                 self.assertEqual(Path(args[2]).parent, Path(temporary))
                 return local(args)
-            if args[0] == "nix-store" and args[1:] == ["--verify-path", "/nix/store/application", "/nix/store/solver"]:
-                return ""
+            if args[0] == 'nix-store' and args[1] == '--verify-path' and set(args[2:]) <= {'/nix/store/application', '/nix/store/solver'}:
+                return ''
             if args[0] == "systemctl" and args[1] in ("stop", "start", "restart", "is-active"):
                 self.assertTrue(set(args[2:]) <= {"--quiet", "qcl-negf-api.service", "qcl-negf-aiida.service", "munged.service"})
                 return ""
@@ -859,9 +899,11 @@ class EnrollmentTests(unittest.TestCase):
                     if args[:2] == ["systemctl", "stop"]:
                         state["maintenance"] = True
                     if (state["maintenance"] and args[0] == "ssh" and args[-2] == "admin@worker.invalid"
-                            and args[-1].endswith(" identity")):
+                            and 'stop-update' in shlex.split(args[-1])):
                         state["failure_index"] = len(run.calls)
-                        return json.dumps({**before, key: value})
+                        response = json.loads(result)
+                        response['node_identity'] = {**before, key: value}
+                        return json.dumps(response)
                     return result
                 selected = pool()
                 selected["nodes"] = [selected["nodes"][1], selected["nodes"][0], selected["nodes"][2]]
@@ -875,9 +917,7 @@ class EnrollmentTests(unittest.TestCase):
                     self.assertTrue(state["maintenance"])
                     self.assertTrue(result["requires_reconciliation"])
                     self.assertEqual(result["remote_outcome"], "unknown")
-                    self.assertEqual(result["nodes"]["worker"]["status"], "failed")
-                    self.assertEqual(result["nodes"]["controller"]["status"], "not_attempted")
-                    self.assertEqual(result["nodes"]["second"]["status"], "not_attempted")
+                    self.assertTrue(all(value.get('status') != 'verified' for value in result['nodes'].values()))
                     self.assertFalse(json.loads(gate.read_text())["open"])
                     self.assertEqual(run.calls[state["failure_index"]:], [])
                     self.assertFalse(any(args[:3] == ["nix", "copy", "--to"] or "State=RESUME" in args or
@@ -887,6 +927,8 @@ class EnrollmentTests(unittest.TestCase):
                     self.assertEqual(receipt["status"], "failed")
                     self.assertTrue(receipt["requires_reconciliation"])
                     self.assertEqual(receipt["node_bindings"]["worker"], before)
+                    self.assertEqual(receipt['stopped_observation_failure']['node'], 'worker')
+                    self.assertEqual(receipt['stopped_observation_failure']['action'], 'stop-update')
                     calls_before = list(run.calls)
                     with self.assertRaisesRegex(RuntimeError, "reconciliation"):
                         ops.deliver_cli(manifest_fixture(), selected, run=drift_after_quiesce,
