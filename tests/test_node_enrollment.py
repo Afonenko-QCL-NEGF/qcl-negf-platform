@@ -721,6 +721,7 @@ class EnrollmentTests(unittest.TestCase):
     def test_startup_requires_local_authority_and_bound_worker_before_resume(self):
         import worker_lifecycle as worker
         from test_worker_shutdown_intent import authorized_event
+        from worker_startup_fixtures import ControllerFixture
         for case in ("wrong_local", "wrong_worker", "success", "legacy"):
             run = SyntheticCommands(mismatch="legacy" if case == "legacy" else None)
             if case == "wrong_worker":
@@ -729,9 +730,9 @@ class EnrollmentTests(unittest.TestCase):
                  patch.object(ops, "load_enrollment", lambda _: {"registry": registry(), "registry_sha256": "e" * 64, "known_hosts_bytes": b"synthetic"}), \
                  patch.object(ops, "observe_node_identity", lambda **_: WORKER if case == "wrong_local" else CONTROLLER), \
                  patch.object(ops, "freeze_ssh_trust", lambda *a, **k: TRUST), \
-                 patch.object(worker, "_authorized_startup_event", authorized_event):
+                 patch.object(worker, "_authorized_startup_event", authorized_event), \
+                 ControllerFixture(ops, Path(temporary)).patches():
                 runtime, gate = Path(temporary), Path(temporary) / "gate"
-                (runtime / "release.json").write_text(json.dumps({**ops.manifest(manifest_fixture()), "ready": True}))
                 gate.write_text(json.dumps({"open": True, "release_id": "release-a"}))
                 if case == "success":
                     actual = worker.startup("worker", "admin@worker.invalid", enrollment="/protected/registry.json", runtime=runtime, gate=gate, run=run)

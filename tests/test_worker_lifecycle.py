@@ -9,6 +9,7 @@ import sys
 from unittest.mock import patch
 from test_node_enrollment import CONTROLLER, WORKER, TRUST, registry, manifest_fixture
 from test_worker_shutdown_intent import authorized_event
+from worker_startup_fixtures import ControllerFixture
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "ops"))
 
@@ -157,9 +158,8 @@ class WorkerLifecycleTests(unittest.TestCase):
     def test_returning_worker_only_resumes_after_current_ready_identity_is_verified(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            expected = {"schema": "qcl-negf-release-v1", "release_id": "release-a", "ready": True,
-                        "application_path": "/nix/store/application", "solver_executable": "/nix/store/solver/bin/qcl-negf"}
-            (root / "release.json").write_text(json.dumps(expected))
+            expected = {**manifest_fixture(), "ready": True}
+            controller = ControllerFixture(self.ops.release, root, expected)
             gate = root / "admission.json"
             gate.write_text(json.dumps({"release_id": "release-a", "open": True}))
             calls = []
@@ -176,7 +176,8 @@ class WorkerLifecycleTests(unittest.TestCase):
                                            "release": {**expected, "ready": ready}})
                 return ""
 
-            with patch.object(self.ops.release, "load_enrollment", lambda _: {"registry": registry(), "registry_sha256": "e" * 64, "known_hosts_bytes": b"synthetic"}), \
+            with controller.patches(), \
+                 patch.object(self.ops.release, "load_enrollment", lambda _: {"registry": registry(), "registry_sha256": "e" * 64, "known_hosts_bytes": b"synthetic"}), \
                  patch.object(self.ops.release, "observe_node_identity", lambda **_: CONTROLLER), \
                  patch.object(self.ops.release, "freeze_ssh_trust", lambda *a, **k: TRUST), \
                  patch.object(self.ops, "_authorized_startup_event", authorized_event):
