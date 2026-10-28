@@ -1,0 +1,152 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qcl-negf.example/schemas/host-resource-native-startup.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "reservation_id",
+    "host_id",
+    "vm_id",
+    "native_vm_id",
+    "host_boot_id",
+    "policy_sha256",
+    "static_config_fingerprint",
+    "phase",
+    "charged_bytes",
+    "initial_peak_bytes",
+    "binding",
+    "admission_closed",
+    "failure_code",
+    "observed_at"
+  ],
+  "properties": {
+    "schema": {
+      "const": "qcl.host-resource-startup.v1"
+    },
+    "reservation_id": {
+      "type": "string"
+    },
+    "host_id": {
+      "type": "string"
+    },
+    "vm_id": {
+      "type": "string"
+    },
+    "native_vm_id": {
+      "type": "string"
+    },
+    "host_boot_id": {
+      "type": "string"
+    },
+    "policy_sha256": {
+      "type": "string"
+    },
+    "static_config_fingerprint": {
+      "type": "string"
+    },
+    "phase": {
+      "enum": [
+        "cold_reserved",
+        "boot_unknown",
+        "running_quarantined",
+        "binding_ready",
+        "reconciliation_required",
+        "rejected"
+      ]
+    },
+    "charged_bytes": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "initial_peak_bytes": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "binding": {
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "vm_id",
+            "native_id",
+            "process_id",
+            "guest_boot_id",
+            "image_id",
+            "guest_kernel_id",
+            "host_kernel_id",
+            "qemu_version_id",
+            "backend_version_id",
+            "readback_version",
+            "config_fingerprint"
+          ],
+          "properties": {
+            "vm_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "native_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "process_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "guest_boot_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "image_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "guest_kernel_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "host_kernel_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "qemu_version_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "backend_version_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "readback_version": {
+              "type": "string",
+              "minLength": 1
+            },
+            "config_fingerprint": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "admission_closed": {
+      "type": "boolean"
+    },
+    "failure_code": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[A-Za-z0-9_]+$",
+      "maxLength": 80
+    },
+    "observed_at": {
+      "type": "integer",
+      "minimum": 0
+    }
+  }
+}

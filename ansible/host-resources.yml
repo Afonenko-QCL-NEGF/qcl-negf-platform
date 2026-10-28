@@ -1,0 +1,140 @@
+---
+# Administrative installation SOURCE. Does not start/reload services, reserve
+# memory, attach hooks to VMs, or qualify the native protocol.
+- name: Install opt-in resource authority on existing native hosts
+  hosts: qcl_resource_hosts
+  become: true
+  gather_facts: false
+  vars:
+    qcl_resource_install: false
+    qcl_resource_python: /usr/bin/python3
+    qcl_resource_authority_user: qcl-resource-authority
+    qcl_resource_authority_key: ""
+    qcl_resource_backend: ""
+    qcl_resource_private_directory: ""
+  tasks:
+    - name: Require reviewed installation and external protected private inputs
+      ansible.builtin.assert:
+        that:
+          - qcl_resource_install | bool
+          - qcl_resource_backend in ['proxmox', 'libvirt']
+          - qcl_resource_authority_key | length > 0
+          - qcl_resource_authority_user is match('^[a-z_][a-z0-9_-]*$')
+          - qcl_resource_authority_user != 'root'
+          - qcl_resource_private_directory is match('^/')
+          - qcl_resource_python is match('^/')
+    - name: Check existing Python and systemd interpreter without bootstrap
+      ansible.builtin.command:
+        argv: ["{{ qcl_resource_python }}", -I, -c, "import sys; assert sys.version_info >= (3,11)"]
+      changed_when: false
+    - name: Create protected native helper and runtime directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      loop:
+        - /usr/local/lib/qcl-negf-host-resources
+        - /etc/qcl-negf/host-resources
+        - /var/lib/qcl-negf/host-resources
+    - name: Install frozen command engine and resource source
+      ansible.builtin.copy:
+        src: "../ops/{{ item }}.py"
+        dest: "/usr/local/lib/qcl-negf-host-resources/{{ item }}.py"
+        owner: root
+        group: root
+        mode: "0600"
+      loop:
+        - application_release
+        - release_identity
+        - release_trust
+        - release_qualification
+        - release_health
+        - runtime_bindings
+        - host_resource_policy
+        - host_resource_operations
+        - host_resource_backends
+        - host_resource_facts
+        - host_resource_client
+        - host_resource_service
+        - host_resource_startup
+        - host_resource_projection
+    - name: Create public helper directory
+      ansible.builtin.file:
+        path: /usr/local/libexec
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+    - name: Install fixed role helpers
+      ansible.builtin.template:
+        src: templates/host-resources/helper.j2
+        dest: "/usr/local/libexec/qcl-negf-resource-{{ item }}"
+        owner: root
+        group: root
+        mode: "0755"
+      loop: [authority, worker, start-hook, admin]
+    - name: Install unprivileged forced SSH command parser
+      ansible.builtin.template:
+        src: templates/host-resources/forced-command.j2
+        dest: /usr/local/libexec/qcl-negf-resource-ssh-authority
+        owner: root
+        group: root
+        mode: "0755"
+    - name: Create dedicated restricted transport identity
+      ansible.builtin.user:
+        name: "{{ qcl_resource_authority_user }}"
+        system: true
+        create_home: true
+        password_lock: true
+        shell: /bin/sh
+        home: "/home/{{ qcl_resource_authority_user }}"
+    - name: Protect transport home and key directory from account writes
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - "/home/{{ qcl_resource_authority_user }}"
+        - "/home/{{ qcl_resource_authority_user }}/.ssh"
+    - name: Install only restricted authority key
+      ansible.builtin.copy:
+        content: 'restrict,command="/usr/local/libexec/qcl-negf-resource-ssh-authority" {{ qcl_resource_authority_key }}'
+        dest: "/home/{{ qcl_resource_authority_user }}/.ssh/authorized_keys"
+        owner: root
+        group: root
+        mode: "0644"
+      # Public key readable by sshd's account context, writable only by root.
+    - name: Install narrow sudo authority only
+      ansible.builtin.template:
+        src: templates/host-resources/sudoers.j2
+        dest: /etc/sudoers.d/qcl-negf-resource-authority
+        owner: root
+        group: root
+        mode: "0440"
+        validate: /usr/sbin/visudo -cf %s
+    - name: Copy reviewed private config files outside the store
+      ansible.builtin.copy:
+        src: "{{ qcl_resource_private_directory }}/{{ item }}.json"
+        dest: "/etc/qcl-negf/host-resources/{{ item }}.json"
+        owner: root
+        group: root
+        mode: "0600"
+      loop: [service, runtime, policy, agreement, qualification]
+      no_log: true
+    - name: Check unknown existing libvirt primary hook before providing drop-in
+      ansible.builtin.stat:
+        path: /etc/libvirt/hooks/qemu
+      register: qcl_primary_hook
+      when: qcl_resource_backend == 'libvirt'
+    - name: Refuse overwriting or guessing existing primary hook ownership
+      ansible.builtin.assert:
+        that: not qcl_primary_hook.stat.exists
+        fail_msg: Coordinate the existing owning hook before installation; do not replace it.
+      when: qcl_resource_backend == 'libvirt'
+    - name: Leave hook attachment and cold reservation as separate administrative gate
+      ansible.builtin.debug:
+        msg: Installed source only. Prepare full cold reservations before enabling autostart; wire owned PVE/libvirt hooks through the separate P22/native plan.

@@ -14,20 +14,21 @@ from pathlib import Path
 import stat
 import tempfile
 import time
+import threading
 import uuid
 from typing import Callable, Protocol, Sequence
 
-from host_resource_policy import (HostResourcePolicy, PolicyValidationError, ResidentGrant,
-                                 validate_host_grants, validate_host_resource_policy, validate_resize)
+from host_resource_policy import (HostResourcePolicy, PolicyValidationError as PolicyValidationError, ResidentGrant,
+                                 validate_host_grants, validate_host_resource_policy as validate_host_resource_policy, validate_resize)
 
-STATE_SCHEMA = "qcl.host-resource-state.v2"
+STATE_SCHEMA = "qcl.host-resource-state.v3"
 MAX_STATE_BYTES = 1024 * 1024
 PENDING = {"HOST_GRANT", "GROW_UNKNOWN", "GUEST_ADMIT", "SHRINK_READY", "SHRINK_UNKNOWN"}
 PHASES = PENDING | {"RUN", "RELEASE", "SHRINK_DEFERRED"}
 UNKNOWN = {"GROW_UNKNOWN", "SHRINK_UNKNOWN"}
 CLEANUP_BLOCK = "native owned cleanup unconfirmed; administrator reconciliation required"
 RECEIPT_FIELDS = {"request", "phase", "target_bytes", "old_bytes", "failure", "finished",
-                  "mutation_id", "mutation_started_at", "native_cleanup_confirmed"}
+                  "mutation_id", "mutation_started_at", "native_cleanup_confirmed", "native_workload", "native_context"}
 
 
 class ResourceError(RuntimeError):
@@ -238,6 +239,8 @@ class FileReceiptStore:
         self.directory = Path(directory).absolute()
         self.owner_uid = owner_uid
         self.state_path = self.directory / "state.json"
+        self._lock_owner = None
+        self._lock_reentrant = False
         created = not self.directory.exists()
         if created:
             self.directory.mkdir(mode=0o700)
@@ -263,18 +266,53 @@ class FileReceiptStore:
         require(stat.S_ISREG(st.st_mode) and st.st_uid == self.owner_uid and
                 not st.st_mode & 0o022 and st.st_nlink == 1, "trust", "unsafe host state file")
 
+    @classmethod
+    def open_existing(cls, directory, *, owner_uid=0):
+        """Status must not create/fsync directories or initialize host state."""
+        self = cls.__new__(cls)
+        self.directory, self.owner_uid = Path(directory).absolute(), owner_uid
+        self.state_path = self.directory / "state.json"
+        self.completed_directory = self.directory / "completed"
+        self.workload_directory = self.directory / "workload-ids"
+        self._lock_owner = None
+        self._lock_reentrant = False
+        for path in (self.directory, self.completed_directory, self.workload_directory):
+            self._check_path(path, directory=True)
+        return self
+
     @contextmanager
-    def locked(self):
+    def operation(self):
+        """One native invocation: capture facts and call existing locked methods."""
+        require(self._lock_owner is None, "host_locked", "another operation owns this store")
+        with self.locked():
+            self._lock_reentrant = True
+            try:
+                yield
+            finally:
+                self._lock_reentrant = False
+
+    @contextmanager
+    def locked(self, *, read_only=False):
+        identity = (os.getpid(), threading.get_ident())
+        if self._lock_owner is not None:
+            require(self._lock_owner == identity and self._lock_reentrant,
+                    "host_locked", "another operation owns this store")
+            require(read_only or not self._lock_read_only, "read_only", "read-only ownership cannot mutate")
+            yield
+            return
         self._check_path(self.directory, directory=True)
-        fd = os.open(self.directory / "host.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        flags = os.O_RDONLY if read_only else os.O_RDWR | os.O_CREAT
+        fd = os.open(self.directory / "host.lock", flags | os.O_NOFOLLOW, 0o600)
         try:
             self._check_fd(fd)
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, (fcntl.LOCK_SH if read_only else fcntl.LOCK_EX) | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise ResourceError("host_locked", "another host operation owns the lock") from exc
+            self._lock_owner, self._lock_read_only = identity, read_only
             yield
         finally:
+            self._lock_owner = None
             os.close(fd)
 
     def load(self):
@@ -303,7 +341,7 @@ class FileReceiptStore:
             return None
         record = self._read(path)
         require(type(record) is dict and set(record) == {"schema", "receipt", "context"} and
-                record["schema"] == "qcl.host-resource-completed.v2", "state", "invalid completed receipt")
+                record["schema"] == "qcl.host-resource-completed.v3", "state", "invalid completed receipt")
         require(type(record["context"]) is dict and
                 set(record["context"]) == {"host_boot_id", "policy_sha256", "binding"},
                 "state", "missing original host/policy/runtime context")
@@ -341,12 +379,13 @@ class FileReceiptStore:
                 "state", "active/unknown grants cannot be archived")
         req = row["request"]
         self._immutable(self.completed_directory / self._key(req["request_id"]),
-                        {"schema": "qcl.host-resource-completed.v2", "receipt": row, "context": context})
+                        {"schema": "qcl.host-resource-completed.v3", "receipt": row, "context": context})
         self._immutable(self.workload_directory / self._key(req["workload_id"]),
                         {"schema": "qcl.host-resource-workload-id.v1",
                          "workload_id": req["workload_id"], "request_id": req["request_id"]})
 
     def save(self, state):
+        require(self._lock_owner is None or not self._lock_read_only, "read_only", "status cannot save")
         data = json.dumps(state, sort_keys=True, separators=(",", ":")).encode()
         require(len(data) <= MAX_STATE_BYTES, "state_full", "retain old journal; no mutation")
         self._atomic(self.state_path, data)
@@ -401,8 +440,11 @@ class HostResourceController:
 
     def _load(self):
         state = self.store.load()
+        require(type(state) is not dict or state.get("schema") not in
+                {"qcl.host-resource-state.v1", "qcl.host-resource-state.v2"},
+                "upgrade_required", "legacy state retained; explicit upgrade required, never reset")
         require(type(state) is dict and set(state) == {"schema", "policy_sha256", "host_boot_id",
-                "grants", "bindings", "desired", "receipts", "blocked"} and
+                "grants", "bindings", "desired", "receipts", "blocked", "startups"} and
                 state["schema"] == STATE_SCHEMA, "state", "invalid journal shape/schema")
         self._grants(state)
         require(type(state["receipts"]) is list, "state", "invalid receipts")
@@ -414,6 +456,15 @@ class HostResourceController:
             require(row["phase"] in PHASES and req.request_id not in ids and
                     req.workload_id not in workloads and type(row["finished"]) is bool,
                     "state", "invalid phase or duplicate identity")
+            native = row["native_workload"]
+            require(native is None or (type(native) is dict and set(native) ==
+                    {"kind", "native_id", "generation"} and all(type(v) is str and v for v in native.values())),
+                    "state", "invalid native workload identity")
+            context = row["native_context"]
+            require(context is None or (type(context) is dict and set(context) ==
+                    {"unit", "invocation_id", "cgroup", "host_boot_id", "mutation_id"} and
+                    context["mutation_id"] == row["mutation_id"] and all(type(v) is str and v for v in context.values())),
+                    "state", "invalid native invocation context")
             integer(row["target_bytes"], "target_bytes", 1)
             integer(row["old_bytes"], "old_bytes", 1)
             require(type(row["native_cleanup_confirmed"]) is bool and
@@ -432,10 +483,27 @@ class HostResourceController:
         require(sum(row["phase"] in PENDING for row in state["receipts"]) <= 1,
                 "state", "multiple pending mutations")
         vm_ids = {vm.vm_id for vm in self.policy.vms}
+        require(type(state["startups"]) is dict and set(state["startups"]) == vm_ids and
+                all(type(value) is dict and value.get("phase") in
+                    {"cold_reserved", "boot_unknown", "running_quarantined", "binding_ready"}
+                    for value in state["startups"].values()), "state", "incomplete startup scope")
         require(type(state["bindings"]) is dict and set(state["bindings"]) == vm_ids and
                 type(state["desired"]) is dict and set(state["desired"]) == vm_ids,
                 "state", "incomplete native/desired snapshot")
         for grant in self._grants(state):
+            startup = state["startups"][grant.vm_id]
+            require(set(startup) == {"phase", "reservation_id", "native_id",
+                    "static_config_fingerprint", "initial_peak_bytes"}, "state", "invalid startup record")
+            if state["bindings"][grant.vm_id] is None:
+                require(startup["phase"] in {"cold_reserved", "boot_unknown"} and
+                        grant.guest_bytes == self._vm(grant.vm_id).maximum_bytes and
+                        not self._live(state, grant.vm_id), "state", "unbound startup must retain maximum")
+            else:
+                binding = RuntimeBinding(**state["bindings"][grant.vm_id])
+                require(binding.vm_id == grant.vm_id and binding.native_id == startup["native_id"] and
+                        binding.config_fingerprint == startup["static_config_fingerprint"] and
+                        startup["phase"] in {"running_quarantined", "binding_ready"},
+                        "state", "startup/binding mismatch")
             floor = self._floor(state, grant.vm_id)
             require(grant.active_floor_bytes >= floor, "state", "unpaid aggregate commitments")
             if self._live(state, grant.vm_id):
@@ -522,6 +590,8 @@ class HostResourceController:
     def _guard(self, state, evidence, *, pressure=True, completing=None):
         require(type(evidence) is HostEvidence, "shape", "HostEvidence required")
         require(state["blocked"] is None, "reconciliation_required", str(state["blocked"]))
+        require(all(value["phase"] == "binding_ready" for value in state["startups"].values()),
+                "startup_binding_required", "cold/quarantined reservation does not admit work")
         require(all(row["native_cleanup_confirmed"] for row in state["receipts"]),
                 "reconciliation_required", "latest native mutation cleanup requires exact admin proof")
         if evidence.host_boot_id != state["host_boot_id"] or \
@@ -583,7 +653,11 @@ class HostResourceController:
                      "grants": [asdict(g) for g in grants],
                      "bindings": {key: asdict(b) for key, b in bindings.items()},
                      "desired": {g.vm_id: g.guest_bytes for g in grants},
-                     "receipts": [], "blocked": None}
+                     "receipts": [], "blocked": None,
+                     "startups": {key: {"phase": "binding_ready", "reservation_id": None,
+                         "native_id": b.native_id, "static_config_fingerprint": b.config_fingerprint,
+                         "initial_peak_bytes": self._vm(key).maximum_bytes}
+                         for key, b in bindings.items()}}
             self._guard(state, evidence)
             self._save(state)
 
@@ -659,7 +733,8 @@ class HostResourceController:
             require(floor <= target, "maximum", "aggregate commitments exceed protected guest capacity")
             row = {"request": asdict(request), "phase": "HOST_GRANT", "target_bytes": target,
                    "old_bytes": grant.guest_bytes, "failure": None, "finished": False,
-                   "mutation_id": None, "mutation_started_at": None, "native_cleanup_confirmed": True}
+                   "mutation_id": None, "mutation_started_at": None, "native_cleanup_confirmed": True,
+                   "native_workload": None, "native_context": None}
             state["receipts"].append(row)
             self._set_grant(state, replace(grant, guest_bytes=target, active_floor_bytes=floor,
                                            state="active"))
@@ -697,6 +772,10 @@ class HostResourceController:
             row["mutation_id"] = uuid.uuid4().hex if needs_resize else None
             row["mutation_started_at"] = int(self.clock()) if needs_resize else None
             row["native_cleanup_confirmed"] = not needs_resize
+            # Installed production backend joins this worker's native unit before
+            # the barrier. Synthetic/typed A adapters have no native unit context.
+            prepare = getattr(self.backend, "prepare_mutation", None)
+            row["native_context"] = prepare(row) if needs_resize and prepare else None
             self._set_grant(state, replace(grant, state="ambiguous"))
             self._save(state)  # cleanup-pending barrier MUST be durable before actual resize
             try:

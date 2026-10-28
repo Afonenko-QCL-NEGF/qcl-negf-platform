@@ -1,0 +1,7 @@
+{
+  "schema": "qcl.host-resource-native-reference.v1",
+  "workload": {
+    "kind": "slurm_allocation",
+    "native_id": "42"
+  }
+}

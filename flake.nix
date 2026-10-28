@@ -23,6 +23,10 @@
     nixosModules.default = import ./modules;
     nixosModules.image = import ./modules/image.nix;
     nixosModules.linuxWorker = import ./modules/linux-worker.nix;
+    nixosModules.hostResources = import ./modules/host-resources.nix;
+    packages = forAll (system: {
+      hostResources = import ./nix/host-resources.nix { pkgs = nixpkgs.legacyPackages.${system}; };
+    });
     lib.mkPythonEnvironment = { system, workspaceRoot, includeTests ? false }:
       import ./nix/application.nix {
         pkgs = nixpkgs.legacyPackages.${system};

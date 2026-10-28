@@ -1,0 +1,17 @@
+{
+  "schema": "qcl.host-resource-startup.v1",
+  "reservation_id": "synthetic-reservation",
+  "host_id": "synthetic-host",
+  "vm_id": "synthetic-vm",
+  "native_vm_id": "synthetic-uuid",
+  "host_boot_id": "synthetic-boot",
+  "policy_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "static_config_fingerprint": "1111111111111111111111111111111111111111111111111111111111111111",
+  "phase": "cold_reserved",
+  "charged_bytes": 1073741824,
+  "initial_peak_bytes": 1073741824,
+  "binding": null,
+  "admission_closed": true,
+  "failure_code": null,
+  "observed_at": 100
+}

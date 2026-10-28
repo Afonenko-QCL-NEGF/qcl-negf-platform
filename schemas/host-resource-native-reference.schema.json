@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qcl-negf.example/schemas/host-resource-native-reference.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "workload"
+  ],
+  "properties": {
+    "schema": {
+      "const": "qcl.host-resource-native-reference.v1"
+    },
+    "workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "native_id"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "slurm_allocation",
+            "systemd_build"
+          ]
+        },
+        "native_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.:@-]+$",
+          "minLength": 1,
+          "maxLength": 200
+        }
+      }
+    }
+  }
+}

@@ -31,7 +31,21 @@ def fingerprint(value):
 
 def trusted_root_path(path, *, directory=False, executable=False):
     """Reject symlinks and writable/user-owned ancestors, including /tmp."""
+    try:
+        release_commands.protected_parts(str(path))
+    except ValueError as error:
+        raise ResourceError("trust", "canonical protected path required") from error
     path = Path(path)
+    if str(path).startswith("/nix/store/"):
+        # Reuse P12's exact native-store exception; never relax /tmp or another
+        # writable ancestor. Store descendants are still root-owned/no-symlink.
+        from runtime_bindings import read_store_file
+        leaf = path / "nixos-version" if directory else path
+        limit = 4096 if directory else 128 * 1024**2
+        read_store_file(leaf, limit=limit)
+        if executable:
+            require(path.stat().st_mode & 0o111 != 0, "trust", "native tool is not executable")
+        return path
     require(path.is_absolute() and path == path.absolute(), "trust", "absolute canonical path required")
     for item in (path, *path.parents):
         st = item.lstat()
@@ -63,9 +77,12 @@ def read_root_json(path):
 
 class NativeCommandRunner:
     """Bounded local argv execution. Only root-enrolled absolute tools are allowed."""
-    def __init__(self, tools):
+    def __init__(self, tools, *, slurm_conf=None):
         require(os.geteuid() == 0, "root_required", "native resource helper runs as root")
         self.tools = frozenset(str(trusted_root_path(p, executable=True)) for p in tools)
+        self.environment = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C", "TZ": "UTC"}
+        if slurm_conf is not None:
+            self.environment["SLURM_CONF"] = str(trusted_root_path(slurm_conf))
 
     def run(self, argv, *, timeout_seconds, max_output_bytes=MAX_OUTPUT_BYTES):
         require(type(argv) in (list, tuple) and bool(argv) and argv[0] in self.tools,
@@ -81,7 +98,7 @@ class NativeCommandRunner:
             # Its cleanup reserve is inside the operation's original timeout.
             return release_commands.command(argv, timeout_seconds=timeout_seconds,
                 output_bytes=max_output_bytes, cleanup_seconds=min(2.0, timeout_seconds / 2),
-                env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C", "TZ": "UTC"})
+                env=self.environment)
         except release_commands.CommandFailure as exc:
             record = dict(exc.record)
             if record.get("cleanup_confirmed") is not True:
@@ -95,6 +112,14 @@ class NativeCommandRunner:
             error.native_output = record["stdout"] + record["stderr"]
             error.native_output_truncated = record["output_truncated"]
             raise error from exc
+
+
+def pve_config_fingerprint(config):
+    require(type(config) is dict and all(type(v) in {str,int,bool} for v in config.values()),
+        "unsupported", "qualified scalar PVE static config required")
+    stable={key: str(int(value)) if type(value) is bool else str(value)
+        for key,value in config.items() if key not in {"digest","balloon"}}
+    return fingerprint(stable)
 
 
 @dataclass(frozen=True)
@@ -152,8 +177,8 @@ class ProxmoxMemoryBackend:
         integer(assigned, "PVE actual balloon/fixed allocation", 1)
         if not config["balloon"]:
             require(not self.dynamic and assigned == configured, "readback", "fixed reservation mismatch")
-        stable = {key: value for key, value in config.items() if key not in {"digest", "balloon"}}
-        return VMReadback(vm_id, actual_uuid[0], str(status["pid"]), fingerprint(stable),
+        stable = pve_config_fingerprint(config)
+        return VMReadback(vm_id, actual_uuid[0], str(status["pid"]), stable,
                           config["digest"], configured, assigned, status.get("status") == "running")
 
     def resize(self, vm_id: str, target_bytes: int, before: VMReadback,
@@ -173,6 +198,19 @@ class LibvirtVM:
     native_id: str
     name: str
     pid_file: str | None = None  # actual libvirt runtime PID locator, qualified for this site
+
+
+def libvirt_config_fingerprint(xml):
+    """Static domain identity excludes runtime domain ID/aliases and target RAM."""
+    xml = ET.fromstring(ET.tostring(xml))
+    xml.attrib.pop("id", None)
+    current = xml.find("currentMemory")
+    require(current is not None, "readback", "explicit currentMemory required")
+    current.text = "CONTROLLED_MEMORY_TARGET"
+    for parent in xml.iter():
+        for child in list(parent):
+            if child.tag == "alias": parent.remove(child)
+    return fingerprint(ET.tostring(xml, encoding="unicode"))
 
 
 class LibvirtMemoryBackend:
@@ -239,15 +277,14 @@ class LibvirtMemoryBackend:
             balloon = xml.find("devices/memballoon")
             require(balloon is not None and balloon.get("model") == "virtio",
                     "unsupported", "qualified virtio balloon device required")
-        current.text = "CONTROLLED_MEMORY_TARGET"
-        stable = ET.tostring(xml, encoding="unicode")
+        stable = libvirt_config_fingerprint(xml)
         process_id = "domid:" + domain_id  # only fixture/source mode; never accepted by native verifier
         if vm.pid_file is not None:
             path = trusted_root_path(vm.pid_file)
             require(path.stat().st_size <= 32, "readback", "oversized libvirt PID file")
             process_id = path.read_text().strip()
             require(process_id.isdigit() and int(process_id) > 0, "readback", "invalid libvirt QEMU PID")
-        return VMReadback(vm_id, vm.native_id, process_id, fingerprint(stable),
+        return VMReadback(vm_id, vm.native_id, process_id, stable,
                           hashlib.sha256(raw_xml.encode()).hexdigest(), configured,
                           stats["actual"] * 1024, running)
 
@@ -354,6 +391,19 @@ class RootNativeBoundary:
                 "shape", "protected runtime configuration required")
         trusted_root_path(self.config["state_directory"], directory=True)
         self.runner = NativeCommandRunner([self.config["backend_config"]["tool"]])
+
+    def open_owner(self):
+        """Open the single owner without a stale/generated evidence prerequisite.
+
+        Production provider captures fresh facts inside store.operation(). Cold
+        preparation has no guest/probe dependency. Existing typed open is kept.
+        """
+        require(read_root_json(self.config_path) == self.config, "identity_mismatch", "runtime config changed")
+        policy = validate_host_resource_policy(read_root_json(self.config["policy"]))
+        backend = backend_from_config(self.config["backend_config"], self.runner,
+            dynamic=policy.active_grant.mechanism == "qualified_dynamic")
+        store = FileReceiptStore(Path(self.config["state_directory"]))
+        return policy, store, backend
 
     def open(self):
         # Every call rereads the protected inputs. No client can substitute facts.

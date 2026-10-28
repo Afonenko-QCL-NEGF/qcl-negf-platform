@@ -1,0 +1,11 @@
+{
+  "schema": "qcl.host-resource-projection.v1",
+  "observed_at": 100,
+  "state_generation": null,
+  "status": "not_initialized",
+  "host": null,
+  "vms": [],
+  "operations": [],
+  "complete": true,
+  "next_cursor": null
+}

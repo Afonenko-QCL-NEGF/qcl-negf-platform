@@ -1,0 +1,503 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qcl-negf.example/schemas/host-resource-native-projection.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "observed_at",
+    "state_generation",
+    "status",
+    "host",
+    "vms",
+    "operations",
+    "complete",
+    "next_cursor"
+  ],
+  "properties": {
+    "schema": {
+      "const": "qcl.host-resource-projection.v1"
+    },
+    "observed_at": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "state_generation": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "status": {
+      "enum": [
+        "ok",
+        "not_initialized",
+        "upgrade_required",
+        "reconciliation_required"
+      ]
+    },
+    "host": {
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "host_id",
+            "physical_ram_bytes",
+            "H_bytes",
+            "F_bytes",
+            "owned_pool_bytes",
+            "charged_guest_bytes",
+            "overhead_bytes",
+            "native_freshness"
+          ],
+          "properties": {
+            "host_id": {
+              "type": "string"
+            },
+            "physical_ram_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "H_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "F_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "owned_pool_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "charged_guest_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "overhead_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "native_freshness": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "status",
+                "observed_at"
+              ],
+              "properties": {
+                "status": {
+                  "enum": [
+                    "fresh",
+                    "stale",
+                    "not_measured",
+                    "inconsistent"
+                  ]
+                },
+                "observed_at": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "vms": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "vm_id",
+          "grant_state",
+          "charged_bytes",
+          "desired_bytes",
+          "current_assigned_bytes",
+          "current_configured_bytes",
+          "protected_floor_bytes",
+          "boot_phase",
+          "maintenance_required",
+          "failure_code",
+          "native_freshness",
+          "cpu"
+        ],
+        "properties": {
+          "vm_id": {
+            "type": "string"
+          },
+          "grant_state": {
+            "enum": [
+              "idle",
+              "active",
+              "ambiguous",
+              "unknown"
+            ]
+          },
+          "charged_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "desired_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "current_assigned_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "current_configured_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "protected_floor_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "boot_phase": {
+            "enum": [
+              "cold_reserved",
+              "boot_unknown",
+              "running_quarantined",
+              "binding_ready",
+              "unknown"
+            ]
+          },
+          "maintenance_required": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "failure_code": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[A-Za-z0-9_]+$",
+            "maxLength": 80
+          },
+          "native_freshness": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "status",
+              "observed_at"
+            ],
+            "properties": {
+              "status": {
+                "enum": [
+                  "fresh",
+                  "stale",
+                  "not_measured",
+                  "inconsistent"
+                ]
+              },
+              "observed_at": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 0
+              }
+            }
+          },
+          "cpu": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "desired_weight",
+              "current_weight",
+              "configured_vcpus",
+              "online_vcpus",
+              "online_change_supported"
+            ],
+            "properties": {
+              "desired_weight": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 0
+              },
+              "current_weight": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 0
+              },
+              "configured_vcpus": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 0
+              },
+              "online_vcpus": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 0
+              },
+              "online_change_supported": {
+                "const": false
+              }
+            }
+          }
+        }
+      }
+    },
+    "operations": {
+      "type": "array",
+      "maxItems": 128,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema",
+          "request_id",
+          "workload",
+          "native_generation",
+          "host_id",
+          "vm_id",
+          "state_generation",
+          "phase",
+          "admission",
+          "failure_code",
+          "requested_workload_bytes",
+          "target_bytes",
+          "charged_bytes",
+          "current_assigned_bytes",
+          "current_configured_bytes",
+          "protected_floor_bytes",
+          "cleanup",
+          "native_freshness"
+        ],
+        "properties": {
+          "schema": {
+            "const": "qcl.host-resource-operation.v1"
+          },
+          "request_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "workload": {
+            "anyOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "kind",
+                  "native_id"
+                ],
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "slurm_allocation",
+                      "systemd_build"
+                    ]
+                  },
+                  "native_id": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9_.:@-]+$",
+                    "minLength": 1,
+                    "maxLength": 200
+                  }
+                }
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "native_generation": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "host_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "vm_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state_generation": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "phase": {
+            "enum": [
+              "HOST_GRANT",
+              "GROW_UNKNOWN",
+              "GUEST_ADMIT",
+              "RUN",
+              "SHRINK_READY",
+              "SHRINK_DEFERRED",
+              "SHRINK_UNKNOWN",
+              "RELEASE",
+              "RESOURCE_WAIT",
+              "NOT_INITIALIZED",
+              "UNSUPPORTED",
+              "REJECTED"
+            ]
+          },
+          "admission": {
+            "enum": [
+              "ready",
+              "resource_wait",
+              "reconciliation_required",
+              "unsupported",
+              "rejected"
+            ]
+          },
+          "failure_code": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[A-Za-z0-9_]+$",
+            "maxLength": 80
+          },
+          "requested_workload_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "target_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "charged_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "current_assigned_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "current_configured_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "protected_floor_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "cleanup": {
+            "enum": [
+              "not_started",
+              "pending",
+              "confirmed",
+              "unknown"
+            ]
+          },
+          "native_freshness": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "status",
+              "observed_at"
+            ],
+            "properties": {
+              "status": {
+                "enum": [
+                  "fresh",
+                  "stale",
+                  "not_measured",
+                  "inconsistent"
+                ]
+              },
+              "observed_at": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    "complete": {
+      "type": "boolean"
+    },
+    "next_cursor": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

@@ -1,9 +1,10 @@
 # Выделения памяти физического хоста
 
-P20-A предоставляет source/fixture foundation для [контракта P19](resident-memory-policy.md).
-Владелец — Platform; реальные policy, inventory, квалификация backend/image и журнал находятся в
-private site. Этот модуль не запускает solver, не заменяет Slurm, не вводит daemon или межхостовой
-ledger.
+P20-A предоставляет lifecycle foundation, а [P20-B](host-resource-integration.md) добавляет opt-in
+production facts/helper/transport/startup/projection source для
+[контракта P19](resident-memory-policy.md). Владелец — Platform; реальные policy, inventory,
+квалификация backend/image и журнал находятся в private site. Этот модуль не запускает solver, не
+заменяет Slurm, не вводит daemon или межхостовой ledger.
 
 ## Контракт и граница доверия
 
@@ -35,12 +36,13 @@ floor, в целых байтах. Полный target вычисляет host: 
 переиспользуются.
 
 Публичные классы допускают dependency injection для synthetic fixtures. Они сами по себе не являются
-границей привилегий. Native вызывающий процесс обязан использовать `RootNativeBoundary`: root-owned
-policy, evidence, qualification и state directory без group/other write, проверенные абсолютные
-executable paths, доверенное локальное соединение backend и bounded argv execution. Не принимать
-policy, evidence, executable, argv или идентичность caller из job payload. Нативная интеграция с
-runtime helpers P12 требует отдельного принятого exact interface: launch binding пока отсутствует,
-общий command engine P11/P12 переиспользуется. Hyper-V пока возвращает unsupported.
+границей привилегий. Native вызывающий процесс обязан использовать установленный root ingress P20-B
+и `RootNativeBoundary`/controller: root-owned policy, evidence, qualification и state directory без
+group/other write, проверенные абсолютные executable paths, доверенное локальное соединение backend
+и bounded argv execution. Не принимать policy, evidence, executable, argv или идентичность caller из
+job payload. Нативная интеграция с runtime helpers P12 требует отдельного принятого exact interface:
+launch binding пока отсутствует, общий command engine P11/P12 переиспользуется. Hyper-V пока
+возвращает unsupported.
 
 `RootNativeBoundary(private_config_path).invoke(action, request=ResourceRequest(...))` обрабатывает
 REQUEST; остальные действия принимают только `request_id`. Защищённый runtime JSON имеет schema
@@ -61,13 +63,15 @@ REQUEST; остальные действия принимают только `re
 запрещают допуск/освобождение. Bootstrap возможен только один раз из independently verified idle
 baseline без чужой или неизвестной работы.
 
-Писатель этих private probes обязан аутентифицировать **актуальные** host/guest факты. Production
-probe provider, установленный root helper/transport и launch/P12 wiring **ещё не реализованы**: это
-оставшаяся source integration P20-B, а не только native gate существующего кода. P20-A не генерирует
-evidence из запросов задач. До реализации provider, transport и их отдельной приёмки production
-admission отсутствует. `RootNativeBoundary` — локальная source boundary, не установленный job-facing
-entrypoint. P07/P22 launch consumers не READY по её Python signatures. Одно наличие root-owned файла
-или строки evidence_ref не является измерением.
+Писатель private probes обязан аутентифицировать актуальные host/guest факты. P20-B реализует
+`NativeFactsProvider`, отдельный privileged ingress, demand-only client, cold/offline API и
+read-only projection; source installation opt-in и отдельно от реальной установки. Поддержанный
+production путь — одновременно оплаченные fixed maxima всех owned VM. Dynamic task/lock cleanup
+producer и owning staging completion producer **отсутствуют в source**: это отдельные follow-up, не
+просто `not_measured` имеющегося адаптера. P07/P22/P12 launch/start wiring здесь не меняется и не
+READY. Точные DTO, источники, роли, ограничения и отдельные N gates описаны в
+[руководстве интеграции](host-resource-integration.md). Одно наличие protected JSON не является
+измерением.
 
 ## Состояния и неатомарные переходы
 
@@ -80,32 +84,33 @@ SHRINK_DEFERRED -> SHRINK_READY (только durable metadata после осв
 ```
 
 Журнал `FileReceiptStore` использует один per-host flock, atomic replace и fsync файла/каталога.
-Текущий private state — `qcl.host-resource-state.v2`, completed archive —
-`qcl.host-resource-completed.v2`, protected probe bundle — `qcl.host-resource-probe.v2`. Ранние v1
-P20-A не публиковались и не устанавливались; v1 отвергается без reset, auto-migration или потери
-истории. Resource request schema и workload-id index сохраняют v1: их demand/identity формат не
-менялся. До изменения backend он сохраняет полный округлённый grant и desired target. Одновременно
-один pending grow/admit/shrink владеет хостом; несколько RUN commitments могут сосуществовать, в том
-числе на одной VM. Обычные Slurm/cgroup limits остаются внутри grant. Завершение одной задачи
-требует точного snapshot остальных живых задач и снимает только её commitment; пока другие активны,
-VM grant не уменьшается. Последний finish другой VM при занятом pending slot сохраняет
-`SHRINK_DEFERRED` и полный charge. При освобождении slot первый deferred receipt под тем же host
-lock получает `SHRINK_READY`; это только durable metadata, backend resize/retry не вызывается.
-Несколько deferred завершений сериализуются так же. `RELEASE` такого receipt означает завершение
-workload; физический charge показывает только `snapshot()`. Host capacity возвращается исключительно
-после последнего completion и SHRINK/readback/RELEASE. Повторный request-id с тем же payload
-возвращает прежний receipt, другой payload отклоняется. Завершённые id не переиспользуются. Активный
-state ограничен по объёму (1 MiB), но **общего лимита числа запросов нет**. Завершённый receipt с
-исходным host/policy/runtime context сохраняется отдельно в immutable
-`completed/<request-hash>.json`; индекс `workload-ids/<workload-hash>.json` сохраняет запрет
-повторного workload ID. Поиск старого request или workload выполняется по одному hash path, без
-чтения всей истории в RAM. Сначала публикуются receipt и индекс с fsync их действительных parent
-directories, затем completed row удаляется из active state. Crash между этими barriers сохраняет
-прежний charge; old request не выполняется повторно. Unknown/active rows не архивируются и не
-удаляются. История занимает private operational storage с реальным резервом места; удалять её с
-потерей idempotency запрещено. Автоматической очистки и TTL нет. Переполнение active byte buffer
-закрывает новые запросы до завершения текущей работы или административной сверки, а не после
-заданного lifetime числа attempts.
+Текущий private state — `qcl.host-resource-state.v3`, completed archive —
+`qcl.host-resource-completed.v3`, protected probe bundle — `qcl.host-resource-probe.v2`. P20-A v2
+опубликован, но в этой site не установлен; mutating v3 entrypoints отвергают v1/v2 с
+`upgrade_required`, сохраняя исходные bytes, grants и idempotency. Старые completed v1/v2 не
+переинтерпретируются; несовместимость закрывает admission. Автомиграции/reset нет. Resource request
+schema и workload-id index сохраняют v1: их demand/identity формат не менялся. До изменения backend
+он сохраняет полный округлённый grant и desired target. Одновременно один pending grow/admit/shrink
+владеет хостом; несколько RUN commitments могут сосуществовать, в том числе на одной VM. Обычные
+Slurm/cgroup limits остаются внутри grant. Завершение одной задачи требует точного snapshot
+остальных живых задач и снимает только её commitment; пока другие активны, VM grant не уменьшается.
+Последний finish другой VM при занятом pending slot сохраняет `SHRINK_DEFERRED` и полный charge. При
+освобождении slot первый deferred receipt под тем же host lock получает `SHRINK_READY`; это только
+durable metadata, backend resize/retry не вызывается. Несколько deferred завершений сериализуются
+так же. `RELEASE` такого receipt означает завершение workload; физический charge показывает только
+`snapshot()`. Host capacity возвращается исключительно после последнего completion и
+SHRINK/readback/RELEASE. Повторный request-id с тем же payload возвращает прежний receipt, другой
+payload отклоняется. Завершённые id не переиспользуются. Активный state ограничен по объёму (1 MiB),
+но **общего лимита числа запросов нет**. Завершённый receipt с исходным host/policy/runtime context
+сохраняется отдельно в immutable `completed/<request-hash>.json`; индекс
+`workload-ids/<workload-hash>.json` сохраняет запрет повторного workload ID. Поиск старого request
+или workload выполняется по одному hash path, без чтения всей истории в RAM. Сначала публикуются
+receipt и индекс с fsync их действительных parent directories, затем completed row удаляется из
+active state. Crash между этими barriers сохраняет прежний charge; old request не выполняется
+повторно. Unknown/active rows не архивируются и не удаляются. История занимает private operational
+storage с реальным резервом места; удалять её с потерей idempotency запрещено. Автоматической
+очистки и TTL нет. Переполнение active byte buffer закрывает новые запросы до завершения текущей
+работы или административной сверки, а не после заданного lifetime числа attempts.
 
 Native argv исполняет принятый `application_release.command` из P11/P12: bounded combined output,
 cleanup reserve внутри исходного timeout, проверка отсутствия исполняющихся членов собственной
@@ -174,8 +179,9 @@ RELEASE со свежим guest completion; при другом allocation ос�
 proof может сохраниться отдельно от memory outcome; backend mutation/retry не выполняется. Receipt в
 последующих фазах не потребляет уже ненужный proof повторно. Этот путь снимает только cleanup block:
 reboot/policy/config/identity block требует отдельной административной сверки. Production writer
-этого cleanup proof, его actual source facts и privileged transport отсутствуют в P20-A и остаются
-P20-B; synthetic injected evidence в fixtures не является заменой.
+этого dynamic cleanup proof отсутствует и в текущем P20-B: отдельный protocol/source follow-up;
+privileged transport source реализован отдельно от установки/N; synthetic injected evidence в
+fixtures не является заменой.
 
 Несовпадение host boot, guest boot/machine/image/backend, config fingerprint или policy блокирует
 допуск и сохраняет все grants ambiguous. TTL не снимает активное/неизвестное выделение. После reboot
