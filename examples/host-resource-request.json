@@ -1,0 +1,9 @@
+{
+  "schema": "qcl.host-resource-request.v1",
+  "request_id": "synthetic-request-1",
+  "host_id": "synthetic-host",
+  "vm_id": "synthetic-worker",
+  "owner_id": "synthetic-owner",
+  "workload_bytes": 1073741824,
+  "workload_id": "synthetic-workload-1"
+}
