@@ -12,6 +12,7 @@ let
     cp ${../ops/host_resource_policy.py} "$out/ops/host_resource_policy.py"
     cp ${../ops/host_resource_operations.py} "$out/ops/host_resource_operations.py"
     cp ${../ops/host_resource_backends.py} "$out/ops/host_resource_backends.py"
+    cp ${../ops/host_resource_recovery.py} "$out/ops/host_resource_recovery.py"
     cp ${../ops/host_resource_native_cleanup.py} "$out/ops/host_resource_native_cleanup.py"
     cp ${../ops/host_resource_facts.py} "$out/ops/host_resource_facts.py"
     cp ${../ops/host_resource_startup.py} "$out/ops/host_resource_startup.py"

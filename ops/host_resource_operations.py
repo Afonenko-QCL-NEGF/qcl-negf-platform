@@ -340,6 +340,9 @@ class FileReceiptStore:
         if not path.exists():
             return None
         record = self._read(path)
+        if type(record) is dict and record.get('schema')=='qcl.host-resource-retired.v1':
+            from host_resource_recovery import validate_retired
+            return validate_retired(self,record,request_id)
         require(type(record) is dict and set(record) == {"schema", "receipt", "context"} and
                 record["schema"] == "qcl.host-resource-completed.v3", "state", "invalid completed receipt")
         require(type(record["context"]) is dict and
@@ -369,10 +372,62 @@ class FileReceiptStore:
 
     def _immutable(self, path, record):
         self._check_path(path.parent, directory=True)
-        if path.exists():
-            require(self._read(path) == record, "state", "completed idempotency record conflicts")
-        else:
+        try:
+            path.lstat()
+        except FileNotFoundError:
             self._atomic(path, json.dumps(record, sort_keys=True).encode())
+        self._sync_immutable(path, record)
+
+    def _sync_immutable(self, path, record, *, conflict_code="state"):
+        """Revalidate and durably publish the same immutable file, without rewrite.
+
+        A visible equal record may be left by failed file/rename-directory fsync.
+        It must cross every barrier again before control or journal progression.
+        Production ancestry is additionally protected by RootNativeBoundary.
+        """
+        require(path.parent == self.directory or path.parent.parent == self.directory,
+                "trust", "immutable artifact must stay within the owned store")
+        self._check_path(self.directory, directory=True)
+        self._check_path(path.parent, directory=True)
+        store_parent = self.directory.parent.lstat()
+        store_root = self.directory.lstat()
+        parent = path.parent.lstat()
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            self._check_fd(fd)
+            before = os.fstat(fd)
+            require(before.st_size <= MAX_STATE_BYTES, "state_full", "immutable record is too large")
+            data = os.read(fd, MAX_STATE_BYTES + 1)
+            require(len(data) <= MAX_STATE_BYTES and strict_json(data.decode()) == record,
+                    conflict_code, "immutable idempotency record conflicts")
+            os.fsync(fd)
+            self._sync_directory(path.parent)
+            if path.parent != self.directory:
+                self._sync_directory(self.directory)
+            # Constructor mkdir may itself have survived a failed parent sync;
+            # visibility on retry does not establish the store entry's durability.
+            self._sync_directory(self.directory.parent)
+            self._check_fd(fd)
+            after = os.fstat(fd)
+            current = path.lstat()
+            current_parent = path.parent.lstat()
+            current_root = self.directory.lstat()
+            current_store_parent = self.directory.parent.lstat()
+            self._check_path(self.directory, directory=True)
+            self._check_path(path.parent, directory=True)
+            require((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) ==
+                    (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) and
+                    (current.st_dev, current.st_ino) == (after.st_dev, after.st_ino) and
+                    (parent.st_dev, parent.st_ino) == (current_parent.st_dev, current_parent.st_ino) and
+                    (store_root.st_dev, store_root.st_ino) == (current_root.st_dev, current_root.st_ino) and
+                    (store_parent.st_dev, store_parent.st_ino) ==
+                    (current_store_parent.st_dev, current_store_parent.st_ino),
+                    "trust", "immutable file or parent changed during durability check")
+            os.lseek(fd, 0, os.SEEK_SET)
+            require(os.read(fd, MAX_STATE_BYTES + 1) == data,
+                    "trust", "immutable content changed during durability check")
+        finally:
+            os.close(fd)
 
     def archive_completed(self, row, context):
         require(row["phase"] == "RELEASE" and row["finished"] is True,
@@ -383,6 +438,23 @@ class FileReceiptStore:
         self._immutable(self.workload_directory / self._key(req["workload_id"]),
                         {"schema": "qcl.host-resource-workload-id.v1",
                          "workload_id": req["workload_id"], "request_id": req["request_id"]})
+
+    def is_retired(self, request_id):
+        path=self.completed_directory/self._key(request_id)
+        if not path.exists():return False
+        record=self._read(path)
+        if record.get('schema')!='qcl.host-resource-retired.v1':return False
+        from host_resource_recovery import validate_retired
+        validate_retired(self,record,request_id);return True
+
+    def archive_retired(self,row,context,recovery_id,proof_sha256):
+        from host_resource_recovery import validate_retired
+        record=dict(schema='qcl.host-resource-retired.v1',receipt=row,context=context,
+                    recovery_id=recovery_id,recovery_proof_sha256=proof_sha256)
+        validate_retired(self,record,row['request']['request_id'])
+        self._immutable(self.completed_directory/self._key(row['request']['request_id']),record)
+        self._immutable(self.workload_directory/self._key(row['request']['workload_id']),
+            dict(schema='qcl.host-resource-workload-id.v1',workload_id=row['request']['workload_id'],request_id=row['request']['request_id']))
 
     def save(self, state):
         require(self._lock_owner is None or not self._lock_read_only, "read_only", "status cannot save")

@@ -355,6 +355,9 @@ class NativeCleanupSources:
             require(not stat.S_ISDIR(budget.stat(p).st_mode),'cleanup_evidence','nested native cgroup unsupported')
         require(members.decode().split()==[str(worker['pid'])] and budget.read(root/'cgroup.procs')==members,'cleanup_evidence','extra owned native descendants')
         final=budget.stat(root);return (initial.st_dev,initial.st_ino)==(final.st_dev,final.st_ino)
+    def target_before_exec(self,intent,dispatch,profile,backend,worker,cli):
+        from host_resource_recovery import prepare_target_seal
+        return prepare_target_seal(self,intent,dispatch,profile,backend,worker,cli)
     def lock_released(self,backend,vm):
         if not hasattr(backend,'node'):return True  # libvirt EndJob is in its qualified successful RPC reply
         return _pve_lock_released(backend.vms[vm].vmid)
@@ -435,6 +438,12 @@ class NativeMutationProofs:
         worker,cli=self.sources.claim_process(intent.native_context)
         require(worker==dispatch['worker_birth'] and worker!=cli,'native_owner','actual root worker/CLI generation changed')
         doc=dict(schema=WITNESS_SCHEMA,intent=asdict(intent),intent_sha256=fingerprint(asdict(intent)),phase='CLAIMED',worker_birth=worker,cli_birth=cli,cgroup=intent.native_context['cgroup'],source_ids=p['source_ids'],native_peer=p['native_peer_identity'],claimed_at=self.sources.clock(),terminal_at=None,local_cleanup_confirmed=False,result_sha256=None)
+        capture=getattr(self.sources,'target_before_exec',None)
+        if capture is not None:
+            target=capture(intent,dispatch,p,self.backend,worker,cli)
+            if target is not None:
+                from host_resource_recovery import decode_target
+                decode_target(target);self.exclusive(self.path(mutation_id).with_suffix('.target.json'),target)
         decode_witness(doc);self.exclusive(self.path(mutation_id),doc)
         return self.backend.mutation_argv(intent.binding.vm_id,intent.target_bytes,before)
     def execute(self,intent,*,timeout_seconds):
@@ -501,6 +510,9 @@ class QualifiedMutationBackend:
 def native_exec_main(argv=None):
     require(os.geteuid()==0,'root_required','root native pre-exec only')
     argv=sys.argv[1:] if argv is None else argv
+    if type(argv) is list and len(argv)==3 and argv[0]=='recovery':
+        from host_resource_recovery import native_exec
+        return native_exec(argv[1],argv[2])
     require(type(argv) is list and len(argv)==1 and type(argv[0]) is str and UUID.fullmatch(argv[0]),'shape','one native mutation UUID required')
     from host_resource_service import open_service
     service=open_service();backend=service.controller.backend

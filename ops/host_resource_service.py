@@ -78,7 +78,8 @@ class NativeResourceService:
                 require(previous is None or previous['native_workload']==mapping,'native_generation','native ID reused; retain original charge')
                 row=next((r for r in state['receipts'] if r['request']['request_id']==request_id),None)
                 if row is None:row=c.store.completed(request_id)
-                if row and row['phase']=='RELEASE':return operation_view(ref,state=state,row=row)
+                if row and (row['phase']=='RELEASE' or c.store.is_retired(request_id)):
+                    return operation_view(ref,state=state,row=row,failure='reconciliation_required' if c.store.is_retired(request_id) else None)
                 if type(value) is NativeDemand:
                     require(value.workload_bytes>=native['limit_bytes'],'demand','demand below actual native allocation')
                     req=ResourceRequest(request_id,c.policy.host_id,vm,c.policy.owner_id,value.workload_bytes,workload_id)
@@ -171,7 +172,12 @@ def open_service():
     provider=NativeFactsProvider(policy,facts,backend,runner)
     if proofs is not None:provider.native_proofs=proofs
     controller=HostResourceController(policy,store,backend)
-    return NativeResourceService(controller,provider)
+    service=NativeResourceService(controller,provider)
+    if config.get('native_recovery') is not None:
+        require(proofs is not None,'qualification','retirement requires existing dynamic source owner')
+        from host_resource_recovery import NativeRecoveryService
+        service.recovery=NativeRecoveryService(controller,provider,proofs,config['native_recovery'],runner)
+    return service
 
 
 def native_unit_context(row,*,sources,systemctl):
@@ -239,6 +245,10 @@ def root_main(role,argv=None):
     argv=list(sys.argv[1:] if argv is None else argv)
     require(os.geteuid()==0,'root_required','root helper only')
     config=validate_service_config(read_root_json(CONFIG))
+    if role=='worker' and len(argv)==2 and argv[0]=='retirement':
+        from host_resource_recovery import NativeRecoveryRequest
+        service=open_service();require(hasattr(service,'recovery'),'qualification','protected retirement owner missing')
+        return service.recovery.retire(NativeRecoveryRequest(**decode_token(argv[1])))
     require(len(argv)==2,'shape','action and bounded token required');action,token=argv;document=decode_token(token)
     if role in {'client','authority'}:
         allowed_uid=config['client_uid'] if role=='client' else config['authority_uid']
@@ -291,13 +301,23 @@ def ssh_main(role,*,helper_prefix='/run/current-system/sw/bin'):
 def main(role):
     try:result=root_main(role)
     except ResourceError as error:
-        from host_resource_client import NativeWorkloadRef
-        ref=NativeWorkloadRef('slurm_allocation','unknown')
-        try:
-            action,token=sys.argv[1:];value=decode_action(action,decode_token(token))
-            ref=value.workload if type(value) is NativeDemand else value
-        except (ValueError,ResourceError):ref=None
-        result=operation_view(ref or NativeWorkloadRef('slurm_allocation','unknown'),failure=error.code)
-        if ref is None:result['workload']=None
+        if role=='worker' and len(sys.argv)==3 and sys.argv[1]=='retirement':
+            from host_resource_recovery import NativeRecoveryRequest,read_recovery_status
+            try:
+                request=NativeRecoveryRequest(**decode_token(sys.argv[2]))
+                result=read_recovery_status(request.recovery_id)
+                result.update(phase='hold',failure_code=error.code)
+            except Exception as secondary:
+                error.native_journal_error=repr(secondary)
+                raise error
+        else:
+            from host_resource_client import NativeWorkloadRef
+            ref=NativeWorkloadRef('slurm_allocation','unknown')
+            try:
+                action,token=sys.argv[1:];value=decode_action(action,decode_token(token))
+                ref=value.workload if type(value) is NativeDemand else value
+            except (ValueError,ResourceError):ref=None
+            result=operation_view(ref or NativeWorkloadRef('slurm_allocation','unknown'),failure=error.code)
+            if ref is None:result['workload']=None
     data=json.dumps(result,separators=(',',':'));require(len(data.encode())<=MAX_PACKET,'output_bound','response bound')
     print(data);return 0  # transport success; public client interprets admission
