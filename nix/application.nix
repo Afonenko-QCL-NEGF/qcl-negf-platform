@@ -32,21 +32,24 @@ let
 in
 assert lib.hasPrefix "3.14." pkgs.python314.version;
 environment.overrideAttrs (old: {
-  # Retain the exact selected immutable Research tree in the application closure.
-  # The caller supplies its source ID from the existing release Git graph.
   passthru = (old.passthru or {}) // {
     inherit captureRuntime;
-    configuratorCatalogRoot = "${workspaceRoot}/components/qcl-negf-research";
   };
   postInstall = (old.postInstall or "") + ''
+    mkdir -p "$out/share/qcl-negf"
+    cat > "$out/share/qcl-negf/runtime.json" <<'JSON'
+    ${builtins.toJSON {
+      schema = "qcl-negf-application-runtime-v1";
+      configurator.catalog_root = "${workspaceRoot}/components/qcl-negf-research";
+    }}
+    JSON
     # AiiDA imports initialize configuration directories even without a profile.
     # Keep the integrity check's mutable state in the build sandbox.
     AIIDA_PATH="$TMPDIR/qcl-negf-application-check" "$out/bin/python" - <<'PY'
-    from importlib.metadata import distribution
+    import runpy
     import aiida_qcl_negf, qcl_negf_api, qcl_negf_contracts, qcl_negf_results
     from aiida.plugins import CalculationFactory, ParserFactory, WorkflowFactory
-    for name in ("qcl-negf-contracts", "aiida-qcl-negf", "qcl-negf-api", "qcl-negf-results"):
-        assert distribution(name).version == ${builtins.toJSON project.version}, name
+    runpy.run_path("${../ops/application_compatibility.py}", run_name="__main__")
     CalculationFactory("qcl_negf.execution")
     ParserFactory("qcl_negf.execution")
     WorkflowFactory("qcl_negf.plan")

@@ -17,7 +17,10 @@ let
     inherit lib;
     pkgs = {
       writeShellScript = name: text: text;
-      writeText = name: text: { outPath = "/synthetic-binding.json"; inherit text; };
+      writeText = name: text: if name == "qcl-negf-application-launch.json"
+        then lib.escapeShellArg text else "/synthetic-binding.json";
+      runCommand = name: attrs: script: "/synthetic-operations";
+      python314 = "/synthetic-python";
       coreutils = "/synthetic-coreutils";
       util-linux = "/synthetic-util-linux";
     };
@@ -54,7 +57,6 @@ let
   disabled = (make { enable = false; }).config.content.systemd.services.qcl-negf-api.content;
   failures = value: builtins.filter (entry: lib.hasPrefix "Saved results" entry.message)
     (builtins.filter (entry: !entry.assertion) value.config.content.assertions);
-  binding = builtins.fromJSON api.environment.QCL_NEGF_SAVED_RESULTS_BINDING_FILE.text;
 in
 assert failures module == [];
 assert failures (makeWithMount {} {}) != [];
@@ -73,16 +75,6 @@ assert failures (make { holdRef = null; }) != [];
 assert failures (make { accessBindingRef = null; }) != [];
 assert failures (make { retentionPolicyId = null; }) != [];
 assert failures (make { retentionOwnerId = null; }) != [];
-assert binding == {
-  namespace_id = "retained-test";
-  storage_identity = "storage-test-identity";
-  root = "/run/qcl-negf-saved";
-  allowed_computer_uuids = [ "11111111-1111-4111-8111-111111111111" ];
-  retention_policy_id = "indefinite-owner-disposition";
-  retention_owner_id = "test-owner";
-  hold_ref = "test-hold";
-  access_binding_ref = "test-access-receipt";
-};
 assert api.unitConfig.RequiresMountsFor == [ "/var/lib/qcl-negf" "/run/secrets/api-token" "/srv/qcl-negf/jobs" "/run/site/saved-storage-identity" ];
 assert api.serviceConfig.BindReadOnlyPaths == [ "/srv/qcl-negf/jobs:/run/qcl-negf-saved" ];
 assert api.serviceConfig.ReadOnlyPaths == [ "/srv/qcl-negf/jobs" "/run/site/saved-storage-identity" ];

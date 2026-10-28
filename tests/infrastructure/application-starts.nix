@@ -3,10 +3,14 @@
 { nixpkgs }:
 let
   lib = import (nixpkgs + "/lib");
-  make = enabled: import ../../modules/application.nix {
+  make = enabled: slice: import ../../modules/application.nix {
     inherit lib;
     pkgs = {
       writeShellScript = name: text: text;
+      writeText = name: text: lib.escapeShellArg text;
+      runCommand = name: attrs: script: "/synthetic-operations";
+      python314 = "/synthetic-python";
+      util-linux = "util-linux";
       bash = "bash";
       openssh = "openssh";
       slurm = "slurm";
@@ -19,25 +23,25 @@ let
         profile = "qcl-negf";
         package = {
           outPath = "/nix/store/synthetic-application";
-          configuratorCatalogRoot = "/nix/store/synthetic-research";
         };
         api = {
           enable = true; port = 8080; allowedCodesFile = null;
           configurator = {
             enable = enabled;
-            catalogRoot = "/nix/store/synthetic-research";
-            catalogSourceId = "synthetic-source";
           };
         };
       };
-      systemd.services.qcl-negf-api.serviceConfig.Slice = "system.slice";
+      systemd.services.qcl-negf-api.serviceConfig.Slice = slice;
     };
   };
-  module = make false;
-  enabledModule = make true;
+  module = make false "system.slice";
+  enabledModule = make true "system.slice";
+  nestedModule = make true "research-api.slice";
 in {
   daemon = module.config.content.systemd.services.qcl-negf-aiida.serviceConfig.ExecStart;
   daemonPath = module.config.content.systemd.services.qcl-negf-aiida.path;
   api = module.config.content.systemd.services.qcl-negf-api.content.serviceConfig.ExecStart;
+  apiPath = module.config.content.systemd.services.qcl-negf-api.content.path or [];
   configuratorApi = enabledModule.config.content.systemd.services.qcl-negf-api.content.serviceConfig.ExecStart;
+  nestedApi = nestedModule.config.content.systemd.services.qcl-negf-api.content.serviceConfig.ExecStart;
 }
