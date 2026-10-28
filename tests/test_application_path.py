@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import pwd
 import shutil
+import shlex
 import subprocess
 import sys
 
@@ -22,6 +23,28 @@ def starts():
         check=True, capture_output=True, text=True, timeout=60,
     )
     return json.loads(result.stdout)
+
+
+def materialize_api(script, tmp_path, profile):
+    """Run the real helper with an explicit synthetic trusted-profile boundary."""
+    arguments = shlex.split(script)
+    payload = arguments[arguments.index("--config") + 1]
+    configuration = tmp_path / "launch.json"
+    configuration.write_text(payload)
+    bridge = tmp_path / "launch.py"
+    operations = Path(__file__).parents[1] / "ops"
+    bridge.write_text(
+        f"import sys; sys.path.insert(0, {str(operations)!r})\n"
+        "import json\nfrom pathlib import Path\nimport runtime_bindings as runtime\n"
+        "configuration=json.loads(Path(sys.argv[sys.argv.index('--config')+1]).read_text())\n"
+        f"profile=Path({str(profile)!r})\n"
+        "def unavailable(_): raise FileNotFoundError('no synthetic release record')\n"
+        "runtime.launch(configuration,port=int(sys.argv[sys.argv.index('--port')+1]),"
+        "target=lambda _:str(profile.resolve(strict=True)),read_json=unavailable)\n"
+    )
+    return script.replace("/synthetic-python/bin/python3",sys.executable).replace(
+        "/synthetic-operations/ops/runtime_bindings.py",str(bridge)).replace(
+        shlex.quote(payload),str(configuration))
 
 
 @pytest.mark.parametrize("service,arguments", [
@@ -55,7 +78,8 @@ def test_nested_verdi_tracks_current_profile(starts, tmp_path, service, argument
         if profile.is_symlink():
             profile.unlink()
         profile.symlink_to(binaries.parent)
-        script = starts[service].replace("/nix/var/nix/profiles/qcl-negf-application", str(profile))
+        script = (materialize_api(starts[service], tmp_path, profile) if service == "api" else
+                  starts[service].replace("/nix/var/nix/profiles/qcl-negf-application", str(profile)))
         if script.startswith("/"):
             script = "exec " + script
         result = subprocess.run(
@@ -101,7 +125,7 @@ def test_api_wrapper_clears_unbound_configurator_environment(starts, tmp_path):
         "if k.startswith('QCL_NEGF_CONFIGURATOR_')}))\n"
     )
     executable.chmod(0o755)
-    script = starts["api"].replace("/nix/var/nix/profiles/qcl-negf-application", str(binaries.parent))
+    script = materialize_api(starts["api"], tmp_path, binaries.parent)
     result = subprocess.run(["/bin/sh", "-c", script], env={
         "PATH":"/usr/bin:/bin", "QCL_NEGF_CONFIGURATOR_EXECUTABLE":"/foreign/solver",
         "QCL_NEGF_CONFIGURATOR_CATALOG_ROOT":"/foreign/research",
@@ -112,69 +136,31 @@ def test_api_wrapper_clears_unbound_configurator_environment(starts, tmp_path):
     assert json.loads(result.stdout) == {}
 
 
-@pytest.mark.parametrize('binding', ['exact','foreign-application','foreign-solver','missing-catalog'])
-def test_opt_in_api_checks_current_release_without_disabling_old_api(starts, tmp_path, binding):
-    """Execute the actual generated script with tiny immutable-package stand-ins."""
-    application = tmp_path / 'application'
-    foreign = tmp_path / 'foreign'
-    solver = tmp_path / 'solver'
-    research = tmp_path / 'research'
-    profile = tmp_path / 'application-profile'
-    for directory in (application/'bin', foreign/'bin', solver/'bin', research/'config'):
-        directory.mkdir(parents=True)
-    for root in (application,foreign):
-        executable = root / 'bin/qcl-negf-api'
-        executable.write_text(f'#!{sys.executable}\n'
-            'import json, os\n'
-            "print(json.dumps({k:v for k,v in os.environ.items() if k.startswith('QCL_NEGF_CONFIGURATOR_')}))\n")
-        executable.chmod(0o755)
-    (solver/'bin/qcl-negf').write_text('# synthetic, never executed\n')
-    (solver/'bin/qcl-negf').chmod(0o755)
-    if binding != 'missing-catalog':
-        (research/'config/configurator-catalog.json').write_text('{}')
-    profile.symlink_to(foreign if binding=='foreign-application' else application)
-    readlink = shutil.which('readlink')
-    assert readlink
-    script = starts['configuratorApi']
-    for old, new in {
-        '/nix/var/nix/profiles/qcl-negf-application': str(profile),
-        '/nix/store/synthetic-application': str(application),
-        '/nix/store/synthetic-solver': str(solver),
-        '/nix/store/synthetic-research': str(research),
-        '/synthetic-coreutils/bin/readlink': readlink,
-    }.items():
-        script = script.replace(old,new)
-    result = subprocess.run(['/bin/sh','-c',script],env={
-        'PATH':'/usr/bin:/bin',
-        'QCL_NEGF_SOLVER_EXECUTABLE':'/foreign/solver' if binding=='foreign-solver' else str(solver/'bin/qcl-negf'),
-        'QCL_NEGF_CONFIGURATOR_EXECUTABLE':'/stale/solver',
-        'QCL_NEGF_CONFIGURATOR_CATALOG_SOURCE_ID':'stale-source',
-    },capture_output=True,text=True,timeout=10)
-    assert result.returncode == 0, result.stderr
-    expected = {
-        'QCL_NEGF_CONFIGURATOR_EXECUTABLE':str(solver/'bin/qcl-negf'),
-        'QCL_NEGF_CONFIGURATOR_CATALOG_ROOT':str(research),
-        'QCL_NEGF_CONFIGURATOR_CATALOG_SOURCE_ID':'synthetic-source',
-        'QCL_NEGF_CONFIGURATOR_CGROUP_ROOT':'/sys/fs/cgroup/system.slice/qcl-negf-api.service',
-    } if binding=='exact' else {}
-    assert json.loads(result.stdout) == expected
+def test_api_mount_probe_has_explicit_native_executable_path(starts):
+    assert "util-linux" in starts["apiPath"]
 
 
-def test_enabled_configurator_fixture_contains_live_guards_and_exports(starts):
-    """The execution cases must exercise the enabled branch, not empty fallback."""
-    enabled, disabled = starts['configuratorApi'], starts['api']
-    assert 'readlink -f /nix/var/nix/profiles/qcl-negf-application' in enabled
-    assert 'QCL_NEGF_SOLVER_EXECUTABLE:-' in enabled
-    assert '/nix/store/synthetic-application' in enabled
-    assert '/nix/store/synthetic-solver/bin/qcl-negf' in enabled
-    assert '/nix/store/synthetic-research/config/configurator-catalog.json' in enabled
-    for variable in ('QCL_NEGF_CONFIGURATOR_EXECUTABLE',
-                     'QCL_NEGF_CONFIGURATOR_CATALOG_ROOT',
-                     'QCL_NEGF_CONFIGURATOR_CATALOG_SOURCE_ID',
-                     'QCL_NEGF_CONFIGURATOR_CGROUP_ROOT'):
-        assert f'export {variable}=' in enabled
-        assert f'export {variable}=' not in disabled
-    assert 'readlink -f' not in disabled
-    assert 'QCL_NEGF_SOLVER_EXECUTABLE:-' not in disabled
-    assert 'unset QCL_NEGF_CONFIGURATOR_EXECUTABLE QCL_NEGF_CONFIGURATOR_CATALOG_ROOT' in disabled
-    assert 'unset QCL_NEGF_CONFIGURATOR_CATALOG_SOURCE_ID QCL_NEGF_CONFIGURATOR_CGROUP_ROOT' in disabled
+def test_enabled_api_uses_runtime_binding_without_disabling_base_api(starts, tmp_path):
+    binaries = tmp_path / "active-application/bin"
+    binaries.mkdir(parents=True)
+    executable = binaries / "qcl-negf-api"
+    executable.write_text(f"#!{sys.executable}\nimport json,os\n"
+        "print(json.dumps({k:v for k,v in os.environ.items() if k.startswith('QCL_NEGF_CONFIGURATOR_')}))\n")
+    executable.chmod(0o755)
+    for enabled in (False, True):
+        script = materialize_api(starts["configuratorApi" if enabled else "api"],tmp_path,binaries.parent)
+        result = subprocess.run(["/bin/sh","-c",script],env={"PATH":"/usr/bin:/bin"},
+                                capture_output=True,text=True,timeout=10)
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout) == {}
+        assert ("invalid_runtime_binding" in result.stderr) is enabled
+
+
+@pytest.mark.parametrize("script,expected", [
+    ("configuratorApi", "/sys/fs/cgroup/system.slice/qcl-negf-api.service"),
+    ("nestedApi", "/sys/fs/cgroup/research.slice/research-api.slice/qcl-negf-api.service"),
+])
+def test_runtime_configurator_envelope_tracks_native_unit_slice(starts, script, expected):
+    arguments = shlex.split(starts[script])
+    configuration = json.loads(arguments[arguments.index("--config")+1])
+    assert configuration["configurator"] == {"cgroup_root":expected}

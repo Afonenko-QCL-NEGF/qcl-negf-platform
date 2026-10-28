@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 import test_application_release as support
 from test_application_release import Commands, delivery_manifest
+from test_node_enrollment import WORKER, ENROLL_IDS
 
 
 LITERAL = '{"components":[{"path":"components/QCLNEGF.jl","revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","url":"https://github.com/Afonenko-QCL-NEGF/QCLNEGF.jl"}],"format":"qcl-negf.git-graph.v1","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
@@ -95,25 +96,38 @@ class QuantumDeliveryTests(unittest.TestCase):
 
     def test_prepare_activate_ready_preserve_context_and_remote_json(self):
         value = quantum_manifest()
-        with patch.object(self.ops, 'prefetch_controller_closures', return_value={}), \
-             patch.object(self.ops, 'verify_solver_build', return_value=None):
-            # The inherited fixture exercises real publication/profiles/lifecycle,
-            # mocking only OS commands, as in existing activation controls.
-            commands = Commands()
+        generation = self.ops._process_generation
+        commands = Commands()
+        def run(argv):
+            result = commands(argv)
+            if argv[:3] == ['nix', 'path-info', '--json']:
+                return json.dumps({row['path']: {'narHash': row['narHash']}
+                                   for row in value['closures']})
+            return result
+        with patch.object(self.ops, 'installed_manifest_sha256',
+                          return_value=value['solver_build']['julia_manifest_sha256']), \
+             patch.object(self.ops, 'observe_node_identity', return_value=dict(WORKER)), \
+             patch.object(self.ops, '_process_generation',
+                          lambda: (*generation()[:2], WORKER['boot_id'])):
+            # Реальные publication/profiles/lifecycle/qualification; только
+            # OS commands, identity/boot и installed Manifest I/O синтетические.
             profile = self.runtime.parent / 'profile'
             self.gate.write_text(json.dumps({'open': False, 'release_id': value['release_id']}))
             prepared = self.ops.prepare_initial(value, profile=profile, runtime=self.runtime,
-                gate=self.gate, run=commands)
+                gate=self.gate, run=run)
             self.assertFalse(prepared['ready'])
             self.assertEqual(prepared['quantum_runtime_context'], self.ops.quantum_context(value))
             before = (self.runtime / 'release.json').read_bytes()
             self.ops.prepare_initial(value, profile=profile, runtime=self.runtime,
-                gate=self.gate, run=commands)
+                gate=self.gate, run=run)
             self.assertEqual((self.runtime / 'release.json').read_bytes(), before)
             result = self.ops.activate(value, profile=profile, runtime=self.runtime,
-                gate=self.gate, run=commands)
+                gate=self.gate, run=run, role='worker',
+                expected_node_identity=dict(WORKER), enrollment_id=ENROLL_IDS[1])
         record = json.loads((self.runtime / 'release.json').read_text())
         self.assertTrue(record['ready'])
+        self.assertEqual(record['node_identity'], WORKER)
+        self.assertEqual(record['qualification_enrollment_id'], ENROLL_IDS[1])
         self.assertEqual(record['sources'], value['sources'])
         self.assertEqual(record['solver_build'], value['solver_build'])
         self.assertEqual(record['quantum_runtime_context'], self.ops.quantum_context(value))

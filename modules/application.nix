@@ -38,11 +38,6 @@ let cfg = config.qclNegf.application;
       hold_ref = savedResults.holdRef;
       access_binding_ref = savedResults.accessBindingRef;
     });
-    packageCatalogRoot = cfg.package.configuratorCatalogRoot or null;
-    solver = config.qclNegf.cluster.solverPackage;
-    configuratorBound = configuratorEnabled && solver != null &&
-      packageCatalogRoot != null && configurator.catalogRoot != null &&
-      configurator.catalogRoot == packageCatalogRoot && configurator.catalogSourceId != null;
     apiSlice = config.systemd.services.qcl-negf-api.serviceConfig.Slice or "system.slice";
     sliceParts = lib.splitString "-" (lib.removeSuffix ".slice" apiSlice);
     slicePath = if apiSlice == "-.slice" then "" else
@@ -60,65 +55,28 @@ let cfg = config.qclNegf.application;
       cp ${../ops/plan.ts} "$out/ops/plan.ts"
       cp ${../ops/register_aiida.py} "$out/ops/register_aiida.py"
       cp ${../ops/application_release.py} "$out/ops/application_release.py"
+      cp ${../ops/release_identity.py} "$out/ops/release_identity.py"
+      cp ${../ops/release_trust.py} "$out/ops/release_trust.py"
+      cp ${../ops/release_qualification.py} "$out/ops/release_qualification.py"
+      cp ${../ops/release_health.py} "$out/ops/release_health.py"
+      cp ${../ops/runtime_bindings.py} "$out/ops/runtime_bindings.py"
     '';
+    launchConfiguration = pkgs.writeText "qcl-negf-application-launch.json" (builtins.toJSON {
+      schema = "qcl-negf-application-launch-v1";
+      allowed_codes_file = cfg.api.allowedCodesFile;
+      configurator = if configuratorEnabled then { cgroup_root = configuratorCgroupRoot; } else null;
+      saved_results = if savedBound then {
+        binding_file = toString savedBinding;
+        root = savedRoot;
+        alias = savedAlias;
+        nfs_source = savedMount.device;
+        storage_identity_file = savedResults.storageIdentityFile;
+      } else null;
+    });
     apiStart = pkgs.writeShellScript "qcl-negf-api-start" ''
       set -eu
-      export PATH=${applicationProfile}/bin:$PATH
-      # EnvironmentFile may describe a newer CD release. Never inherit an old
-      # or site-injected configurator binding when this unit has no exact match.
-      unset QCL_NEGF_CONFIGURATOR_EXECUTABLE QCL_NEGF_CONFIGURATOR_CATALOG_ROOT
-      unset QCL_NEGF_CONFIGURATOR_CATALOG_SOURCE_ID QCL_NEGF_CONFIGURATOR_CGROUP_ROOT
-      quantum_context_sha256="''${QCL_NEGF_QUANTUM_RUNTIME_CONTEXT_SHA256:-}"
-      unset QCL_NEGF_QUANTUM_RUNTIME_CONTEXT_SHA256 QCL_NEGF_QUANTUM_RUNTIME_RELEASE_FILE
-      unset QCL_NEGF_QUANTUM_RUNTIME_CONTEXT
-      unset QCL_NEGF_SAVED_RESULTS_BINDING_FILE
-      ${lib.optionalString savedBound ''
-        # Both paths must still be exact NFS mounts in this unit's namespace.
-        # A missing automount or an empty local directory is never a provider.
-        if [ "$(${pkgs.coreutils}/bin/readlink -f ${applicationProfile})" = ${lib.escapeShellArg (toString cfg.package)} ] \
-          && [ "$(${pkgs.coreutils}/bin/readlink -e ${lib.escapeShellArg savedRoot})" = ${lib.escapeShellArg savedRoot} ] \
-          && [ "$(${pkgs.coreutils}/bin/readlink -e ${savedAlias})" = ${savedAlias} ] \
-          && [ "$(${pkgs.util-linux}/bin/findmnt -rn -M ${lib.escapeShellArg savedRoot} -o FSTYPE)" = nfs4 ] \
-          && [ "$(${pkgs.util-linux}/bin/findmnt -rn -M ${lib.escapeShellArg savedRoot} -o SOURCE)" = ${lib.escapeShellArg savedMount.device} ] \
-          && [ "$(${pkgs.util-linux}/bin/findmnt -rn -M ${savedAlias} -o FSTYPE)" = nfs4 ] \
-          && [ "$(${pkgs.util-linux}/bin/findmnt -rn -M ${savedAlias} -o SOURCE)" = ${lib.escapeShellArg savedMount.device} ] \
-          && [ -r ${savedAlias} ] && [ -x ${savedAlias} ] \
-          && [ -f ${lib.escapeShellArg savedResults.storageIdentityFile} ] \
-          && [ "$(${pkgs.coreutils}/bin/readlink -e ${lib.escapeShellArg savedResults.storageIdentityFile})" = ${lib.escapeShellArg savedResults.storageIdentityFile} ] \
-          && [ "$(${pkgs.coreutils}/bin/stat -c %u ${lib.escapeShellArg savedResults.storageIdentityFile})" = 0 ] \
-          && [ "$(${pkgs.coreutils}/bin/stat -c %s ${lib.escapeShellArg savedResults.storageIdentityFile})" -le 257 ] \
-          && [ "$((0$(${pkgs.coreutils}/bin/stat -c %a ${lib.escapeShellArg savedResults.storageIdentityFile}) & 022))" -eq 0 ] \
-          && [ "$(${pkgs.coreutils}/bin/cat ${lib.escapeShellArg savedResults.storageIdentityFile})" = ${lib.escapeShellArg savedResults.storageIdentity} ]; then
-          case ",$(${pkgs.util-linux}/bin/findmnt -rn -M ${savedAlias} -o OPTIONS)," in
-            *,ro,*) export QCL_NEGF_SAVED_RESULTS_BINDING_FILE=${lib.escapeShellArg (toString savedBinding)} ;;
-          esac
-        fi
-      ''}
-      ${lib.optionalString configuratorBound ''
-        if [ "$(${pkgs.coreutils}/bin/readlink -f ${applicationProfile})" = ${lib.escapeShellArg (toString cfg.package)} ] \
-          && [ "''${QCL_NEGF_SOLVER_EXECUTABLE:-}" = ${lib.escapeShellArg "${solver}/bin/qcl-negf"} ] \
-          && [ -x ${lib.escapeShellArg "${solver}/bin/qcl-negf"} ] \
-          && [ -r ${lib.escapeShellArg "${configurator.catalogRoot}/config/configurator-catalog.json"} ]; then
-          export QCL_NEGF_CONFIGURATOR_EXECUTABLE=${lib.escapeShellArg "${solver}/bin/qcl-negf"}
-          export QCL_NEGF_CONFIGURATOR_CATALOG_ROOT=${lib.escapeShellArg configurator.catalogRoot}
-          export QCL_NEGF_CONFIGURATOR_CATALOG_SOURCE_ID=${lib.escapeShellArg configurator.catalogSourceId}
-          export QCL_NEGF_CONFIGURATOR_CGROUP_ROOT=${lib.escapeShellArg configuratorCgroupRoot}
-          # The getter validates ready/profile/solver and this digest against
-          # the existing root-owned release record before building child env.
-          case "$quantum_context_sha256" in
-            ""|*[!0-9a-f]*) ;;
-            *) if [ "''${#quantum_context_sha256}" -eq 64 ]; then
-                 export QCL_NEGF_QUANTUM_RUNTIME_CONTEXT_SHA256="$quantum_context_sha256"
-                 export QCL_NEGF_QUANTUM_RUNTIME_RELEASE_FILE=/var/lib/qcl-negf-admin/runtime/release.json
-               fi ;;
-          esac
-        fi
-      ''}
-      ${lib.optionalString (cfg.api.allowedCodesFile != null) ''
-        export QCL_NEGF_ALLOWED_CODES="$(cat ${lib.escapeShellArg cfg.api.allowedCodesFile})"
-        test -n "$QCL_NEGF_ALLOWED_CODES"
-      ''}
-      exec ${applicationProfile}/bin/qcl-negf-api --host 127.0.0.1 --port ${toString cfg.api.port}
+      exec ${pkgs.python314}/bin/python3 ${operations}/ops/runtime_bindings.py \
+        --config ${launchConfiguration} --port ${toString cfg.api.port}
     '';
     daemonStart = pkgs.writeShellScript "qcl-negf-aiida-start" ''
       export PATH=${applicationProfile}/bin:$PATH
@@ -158,15 +116,6 @@ in {
       };
       configurator = {
         enable = lib.mkEnableOption "bounded source-bound Runner catalog/preview in the existing API unit";
-        catalogRoot = lib.mkOption {
-          type = lib.types.nullOr lib.types.str;
-          default = if cfg.enable then packageCatalogRoot else null;
-          description = "Immutable Research root from the selected application package passthru; explicit overrides must match it exactly.";
-        };
-        catalogSourceId = lib.mkOption {
-          type = lib.types.nullOr lib.types.str; default = null;
-          description = "Exact Research source identity from the same release Git graph as package/catalog/solver; never a guessed version or latest alias.";
-        };
       };
       tls = {
         enable = lib.mkEnableOption "loopback-only TLS API proxy with runtime credentials";
@@ -181,9 +130,7 @@ in {
     qclNegf.enable = true;
     assertions = [
       { assertion = !savedEnabled || savedBound; message = "Saved results require an enabled API, explicit finite namespace/storage/retention/access binding, canonical runtime identity path, Computer UUIDs and the existing hard NFSv4 jobs mount."; }
-      { assertion = !configuratorEnabled || (cfg.api.enable && solver != null); message = "Configurator requires the existing API and selected immutable cluster solver package."; }
-      { assertion = !configuratorEnabled || (packageCatalogRoot != null && configurator.catalogRoot != null && configurator.catalogRoot == packageCatalogRoot && lib.hasPrefix "/nix/store/" configurator.catalogRoot); message = "Configurator catalog must match the selected application's immutable Research passthru."; }
-      { assertion = !configuratorEnabled || (configurator.catalogSourceId != null && builtins.match "[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}" configurator.catalogSourceId != null); message = "Configurator requires an explicit exact Research source identity from the release Git graph."; }
+      { assertion = !configuratorEnabled || cfg.api.enable; message = "Configurator requires the existing API; solver and Research bindings come from its protected active release descriptor."; }
       { assertion = !configuratorEnabled || lib.versionAtLeast config.systemd.package.version "254"; message = "Configurator DelegateSubgroup requires systemd >= 254."; }
       { assertion = !configuratorEnabled || (builtins.match "[A-Za-z0-9_.:-]+[.]slice" apiSlice != null); message = "Configurator requires an ordinary explicitly bound systemd slice name."; }
       { assertion = config.qclNegf.cluster.submit || config.qclNegf.cluster.controller; message = "AiiDA requires the local Slurm submission configuration."; }
@@ -203,7 +150,10 @@ in {
       '';
     };
     environment.systemPackages = [ cfg.package ];
-    systemd.tmpfiles.rules = [ "d /var/lib/qcl-negf/aiida 0700 qcl-negf qcl-negf -" ] ++ lib.optional cfg.api.enable "d ${exportSpoolDirectory} 0700 qcl-negf qcl-negf -";
+    systemd.tmpfiles.rules = [ "d /var/lib/qcl-negf/aiida 0700 qcl-negf qcl-negf -" ] ++ lib.optionals cfg.api.enable [
+      "d ${exportSpoolDirectory} 0700 qcl-negf qcl-negf -"
+      "d /var/lib/qcl-negf/runtime-failures 0700 qcl-negf qcl-negf 7d"
+    ];
     systemd.services.qcl-negf-bootstrap = lib.mkIf cfg.bootstrap.enable {
       description = "Reconcile the declared AiiDA profile and immutable installed Code";
       wantedBy = [ "multi-user.target" ];
@@ -290,6 +240,7 @@ in {
     };
     systemd.services.qcl-negf-api = lib.mkIf cfg.api.enable {
       description = "QCL-NEGF scientific API";
+      path = [ pkgs.util-linux ];
       wantedBy = [ "multi-user.target" ];
       requires = [ "qcl-negf-aiida.service" "qcl-negf-application-profile.service" ] ++ bootstrapUnits ++ config.qclNegf.runtimeSecretUnits;
       partOf = bootstrapUnits;
@@ -310,13 +261,6 @@ in {
         QCL_NEGF_EXPORT_DISK_BYTES = toString cfg.api.exportDiskBytes;
         QCL_NEGF_EXPORT_TTL_SECONDS = toString cfg.api.exportTtlSeconds;
         TMPDIR = exportSpoolDirectory;
-      } // lib.optionalAttrs savedBound {
-        QCL_NEGF_SAVED_RESULTS_BINDING_FILE = savedBinding;
-      } // lib.optionalAttrs configuratorBound {
-        QCL_NEGF_CONFIGURATOR_EXECUTABLE = "${solver}/bin/qcl-negf";
-        QCL_NEGF_CONFIGURATOR_CATALOG_ROOT = configurator.catalogRoot;
-        QCL_NEGF_CONFIGURATOR_CATALOG_SOURCE_ID = configurator.catalogSourceId;
-        QCL_NEGF_CONFIGURATOR_CGROUP_ROOT = configuratorCgroupRoot;
       };
       serviceConfig = {
         User = "qcl-negf"; Group = "qcl-negf";

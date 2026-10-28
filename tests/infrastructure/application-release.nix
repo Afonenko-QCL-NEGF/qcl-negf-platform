@@ -36,39 +36,19 @@ let
     }) extra ];
   };
   controller = (make "controller" {}).config;
-  catalogRoot = "/nix/store/synthetic-research";
-  application = pkgs.hello.overrideAttrs (old: {
-    passthru = (old.passthru or {}) // { configuratorCatalogRoot = catalogRoot; };
-  });
   configurator = extra: (make "controller" {
-    imports = [ {
-      qclNegf.application.package = lib.mkOverride 60 application;
-      qclNegf.application.api.configurator = {
-        enable = lib.mkDefault true;
-        catalogSourceId = lib.mkDefault "synthetic-research-source";
-      };
-    } extra ];
+    imports = [ { qclNegf.application.api.configurator.enable = lib.mkDefault true; } extra ];
   }).config;
   configured = configurator {};
-  missingSource = configurator {
-    qclNegf.application.package = lib.mkForce application;
-    qclNegf.application.api.configurator = { enable = true; catalogSourceId = null; };
+  missingApi = configurator {
+    qclNegf.application.api.enable = lib.mkForce false;
   };
-  mismatchedCatalog = configurator {
-    qclNegf.application.package = lib.mkForce application;
-    qclNegf.application.api.configurator = {
-      enable = true; catalogSourceId = "synthetic-research-source";
-      catalogRoot = "/nix/store/foreign-research";
-    };
-  };
+  # Runtime metadata, rather than image-era package passthru, owns these bindings.
   missingBundle = configurator {
     qclNegf.application.package = lib.mkForce pkgs.hello;
   };
   missingSolver = configurator {
     qclNegf.cluster.solverPackage = lib.mkForce null;
-  };
-  malformedSource = configurator {
-    qclNegf.application.api.configurator.catalogSourceId = "unbound source";
   };
   nested = configurator {
     systemd.services.qcl-negf-api.serviceConfig.Slice = "research-api.slice";
@@ -95,16 +75,14 @@ assert !controller.qclNegf.application.api.configurator.enable;
 assert !(disabledApi.environment ? QCL_NEGF_CONFIGURATOR_EXECUTABLE);
 assert !(disabledApi.serviceConfig ? DelegateSubgroup);
 assert configuratorFailures configured == [];
-assert configuratorFailures missingSource != [];
-assert configuratorFailures mismatchedCatalog != [];
-assert configuratorFailures missingBundle != [];
-assert configuratorFailures missingSolver != [];
-assert configuratorFailures malformedSource != [];
-assert api.environment.QCL_NEGF_CONFIGURATOR_EXECUTABLE == "${pkgs.hello}/bin/qcl-negf";
-assert api.environment.QCL_NEGF_CONFIGURATOR_CATALOG_ROOT == catalogRoot;
-assert api.environment.QCL_NEGF_CONFIGURATOR_CATALOG_SOURCE_ID == "synthetic-research-source";
-assert api.environment.QCL_NEGF_CONFIGURATOR_CGROUP_ROOT == "/sys/fs/cgroup/system.slice/qcl-negf-api.service";
-assert nested.systemd.services.qcl-negf-api.environment.QCL_NEGF_CONFIGURATOR_CGROUP_ROOT == "/sys/fs/cgroup/research.slice/research-api.slice/qcl-negf-api.service";
+assert configuratorFailures missingApi != [];
+assert configuratorFailures missingBundle == [];
+assert configuratorFailures missingSolver == [];
+assert !(api.environment ? QCL_NEGF_CONFIGURATOR_EXECUTABLE);
+assert !(api.environment ? QCL_NEGF_CONFIGURATOR_CATALOG_ROOT);
+assert !(api.environment ? QCL_NEGF_CONFIGURATOR_CATALOG_SOURCE_ID);
+assert !(api.environment ? QCL_NEGF_CONFIGURATOR_CGROUP_ROOT);
+assert nested.systemd.services.qcl-negf-api.serviceConfig.DelegateSubgroup == "api";
 assert api.serviceConfig.Delegate == "cpu memory pids";
 assert api.serviceConfig.DelegateSubgroup == "api";
 assert api.serviceConfig.KillMode == "control-group";
