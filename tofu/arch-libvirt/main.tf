@@ -13,6 +13,17 @@ resource "terraform_data" "admission" {
       condition     = filesha256(var.image_path) == var.image_sha256
       error_message = "The local root image does not match its reviewed SHA-256."
     }
+    precondition {
+      condition = length(var.additional_routes) == 0 || try(
+        can(cidrnetmask(var.address)) && tonumber(split("/", var.address)[1]) <= 30 &&
+        alltrue([for route in var.additional_routes :
+          cidrhost("${route.via}/${split("/", var.address)[1]}", 0) == cidrhost(var.address, 0) &&
+          route.via != cidrhost("${split("/", var.address)[0]}/32", 0) &&
+          route.via != cidrhost(var.address, 0) && route.via != cidrhost(var.address, -1)
+        ]), false
+      )
+      error_message = "Additional routes need an IPv4 guest subnet with prefix at most 30 and directly reachable next hops distinct from guest, network and broadcast addresses."
+    }
   }
 }
 resource "libvirt_pool" "qcl" {
@@ -52,7 +63,7 @@ resource "libvirt_cloudinit_disk" "seed" {
     match       = { macaddress = lower(var.mac) }
     "set-name"  = "cluster0"
     addresses   = [var.address]
-    routes      = [{ to = "default", via = var.gateway }]
+    routes      = concat([{ to = "default", via = var.gateway }], var.additional_routes)
     nameservers = { addresses = var.dns_servers }
   } } })
 }

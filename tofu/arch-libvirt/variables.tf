@@ -78,6 +78,21 @@ variable "address" {
   }
 }
 variable "gateway" { type = string }
+variable "additional_routes" {
+  type        = list(object({ to = string, via = string }))
+  default     = []
+  description = "Specific IPv4 NoCloud routes after the unchanged default. Next hops must be directly reachable on the guest subnet."
+  validation {
+    condition = alltrue([for route in var.additional_routes : try(
+      can(cidrnetmask(route.to)) &&
+      tonumber(split("/", route.to)[1]) >= 1 &&
+      route.to == "${cidrhost(route.to, 0)}/${tonumber(split("/", route.to)[1])}" &&
+      route.via == cidrhost("${route.via}/32", 0) &&
+      can(cidrnetmask("${route.via}/32")), false
+    )]) && length(distinct([for route in var.additional_routes : route.to])) == length(var.additional_routes)
+    error_message = "Additional routes require unique canonical IPv4 CIDRs with prefix 1..32 and canonical bare IPv4 next hops; default routes are not allowed."
+  }
+}
 variable "dns_servers" { type = list(string) }
 variable "ssh_public_keys" {
   type = list(string)

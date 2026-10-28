@@ -28,6 +28,9 @@ table inet qcl_negf {
 table ip qcl_negf_nat {
     chain postrouting {
         type nat hook postrouting priority srcnat; policy accept;
+{% if qcl_external_worker_ipv4_addresses | length > 0 %}
+        ip saddr {{ qcl_cluster_cidr }} ip daddr { {{ qcl_external_worker_ipv4_addresses | join(', ') }} } oifname "{{ qcl_management_bridge }}" return
+{% endif %}
         ip saddr { {{ qcl_cluster_cidr }}, {{ qcl_ci_cidr }} } oifname "{{ qcl_management_bridge }}" masquerade
     }
 }
