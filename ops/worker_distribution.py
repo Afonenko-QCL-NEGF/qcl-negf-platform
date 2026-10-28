@@ -218,6 +218,60 @@ def graph(value):
     return value
 
 
+def canonical_hash(value):
+    # Cross-language contract: ASCII proof fields, sorted object keys, no newline.
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'),
+                                     ensure_ascii=False, allow_nan=False).encode()).hexdigest()
+
+
+def depot_v2(depot, binding, source_ref, depot_ref):
+    keys(depot, ('format', 'sources', 'julia', 'juliaManifest', 'url', 'hash', 'compatibility'))
+    graph(depot['sources'])
+    c = depot['compatibility']
+    keys(c, ('schema', 'inputs', 'inputs_sha256', 'native'))
+    i = c['inputs']
+    keys(i, ('schema', 'system', 'julia', 'files', 'selector_policy'))
+    require(i['schema'] == 'qcl-negf.julia-depot-inputs.v1' and i['system'] == 'x86_64-linux'
+            and i['selector_policy'] == 'locked-external-native-default-v1', 'Unsupported depot profile')
+    j = i['julia']
+    keys(j, ('version', 'drv', 'output', 'profile', 'test_workers'))
+    require(j['version'] == '1.13.0' and matches(STORE, j['drv']) and j['drv'].endswith('.drv')
+            and matches(STORE, j['output']) and not j['output'].endswith('.drv') and j['profile'] in ('production-build', 'local-debug')
+            and (j['test_workers'] is None or positive(j['test_workers']) and j['test_workers'] <= 9007199254740991)
+            and (j['profile'] != 'local-debug' or j['test_workers'] == 2), 'Invalid Julia factory')
+    require(isinstance(i['files'], list) and 0 < len(i['files']) <= 128, 'Invalid input file count')
+    prior = ''
+    for row in i['files']:
+        keys(row, ('path', 'sha256'))
+        relative(row['path'])
+        require(row['path'] > prior and (row['sha256'] is None or matches(SHA, row['sha256'])),
+                'Invalid sorted input file inventory')
+        prior = row['path']
+    require(any(r['path'] == 'julia/Manifest.toml' and r['sha256'] == depot['juliaManifest']
+                for r in i['files']), 'Native Manifest input differs')
+    require(c['schema'] == 'qcl-negf.julia-depot-compatibility.v1'
+            and c['inputs_sha256'] == canonical_hash(i), 'Dependency identity differs')
+    n = c['native']
+    keys(n, ('schema', 'inputs_sha256', 'julia_drv', 'julia_output', 'observed_platform',
+             'preferences_sha256', 'selector_closure_sha256', 'artifact_selection_sha256', 'receipt_sha256'))
+    require(n['schema'] == 'qcl-negf.julia-depot-native.v1' and n['inputs_sha256'] == c['inputs_sha256']
+            and n['julia_drv'] == j['drv'] and n['julia_output'] == j['output']
+            and isinstance(n['observed_platform'], str)
+            and re.fullmatch(r'[!-~]{1,1024}', n['observed_platform'])
+            and all(matches(SHA, n[k]) for k in ('preferences_sha256', 'selector_closure_sha256',
+                     'artifact_selection_sha256', 'receipt_sha256')), 'Native qualification binding differs')
+    keys(binding, ('schema', 'producer_source_graph_sha256', 'selected_source_graph_record_sha256',
+                   'inputs_sha256', 'consumed_metadata_sha256', 'consumed_metadata_bytes'))
+    require(binding['schema'] == 'qcl-negf-worker-depot-binding-v1'
+            and binding['producer_source_graph_sha256'] == canonical_hash(depot['sources'])
+            and binding['selected_source_graph_record_sha256'] == source_ref['sha256']
+            and binding['inputs_sha256'] == c['inputs_sha256']
+            and binding['consumed_metadata_sha256'] == depot_ref['sha256']
+            and type(binding['consumed_metadata_bytes']) is int
+            and binding['consumed_metadata_bytes'] == depot_ref['bytes'] <= 65536,
+            'Original/current/consumed depot binding differs')
+
+
 def texts(value):
     require(isinstance(value, list) and 0 < len(value) <= 128
             and all(isinstance(x, str) and 0 < len(x) <= 4096
@@ -376,18 +430,25 @@ def joins(root, m, inventory, deadline):
                 'nar_hash': image['nar_hash'], 'closures': release['closures']}
     runtime = m['runtime_evidence']
     build = record(image['build_evidence'])
+    v2 = build.get('schema') == 'qcl-negf-worker-build-projection-v2'
     keys(build, ('schema', 'original_receipt_sha256', 'identity', 'depot_sha256',
-                 'lock_artifacts', 'julia_manifest_sha256', 'native_contract'))
-    require(build['schema'] == 'qcl-negf-worker-build-projection-v1'
+                 'lock_artifacts', 'julia_manifest_sha256', 'native_contract',
+                 *(('depot_compatibility',) if v2 else ())))
+    require(build['schema'] in ('qcl-negf-worker-build-projection-v1', 'qcl-negf-worker-build-projection-v2')
             and matches(SHA, build['original_receipt_sha256']) and build['identity'] == identity
             and build['depot_sha256'] == runtime['depot']['sha256']
             and refs(build['lock_artifacts']) == refs(runtime['lock_artifacts']), 'Original build/source/closure/lock join differs')
     native_contract(build['native_contract'])
     require(build['native_contract']['source_sha256'] == m['source_graph']['sha256'], 'Native contract source differs')
     depot = record(runtime['depot'])
-    keys(depot, ('format', 'sources', 'julia', 'juliaManifest', 'url', 'hash'))
-    require(depot['format'] == 'qcl-negf.julia-depot.v1' and depot['sources'] == sources
-            and depot['julia'] == '1.13.0'
+    if v2:
+        require(depot.get('format') == 'qcl-negf.julia-depot.v2', 'V2 build needs V2 depot')
+        depot_v2(depot, build['depot_compatibility'], m['source_graph'], runtime['depot'])
+    else:
+        keys(depot, ('format', 'sources', 'julia', 'juliaManifest', 'url', 'hash'))
+        require(depot['format'] == 'qcl-negf.julia-depot.v1' and depot['sources'] == sources,
+                'Legacy depot needs exact current graph')
+    require(depot['julia'] == '1.13.0'
             and depot['juliaManifest'] == inventory['records/locks/Manifest.toml']['sha256']
             and build['julia_manifest_sha256'] == depot['juliaManifest'] and matches(NAR, depot['hash']),
             'Original depot/Julia lock/source join differs')
