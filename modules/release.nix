@@ -6,6 +6,10 @@ let
   operations = pkgs.runCommand "qcl-negf-release-operations" {} ''
     mkdir -p "$out/ops"
     cp ${../ops/application_release.py} "$out/ops/application_release.py"
+    cp ${../ops/release_identity.py} "$out/ops/release_identity.py"
+    cp ${../ops/release_trust.py} "$out/ops/release_trust.py"
+    cp ${../ops/release_qualification.py} "$out/ops/release_qualification.py"
+    cp ${../ops/release_health.py} "$out/ops/release_health.py"
     cp ${../ops/worker_lifecycle.py} "$out/ops/worker_lifecycle.py"
     cp ${../ops/aiida_update_check.py} "$out/ops/aiida_update_check.py"
     cp ${../ops/register_aiida.py} "$out/ops/register_aiida.py"

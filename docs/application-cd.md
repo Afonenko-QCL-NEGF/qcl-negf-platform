@@ -2,8 +2,8 @@
 
 The umbrella GitHub Actions workflow builds and checks immutable source artifacts. A local serial
 owner on the permanent controller performs whole-cluster update; it needs no GitHub deployment
-credential or delivery runner. This component adds no deploy daemon, discovery or revision lock catalog. The initial deployment is
-CPU-only and selects one release for the active pool.
+credential or delivery runner. This component adds no deploy daemon, discovery or revision lock
+catalog. The initial deployment is CPU-only and selects one release for the active pool.
 
 ## One-time image preparation
 
@@ -12,8 +12,8 @@ controller and Linux workers; the private-site example does this. The image inst
 release/lifecycle commands, profile initialization and a slurmd boot gate. API/AiiDA/bootstrap run
 from the stable `/nix/var/nix/profiles/qcl-negf-application`; initialization sets it only when
 absent, so reboot retains the CD-selected release. Services read runtime
-`/var/lib/qcl-negf-admin/runtime/service.env`. The solver profile is a GC root only; InstalledCode always
-uses immutable `/nix/store/.../bin/qcl-negf`.
+`/var/lib/qcl-negf-admin/runtime/service.env`. The solver profile is a GC root only; InstalledCode
+always uses immutable `/nix/store/.../bin/qcl-negf`.
 
 OS changes require the deployment procedure again. Database schema changes are explicit maintenance
 with backup. Routine activation runs neither migrations nor `nixos-rebuild`.
@@ -51,8 +51,9 @@ and trust checks; this procedure does not disable `require-sigs`.
 
 The explicit private pool is a routing projection of protected enrollment and must cover every
 enrolled controller/worker exactly. An offline enrolled worker blocks update; retiring one requires
-a separate trusted enrollment change before the update signal. This synthetic v2 example references the enrollment example below; actual protected
-inventory and host-key enrollment must be supplied by the operator:
+a separate trusted enrollment change before the update signal. This synthetic v2 example references
+the enrollment example below; actual protected inventory and host-key enrollment must be supplied by
+the operator:
 
 ```json
 {
@@ -82,12 +83,12 @@ workflows (including paused/waiting retries) and all Slurm jobs/queue, signal up
 sudo qcl-negf-release update --manifest /private/release.json --pool /private/pool-v2.json --enrollment /operator-protected/enrollment.json
 ```
 
-`deliver` is a compatibility alias of this same safe whole-cluster path; it cannot omit workers
-or bypass cancellation. Defaults are one 1800-second operation, 360-second bounded commands,
-1 MiB per-command combined output and 8 MiB aggregate; deadlines never reset by node. These are
+`deliver` is a compatibility alias of this same safe whole-cluster path; it cannot omit workers or
+bypass cancellation. Defaults are one 1800-second operation, 360-second bounded commands, 1 MiB
+per-command combined output and 8 MiB aggregate; deadlines never reset by node. These are
 engineering bounds, not a scientific CPU/RAM grant. An optional operator-owned standard
-`systemd-run` oneshot can detach the exact immutable command with `RuntimeMaxSec`; no new service
-or automatic admission opener is installed.
+`systemd-run` oneshot can detach the exact immutable command with `RuntimeMaxSec`; no new service or
+automatic admission opener is installed.
 
 Before maintenance, protected enrollment and readonly identity probes bind the actual local
 controller and all enrolled nodes. The controller then fetches both named closures with
@@ -99,58 +100,65 @@ remains supported when both closures already exist in the controller store and m
 hashes. Delivery cannot accept a manifest without both hashes; minimal four-field manifests remain
 valid for activation and runtime identity checks.
 
-After this preflight and installed capability checks on every node, update captures original
-healthy IDLE state, full Reason and exact registration for every worker. Foreign DOWN/DRAIN or
-maintenance reason refuses before the gate changes. Protected matching retry provenance retains
-the first original state. Update then closes `/srv/qcl-negf/jobs/.release-admission.json`, stops API/AiiDA,
+After this preflight and installed capability checks on every node, update captures original healthy
+IDLE state, full Reason and exact registration for every worker. Foreign DOWN/DRAIN or maintenance
+reason refuses before the gate changes. Protected matching retry provenance retains the first
+original state. Update then closes `/srv/qcl-negf/jobs/.release-admission.json`, stops API/AiiDA,
 drains all enrolled workers after a fresh unchanged original-state read before each
-`Reason=application-release:<attempt_id>` DRAIN and a complete after-readback. It requires complete readonly AiiDA workflow/CalcJob and whole Slurm
-queue absence. Missing/NULL/unknown process states and inaccessible queries are blockers. Both
-published workflow types are queried without parent, creator, release or newest-page filters.
-Every worker is then independently stopped and read back before the first copy/activation. A
-standard runtime mask inhibits only `slurmd.service`; protected own markers retain original
-machine/boot/daemon/SLURM_CONF identity. Bounded scans refuse incomplete proc/cgroup evidence.
-A hard stop requires a positively measured singleton captured daemon generation and complete
-root/sub-cgroup membership, with UID/state/full executable/start-ticks/cgroup evidence and no
-snapshot drift. Empty daemon evidence or any unknown helper/member forbids force. Only the exact
-bound service receives the one scoped kill after empty job-process proof. This barrier stops worker execution; it does not power off VMs
-or prove RAM reclamation. The maintenance owner first
-completes/cancels the old research and removes its automatic resume/queued attempts. The command
-never cancels or restarts research on the user's behalf. `JobRequeue=0` and AiiDA's `--no-requeue`
-prevent a second independent owner. The shared NFS gate is published as the scientific UID because
-the export retains `root_squash`; local runtime state remains administrative. Scientific submitters
-require access to the shared job group, whose UID/GID mapping is a site check.
+`Reason=application-release:<attempt_id>` DRAIN and a complete after-readback. It requires complete
+readonly AiiDA workflow/CalcJob and whole Slurm queue absence. Missing/NULL/unknown process states
+and inaccessible queries are blockers. Both published workflow types are queried without parent,
+creator, release or newest-page filters. Every worker is then independently stopped and read back
+before the first copy/activation. A standard runtime mask inhibits only `slurmd.service`; protected
+own markers retain original machine/boot/daemon/SLURM_CONF identity. Bounded scans refuse incomplete
+proc/cgroup evidence. A hard stop requires a positively measured singleton captured daemon
+generation and complete root/sub-cgroup membership, with UID/state/full
+executable/start-ticks/cgroup evidence and no snapshot drift. Empty daemon evidence or any unknown
+helper/member forbids force. Only the exact bound service receives the one scoped kill after empty
+job-process proof. This barrier stops worker execution; it does not power off VMs or prove RAM
+reclamation. The maintenance owner first completes/cancels the old research and removes its
+automatic resume/queued attempts. The command never cancels or restarts research on the user's
+behalf. `JobRequeue=0` and AiiDA's `--no-requeue` prevent a second independent owner. The shared NFS
+gate is published as the scientific UID because the export retains `root_squash`; local runtime
+state remains administrative. Scientific submitters require access to the shared job group, whose
+UID/GID mapping is a site check.
 
 `nix copy` delivers application+solver closures; activation switches the profile, reconciles a new
 release-specific InstalledCode label with the exact solver path, updates runtime UUID, restarts
 affected services and checks closure/profile identity and service health on every selected node.
 `ready:false` marks prepared configuration; `ready:true` is published only after checks. Old Code
-provenance is not relabelled/deleted. After the last activation, fresh whole-fleet checks verify every enrolled identity, both profiles,
-service/auth health, the configured real NFS endpoint with one exclusive tiny own probe, and
-actual zero-allocation Slurm registration. The complete AiiDA/Slurm absence checks repeat after
-restart and before admission. RESUME requires retained original→own tagged DRAIN→measured stop
-provenance, a current body-derived six-field tuple and actual restarted daemon UTC window. A
-standard not-responding DOWN reason is supported only in its measured own stop window. One RESUME
-is followed by at most ten readonly polls; exact same-generation IDLE and zero allocations on
-every worker precede gate opening. Other state/reason/resource/generation changes remain closed. Own stop
-markers are removed after durable terminal success. Partial/unknown outcomes never auto-retry. Partial failure leaves it closed and publishes node statuses in
-`/var/lib/qcl-negf-admin/runtime/delivery-report.json`; for a known failure, fix the cause and explicitly
-repeat the same idempotent command. An uncertain outcome requires trusted reconciliation first. A
-repeated successful activation retains profile/Code identity and repeats checks. Application and
-solver profiles are reconciled independently. An identical retry repairs a missing or wrong solver
-GC root without changing the selected release, immutable solver executable or InstalledCode
-identity. Healthy profiles receive no extra `nix-env --set`; each setter is followed by a resolved
-closure identity check. Setter failure or a mismatched result leaves no ready record. The `check`
-command rejects a missing or wrong solver profile before checking services or running the solver
-self-check. Each required unit is checked separately. Activation also runs the pinned solver
-`self-check` as `qcl-negf`, with one Julia/BLAS thread and a 300-second limit, before readiness.
-This small analytic PV/HDF5 execution check verifies the installed runtime, not stationary
-convergence or scientific acceptance. An identical retry starts any services stopped by maintenance
-while retaining the selected immutable closure and Code identity. Targeted activation/check
-regressions use injected stdlib command fakes for Nix, systemd and Code registration, with real
-temporary profile links and runtime records. They do not establish real Nix, service or AiiDA
-reconciliation behavior. After reboot, bootstrap derives solver/Code selection from the current
-runtime release instead of publishing the original image's seed Code UUID again.
+provenance is not relabelled/deleted. After the last activation, fresh whole-fleet checks verify
+every enrolled identity, both profiles, service/auth health, the configured real NFS endpoint with
+one exclusive tiny own probe, and actual zero-allocation Slurm registration. The complete
+AiiDA/Slurm absence checks repeat after restart and before admission. RESUME requires retained
+original→own tagged DRAIN→measured stop provenance, a current body-derived six-field tuple and
+actual restarted daemon UTC window. A standard not-responding DOWN reason is supported only in its
+measured own stop window. One RESUME is followed by at most ten readonly polls; exact
+same-generation IDLE and zero allocations on every worker precede gate opening. Other
+state/reason/resource/generation changes remain closed. Own stop markers are removed after durable
+terminal success. Partial/unknown outcomes never auto-retry. Partial failure leaves it closed and
+publishes node statuses in `/var/lib/qcl-negf-admin/runtime/delivery-report.json`; for a known
+failure, fix the cause and explicitly repeat the same idempotent command. An uncertain outcome
+requires trusted reconciliation first. A repeated successful activation retains profile/Code
+identity and repeats checks. Application and solver profiles are reconciled independently. An
+identical retry repairs a missing or wrong solver GC root without changing the selected release,
+immutable solver executable or InstalledCode identity. Healthy profiles receive no extra
+`nix-env --set`; each setter is followed by a resolved closure identity check. Setter failure or a
+mismatched result leaves no ready record. The `check` command rejects a missing or wrong solver
+profile before checking services. Современная активация зарегистрированных узлов отделяет
+[квалификацию артефакта владельца](artifact-qualification.md) от текущего состояния активации и
+загрузки: совместимое обновление APP повторно использует неизменное свидетельство solver; текущий
+статус и RESUME читают защищённые подтверждения и данные дешёвой проверки состояния. При отсутствии
+свидетельства solver до установления готовности требуется закреплённый `self-check` от имени
+`qcl-negf`, с одним потоком Julia/BLAS и существующим ограничением в 300 секунд. Эта аналитическая
+проверка исполнения PV/HDF5 даёт свидетельство о среде исполнения, но не о стационарной сходимости
+или научной приёмке. Устаревшие манифесты из четырёх полей и холодный `node-check` сохраняют явную
+полную проверку без повторно используемой квалификации. An identical retry starts any services
+stopped by maintenance while retaining the selected immutable closure and Code identity. Targeted
+activation/check regressions use injected stdlib command fakes for Nix, systemd and Code
+registration, with real temporary profile links and runtime records. They do not establish real Nix,
+service or AiiDA reconciliation behavior. After reboot, bootstrap derives solver/Code selection from
+the current runtime release instead of publishing the original image's seed Code UUID again.
 
 ## Jobs and returning workers
 
@@ -305,10 +313,10 @@ stored in the Nix store. The following identities are synthetic examples only:
 Registry and known_hosts must be bounded root-owned regular files beneath a complete root-owned
 namespace with no group/other write or symlink components. User homes and /tmp are not production
 trust inputs. Verified bytes are frozen in unique root0700 operations beneath
-/var/lib/qcl-negf-admin/trust-snapshots, file0600; all later SSH/Nix copies use that snapshot with strict
-verification and no global known_hosts/config fallback. Source pathname substitution cannot change
-the snapshot. Snapshot hashes link private receipts to bytes; they are not source revision locks.
-Snapshots are conservatively retained, including unknown attempts; operator housekeeping must
+/var/lib/qcl-negf-admin/trust-snapshots, file0600; all later SSH/Nix copies use that snapshot with
+strict verification and no global known_hosts/config fallback. Source pathname substitution cannot
+change the snapshot. Snapshot hashes link private receipts to bytes; they are not source revision
+locks. Snapshots are conservatively retained, including unknown attempts; operator housekeeping must
 preserve references until reconciliation/child cleanup. Trusted root/operator mutation and hardware
 attestation are outside this contract.
 
@@ -336,9 +344,10 @@ remains diagnostic and must satisfy old gate checks; it is not enrolled fleet ev
 installed tooling without identity or role metadata must be upgraded through separately authorized
 initial bootstrap; there is no permissive copy/install before preflight or auto enrollment fallback.
 Startup uses the same authority/trust/worker binding and rejects unresolved receipts; CR02 shared
-lifecycle intent/owner coordination is implemented below. I14 software adapters are prepared in source; native full-fleet acceptance remains a separate gate.
-Synthetic API tests establish none of real inventory completeness, provider/SSH trust, service/VM
-health, all-worker I14 gates, or scientific acceptance.
+lifecycle intent/owner coordination is implemented below. I14 software adapters are prepared in
+source; native full-fleet acceptance remains a separate gate. Synthetic API tests establish none of
+real inventory completeness, provider/SSH trust, service/VM health, all-worker I14 gates, or
+scientific acceptance.
 
 ## Persistent normal-shutdown admission guard (CR02)
 
@@ -363,32 +372,33 @@ requires reconciliation, never trustworthy completion. All preexisting CR04 byte
 retry blocks before further snapshot/SSH/copy/RESUME. The Windows wrappers coordinate protected
 registry route and scoped enrollment output; actual authenticated actor mapping, private inventory,
 SSH trust and Hyper-V/GPO event ordering remain deployment gates. See
-[Windows lifecycle](windows-workers.md). Whole-cluster I14 cancellation, stopped-worker and final-health adapters are prepared in source;
-VM poweroff is excluded. Durable unknown update ownership inhibits ordinary startup. The original
-source packet failed (76 test methods, 13 failures including subtests, 10 errors); the whole F1–F7
-repair is source-only and awaits the separately admitted whole test packet and independent review.
-No native proc/cgroup/Slurm/NFS/SQL or scientific acceptance is inherited from this source work.
+[Windows lifecycle](windows-workers.md). Whole-cluster I14 cancellation, stopped-worker and
+final-health adapters are prepared in source; VM poweroff is excluded. Durable unknown update
+ownership inhibits ordinary startup. The original source packet failed (76 test methods, 13 failures
+including subtests, 10 errors); the whole F1–F7 repair is source-only and awaits the separately
+admitted whole test packet and independent review. No native proc/cgroup/Slurm/NFS/SQL or scientific
+acceptance is inherited from this source work.
 
 ## Rollout and evidence boundaries
 
 The new actions/helper and configured NFS endpoint must already be installed on controller and
-workers before their first whole update. An older CLI fails the readonly capability preflight;
-there is no fallback to old partial delivery. Application/solver closures do not imply OS image
+workers before their first whole update. An older CLI fails the readonly capability preflight; there
+is no fallback to old partial delivery. Application/solver closures do not imply OS image
 compatibility. A candidate requiring OS/Slurm/NFS changes needs a separately reviewed prebuilt-role
-maintenance gate; `requires_os_maintenance` candidates are refused by this application path.
-Source fakes/stdlib tests do not establish native QueryBuilder NULL semantics, mask/proc/cgroup
+maintenance gate; `requires_os_maintenance` candidates are refused by this application path. Source
+fakes/stdlib tests do not establish native QueryBuilder NULL semantics, mask/proc/cgroup
 permissions, NFS durability, installed runtime, guest/restore, CI or scientific acceptance.
 
-Update metadata bytes are conservatively precharged upper bounds (64 MiB per action), not
-server IO measurements. Actual returned bytes are separate. Reads include sentinel reservations;
-iterator caps charge before each access, including skipped names. Health, marker cleanup and
-update activation share finite action deadlines. Expired probes/publications retain own cleanup
-evidence and unknown status; source bounds do not promise interrupting kernel-blocked fsync.
+Update metadata bytes are conservatively precharged upper bounds (64 MiB per action), not server IO
+measurements. Actual returned bytes are separate. Reads include sentinel reservations; iterator caps
+charge before each access, including skipped names. Health, marker cleanup and update activation
+share finite action deadlines. Expired probes/publications retain own cleanup evidence and unknown
+status; source bounds do not promise interrupting kernel-blocked fsync.
 
-The R1–R5 source amendment separates complete global PID classification (comm, UID tuple,
-unified cgroup, encoded PID/start ticks/state) from mandatory full executable proof for every
-own root/sub-cgroup member and daemon. Unrelated classified kernel/zombie processes may lack a
-userspace executable; missing own executable or denied/malformed classification still refuses.
+The R1–R5 source amendment separates complete global PID classification (comm, UID tuple, unified
+cgroup, encoded PID/start ticks/state) from mandatory full executable proof for every own
+root/sub-cgroup member and daemon. Unrelated classified kernel/zombie processes may lack a userspace
+executable; missing own executable or denied/malformed classification still refuses.
 PID/start/executable/UID/comm/cgroup identity and live/nonexecuting class are compared separately
 from volatile accounting. Bounded raw before/after observations remain private evidence.
 
@@ -416,27 +426,23 @@ failure is not measured, and no source/native/scientific-ready claim follows fro
 
 Release runtime metadata, service environment and protected stop markers live in
 `/var/lib/qcl-negf-admin/runtime` (root-owned 0755); frozen SSH trust lives in
-`/var/lib/qcl-negf-admin/trust-snapshots` (root-owned 0700). The parent
-`/var/lib/qcl-negf-admin` is root-owned 0755. These paths are separate from the
-service-owned `/var/lib/qcl-negf` AiiDA home, including its controller DATA bind.
-Every protected ancestor must still be root-owned, non-writable by group/others
-and traversed without symlinks. Do not change the AiiDA home's ownership.
+`/var/lib/qcl-negf-admin/trust-snapshots` (root-owned 0700). The parent `/var/lib/qcl-negf-admin` is
+root-owned 0755. These paths are separate from the service-owned `/var/lib/qcl-negf` AiiDA home,
+including its controller DATA bind. Every protected ancestor must still be root-owned, non-writable
+by group/others and traversed without symlinks. Do not change the AiiDA home's ownership.
 
-Existing installations must explicitly reconcile prior runtime state before
-activating these defaults; no automatic copy, old-path fallback or trust adoption
-is performed. Initialize fresh runtime/trust state only after enrollment and
-release identities are checked. The new defaults do not migrate scientific data,
-AiiDA configuration, application or solver closures.
+Existing installations must explicitly reconcile prior runtime state before activating these
+defaults; no automatic copy, old-path fallback or trust adoption is performed. Initialize fresh
+runtime/trust state only after enrollment and release identities are checked. The new defaults do
+not migrate scientific data, AiiDA configuration, application or solver closures.
 
-For a fresh guest, deliver the new root-owned release command closure through Nix,
-then run its `prepare-initial` with the new runtime namespace before switching the
-NixOS system. Keep the admission gate closed; preserve an already exact profile
-and the same release identity. This prepares the new service environment before
-the changed `EnvironmentFile` and slurmd `ExecStartPre` become active. Do not copy
-old runtime files as a substitute for checked initial preparation. Existing-state
-reconciliation remains an explicit operator step.
+For a fresh guest, deliver the new root-owned release command closure through Nix, then run its
+`prepare-initial` with the new runtime namespace before switching the NixOS system. Keep the
+admission gate closed; preserve an already exact profile and the same release identity. This
+prepares the new service environment before the changed `EnvironmentFile` and slurmd `ExecStartPre`
+become active. Do not copy old runtime files as a substitute for checked initial preparation.
+Existing-state reconciliation remains an explicit operator step.
 
-Both owning operational commands, `qcl-negf-release` and
-`qcl-negf-worker-lifecycle`, explicitly export the same generated `SLURM_CONF`
-used by the configured Slurm daemon. Their raw Slurm dependencies must not fall
-back to DNS configless discovery or a caller's unrelated configuration.
+Both owning operational commands, `qcl-negf-release` and `qcl-negf-worker-lifecycle`, explicitly
+export the same generated `SLURM_CONF` used by the configured Slurm daemon. Their raw Slurm
+dependencies must not fall back to DNS configless discovery or a caller's unrelated configuration.

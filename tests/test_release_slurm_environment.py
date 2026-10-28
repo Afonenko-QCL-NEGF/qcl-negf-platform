@@ -41,7 +41,7 @@ class ReleaseSlurmEnvironmentTests(unittest.TestCase):
                 };
               };
               in builtins.map (p: { inherit (p) name text; }) module.config.environment.systemPackages
-            '''.replace("MODULE", str(module)).replace("CONFIGDIR", json.dumps(str(root))).replace("OPERATIONS", json.dumps(str(operations.parent)))
+            '''.replace("MODULE", '(builtins.toPath ' + json.dumps(str(module), ensure_ascii=False) + ')').replace("CONFIGDIR", json.dumps(str(root))).replace("OPERATIONS", json.dumps(str(operations.parent)))
             evaluated = subprocess.run(["nix-instantiate", "--eval", "--strict", "--json", "--expr", expression], capture_output=True, text=True, timeout=10)
             self.assertEqual(evaluated.returncode, 0, evaluated.stderr)
             wrappers = json.loads(evaluated.stdout)

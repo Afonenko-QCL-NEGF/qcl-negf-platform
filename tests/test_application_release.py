@@ -122,7 +122,7 @@ POOL = {"schema": "qcl-negf-active-pool-v2", "nodes": [
 
 
 def update_capability():
-    return {'schema':'qcl-negf-local-update-capability-v2','lifecycle_owner':'qcl-negf-lifecycle-owner-v1','stop_update':True,'stopped_identity':True,'fleet_health':True,'aiida_two_workflow_types':True}
+    return {'schema':'qcl-negf-local-update-capability-v3','lifecycle_owner':'qcl-negf-lifecycle-owner-v1','stop_update':True,'stopped_identity':True,'fleet_health':True,'aiida_two_workflow_types':True,'artifact_qualification':True}
 
 def clear_aiida():
     return {'schema':'qcl-negf-aiida-update-check-v1','profile':'qcl-negf','roots_checked':True,'calcjobs_checked':True,'active_root_found':False,'active_calcjob_found':False,'root_sample':None,'calcjob_sample':None}
@@ -283,6 +283,19 @@ def install_controller_config_io(test,root):
     path.write_text(json.dumps({'role':'controller','email':'service@example.invalid',
         'allowed_codes_file':str(root/'controller-code-uuid'),
         'slurm_conf':'/etc/slurm.conf','nfs_source':'storage.invalid:/srv/qcl-negf/jobs'}))
+    hook=patch.object(test.ops, 'observe_qualification_environment', lambda **_: {
+        'kernel_release':'6.12-fixture','kernel_path':'/nix/store/kernel',
+        'modules_path':'/nix/store/modules','restore_epoch':'44444444-4444-4444-4444-444444444444'})
+    hook.start();test.addCleanup(hook.stop)
+    protected_read = test.ops.read_protected_file
+    def receipt_read(path, limit=65536, **kwargs):
+        if Path(path).is_relative_to(Path(tempfile.gettempdir())) and (Path(path).parent.name == 'qualifications' or Path(path).name in ('qualification-epoch.json', 'release.json')):
+            data = Path(path).read_bytes()
+            if len(data) > limit: raise ValueError('Synthetic protected metadata exceeds bound')
+            return data
+        return protected_read(path, limit, **kwargs)
+    hook=patch.object(test.ops, 'read_protected_file', receipt_read)
+    hook.start();test.addCleanup(hook.stop)
     hook=patch.object(test.ops, 'PROFILE', root/'controller-profile')
     hook.start();test.addCleanup(hook.stop)
     original=io.open
@@ -1058,7 +1071,9 @@ class ApplicationReleaseTests(unittest.TestCase):
             self.assertEqual([args for args in run.calls if args[0] != "ssh"][:2], [
                 ["nix", "copy", "--from", "https://cache.example.invalid", "/nix/store/application", "/nix/store/solver"],
                 ["nix", "path-info", "--json", "/nix/store/application", "/nix/store/solver"]])
-            self.assertEqual(run.prefetch_gate_snapshots, [original, original])
+            self.assertEqual(run.prefetch_gate_snapshots[:2], [original, original])
+            self.assertTrue(all(json.loads(raw) == {'open': False, 'release_id': 'release-a'}
+                                for raw in run.prefetch_gate_snapshots[2:]))
             first_stop=next(i for i,a in enumerate(run.calls) if a[:2]==["systemctl","stop"])
             self.assertTrue(any('scontrol' in a and 'show' in a for a in run.calls[:first_stop]),
                             "original registration captured before service mutation")
@@ -1102,7 +1117,9 @@ class ApplicationReleaseTests(unittest.TestCase):
             self.ops.deliver_cli(delivery_manifest(False), POOL, runtime=Path(temporary)/'runtime', gate=gate, run=run)
             self.assertEqual(next(args for args in run.calls if args[0] != "ssh")[:3], ["nix", "path-info", "--json"])
             self.assertFalse(any(args[:3] == ["nix", "copy", "--from"] for args in run.calls))
-            self.assertEqual(run.prefetch_gate_snapshots, [original])
+            self.assertEqual(run.prefetch_gate_snapshots[:1], [original])
+            self.assertTrue(all(json.loads(raw) == {'open': False, 'release_id': 'release-a'}
+                                for raw in run.prefetch_gate_snapshots[1:]))
 
     def test_invalid_cache_argument_or_absent_manifest_hashes_refuses_before_commands(self):
         # Keep the literal password/argument table aligned with Root OPS04 tests.
@@ -1584,7 +1601,7 @@ class I14UpdateTests(unittest.TestCase):
                 if words[3]=='health-update' and getattr(self,'nfs_fault',False):
                     value=json.loads(response);del value['nfs_source'];return json.dumps(value)
                 return response
-            if words[3]=='check':return json.dumps({'schema':'qcl-negf-node-release-check-v1','node_identity':actual,'release':{**release(),'ready':True}})
+            if words[3]=='check':return json.dumps({'schema':'qcl-negf-node-release-check-v1','node_identity':actual,'release':{**selected_release_response(words),'ready':True}})
         if args==['id','-u']:return '1000\n'
         if args==['id','-un']:return 'operator\n'
         if args==['env','TZ=UTC','LC_ALL=C','date','+%s']:return '1791504120\n'
@@ -3832,7 +3849,7 @@ class OPS03WholeRoutingTests(unittest.TestCase):
             if argv[0]=='ssh' and shlex.split(argv[-1])[-1]=='update-capabilities':
                 return json.dumps({'schema':'qcl-negf-local-update-capability-v1',
                     'stop_update':True,'stopped_identity':True,'fleet_health':True,
-                    'aiida_two_workflow_types':True})
+                    'aiida_two_workflow_types':True,'artifact_qualification':True})
             return original(argv)
         before=self.gate.read_bytes()
         with self.assertRaises(ValueError):
@@ -3917,10 +3934,10 @@ class OPS03LocalIdentityTests(unittest.TestCase):
         observations=[]
         def observer(**kwargs):
             observations.append(True)
-            return dict(WORKER if len(observations)==1 else {**WORKER,'machine_id':SECOND['machine_id']})
+            return dict(WORKER if len(observations)<=2 else {**WORKER,'machine_id':SECOND['machine_id']})
         with self.process_boot(WORKER),patch.object(self.ops,'observe_node_identity',observer):
             with self.assertRaises(ValueError):self.activate(expected_node_identity=dict(WORKER))
-        self.assertEqual(len(observations),2)
+        self.assertEqual(len(observations),3)
         self.assertFalse(json.loads((self.runtime/'release.json').read_text())['ready'])
         self.assertTrue(list((self.runtime/'delivery-attempts').glob('*.lifecycle-intent.json')))
         self.assertFalse(json.loads(self.gate.read_text())['open'])
