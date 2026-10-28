@@ -1,0 +1,46 @@
+{
+  "schema": "qcl.monitoring-config.v1",
+  "role": "native_host",
+  "reader_uid": 2001,
+  "observer_uid": 2002,
+  "tools": {
+    "sudo": "/usr/bin/sudo",
+    "systemctl": "/usr/bin/systemctl",
+    "journalctl": "/usr/bin/journalctl",
+    "pvesh": "/usr/bin/pvesh",
+    "virsh": "/usr/bin/virsh"
+  },
+  "targets": [],
+  "scopes": {
+    "host_id": "host-a",
+    "machine_id": "11111111111111111111111111111111",
+    "backend": "disabled",
+    "node": null,
+    "version": null,
+    "vms": [],
+    "services": [],
+    "cgroups": [],
+    "journal": false
+  },
+  "bounds": {
+    "command_seconds": 5,
+    "sample_seconds": 15,
+    "fresh_seconds": 10,
+    "output_bytes": 524288,
+    "journal_bytes": 131072,
+    "journal_events": 64,
+    "lookback_seconds": 60,
+    "retention_entries": 128
+  },
+  "storage": {
+    "binding": "unqualified",
+    "directory": "/var/log/qcl-negf-monitoring",
+    "maximum_bytes": null,
+    "keep_free_bytes": 1048576,
+    "retention_seconds": 604800,
+    "minimum_inodes": 16,
+    "device": null,
+    "quota_project": null
+  },
+  "graph_links": []
+}

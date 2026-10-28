@@ -1,0 +1,191 @@
+---
+# Opt-in installation SOURCE, for existing owned hosts only. Never enables/starts
+# a service, creates a VM, provisions storage/quota, or imports private B ledgers.
+- name: Install separate QCL monitoring observer and disabled sampler source
+  hosts: qcl_monitoring_hosts
+  become: true
+  gather_facts: false
+  vars:
+    qcl_monitoring_install: false
+    qcl_monitoring_python: /usr/bin/python3
+    qcl_monitoring_resource_source: /usr/local/lib/qcl-negf-host-resources
+    qcl_monitoring_reader_user: qcl-monitor-reader
+    qcl_monitoring_observer_user: qcl-monitor-observer
+    qcl_monitoring_reader_uid: 0
+    qcl_monitoring_observer_uid: 0
+    qcl_monitoring_observer_key: ""
+    qcl_monitoring_private_config: ""
+  tasks:
+    - name: Require explicit reviewed inputs and distinct native identities
+      ansible.builtin.assert:
+        that:
+          - qcl_monitoring_install | bool
+          - qcl_monitoring_reader_uid | int > 0
+          - qcl_monitoring_observer_uid | int > 0
+          - qcl_monitoring_reader_uid | int != qcl_monitoring_observer_uid | int
+          - qcl_monitoring_reader_user is match('^[a-z_][a-z0-9_-]*$')
+          - qcl_monitoring_observer_user is match('^[a-z_][a-z0-9_-]*$')
+          - qcl_monitoring_reader_user != 'root'
+          - qcl_monitoring_observer_user != 'root'
+          - qcl_monitoring_reader_user != qcl_monitoring_observer_user
+          - qcl_monitoring_python is match('^/[A-Za-z0-9_./+-]+$')
+          - qcl_monitoring_resource_source is match('^/[A-Za-z0-9_./+-]+$')
+          - qcl_monitoring_private_config is match('^/')
+          - qcl_monitoring_observer_key is match('^ssh-(ed25519|rsa) [A-Za-z0-9+/=]+( .*)?$')
+    - name: Check existing interpreter/dependencies without installing anything
+      ansible.builtin.command:
+        argv: [
+          "{{ qcl_monitoring_python }}",
+          -I,
+          -B,
+          -c,
+          "import jsonschema, referencing; import sys; assert sys.version_info >= (3,11)",
+        ]
+      changed_when: false
+    - name: Require existing published resource source
+      ansible.builtin.stat:
+        path: "{{ qcl_monitoring_resource_source }}/host_resource_projection.py"
+      register: qcl_projection_source
+    - name: Refuse guessed or missing P20 source
+      ansible.builtin.assert:
+        that: qcl_projection_source.stat.isreg | default(false)
+    - name: Create only own source/config/helper directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - /usr/local/lib/qcl-negf-monitoring
+        - /usr/local/lib/qcl-negf-monitoring/ops
+        - /usr/local/lib/qcl-negf-monitoring/schemas
+        - /usr/local/libexec
+        - /etc/qcl-negf/monitoring
+    - name: Install P31 source only
+      ansible.builtin.copy:
+        src: "../ops/{{ item }}.py"
+        dest: "/usr/local/lib/qcl-negf-monitoring/ops/{{ item }}.py"
+        owner: root
+        group: root
+        mode: "0644"
+      loop: [cluster_projection, native_monitoring, monitoring_runtime]
+    - name: Package the unchanged published P11 protected-file dependency for unprivileged ingress
+      ansible.builtin.copy:
+        src: "{{ qcl_monitoring_resource_source }}/release_trust.py"
+        remote_src: true
+        dest: /usr/local/lib/qcl-negf-monitoring/ops/release_trust.py
+        owner: root
+        group: root
+        mode: "0644"
+    - name: Install published schemas without changing P20 installation
+      ansible.builtin.copy:
+        src: "../schemas/{{ item }}.schema.json"
+        dest: "/usr/local/lib/qcl-negf-monitoring/schemas/{{ item }}.schema.json"
+        owner: root
+        group: root
+        mode: "0644"
+      loop: [cluster-projection, monitoring-config, host-resource-native-projection]
+    - name: Create dedicated restricted reader and transport identities
+      ansible.builtin.user:
+        name: "{{ item.name }}"
+        uid: "{{ item.uid }}"
+        system: true
+        create_home: false
+        password_lock: true
+        shell: /bin/sh
+      loop:
+        - { name: "{{ qcl_monitoring_reader_user }}", uid: "{{ qcl_monitoring_reader_uid }}" }
+        - { name: "{{ qcl_monitoring_observer_user }}", uid: "{{ qcl_monitoring_observer_uid }}" }
+    - name: Install fixed role helpers without a generic action ingress
+      ansible.builtin.copy:
+        dest: "/usr/local/libexec/{{ item.name }}"
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!{{ qcl_monitoring_python }} -I
+          import sys
+          sys.dont_write_bytecode = True
+          sys.path[:0] = ['/usr/local/lib/qcl-negf-monitoring/ops', '{{ qcl_monitoring_resource_source }}']
+          import monitoring_runtime as m
+          {{ item.expression }}
+      loop:
+        - { name: qcl-negf-monitor-read, expression: "sys.exit(m.main('read'))" }
+        - { name: qcl-negf-monitor-observer, expression: "sys.exit(m.main('observer'))" }
+        - { name: qcl-negf-monitor-sample, expression: "sys.exit(m.main('sample'))" }
+        - { name: qcl-negf-monitor-storage, expression: "sys.exit(m.main('maintain'))" }
+        - { name: qcl-negf-monitor-rpc, expression: "raise SystemExit('forced observer required')" }
+        - {
+            name: qcl-negf-monitor-ssh-observer,
+            expression: "m.ssh_main('/usr/local/libexec/qcl-negf-monitor-rpc', '/usr/local/libexec/qcl-negf-monitor-observer')",
+          }
+        - {
+            name: qcl-negf-cluster-status,
+            expression: "m.client_main('/usr/local/libexec/qcl-negf-monitor-read')",
+          }
+    - name: Protect observer home and authorized key directory from account writes
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - "/home/{{ qcl_monitoring_observer_user }}"
+        - "/home/{{ qcl_monitoring_observer_user }}/.ssh"
+    - name: Bind SSH home without adding an interactive login credential
+      ansible.builtin.user:
+        name: "{{ qcl_monitoring_observer_user }}"
+        home: "/home/{{ qcl_monitoring_observer_user }}"
+        create_home: false
+    - name: Install only the restricted observer key
+      ansible.builtin.copy:
+        content: 'restrict,command="/usr/local/libexec/qcl-negf-monitor-ssh-observer" {{ qcl_monitoring_observer_key }}'
+        dest: "/home/{{ qcl_monitoring_observer_user }}/.ssh/authorized_keys"
+        owner: root
+        group: root
+        mode: "0644"
+      no_log: true
+    - name: Install narrow root helper sudo permissions
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/qcl-negf-monitoring
+        owner: root
+        group: root
+        mode: "0440"
+        validate: /usr/sbin/visudo -cf %s
+        content: |
+          {{ qcl_monitoring_reader_user }} ALL=(root) NOPASSWD: /usr/local/libexec/qcl-negf-monitor-read *
+          {{ qcl_monitoring_observer_user }} ALL=(root) NOPASSWD: /usr/local/libexec/qcl-negf-monitor-observer *
+    - name: Copy secret-free protected runtime config; private keys are separate
+      ansible.builtin.copy:
+        src: "{{ qcl_monitoring_private_config }}"
+        dest: /etc/qcl-negf/monitoring/service.json
+        owner: root
+        group: root
+        mode: "0644"
+      no_log: true
+    - name: Install disabled independent sampler unit, without reload/start/enable
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/qcl-negf-monitor-sample.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Bounded QCL observation sampler
+          [Service]
+          Type=oneshot
+          User=root
+          UMask=0077
+          RuntimeDirectory=qcl-negf-monitoring
+          RuntimeDirectoryMode=0700
+          RuntimeDirectoryPreserve=yes
+          ExecStart=/usr/local/libexec/qcl-negf-monitor-sample
+          TimeoutStartSec=310
+          MemoryMax=128M
+          CPUQuota=25%
+          NoNewPrivileges=yes
+    - name: Leave live activation, collector capacity and actual trust as native gates
+      ansible.builtin.debug:
+        msg: Source installed only. No timer/service started, no storage/quota prepared, no native qualification or grant produced.
