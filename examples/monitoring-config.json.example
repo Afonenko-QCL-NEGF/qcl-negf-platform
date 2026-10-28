@@ -1,5 +1,5 @@
 {
-  "schema": "qcl.monitoring-config.v1",
+  "schema": "qcl.monitoring-config.v2",
   "role": "native_host",
   "reader_uid": 2001,
   "observer_uid": 2002,
@@ -8,7 +8,10 @@
     "systemctl": "/usr/bin/systemctl",
     "journalctl": "/usr/bin/journalctl",
     "pvesh": "/usr/bin/pvesh",
-    "virsh": "/usr/bin/virsh"
+    "virsh": "/usr/bin/virsh",
+    "lvs": "/usr/sbin/lvm",
+    "squeue": "/usr/bin/squeue",
+    "scontrol": "/usr/bin/scontrol"
   },
   "targets": [],
   "scopes": {
@@ -20,7 +23,9 @@
     "vms": [],
     "services": [],
     "cgroups": [],
-    "journal": false
+    "journal": false,
+    "units": [],
+    "manager_version": null
   },
   "bounds": {
     "command_seconds": 5,
@@ -40,7 +45,15 @@
     "retention_seconds": 604800,
     "minimum_inodes": 16,
     "device": null,
-    "quota_project": null
+    "quota_project": null,
+    "allocation": null
   },
-  "graph_links": []
+  "graph_links": [],
+  "context": {
+    "enabled": false,
+    "cluster_id": null,
+    "owner_uids": [],
+    "slurm_conf": "/etc/slurm/slurm.conf",
+    "version_profile": "25.11.8"
+  }
 }

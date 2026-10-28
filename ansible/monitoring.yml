@@ -7,6 +7,10 @@
   gather_facts: false
   vars:
     qcl_monitoring_install: false
+    qcl_monitoring_collector_source: false
+    qcl_monitoring_allocation_mount: ""
+    qcl_monitoring_vector: /usr/bin/vector
+    qcl_monitoring_collector_address: "127.0.0.1:8081"
     qcl_monitoring_python: /usr/bin/python3
     qcl_monitoring_resource_source: /usr/local/lib/qcl-negf-host-resources
     qcl_monitoring_reader_user: qcl-monitor-reader
@@ -69,7 +73,7 @@
         owner: root
         group: root
         mode: "0644"
-      loop: [cluster_projection, native_monitoring, monitoring_runtime]
+      loop: [cluster_projection, native_monitoring, monitoring_runtime, slurm_context]
     - name: Package the unchanged published P11 protected-file dependency for unprivileged ingress
       ansible.builtin.copy:
         src: "{{ qcl_monitoring_resource_source }}/release_trust.py"
@@ -112,6 +116,8 @@
           {{ item.expression }}
       loop:
         - { name: qcl-negf-monitor-read, expression: "sys.exit(m.main('read'))" }
+        - { name: qcl-negf-monitor-context, expression: "sys.exit(m.main('context'))" }
+        - { name: qcl-negf-monitor-storage-check, expression: "sys.exit(m.main('storage-check'))" }
         - { name: qcl-negf-monitor-observer, expression: "sys.exit(m.main('observer'))" }
         - { name: qcl-negf-monitor-sample, expression: "sys.exit(m.main('sample'))" }
         - { name: qcl-negf-monitor-storage, expression: "sys.exit(m.main('maintain'))" }
@@ -155,7 +161,7 @@
         mode: "0440"
         validate: /usr/sbin/visudo -cf %s
         content: |
-          {{ qcl_monitoring_reader_user }} ALL=(root) NOPASSWD: /usr/local/libexec/qcl-negf-monitor-read *
+          {{ qcl_monitoring_reader_user }} ALL=(root) NOPASSWD: /usr/local/libexec/qcl-negf-monitor-read *, /usr/local/libexec/qcl-negf-monitor-context *
           {{ qcl_monitoring_observer_user }} ALL=(root) NOPASSWD: /usr/local/libexec/qcl-negf-monitor-observer *
     - name: Copy secret-free protected runtime config; private keys are separate
       ansible.builtin.copy:
@@ -186,6 +192,66 @@
           MemoryMax=128M
           CPUQuota=25%
           NoNewPrivileges=yes
-    - name: Leave live activation, collector capacity and actual trust as native gates
+          StandardOutput=null
+          StandardError=null
+    # Optional source for the SAME owned Vector process. No allocation is made here.
+    - name: Require explicit existing collector inputs before writing its source
+      ansible.builtin.assert:
+        that:
+          - qcl_monitoring_allocation_mount is match('^/[A-Za-z0-9_./-]+$')
+          - "'..' not in qcl_monitoring_allocation_mount.split('/')"
+          - qcl_monitoring_vector is match('^/[A-Za-z0-9_./+-]+$')
+          - qcl_monitoring_collector_address is match('^[A-Za-z0-9_.:-]+$')
+      when: qcl_monitoring_collector_source | bool
+    - name: Require existing collector identity without creating allocation directories
+      ansible.builtin.getent:
+        database: passwd
+        key: qcl-monitoring
+      when: qcl_monitoring_collector_source | bool
+    - name: Install bounded own collector configuration source
+      ansible.builtin.copy:
+        dest: /etc/qcl-negf/monitoring/vector.json
+        owner: root
+        group: qcl-monitoring
+        mode: "0640"
+        content: |
+          {
+            "data_dir": "{{ qcl_monitoring_allocation_mount }}/state",
+            "sources": {"scientific": {"type": "http_server", "address": "{{ qcl_monitoring_collector_address }}", "path": "/events", "strict_path": true, "decoding": {"codec": "json"}, "framing": {"method": "newline_delimited", "newline_delimited": {"max_length": 16384}}}},
+            "sinks": {"telemetry": {"type": "file", "inputs": ["scientific"], "path": "{{ qcl_monitoring_allocation_mount }}/data/events-%Y-%m-%d.ndjson", "encoding": {"codec": "json"}, "buffer": {"type": "memory", "max_events": 256, "when_full": "drop_newest"}, "acknowledgements": {"enabled": false}}}
+          }
+      when: qcl_monitoring_collector_source | bool
+    - name: Install optional disabled collector unit only without replacing a live foreign instance
+      ansible.builtin.copy:
+        dest: /etc/qcl-negf/monitoring/vector.service.source
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Own bounded QCL technical collector
+          [Service]
+          User=qcl-monitoring
+          Group=qcl-monitoring
+          ExecCondition=+/usr/local/libexec/qcl-negf-monitor-storage-check
+          ExecStart={{ qcl_monitoring_vector }} --config /etc/qcl-negf/monitoring/vector.json
+          NoNewPrivileges=yes
+          CapabilityBoundingSet=
+          ProtectSystem=strict
+          ProtectHome=yes
+          PrivateDevices=yes
+          PrivateTmp=no
+          RootDirectory=
+          RootImage=
+          BindPaths=
+          BindReadOnlyPaths=
+          TemporaryFileSystem=
+          ReadWritePaths={{ qcl_monitoring_allocation_mount }}/data {{ qcl_monitoring_allocation_mount }}/state
+          StandardOutput=null
+          StandardError=null
+          MemoryMax=512M
+          CPUQuota=100%
+      when: qcl_monitoring_collector_source | bool
+    - name: Leave live activation, collector identity/unit placement/capacity and actual trust as native gates
       ansible.builtin.debug:
         msg: Source installed only. No timer/service started, no storage/quota prepared, no native qualification or grant produced.

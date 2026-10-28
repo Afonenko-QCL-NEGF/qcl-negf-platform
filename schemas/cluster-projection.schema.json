@@ -4,7 +4,7 @@
   "properties": {
     "schema": {
       "enum": [
-        "qcl.cluster-projection.v1"
+        "qcl.cluster-projection.v2"
       ]
     },
     "read_at": {
@@ -61,184 +61,7 @@
             "type": "array",
             "maxItems": 128,
             "items": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "service_id": {
-                  "type": "string",
-                  "minLength": 1,
-                  "maxLength": 128,
-                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                },
-                "active_state": {
-                  "anyOf": [
-                    {
-                      "type": "string",
-                      "minLength": 1,
-                      "maxLength": 128,
-                      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
-                },
-                "sub_state": {
-                  "anyOf": [
-                    {
-                      "type": "string",
-                      "minLength": 1,
-                      "maxLength": 128,
-                      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
-                },
-                "result": {
-                  "anyOf": [
-                    {
-                      "type": "string",
-                      "minLength": 1,
-                      "maxLength": 128,
-                      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
-                },
-                "invocation_id": {
-                  "anyOf": [
-                    {
-                      "type": "string",
-                      "minLength": 1,
-                      "maxLength": 128,
-                      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
-                },
-                "observed_at": {
-                  "anyOf": [
-                    {
-                      "type": "integer",
-                      "minimum": 0
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
-                },
-                "coverage": {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "properties": {
-                    "source_id": {
-                      "type": "string",
-                      "minLength": 1,
-                      "maxLength": 128,
-                      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                    },
-                    "status": {
-                      "enum": [
-                        "fresh",
-                        "stale",
-                        "not_measured",
-                        "inconsistent",
-                        "unsupported"
-                      ]
-                    },
-                    "observed_at": {
-                      "anyOf": [
-                        {
-                          "type": "integer",
-                          "minimum": 0
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ]
-                    },
-                    "host_boot_id": {
-                      "anyOf": [
-                        {
-                          "type": "string",
-                          "minLength": 1,
-                          "maxLength": 128,
-                          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ]
-                    },
-                    "generation": {
-                      "anyOf": [
-                        {
-                          "type": "string",
-                          "minLength": 1,
-                          "maxLength": 128,
-                          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ]
-                    },
-                    "complete": {
-                      "type": "boolean"
-                    },
-                    "reasons": {
-                      "type": "array",
-                      "maxItems": 128,
-                      "items": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "properties": {
-                          "code": {
-                            "type": "string",
-                            "minLength": 1,
-                            "maxLength": 128,
-                            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                          },
-                          "source_id": {
-                            "type": "string",
-                            "minLength": 1,
-                            "maxLength": 128,
-                            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                          }
-                        },
-                        "required": [
-                          "code",
-                          "source_id"
-                        ]
-                      }
-                    }
-                  },
-                  "required": [
-                    "source_id",
-                    "status",
-                    "observed_at",
-                    "host_boot_id",
-                    "generation",
-                    "complete",
-                    "reasons"
-                  ]
-                }
-              },
-              "required": [
-                "service_id",
-                "active_state",
-                "sub_state",
-                "result",
-                "invocation_id",
-                "observed_at",
-                "coverage"
-              ]
+              "$ref": "#/$defs/service"
             }
           },
           "storage": {
@@ -335,100 +158,7 @@
           "type": "array",
           "maxItems": 128,
           "items": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-              "source_id": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 128,
-                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-              },
-              "status": {
-                "enum": [
-                  "fresh",
-                  "stale",
-                  "not_measured",
-                  "inconsistent",
-                  "unsupported"
-                ]
-              },
-              "observed_at": {
-                "anyOf": [
-                  {
-                    "type": "integer",
-                    "minimum": 0
-                  },
-                  {
-                    "type": "null"
-                  }
-                ]
-              },
-              "host_boot_id": {
-                "anyOf": [
-                  {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 128,
-                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ]
-              },
-              "generation": {
-                "anyOf": [
-                  {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 128,
-                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ]
-              },
-              "complete": {
-                "type": "boolean"
-              },
-              "reasons": {
-                "type": "array",
-                "maxItems": 128,
-                "items": {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "properties": {
-                    "code": {
-                      "type": "string",
-                      "minLength": 1,
-                      "maxLength": 128,
-                      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                    },
-                    "source_id": {
-                      "type": "string",
-                      "minLength": 1,
-                      "maxLength": 128,
-                      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                    }
-                  },
-                  "required": [
-                    "code",
-                    "source_id"
-                  ]
-                }
-              }
-            },
-            "required": [
-              "source_id",
-              "status",
-              "observed_at",
-              "host_boot_id",
-              "generation",
-              "complete",
-              "reasons"
-            ]
+            "$ref": "#/$defs/coverage"
           }
         },
         "reasons": {
@@ -462,6 +192,16 @@
         "sources",
         "reasons"
       ]
+    },
+    "current_context": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/current_context"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "required": [
@@ -472,7 +212,8 @@
     "hosts",
     "complete",
     "next_cursor",
-    "coverage"
+    "coverage",
+    "current_context"
   ],
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://qcl.invalid/schemas/cluster-projection.schema.json",
@@ -529,7 +270,7 @@
       "properties": {
         "schema": {
           "enum": [
-            "qcl.native-status.v1"
+            "qcl.native-status.v2"
           ]
         },
         "observed_at": {
@@ -752,100 +493,7 @@
                 ]
               },
               "coverage": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                  "source_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 128,
-                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                  },
-                  "status": {
-                    "enum": [
-                      "fresh",
-                      "stale",
-                      "not_measured",
-                      "inconsistent",
-                      "unsupported"
-                    ]
-                  },
-                  "observed_at": {
-                    "anyOf": [
-                      {
-                        "type": "integer",
-                        "minimum": 0
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ]
-                  },
-                  "host_boot_id": {
-                    "anyOf": [
-                      {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 128,
-                        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ]
-                  },
-                  "generation": {
-                    "anyOf": [
-                      {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 128,
-                        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ]
-                  },
-                  "complete": {
-                    "type": "boolean"
-                  },
-                  "reasons": {
-                    "type": "array",
-                    "maxItems": 128,
-                    "items": {
-                      "type": "object",
-                      "additionalProperties": false,
-                      "properties": {
-                        "code": {
-                          "type": "string",
-                          "minLength": 1,
-                          "maxLength": 128,
-                          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                        },
-                        "source_id": {
-                          "type": "string",
-                          "minLength": 1,
-                          "maxLength": 128,
-                          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                        }
-                      },
-                      "required": [
-                        "code",
-                        "source_id"
-                      ]
-                    }
-                  }
-                },
-                "required": [
-                  "source_id",
-                  "status",
-                  "observed_at",
-                  "host_boot_id",
-                  "generation",
-                  "complete",
-                  "reasons"
-                ]
+                "$ref": "#/$defs/coverage"
               }
             },
             "required": [
@@ -874,164 +522,52 @@
               "type": "array",
               "maxItems": 1024,
               "items": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                  "event_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 128,
-                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                  },
-                  "cause": {
-                    "enum": [
-                      "host_kernel_qemu_oom",
-                      "guest_cgroup_oom",
-                      "systemd_oomd",
-                      "unknown_vm_loss",
-                      "unknown"
-                    ]
-                  },
-                  "scope": {
-                    "enum": [
-                      "host",
-                      "guest",
-                      "unknown"
-                    ]
-                  },
-                  "vm_id": {
-                    "anyOf": [
-                      {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 128,
-                        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ]
-                  },
-                  "workload": {
-                    "anyOf": [
-                      {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 128,
-                        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ]
-                  },
-                  "host_boot_id": {
-                    "anyOf": [
-                      {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 128,
-                        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ]
-                  },
-                  "guest_boot_id": {
-                    "anyOf": [
-                      {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 128,
-                        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ]
-                  },
-                  "event_at": {
-                    "anyOf": [
-                      {
-                        "type": "integer",
-                        "minimum": 0
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ]
-                  },
-                  "source_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 128,
-                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                  },
-                  "native_generation": {
-                    "anyOf": [
-                      {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 128,
-                        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ]
-                  },
-                  "confidence": {
-                    "enum": [
-                      "observed",
-                      "indication",
-                      "unknown"
-                    ]
-                  },
-                  "reasons": {
-                    "type": "array",
-                    "maxItems": 128,
-                    "items": {
-                      "type": "object",
-                      "additionalProperties": false,
-                      "properties": {
-                        "code": {
-                          "type": "string",
-                          "minLength": 1,
-                          "maxLength": 128,
-                          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                        },
-                        "source_id": {
-                          "type": "string",
-                          "minLength": 1,
-                          "maxLength": 128,
-                          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                        }
-                      },
-                      "required": [
-                        "code",
-                        "source_id"
-                      ]
-                    }
-                  }
-                },
-                "required": [
-                  "event_id",
-                  "cause",
-                  "scope",
-                  "vm_id",
-                  "workload",
-                  "host_boot_id",
-                  "guest_boot_id",
-                  "event_at",
-                  "source_id",
-                  "native_generation",
-                  "confidence",
-                  "reasons"
-                ]
+                "$ref": "#/$defs/oom"
               }
             },
             "coverage": {
+              "$ref": "#/$defs/coverage"
+            },
+            "next_cursor": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 2048
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "events",
+            "coverage",
+            "next_cursor"
+          ]
+        },
+        "coverage": {
+          "$ref": "#/$defs/coverage"
+        },
+        "complete": {
+          "type": "boolean"
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 2048
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "capabilities": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kernel_qemu_victim_join": {
               "type": "object",
               "additionalProperties": false,
               "properties": {
@@ -1127,132 +663,106 @@
                 "reasons"
               ]
             },
-            "next_cursor": {
-              "anyOf": [
-                {
-                  "type": "string",
-                  "maxLength": 2048
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            }
-          },
-          "required": [
-            "events",
-            "coverage",
-            "next_cursor"
-          ]
-        },
-        "coverage": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "source_id": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 128,
-              "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-            },
-            "status": {
-              "enum": [
-                "fresh",
-                "stale",
-                "not_measured",
-                "inconsistent",
-                "unsupported"
-              ]
-            },
-            "observed_at": {
-              "anyOf": [
-                {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "host_boot_id": {
-              "anyOf": [
-                {
+            "systemd_manager_unit_oom": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "source_id": {
                   "type": "string",
                   "minLength": 1,
                   "maxLength": 128,
                   "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
                 },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "generation": {
-              "anyOf": [
-                {
-                  "type": "string",
-                  "minLength": 1,
-                  "maxLength": 128,
-                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+                "status": {
+                  "enum": [
+                    "fresh",
+                    "stale",
+                    "not_measured",
+                    "inconsistent",
+                    "unsupported"
+                  ]
                 },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "complete": {
-              "type": "boolean"
-            },
-            "reasons": {
-              "type": "array",
-              "maxItems": 128,
-              "items": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                  "code": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 128,
-                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                  },
-                  "source_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 128,
-                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+                "observed_at": {
+                  "anyOf": [
+                    {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "host_boot_id": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "generation": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128,
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "complete": {
+                  "type": "boolean"
+                },
+                "reasons": {
+                  "type": "array",
+                  "maxItems": 128,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "code": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+                      },
+                      "source_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+                      }
+                    },
+                    "required": [
+                      "code",
+                      "source_id"
+                    ]
                   }
-                },
-                "required": [
-                  "code",
-                  "source_id"
-                ]
-              }
+                }
+              },
+              "required": [
+                "source_id",
+                "status",
+                "observed_at",
+                "host_boot_id",
+                "generation",
+                "complete",
+                "reasons"
+              ]
             }
           },
           "required": [
-            "source_id",
-            "status",
-            "observed_at",
-            "host_boot_id",
-            "generation",
-            "complete",
-            "reasons"
-          ]
-        },
-        "complete": {
-          "type": "boolean"
-        },
-        "next_cursor": {
-          "anyOf": [
-            {
-              "type": "string",
-              "maxLength": 2048
-            },
-            {
-              "type": "null"
-            }
+            "kernel_qemu_victim_join",
+            "systemd_manager_unit_oom"
           ]
         }
       },
@@ -1267,7 +777,8 @@
         "oom",
         "coverage",
         "complete",
-        "next_cursor"
+        "next_cursor",
+        "capabilities"
       ]
     },
     "storage": {
@@ -1276,7 +787,7 @@
       "properties": {
         "schema": {
           "enum": [
-            "qcl.telemetry-storage.v1"
+            "qcl.telemetry-storage.v2"
           ]
         },
         "status": {
@@ -1291,7 +802,8 @@
           "enum": [
             "unqualified",
             "dedicated_mount",
-            "project_quota"
+            "project_quota",
+            "preallocated_loop_linear_v1"
           ]
         },
         "maximum_bytes": {
@@ -1360,9 +872,6 @@
             }
           ]
         },
-        "persist_enabled": {
-          "type": "boolean"
-        },
         "observed_at": {
           "anyOf": [
             {
@@ -1399,6 +908,65 @@
               "source_id"
             ]
           }
+        },
+        "persist_permitted": {
+          "type": "boolean"
+        },
+        "allocation_bytes": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9223372036854775807
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "allocated_reserve_bytes": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9223372036854775807
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "science_charge_bytes": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9223372036854775807
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "capacity_generation": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "collector_state": {
+          "enum": [
+            "active",
+            "inactive",
+            "unknown"
+          ]
         }
       },
       "required": [
@@ -1411,9 +979,14 @@
         "keep_free_bytes",
         "inodes_available",
         "retention_seconds",
-        "persist_enabled",
         "observed_at",
-        "reasons"
+        "reasons",
+        "persist_permitted",
+        "allocation_bytes",
+        "allocated_reserve_bytes",
+        "science_charge_bytes",
+        "capacity_generation",
+        "collector_state"
       ]
     },
     "coverage": {
@@ -1528,7 +1101,9 @@
             "guest_cgroup_oom",
             "systemd_oomd",
             "unknown_vm_loss",
-            "unknown"
+            "unknown",
+            "native_unit_kernel_oom",
+            "native_unit_oomd"
           ]
         },
         "scope": {
@@ -1652,6 +1227,35 @@
               "source_id"
             ]
           }
+        },
+        "unit_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unit_invocation_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[a-f0-9]{32}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "victim_kind": {
+          "enum": [
+            "unknown"
+          ]
         }
       },
       "required": [
@@ -1666,7 +1270,10 @@
         "source_id",
         "native_generation",
         "confidence",
-        "reasons"
+        "reasons",
+        "unit_id",
+        "unit_invocation_id",
+        "victim_kind"
       ]
     },
     "service": {
@@ -1743,100 +1350,7 @@
           ]
         },
         "coverage": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "source_id": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 128,
-              "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-            },
-            "status": {
-              "enum": [
-                "fresh",
-                "stale",
-                "not_measured",
-                "inconsistent",
-                "unsupported"
-              ]
-            },
-            "observed_at": {
-              "anyOf": [
-                {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "host_boot_id": {
-              "anyOf": [
-                {
-                  "type": "string",
-                  "minLength": 1,
-                  "maxLength": 128,
-                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "generation": {
-              "anyOf": [
-                {
-                  "type": "string",
-                  "minLength": 1,
-                  "maxLength": 128,
-                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "complete": {
-              "type": "boolean"
-            },
-            "reasons": {
-              "type": "array",
-              "maxItems": 128,
-              "items": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                  "code": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 128,
-                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                  },
-                  "source_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 128,
-                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
-                  }
-                },
-                "required": [
-                  "code",
-                  "source_id"
-                ]
-              }
-            }
-          },
-          "required": [
-            "source_id",
-            "status",
-            "observed_at",
-            "host_boot_id",
-            "generation",
-            "complete",
-            "reasons"
-          ]
+          "$ref": "#/$defs/coverage"
         }
       },
       "required": [
@@ -1847,6 +1361,268 @@
         "invocation_id",
         "observed_at",
         "coverage"
+      ]
+    },
+    "current_context": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": "qcl.current-context.v1"
+        },
+        "read_at": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "observed_at": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9223372036854775807
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cluster_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "controller_boot_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sample_generation": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "enum": [
+            "fresh",
+            "stale",
+            "partial",
+            "unknown",
+            "disabled",
+            "unsupported"
+          ]
+        },
+        "jobs": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "job_id": {
+                "type": "string",
+                "maxLength": 128,
+                "pattern": "^[0-9]+(?:_[0-9]+|\\+[0-9]+)?$"
+              },
+              "owner_uid": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9223372036854775807
+              },
+              "state": {
+                "enum": [
+                  "queued",
+                  "running",
+                  "finishing",
+                  "retained_terminal",
+                  "unknown"
+                ]
+              },
+              "native_state": {
+                "type": "string",
+                "maxLength": 128,
+                "pattern": "^[^\\u0000-\\u001f\\u007f]*$"
+              },
+              "reason": {
+                "type": "string",
+                "maxLength": 128,
+                "pattern": "^[^\\u0000-\\u001f\\u007f]*$"
+              },
+              "node_expression": {
+                "type": "string",
+                "maxLength": 128,
+                "pattern": "^[^\\u0000-\\u001f\\u007f]*$"
+              },
+              "submit_time": {
+                "anyOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9223372036854775807
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "start_time": {
+                "anyOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9223372036854775807
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "restarts": {
+                "anyOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9223372036854775807
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "cpus": {
+                "anyOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9223372036854775807
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "requested_memory": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "per_node_bytes": {
+                    "anyOf": [
+                      {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9223372036854775807
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "per_cpu_bytes": {
+                    "anyOf": [
+                      {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9223372036854775807
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "per_node_bytes",
+                  "per_cpu_bytes"
+                ]
+              },
+              "generation": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "coverage": {
+                "$ref": "#/$defs/coverage"
+              }
+            },
+            "required": [
+              "job_id",
+              "owner_uid",
+              "state",
+              "native_state",
+              "reason",
+              "node_expression",
+              "submit_time",
+              "start_time",
+              "restarts",
+              "cpus",
+              "requested_memory",
+              "generation",
+              "coverage"
+            ]
+          }
+        },
+        "coverage": {
+          "$ref": "#/$defs/coverage"
+        },
+        "complete": {
+          "type": "boolean"
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "string",
+              "maxLength": 8192
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "schema",
+        "read_at",
+        "observed_at",
+        "cluster_id",
+        "controller_boot_id",
+        "sample_generation",
+        "status",
+        "jobs",
+        "coverage",
+        "complete",
+        "next_cursor"
       ]
     }
   }

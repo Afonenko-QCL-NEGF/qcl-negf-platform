@@ -18,10 +18,12 @@ def coverage(source_id, observed_at=None, boot=None, generation=None, *, status=
 
 def empty_native(host_id, *, observed_at=None):
     cov = coverage(host_id, observed_at, reasons=[reason('not_sampled', host_id)])
-    return dict(schema='qcl.native-status.v1', observed_at=observed_at, host_id=host_id,
+    return dict(schema='qcl.native-status.v2', observed_at=observed_at, host_id=host_id,
         host_boot_id=None, sample_generation=None, host_memory=dict(total_bytes=None, available_bytes=None),
         vms=[], oom=dict(events=[], coverage=coverage(host_id), next_cursor=None), coverage=cov,
-        complete=True, next_cursor=None)
+        complete=True, next_cursor=None, capabilities=dict(
+            kernel_qemu_victim_join=coverage('kernel_qemu_victim_join', status='unsupported', reasons=[reason('lifetime_protocol_unavailable', 'kernel_qemu_victim_join')]),
+            systemd_manager_unit_oom=coverage('systemd_manager_unit_oom', status='unsupported', reasons=[reason('unit_protocol_not_measured', 'systemd_manager_unit_oom')])))
 
 
 def nonnegative(value):
@@ -138,6 +140,40 @@ def classify_journal(records, bindings, *, host_boot_id, scope='host'):
     return events
 
 
+UNIT_OOM_IDS = {'fe6faa94e7774663a0da52717891d8ef': 'native_unit_kernel_oom',
+                'd989611b15e44c9dbf31e3c81256e4ed': 'native_unit_oomd'}
+
+
+def parse_manager_oom(records, unit_bindings, *, host_boot_id):
+    """Observed unit events never assert the identity/type of its killed process."""
+    events = []
+    for record in records:
+        try:
+            cause = UNIT_OOM_IDS[record.get('MESSAGE_ID')]
+            selected = [b for b in unit_bindings if b['unit'] == record.get('UNIT')]
+            if len(selected) != 1:
+                continue
+            binding = selected[0]
+            invocation = record['INVOCATION_ID']
+            cursor = record['__CURSOR']
+            at_us, monotonic_us = int(record['__REALTIME_TIMESTAMP']), int(record['__MONOTONIC_TIMESTAMP'])
+            if (record.get('_PID') != '1' or record.get('_UID') != '0' or record.get('_COMM') != 'systemd' or
+                    record.get('_EXE') != binding['manager_executable'] or record.get('_BOOT_ID') != host_boot_id or
+                    not re.fullmatch(r'[a-f0-9]{32}', invocation) or not isinstance(cursor, str) or not 1 <= len(cursor) <= 2048 or
+                    not 0 <= monotonic_us <= binding['monotonic_us'] or at_us < 0):
+                continue
+            current = invocation == binding['invocation_id']
+            events.append(dict(event_id=hashlib.sha256((host_boot_id+cursor).encode()).hexdigest(),
+                cause=cause, scope='host', vm_id=binding.get('vm_id') if current else None, workload=None,
+                host_boot_id=host_boot_id, guest_boot_id=None, event_at=at_us//1000000,
+                source_id='systemd_manager_unit_oom', native_generation=host_boot_id+':'+invocation,
+                confidence='observed', reasons=[] if current else [reason('historical_unit_only', 'systemd_manager_unit_oom')],
+                unit_id=binding['unit_id'], unit_invocation_id=invocation, victim_kind='unknown'))
+        except (KeyError, ValueError, TypeError):
+            continue
+    return events
+
+
 class NativeSampler:
     def __init__(self, config, sources, *, clock=time.time, previous=None):
         self.config, self.sources, self.clock, self.previous = config, sources, clock, previous
@@ -221,6 +257,36 @@ class NativeSampler:
         native['coverage']['generation'] = native['sample_generation']
         return dict(native=native, services=services)
 
+    def _unit_bindings(self, native, boot, now):
+        c = self.config; units = c['scopes']['units']
+        cap = native['capabilities']['systemd_manager_unit_oom']
+        if c['role'] != 'native_host' or not units or c['scopes']['manager_version'] is None:
+            return []
+        try:
+            version = self.sources.run([c['tools']['systemctl'], '--version'], output_bytes=4096).strip()
+            if version != c['scopes']['manager_version'] or not re.match(r'^systemd 257 \(257\.13(?:[) -])', version):
+                raise ValueError('unit_protocol_unsupported')
+            bindings = []
+            for unit in units:
+                argv = [c['tools']['systemctl'], 'show', '--no-pager', '--property=Id,ControlGroup,InvocationID', '--', unit['unit']]
+                before = self.sources.run(argv, output_bytes=8192)
+                properties = dict(line.split('=', 1) for line in before.splitlines() if '=' in line)
+                if (set(properties) != {'Id', 'ControlGroup', 'InvocationID'} or properties['Id'] != unit['unit'] or
+                        not re.fullmatch(r'[a-f0-9]{32}', properties['InvocationID']) or
+                        not re.fullmatch(r'/[A-Za-z0-9_.@/:-]+', properties['ControlGroup']) or
+                        self.sources.run(argv, output_bytes=8192) != before):
+                    raise ValueError('unit_cycle_changed')
+                vm = next((v for v in native['vms'] if v['vm_id'] == unit['vm_id'] and v['native_generation'] is not None), None)
+                bindings.append(dict(unit_id=unit['unit_id'], unit=unit['unit'],
+                    invocation_id=properties['InvocationID'], vm_id=vm['vm_id'] if vm else None,
+                    manager_executable=unit['manager_executable'], monotonic_us=time.monotonic_ns()//1000))
+            cap.update(status='fresh', complete=True, observed_at=now, host_boot_id=boot, reasons=[])
+            return bindings
+        except Exception:
+            cap.update(status='unsupported', complete=False, observed_at=now, host_boot_id=boot,
+                       reasons=[reason('unit_protocol_or_identity_unavailable', 'systemd_manager_unit_oom')])
+            return []
+
     def _events(self, native, boot, now):
         c = self.config; prev = self.previous
         same = prev and prev['native']['host_boot_id'] == boot and type(prev['native']['observed_at']) is int and prev['native']['observed_at'] <= now
@@ -237,18 +303,27 @@ class NativeSampler:
             oc['reasons'] = [reason('boot_or_clock_gap', 'journal')] if prev and not same else []
             args = [c['tools']['journalctl'], '--boot=' + boot, '--output=json', '--no-pager',
                     '--lines=' + str(c['bounds']['journal_events']), '--since=@' + str(max(0, now-c['bounds']['lookback_seconds'])),
-                    '_TRANSPORT=kernel', '+', '_SYSTEMD_UNIT=systemd-oomd.service']
+                    '_TRANSPORT=kernel', '+', '_SYSTEMD_UNIT=systemd-oomd.service', '+',
+                    'MESSAGE_ID=fe6faa94e7774663a0da52717891d8ef', '+', 'MESSAGE_ID=d989611b15e44c9dbf31e3c81256e4ed']
             cursor = prev.get('journal_cursor') if same else None
             if not cursor:
                 oc['reasons'].append(reason('initial_or_gap_window', 'journal'))
             if cursor:
                 args += ['--after-cursor=' + cursor]
+            unit_before = self._unit_bindings(native,boot,now)
             try:
                 raw = self.sources.run(args, output_bytes=c['bounds']['journal_bytes'])
                 records = [json.loads(line) for line in raw.splitlines()]
                 if len(records) >= c['bounds']['journal_events']:
                     oc['reasons'].append(reason('journal_window_truncated', 'journal'))
                 events = classify_journal(records, bindings, host_boot_id=boot, scope='guest' if c['role'] == 'worker' else 'host')
+                unit_bindings = self._unit_bindings(native, boot, now)
+                keys = ('unit_id','unit','invocation_id','vm_id','manager_executable')
+                if [[b[k] for k in keys] for b in unit_bindings] != [[b[k] for k in keys] for b in unit_before]:
+                    unit_bindings = []
+                    native['capabilities']['systemd_manager_unit_oom'].update(status='inconsistent',complete=False,
+                        reasons=[reason('unit_cycle_changed','systemd_manager_unit_oom')])
+                events += parse_manager_oom(records, unit_bindings, host_boot_id=boot)
                 self.journal_cursor = records[-1].get('__CURSOR') if records else cursor
                 oc.update(status='fresh', complete=not oc['reasons'])
             except Exception:
@@ -271,12 +346,14 @@ class NativeSampler:
         if same:
             current_ids = {r['vm_id'] for r in native['vms'] if r['power_state'] == 'running'}
             for row in prev['native']['vms']:
-                if row['power_state'] == 'running' and row['vm_id'] not in current_ids and not any(e['vm_id'] == row['vm_id'] for e in events):
+                if row['power_state'] == 'running' and row['vm_id'] not in current_ids and not any(e['vm_id'] == row['vm_id'] and e['cause'] in ('host_kernel_qemu_oom','systemd_oomd') and e['confidence'] == 'observed' for e in events):
                     events.append(dict(event_id=hashlib.sha256((row['vm_id']+str(now)).encode()).hexdigest(),
                         cause='unknown_vm_loss', scope='unknown', vm_id=row['vm_id'], workload=None, host_boot_id=boot,
                         guest_boot_id=None, event_at=now, source_id='native', native_generation=row['native_generation'],
                         confidence='unknown', reasons=[reason('loss_without_bound_evidence', 'native')]))
         old_events = prev['native']['oom']['events'] if same else []
+        for event in events:
+            event.setdefault('unit_id', None); event.setdefault('unit_invocation_id', None); event.setdefault('victim_kind', 'unknown')
         ring = {e['event_id']: e for e in old_events + events}
         native['oom'] = dict(events=list(ring.values())[-c['bounds']['retention_entries']:], coverage=oc, next_cursor=None)
         self.cgroups = current
@@ -307,6 +384,8 @@ def _normalize_native_status(document, *, now, fresh_seconds):
     _normalize_coverage(value['coverage'], measurement_at=value['observed_at'], now=now, fresh_seconds=fresh_seconds)
     for vm in value['vms']:
         _normalize_coverage(vm['coverage'], measurement_at=vm['observed_at'], now=now, fresh_seconds=fresh_seconds)
+    for capability in value['capabilities'].values():
+        _normalize_coverage(capability, measurement_at=capability['observed_at'], now=now, fresh_seconds=fresh_seconds)
     source = value['oom']['coverage']
     _normalize_coverage(source, measurement_at=source['observed_at'], now=now, fresh_seconds=fresh_seconds)
     # Historical event confidence/identity/time is evidence, not a freshness claim.
