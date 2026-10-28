@@ -1,6 +1,7 @@
 # Первый внешний worker на Linux x86_64
 
-Этот guide описывает существующий путь **Arch Linux → libvirt/KVM → NixOS worker**.
+Этот guide описывает путь **Linux x86_64 → libvirt/KVM → NixOS worker** и
+отдельную квалификацию Arch/CachyOS adapter на фактическом host.
 Arch остаётся ОС физического хоста. Application и solver работают в госте; установка
 не переустанавливает хост, не меняет его разделы и не создаёт LAN bridge.
 Другие дистрибутивы Linux x86_64 требуют отдельной проверки host adapter: одной
@@ -28,11 +29,95 @@ worker. До изменения гипервизора нужны следующ
 | Trust | Независимо подтверждённые SSH host fingerprints, protected enrollment/known_hosts paths, уже доверенные Nix cache/signing keys и scoped sudo policy |
 | План | Named target, отдельный private state и saved plan, install/smoke budget, место для исходных логов и порядок сохранения данных при неудаче |
 
-Дефолты из [provider input example](../tofu/arch-libvirt/site-base.json.example)
-(30 GiB RAM, 12 vCPU, 512 GiB scratch и documentation IP) не являются измерением
-нового хоста. Учитывайте существующие VM, QEMU overhead, физическую свободную память
+Числа из [provider input example](../tofu/arch-libvirt/site-base.json.example)
+(4 GiB RAM, 2 vCPU, 32 GiB scratch и documentation IP) — synthetic fixture,
+а не defaults или измерение нового хоста. RAM/vCPU/root/scratch задаются явно;
+исторические потолки одного ноутбука больше не ограничивают adapter. Учитывайте
+существующие VM, QEMU overhead, физическую свободную память
 и место под image, root overlay, scratch и результаты. Sparse capacity не резервирует
-реальное место. Пределы текущих variables также не означают поддержку хоста иной ёмкости.
+реальное место. Успешная validation не означает capacity admission.
+
+## Профиль первого дополнительного production worker
+
+Экспорт `platform.nixosModules.linuxWorker` включает существующие `default` и `image`
+modules, разрешает только worker role и требует обычный release guard, initial
+application/solver closures и явные runtime secret units. Он не включает controller,
+Portal, storage или CI на ноутбуке. [`local_lab.py`](../ops/local_lab.py) и
+`mkLocalLab` создают отдельный четырёхмашинный engineering lab и для этого install
+не используются. Сам CachyOS не становится Slurm worker.
+
+[Worker flake template](../examples/linux-worker/flake.nix.template) и
+[worker configuration](../examples/linux-worker/worker.nix.example) копируются в
+private site как `flake.nix` и `worker.nix`. Возьмите accepted root revision и
+reviewed `flake.lock`, совместимый с существующим controller, а также действующий
+`solver-depot.json` с проверенным происхождением. Template использует Platform и
+Nixpkgs из того же root input, не выбирает независимый latest. Замените synthetic
+hosts/nodes/partition/UID/runtime-secret path согласованными private значениями;
+измеренный `RealMemory` должен укладываться в fixed guest grant с OS reserve.
+Controller получает тот же node/partition contract в отдельном maintenance packet.
+
+Без build и host mutation проверяется source:
+
+```sh
+nix eval --no-update-lock-file --raw \
+  "$PRIVATE/worker-site#nixosConfigurations.arch-worker.config.system.build.toplevel.drvPath"
+```
+
+Здесь `$PRIVATE/worker-site` — подготовленный private flake, а не recipe для
+автоматической установки. Eval не доказывает, что image создан или boot выполнен.
+Publisher отдельно проходит fresh builder/resource/ownership checks и дешёвый
+four-role/strict-nginx preflight существующего production site перед тяжёлым build.
+После этого в назначенном image packet строится явный output
+`$PRIVATE/worker-site#packages.x86_64-linux.arch-worker-image` через `nix build
+--no-update-lock-file --no-link --json`, с исходными build logs, source и byte hashes.
+Это отдельная подготовка artifact, а не скрытый шаг recipient install.
+
+`mkImages` сохраняет текущий QCOW2/legacy partition/GRUB `/dev/vda` contract.
+Adapter использует q35/x86_64, VirtIO root+scratch, SATA NoCloud seed, VirtIO NIC
+на существующем LAN bridge, serial console и guest-agent channel. Locked Nixpkgs
+QEMU guest profile предоставляет `virtio_blk`, `virtio_pci`, `virtio_net` и
+`virtio_balloon`. Смена firmware на UEFI, CPU architecture или backend требует
+отдельного boot/driver evidence. При подготовке нового image не переносите machine-id,
+private SSH host keys, enrollment/gate/ready records; отсутствие этих данных подтверждается
+content/first-boot проверкой, не одним импортом module.
+
+Профиль допускает private site-bound image, но не содержит Munge/SSH private key
+bytes. Пример secret unit ожидает отдельно доставленный
+`/var/lib/qcl-negf-secrets/munge.key` и копирует его в `/run/secrets` с owner munge,
+mode 0400. До такой доставки unit и Slurm остаются закрыты. Никаких keys через
+`builtins.readFile`, `environment.etc.*.source`, NoCloud user-data, tofu vars/state
+или image bundle. Не объявляйте site-bound образ reusable без отдельной проверки.
+
+## Resident memory: сначала conservative reservation
+
+Первый профиль поддерживает только `conservative_reservation`:
+`resident_memory.minimum_mib = startup_mib = maximum_mib = memory_mib`.
+Все значения — полная guest RAM в целых MiB, не память одного job. Текущая VM
+остаётся resident и autostart; RAM не возвращается автоматически в idle.
+`memory` и `current_memory` в domain равны этому значению. Balloon device включён
+с `auto_deflate = off`; наличие устройства и guest driver не разрешает online
+shrink/grow и не создаёт active grant protection.
+
+`memory_capability` output явно возвращает `dynamic_supported:false` с причиной
+`native_active_grant_not_qualified`; unequal min/start/max отвергаются на plan.
+Поля `current_memory`/`devices.mem_balloon` и object-form `os.boot_devices`
+проверяются против schema pinned
+[libvirt provider 0.9.9](https://github.com/dmacvicar/terraform-provider-libvirt/blob/v0.9.9/docs/resources/domain.md#schema).
+Смысл устройства задаёт [native libvirt contract](https://libvirt.org/formatdomain.html#memory-balloon-device);
+он не доказывает physical reservation или сохранность active grant.
+Отдельный private [host resource policy](resident-memory-policy.md) задаёт reserves,
+overhead, owned pool/agreement и полный resident grant в bytes (MiB × 1048576).
+Нужны свежие actual host facts и внешнее grant admission перед apply/новой нагрузкой.
+`ownership_verified` и `capacity_verified` по умолчанию false: после review оператор
+явно подтверждает соответствующий private packet. True означает acknowledgement,
+не измерение, не enforceable reservation и не native PASS.
+
+Без защищённого owned pool и учтённых host/foreign reserves новая нагрузка ждёт
+или отвергается. Dynamic mode остаётся unsupported до отдельной квалификации
+host mutation/readback, guest capacity и запрета shrink ниже active grant на
+фактическом NixOS image. Не заменяйте physicalRAM на configured maximum,
+`MemAvailable` или Slurm RealMemory. Общих campaign CPU/RAM/time/attempt quotas
+этот профиль не задаёт; ресурсы измеряют для конкретного install/job packet.
 
 ### Где искать artifact и что проверять
 
@@ -95,17 +180,23 @@ endpoints не выводятся из текущей сети автомати�
 
 До регистрации гостя держите его вне допуска работ: NodeName либо отсутствует на
 controller, либо явно **DRAIN** в согласованной конфигурации controller/worker.
-Пример site содержит `State=UNKNOWN`, поэтому quarantine не возникает автоматически:
-для этого onboarding задайте начальный DRAIN и собственную причину в private
+Новый worker-only пример содержит `State=DRAIN`; прежний full-site example содержит
+`State=UNKNOWN`, поэтому quarantine не возникает автоматически: задайте начальный
+DRAIN и собственную причину в private
 `slurm.nodes` до build/boot. Не включайте guest submit role. Сохраните
 `ReturnToService=0`, `JobRequeue=0` и штатный boot `node-check`; последний проверяет
 release, но сам по себе не доказывает trusted enrollment.
 
 Root и scratch различаются: libvirt задаёт VirtIO serial `qcl-root` и `qcl-scratch`,
 worker mount использует `/dev/disk/by-id/virtio-qcl-scratch`. Форматирование выключено
-по умолчанию. Только для явно нового пустого scratch разрешается согласованный
-worker-specific `qclNegf.cluster.initializeBlankScratch = true`; после инициализации
-верните `false`. Не включайте общий example-параметр `initializeBlankDisks` для уже
+по умолчанию. **Новый пустой scratch ещё не boot-ready:** до обычного boot требуется
+отдельно подготовленный ext4 filesystem на доказанно принадлежащем вам volume либо
+согласованный first-install image с worker-specific
+`qclNegf.cluster.initializeBlankScratch = true`. Во втором случае перед первым boot
+проверьте actual disk identity/serial и отсутствие чужого filesystem/data; после
+успешной инициализации верните `false` в постоянный профиль. Оба варианта — явное
+native действие в отдельном packet, а не команда, исполненная этим guide.
+Не включайте общий example-параметр `initializeBlankDisks` для уже
 существующих storage/control: он также связан с их data/state disks. Существующий
 scratch, host filesystem, scientific data/state disks не форматируются.
 
@@ -139,6 +230,14 @@ ansible-playbook -i "$PRIVATE/inventory.ini" "$PLATFORM/ansible/arch-libvirt.yml
 `/dev/kvm` и выбранный Linux bridge; устанавливает libvirt/QEMU tools, запускает libvirt,
 создаёт выделенный storage directory и добавляет только названных пользователей в
 группу libvirt. Он не обновляет дистрибутив целиком и не настраивает network manager.
+Это optional Arch helper, не универсальный CachyOS bootstrap: он проверяет exact
+Ansible distribution `Archlinux` и ожидает `libvirtd.service`. На derivative или
+modular-daemon host сначала read-only проверьте actual distribution, уже
+установленные executable paths и доступный `qemu:///system` socket/units
+(`virtqemud` либо `libvirtd`); не запускайте два конфликтующих daemon stack.
+Отсутствие system libvirt socket или административного доступа блокирует host
+preparation/import/boot, но не source/image definition и mock/eval tests.
+Не запрашивайте sudo password в логах и не меняйте host network без его владельца.
 NAT-only default network не подходит: нужны прямые LAN routes между guest, controller,
 storage и submit hosts. Bridge готовится заранее штатным network manager хоста.
 
@@ -147,7 +246,9 @@ storage и submit hosts. Bridge готовится заранее штатным
 Private `arch-libvirt.tfvars.json` должен содержать поля из
 [variables](../tofu/arch-libvirt/variables.tf): system `uri` через существующий SSH
 agent, LAN `bridge`, `pool_path`, actual `image_path`/`image_sha256`, root/scratch GiB,
-RAM MiB, vCPU, уникальный MAC, guest CIDR, gateway/DNS и административные public keys.
+RAM MiB, равные resident min/start/max, vCPU, уникальный MAC, guest CIDR, gateway/DNS
+и административные public keys. Ownership/capacity acknowledgement оставляют false
+до сверки соответствующих actual private facts и policy/grant.
 Generated input publisher можно использовать только для того же site/image binding.
 Provider проверяет локальные image bytes перед upload. Сохраните полный Platform
 checkout и его provider lock; копирование одного `.tf` теряет контекст.
@@ -261,10 +362,10 @@ receipt; для возврата существующей машины нужн�
 
 ## Конечный smoke и нормальный shutdown/return
 
-После native admission выполните отдельно назначенный non-scientific smoke: install
-не более 90 минут; smoke/fault — до 45 минут, один engineering job не более
-2 CPU/2 GiB/10 минут и до 1 GiB staged bytes. Это envelope, а не разрешение занять
-ресурсы без свежего host/cluster admission. Сохраните job ID, output и исходные failures.
+После native admission выполните отдельно назначенный non-scientific smoke с
+ресурсами и timeout из свежего host/cluster packet. Числа команд ниже иллюстрируют
+малую synthetic работу; это не общая campaign quota и не разрешение занять ресурсы
+без admission. Сохраните job ID, output и исходные failures.
 
 На controller как `qcl-negf`, из нового принадлежащего ему каталога внутри jobs:
 
@@ -328,7 +429,9 @@ rollback/reinstall receipt; native проверки остаются отдел�
 | Утверждение | Свидетельство | Ограничение | Решение |
 | --- | --- | --- | --- |
 | Источник и доставка известны | Exact source/release/closure records, manifest hash, image bytes/SHA и recipient readback | Checksum не доказывает guest boot | сохранить binding |
+| Linux worker profile проверен по source | Реальная NixOS evaluation в `tests/test_linux_worker_profile.py`; pinned-provider mock plans в `tofu/arch-libvirt/tests/worker.tftest.hcl` | Fixtures synthetic; image build/boot и actual host grants отсутствуют | сохранить раздельные gates |
 | Arch/libvirt host подходит | Measured versions, KVM/bridge/capacity, reviewed saved plan | Другие Linux distros не проверены этим adapter | дополнительно измерить новый backend |
+| Resident RAM защищена на actual host | Private administrator policy, полный fixed grant, native readback и guest OS reserve | Balloon device/acknowledgement не доказывают grant; dynamic пока unsupported | дополнительно измерить |
 | Worker допускается к работам | Unique trusted identity, protected enrollment, DRAIN→health→owning admission, current release/cgroups/NFS | Ни boot, ни source tests не заменяют native receipt | сохранить карантин до evidence |
 | Onboarding smoke выполнен | Tiny batch+srun, scratch→NFS/readback, normal shutdown/return receipts | Не научная сходимость и не full fault/restore acceptance | сохранить раздельные gates |
 

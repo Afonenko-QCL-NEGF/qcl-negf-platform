@@ -1,0 +1,25 @@
+{
+  description = "Private additional Linux/libvirt worker; existing cluster stays external";
+  inputs.qcl.url = "git+https://github.com/Afonenko-QCL-NEGF/qcl-negf.git?submodules=1";
+  # Pin the accepted release using the private flake.lock; do not update implicitly.
+  outputs = { qcl, ... }: let
+    system = "x86_64-linux";
+    platform = qcl.inputs.platform;
+    nixpkgs = platform.inputs.nixpkgs;
+    application = qcl.lib.mkApplication { inherit system; };
+    preparedDepot = qcl.lib.mkPreparedDepot {
+      inherit system;
+      metadata = builtins.fromJSON (builtins.readFile ./solver-depot.json);
+    };
+    solver = qcl.lib.mkSolver { inherit system preparedDepot; };
+    worker = nixpkgs.lib.nixosSystem {
+      inherit system;
+      modules = [ platform.nixosModules.linuxWorker
+        (import ./worker.nix { inherit application solver; }) ];
+    };
+  in {
+    nixosConfigurations.arch-worker = worker;
+    packages.${system}.arch-worker-image =
+      (platform.lib.mkImages { configurations = { arch-worker = worker; }; }).arch-worker;
+  };
+}

@@ -1,7 +1,25 @@
+resource "terraform_data" "admission" {
+  input = "arch-worker"
+  lifecycle {
+    precondition {
+      condition     = var.ownership_verified
+      error_message = "Require a reviewed ownership/state inventory for the exact domain, pool, bridge and disks before apply."
+    }
+    precondition {
+      condition     = var.capacity_verified
+      error_message = "Require fresh private host capacity/reserves, resident policy and grant admission before apply."
+    }
+    precondition {
+      condition     = filesha256(var.image_path) == var.image_sha256
+      error_message = "The local root image does not match its reviewed SHA-256."
+    }
+  }
+}
 resource "libvirt_pool" "qcl" {
-  name   = "qcl-negf"
-  type   = "dir"
-  target = { path = var.pool_path }
+  name       = "qcl-negf"
+  type       = "dir"
+  target     = { path = var.pool_path }
+  depends_on = [terraform_data.admission]
   lifecycle { prevent_destroy = true }
 }
 resource "libvirt_volume" "base" {
@@ -9,17 +27,12 @@ resource "libvirt_volume" "base" {
   pool   = libvirt_pool.qcl.name
   target = { format = { type = "qcow2" } }
   create = { content = { url = abspath(var.image_path) } }
-  lifecycle {
-    precondition {
-      condition     = filesha256(var.image_path) == var.image_sha256
-      error_message = "The local root image does not match its reviewed SHA-256."
-    }
-  }
 }
 resource "libvirt_volume" "root" {
   name          = "arch-worker-root-${substr(var.image_sha256, 0, 16)}.qcow2"
   pool          = libvirt_pool.qcl.name
   capacity      = var.root_gib * 1024 * 1024 * 1024
+  allocation    = 0
   target        = { format = { type = "qcow2" } }
   backing_store = { path = libvirt_volume.base.path, format = { type = "qcow2" } }
 }
@@ -46,20 +59,24 @@ resource "libvirt_cloudinit_disk" "seed" {
 resource "libvirt_volume" "seed" {
   name   = "arch-worker-seed-${libvirt_cloudinit_disk.seed.id}.iso"
   pool   = libvirt_pool.qcl.name
-  target = { format = { type = "raw" } }
+  target = { format = { type = "iso" } }
   create = { content = { url = libvirt_cloudinit_disk.seed.path } }
 }
 resource "libvirt_domain" "worker" {
-  name        = "arch-worker"
-  type        = "kvm"
-  running     = true
-  autostart   = true
-  memory      = var.memory_mib
-  memory_unit = "MiB"
-  vcpu        = var.vcpus
-  cpu         = { mode = "host-passthrough" }
-  os          = { type = "hvm", type_arch = "x86_64", type_machine = "q35", boot_devices = ["hd"] }
+  name                = "arch-worker"
+  type                = "kvm"
+  running             = true
+  autostart           = true
+  memory              = var.memory_mib
+  memory_unit         = "MiB"
+  current_memory      = var.resident_memory.startup_mib
+  current_memory_unit = "MiB"
+  vcpu                = var.vcpus
+  cpu                 = { mode = "host-passthrough" }
+  os                  = { type = "hvm", type_arch = "x86_64", type_machine = "q35", boot_devices = [{ dev = "hd" }] }
   devices = {
+    # Driver/device support alone does not qualify online memory mutation.
+    mem_balloon = { model = "virtio", auto_deflate = "off" }
     disks = [
       { device = "disk", driver = { name = "qemu", type = "qcow2" }, source = { file = { file = libvirt_volume.root.path } }, target = { dev = "vda", bus = "virtio" }, serial = "qcl-root" },
       { device = "disk", driver = { name = "qemu", type = "qcow2", discard = "unmap" }, source = { file = { file = libvirt_volume.scratch.path } }, target = { dev = "vdb", bus = "virtio" }, serial = "qcl-scratch" },

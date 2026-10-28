@@ -55,20 +55,18 @@ facts without collecting them or applying changes. Switch only between idle
 builds, review the saved plan and guest limits after reboot, and restore standard
 before starting compute. This procedure does not stop or cancel running work.
 
-The Arch worker defaults to 30 GiB and 12 vCPU on a host with 32 GiB and 12 logical CPUs/6 physical
-cores. This leaves a nominal 2 GiB outside the guest before QEMU overhead. Ansible requires
-at least 1 GiB of measured host RAM beyond the guest allocation; firmware reservations mean
-Linux may report less than the nominal 32 GiB. All twelve logical CPUs
-are available to the guest and shared with the host scheduler; no logical CPUs are reserved solely
-for Arch. Twelve vCPU are logical execution contexts, not twelve physical cores. The root disk defaults to
-32 GiB and scratch to 512 GiB. Their configurable sum is capped at 700 GiB, leaving space for image
-files and host overhead within an 800 GB device. Check actual free space before creating sparse
-volumes: declared capacity is not reserved physical space.
+The Linux/libvirt adapter requires explicit guest RAM, vCPU, root and scratch capacities from
+fresh private inventory. Its public example is synthetic (4 GiB, 2 vCPU, 32 GiB scratch).
+Resident minimum/startup/maximum must equal the fixed guest RAM: native dynamic memory remains
+unsupported until qualified on the actual NixOS guest. Host/foreign reserves, QEMU overhead and
+the full resident grant belong to the private per-host policy. Operator ownership/capacity flags
+acknowledge its review; they do not prove physical reservation or native readiness. Sparse disk
+capacity is not reserved physical space. See the [Linux guide](linux-workers.md) for gates.
 
 After boot, run `slurmd -C` inside each compute VM and copy the measured topology into the private
 site's `slurm.nodes`. Use a lower `RealMemory` than observed RAM to reserve the guest OS and
-services. `28672` MiB is a conservative example for the 30 GiB Arch guest, not a hardware
-measurement. Reserve one process per calculation and allocate its CPUs/RAM through AiiDA.
+services. Do not copy a historical laptop's `RealMemory` into a newly sized guest.
+Reserve one process per calculation and allocate its CPUs/RAM through AiiDA.
 BLAS/OpenMP defaults are one thread; Slurm cgroup v2 enforces the assigned CPU set and memory
 limits. Every compute node and submission host must retain the same immutable solver store path.
 

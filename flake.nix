@@ -22,6 +22,7 @@
   in {
     nixosModules.default = import ./modules;
     nixosModules.image = import ./modules/image.nix;
+    nixosModules.linuxWorker = import ./modules/linux-worker.nix;
     lib.mkPythonEnvironment = { system, workspaceRoot, includeTests ? false }:
       import ./nix/application.nix {
         pkgs = nixpkgs.legacyPackages.${system};

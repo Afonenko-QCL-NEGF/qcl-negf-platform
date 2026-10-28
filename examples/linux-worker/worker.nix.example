@@ -1,0 +1,35 @@
+# Synthetic values only. Copy privately as worker.nix and replace the inventory
+# with the existing cluster's accepted source/release/network/UID/node settings.
+{ application, solver }: {
+  networking.hostName = "arch-worker";
+  networking.hosts = {
+    "192.0.2.10" = [ "control" ];
+    "192.0.2.11" = [ "storage" ];
+    "192.0.2.14" = [ "arch-worker" ];
+  };
+  qclNegf = {
+    uid = 3000;
+    runtimeSecretUnits = [ "site-worker-secrets.service" ];
+    release.applicationPackage = application;
+    cluster = {
+      solverPackage = solver;
+      nodes = [ "arch-worker CPUs=2 RealMemory=3072 State=DRAIN Reason=first-enrollment" ];
+      partitions = [ "compute Nodes=arch-worker Default=YES State=UP" ];
+      # Existing, separately formatted scratch only. Initial formatting of a newly
+      # owned blank disk requires its own reviewed preparation before normal boot.
+      initializeBlankScratch = false;
+    };
+  };
+  systemd.services.site-worker-secrets = {
+    description = "Load the separately provisioned private worker Munge key";
+    serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
+    script = ''
+      set -eu
+      test -s /var/lib/qcl-negf-secrets/munge.key
+      install -d -m 0755 /run/secrets
+      install -o munge -g munge -m 0400 /var/lib/qcl-negf-secrets/munge.key /run/secrets/munge.key
+    '';
+  };
+  # No secret bytes, machine-id, SSH private host keys or enrollment/ready records
+  # belong in Nix expressions or image contents. Provision these after image build.
+}
