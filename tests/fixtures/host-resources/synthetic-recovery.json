@@ -1,0 +1,24 @@
+{
+  "schema": "qcl.synthetic-native-recovery.v1",
+  "source_kind": "synthetic",
+  "scenarios": [
+    {
+      "name": "queued-old-modify",
+      "event": "server_undefine_waits_for_old_modify"
+    },
+    {
+      "name": "daemon-incarnation-changed",
+      "event": "daemon_changed"
+    },
+    {
+      "name": "exited-cli-live-descendant",
+      "event": "descendant_after_cli_exit"
+    }
+  ],
+  "late_rpc_positions": [
+    "before_uuid_lookup",
+    "waiting_modify_after_old_object_lookup",
+    "running_modify_before_getdefs",
+    "qmp_tail_on_old_qemu"
+  ]
+}

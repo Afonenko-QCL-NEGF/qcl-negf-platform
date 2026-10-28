@@ -95,6 +95,10 @@ class StartupManager:
                                    vm.minimum_bytes,'idle') for vm in p.vms)
         validate_host_grants(p,grants)
         with self.store.locked():
+            from host_resource_recovery import check_start_fence
+            for row in e.vms:
+                check_start_fence(self.store,'libvirt',uuid=row.native_id)
+                check_start_fence(self.store,'proxmox',uuid=row.native_id)
             if self.store.state_path.exists():
                 state=self.controller._load()
                 require(state['host_boot_id']==e.host_boot_id and state['policy_sha256']==e.policy_sha256
@@ -124,6 +128,9 @@ class StartupManager:
         require(set(config)=={'native_id','maximum_bytes','config_fingerprint'},'shape','actual static config required')
         with self.store.locked(read_only=True):
             state=self.controller._load()
+            from host_resource_recovery import check_start_fence
+            check_start_fence(self.store,'libvirt',uuid=native_vm_id)
+            check_start_fence(self.store,'proxmox',uuid=native_vm_id)
             matches=[vm for vm,row in state['startups'].items() if row['native_id']==native_vm_id]
             require(len(matches)==1,'ownership','native VM is not uniquely enrolled')
             vm_id=matches[0];row=state['startups'][vm_id];grant=self.controller._grant(state,vm_id)
@@ -136,6 +143,9 @@ class StartupManager:
 
     def bind_running_startup(self,native_vm_id,evidence):
         with self.store.locked():
+            from host_resource_recovery import check_start_fence
+            check_start_fence(self.store,'libvirt',uuid=native_vm_id)
+            check_start_fence(self.store,'proxmox',uuid=native_vm_id)
             state=self.controller._load();self.controller._fresh(evidence.observed_at)
             require(state['host_boot_id']==evidence.host_boot_id and
                     state['policy_sha256']==evidence.policy_sha256,'identity_mismatch','startup host changed')
@@ -239,16 +249,34 @@ def hook_main(argv=None):
     args=list(sys.argv[1:] if argv is None else argv);require(bool(args),'shape','native hook arguments required')
     config=read_root_json(CONFIG);runtime=read_root_json(config['runtime']);native=runtime['backend_config']
     backend=args.pop(0);require(backend==native['backend'],'ownership','hook backend mismatch')
+    from host_resource_operations import FileReceiptStore
+    from host_resource_recovery import check_start_fence
+    fence_store=None
+    require('state_directory' in runtime or config.get('native_recovery') is None,'trust','recovery requires protected state')
+    if 'state_directory' in runtime:
+        try:fence_store=FileReceiptStore.open_existing(runtime['state_directory'])
+        except FileNotFoundError:pass
     if backend=='libvirt':
         require(len(args)>=3,'shape','libvirt name/operation/suboperation required')
         name,operation,suboperation=args[:3]
-        matches=[v for v in native['vms'].values() if v['name']==name]
-        if not matches:return 0  # foreign domain is untouched
         if operation not in {'prepare','start'} or suboperation!='begin':return 0
-        phase=operation+'-begin';raw=sys.stdin.buffer.read(256*1024+1);native_id=matches[0]['native_id']
+        if fence_store is not None:
+            check_start_fence(fence_store,'libvirt',name=name)
+        matches=[v for v in native['vms'].values() if v['name']==name]
+        phase=operation+'-begin'
+        if not matches and (fence_store is None or not (fence_store.directory/'retired-targets').exists()):return 0
+        raw=sys.stdin.buffer.read(256*1024+1)
+        import xml.etree.ElementTree as ET
+        require(len(raw)<=256*1024 and b'<!DOCTYPE' not in raw and b'<!ENTITY' not in raw,'shape','bounded native hook XML')
+        hook_uuid=ET.fromstring(raw).findtext('uuid')
+        if fence_store is not None and hook_uuid:check_start_fence(fence_store,'libvirt',uuid=hook_uuid)
+        if not matches:return 0  # positive foreign namespace: no native calls
+        native_id=matches[0]['native_id']
     else:
         require(len(args)==2 and args[0].isdigit(),'shape','PVE VMID and phase required')
-        vmid,phase=args;matches=[v for v in native['vms'].values() if str(v['vmid'])==vmid]
+        vmid,phase=args
+        if fence_store is not None:check_start_fence(fence_store,'proxmox',vmid=vmid)
+        matches=[v for v in native['vms'].values() if str(v['vmid'])==vmid]
         if not matches or phase!='pre-start':return 0
         native_id=matches[0]['native_id']
         from host_resource_backends import trusted_root_path
@@ -265,7 +293,10 @@ def admin_main(argv=None):
     import os,sys
     from host_resource_service import open_service
     require(os.geteuid()==0 and os.environ.get('SUDO_UID','0')=='0','root_required','administrative root only')
-    args=list(sys.argv[1:] if argv is None else argv);require(bool(args),'shape','prepare or bind required')
+    args=list(sys.argv[1:] if argv is None else argv);require(bool(args),'shape','administrative action required')
+    if args[0] in {'retire','recovery-status','reserve-replacement'}:
+        from host_resource_recovery import admin_recovery
+        print(json.dumps(admin_recovery(args)));return 0
     service=open_service()
     if args==['prepare']:
         with service.controller.store.operation():

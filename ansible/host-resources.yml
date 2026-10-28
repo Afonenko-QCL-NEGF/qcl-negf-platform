@@ -57,6 +57,7 @@
         - host_resource_operations
         - host_resource_backends
         - host_resource_native_cleanup
+        - host_resource_recovery
         - host_resource_facts
         - host_resource_client
         - host_resource_service

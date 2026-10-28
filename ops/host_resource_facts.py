@@ -264,7 +264,7 @@ class NativeFactsProvider:
         self.policy,self.config,self.backend,self.runner,self.clock=policy,config,backend,runner,clock
         self.sources=sources or LocalSources(config,runner)
         self.last=None;self.native={}
-    def _host_inventory(self):
+    def _host_inventory(self,*,retiring_vm_id=None):
         before=self.sources.host();enrolled=self.config['enrollment'];agreement=read_root_json(self.config['agreement'])
         require(before['machine_id']==self.config['host_identity']['machine_id'] and
             before['dmi_uuid']==self.config['host_identity']['dmi_uuid'] and
@@ -278,6 +278,10 @@ class NativeFactsProvider:
             'capacity_evidence','enrollment/native maxima must match policy exactly')
         rows=self.sources.inventory(getattr(self.backend,'native_backend',self.backend))
         qemu={str(p['pid']) for p in self.sources.processes() if 'qemu-system-' in Path(p['executable']).name or Path(p['executable']).name in {'kvm','qemu-kvm'}}
+        if retiring_vm_id is not None:
+            require(retiring_vm_id in enrolled,'ownership','exact retiring resident required')
+            old=enrolled[retiring_vm_id]['native_id']
+            if not any(r['native_id']==old for r in rows):enrolled={k:v for k,v in enrolled.items() if k!=retiring_vm_id}
         validate_inventory(rows,enrolled,agreement['foreign'],foreign_budget=self.policy.reserves.foreign_max_bytes,observed_qemu_pids=qemu)
         after=self.sources.host()
         require(all(before[k]==after[k] for k in ('boot_id','machine_id','kernel','dmi_uuid','MemTotal')),
@@ -325,10 +329,17 @@ class NativeFactsProvider:
             True,True,host['MemAvailable']>=self.policy.reserves.safety_bytes,fingerprint([host,rows]),tuple(bindings),tuple(qualifications),
             {vm.vm_id:() for vm in self.policy.vms})
     def request_facts(self,demand,*,owner_state):
-        host,rows,agreement=self._host_inventory();bindings=[];qualifications=[];live={};guests={}
+        return self._capture(demand,owner_state=owner_state)
+    def recovery_snapshot(self,retiring_vm_id,*,owner_state):
+        require(retiring_vm_id in owner_state['bindings'],'ownership','retiring resident required')
+        evidence=self._capture(None,owner_state=owner_state,retiring_vm_id=retiring_vm_id)
+        return evidence,{vm.vm_id:self.backend.readback(vm.vm_id) for vm in self.policy.vms if vm.vm_id!=retiring_vm_id}
+    def _capture(self,demand,*,owner_state,retiring_vm_id=None):
+        host,rows,agreement=self._host_inventory(retiring_vm_id=retiring_vm_id);bindings=[];qualifications=[];live={};guests={}
         protected=read_root_json(self.config['qualification'])
         require(protected['schema']=='qcl.host-resource-qualification.v1','qualification','protected exact qualification required')
         for vm in self.policy.vms:
+            if vm.vm_id==retiring_vm_id:continue
             read=self.backend.readback(vm.vm_id);runtime=collect_native_runtime(self.backend,read)
             if self.policy.active_grant.mechanism=='conservative_reservation':
                 require(read.assigned_bytes==read.configured_bytes==vm.maximum_bytes,'readback','fixed full-maximum allocation required')
@@ -368,7 +379,7 @@ class NativeFactsProvider:
         self.last=(evidence,guests)
         proofs=getattr(self,'native_proofs',None)
         if proofs is not None:proofs.validate_state(owner_state,evidence=evidence)
-        self._persist(evidence,guests)
+        if retiring_vm_id is None:self._persist(evidence,guests)
         return evidence
     def _persist(self,evidence,guests):
         # One bounded probe cache for status/RootNativeBoundary, not another grant ledger.

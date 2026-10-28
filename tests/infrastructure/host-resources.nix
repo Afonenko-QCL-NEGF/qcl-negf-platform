@@ -38,5 +38,6 @@ assert builtins.length (builtins.filter (rule: builtins.elem "qcl-resource-autho
 assert package.passthru.source != null;
 assert package.passthru.nativeExec.name == "qcl-negf-resource-native-exec";
 assert pkgs.lib.hasInfix "host_resource_native_cleanup.py" package.passthru.source.buildCommand;
+assert pkgs.lib.hasInfix "host_resource_recovery.py" package.passthru.source.buildCommand;
 assert !(pkgs.lib.hasInfix "native-exec" (builtins.toJSON roles.security.sudo.extraRules));
 true
