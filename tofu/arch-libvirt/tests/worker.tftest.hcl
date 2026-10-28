@@ -19,6 +19,36 @@ variables {
   ssh_public_keys    = ["ssh-ed25519 AAAATEST synthetic-only"]
 }
 
+run "reject_numeric_self_next_hop_for_aliased_guest" {
+  command = plan
+  variables {
+    address           = "192.0.2.014/24"
+    additional_routes = [{ to = "198.51.100.0/24", via = "192.0.2.14" }]
+  }
+  expect_failures = [terraform_data.admission]
+}
+
+run "aliased_guest_with_distinct_next_hop" {
+  command = plan
+  variables {
+    address           = "192.0.2.014/24"
+    additional_routes = [{ to = "198.51.100.0/24", via = "192.0.2.201" }]
+  }
+  assert {
+    condition     = jsonencode(yamldecode(libvirt_cloudinit_disk.seed.network_config).ethernets.cluster0.routes) == jsonencode([{ to = "default", via = "192.0.2.1" }, { to = "198.51.100.0/24", via = "192.0.2.201" }])
+    error_message = "Numeric guest normalization must only reject an actual self next hop."
+  }
+}
+
+run "legacy_empty_routes_keep_guest_spelling" {
+  command = plan
+  variables { address = "192.0.2.014/24" }
+  assert {
+    condition     = yamldecode(libvirt_cloudinit_disk.seed.network_config).ethernets.cluster0.addresses[0] == "192.0.2.014/24" && length(yamldecode(libvirt_cloudinit_disk.seed.network_config).ethernets.cluster0.routes) == 1
+    error_message = "Empty additional routes must retain the existing seed behavior."
+  }
+}
+
 run "conservative_resident_guest_and_devices" {
   command = plan
   assert {
@@ -80,4 +110,158 @@ run "reject_fractional_cpu" {
   command = plan
   variables { vcpus = 1.5 }
   expect_failures = [var.vcpus]
+}
+
+run "ordinary_default_with_specific_cluster_routes" {
+  command = plan
+  variables {
+    additional_routes = [
+      { to = "198.51.100.0/24", via = "192.0.2.201" },
+      { to = "203.0.113.9/32", via = "192.0.2.202" }
+    ]
+  }
+  assert {
+    condition = jsonencode(yamldecode(libvirt_cloudinit_disk.seed.network_config).ethernets.cluster0.routes) == jsonencode([
+      { to = "default", via = "192.0.2.1" },
+      { to = "198.51.100.0/24", via = "192.0.2.201" },
+      { to = "203.0.113.9/32", via = "192.0.2.202" }
+    ])
+    error_message = "Specific cluster routes must follow the unchanged ordinary default with their assigned next hops."
+  }
+}
+
+run "empty_extra_routes_preserves_full_seed" {
+  command = plan
+  assert {
+    condition = libvirt_cloudinit_disk.seed.network_config == yamlencode({
+      version = 2
+      ethernets = { cluster0 = {
+        match       = { macaddress = "52:54:00:00:00:0e" }
+        "set-name"  = "cluster0"
+        addresses   = ["192.0.2.14/24"]
+        routes      = [{ to = "default", via = "192.0.2.1" }]
+        nameservers = { addresses = ["192.0.2.1"] }
+      } }
+    })
+    error_message = "Omitting additional_routes must preserve the complete old network seed."
+  }
+}
+
+run "reject_route_default" {
+  command = plan
+  variables { additional_routes = [{ to = "default", via = "192.0.2.201" }] }
+  expect_failures = [var.additional_routes]
+}
+
+run "reject_route_zero" {
+  command = plan
+  variables { additional_routes = [{ to = "0.0.0.0/0", via = "192.0.2.201" }] }
+  expect_failures = [var.additional_routes]
+}
+
+run "reject_route_ipv6" {
+  command = plan
+  variables { additional_routes = [{ to = "2001:db8::/64", via = "192.0.2.201" }] }
+  expect_failures = [var.additional_routes]
+}
+
+run "reject_route_bad_prefix" {
+  command = plan
+  variables { additional_routes = [{ to = "198.51.100.0/33", via = "192.0.2.201" }] }
+  expect_failures = [var.additional_routes]
+}
+
+run "reject_route_host_bits" {
+  command = plan
+  variables { additional_routes = [{ to = "198.51.100.9/24", via = "192.0.2.201" }] }
+  expect_failures = [var.additional_routes]
+}
+
+run "reject_route_noncanonical_prefix" {
+  command = plan
+  variables { additional_routes = [{ to = "198.51.100.0/024", via = "192.0.2.201" }] }
+  expect_failures = [var.additional_routes]
+}
+
+run "reject_route_whitespace" {
+  command = plan
+  variables { additional_routes = [{ to = "198.51.100.0/24 ", via = "192.0.2.201" }] }
+  expect_failures = [var.additional_routes]
+}
+
+run "reject_route_bad_via" {
+  command = plan
+  variables { additional_routes = [{ to = "198.51.100.0/24", via = "192.0.2.999" }] }
+  expect_failures = [var.additional_routes]
+}
+
+run "reject_route_ipv6_via" {
+  command = plan
+  variables { additional_routes = [{ to = "198.51.100.0/24", via = "2001:db8::1" }] }
+  expect_failures = [var.additional_routes]
+}
+
+run "reject_route_cidr_via" {
+  command = plan
+  variables { additional_routes = [{ to = "198.51.100.0/24", via = "192.0.2.201/32" }] }
+  expect_failures = [var.additional_routes]
+}
+
+run "reject_duplicate_route_destinations" {
+  command = plan
+  variables {
+    additional_routes = [{ to = "198.51.100.0/24", via = "192.0.2.201" }, { to = "198.51.100.0/24", via = "192.0.2.202" }]
+  }
+  expect_failures = [var.additional_routes]
+}
+
+run "reject_route_off_link_next_hop" {
+  command = plan
+  variables { additional_routes = [{ to = "198.51.100.0/24", via = "203.0.113.1" }] }
+  expect_failures = [terraform_data.admission]
+}
+
+run "reject_route_self_next_hop" {
+  command = plan
+  variables { additional_routes = [{ to = "198.51.100.0/24", via = "192.0.2.14" }] }
+  expect_failures = [terraform_data.admission]
+}
+
+run "reject_route_network_next_hop" {
+  command = plan
+  variables { additional_routes = [{ to = "198.51.100.0/24", via = "192.0.2.0" }] }
+  expect_failures = [terraform_data.admission]
+}
+
+run "reject_route_broadcast_next_hop" {
+  command = plan
+  variables { additional_routes = [{ to = "198.51.100.0/24", via = "192.0.2.255" }] }
+  expect_failures = [terraform_data.admission]
+}
+
+run "reject_extra_route_ipv6_guest" {
+  command = plan
+  variables {
+    address           = "2001:db8::14/64"
+    additional_routes = [{ to = "198.51.100.0/24", via = "192.0.2.201" }]
+  }
+  expect_failures = [terraform_data.admission]
+}
+
+run "reject_extra_route_point_to_point_guest" {
+  command = plan
+  variables {
+    address           = "192.0.2.14/31"
+    additional_routes = [{ to = "198.51.100.0/24", via = "192.0.2.201" }]
+  }
+  expect_failures = [terraform_data.admission]
+}
+
+run "reject_extra_route_host_only_guest" {
+  command = plan
+  variables {
+    address           = "192.0.2.14/32"
+    additional_routes = [{ to = "198.51.100.0/24", via = "192.0.2.201" }]
+  }
+  expect_failures = [terraform_data.admission]
 }
