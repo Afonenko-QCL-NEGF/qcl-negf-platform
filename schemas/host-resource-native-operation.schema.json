@@ -1,0 +1,198 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qcl-negf.example/schemas/host-resource-native-operation.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "request_id",
+    "workload",
+    "native_generation",
+    "host_id",
+    "vm_id",
+    "state_generation",
+    "phase",
+    "admission",
+    "failure_code",
+    "requested_workload_bytes",
+    "target_bytes",
+    "charged_bytes",
+    "current_assigned_bytes",
+    "current_configured_bytes",
+    "protected_floor_bytes",
+    "cleanup",
+    "native_freshness"
+  ],
+  "properties": {
+    "schema": {
+      "const": "qcl.host-resource-operation.v1"
+    },
+    "request_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "workload": {
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "native_id"
+          ],
+          "properties": {
+            "kind": {
+              "enum": [
+                "slurm_allocation",
+                "systemd_build"
+              ]
+            },
+            "native_id": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_.:@-]+$",
+              "minLength": 1,
+              "maxLength": 200
+            }
+          }
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "native_generation": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "host_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "vm_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "state_generation": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "phase": {
+      "enum": [
+        "HOST_GRANT",
+        "GROW_UNKNOWN",
+        "GUEST_ADMIT",
+        "RUN",
+        "SHRINK_READY",
+        "SHRINK_DEFERRED",
+        "SHRINK_UNKNOWN",
+        "RELEASE",
+        "RESOURCE_WAIT",
+        "NOT_INITIALIZED",
+        "UNSUPPORTED",
+        "REJECTED"
+      ]
+    },
+    "admission": {
+      "enum": [
+        "ready",
+        "resource_wait",
+        "reconciliation_required",
+        "unsupported",
+        "rejected"
+      ]
+    },
+    "failure_code": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[A-Za-z0-9_]+$",
+      "maxLength": 80
+    },
+    "requested_workload_bytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "target_bytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "charged_bytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "current_assigned_bytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "current_configured_bytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "protected_floor_bytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "cleanup": {
+      "enum": [
+        "not_started",
+        "pending",
+        "confirmed",
+        "unknown"
+      ]
+    },
+    "native_freshness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "observed_at"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "fresh",
+            "stale",
+            "not_measured",
+            "inconsistent"
+          ]
+        },
+        "observed_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

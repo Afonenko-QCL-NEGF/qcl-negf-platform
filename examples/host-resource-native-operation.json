@@ -1,0 +1,26 @@
+{
+  "schema": "qcl.host-resource-operation.v1",
+  "request_id": null,
+  "workload": {
+    "kind": "slurm_allocation",
+    "native_id": "42"
+  },
+  "native_generation": null,
+  "host_id": null,
+  "vm_id": null,
+  "state_generation": null,
+  "phase": "REJECTED",
+  "admission": "reconciliation_required",
+  "failure_code": "native_generation",
+  "requested_workload_bytes": null,
+  "target_bytes": null,
+  "charged_bytes": null,
+  "current_assigned_bytes": null,
+  "current_configured_bytes": null,
+  "protected_floor_bytes": null,
+  "cleanup": "not_started",
+  "native_freshness": {
+    "status": "not_measured",
+    "observed_at": null
+  }
+}

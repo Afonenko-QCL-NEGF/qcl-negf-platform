@@ -1,0 +1,404 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qcl-negf.example/schemas/host-resource-native-state.schema.json",
+  "description": "Private owner layout v3; external consumers use bounded operation/projection DTOs.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "policy_sha256",
+    "host_boot_id",
+    "grants",
+    "bindings",
+    "desired",
+    "receipts",
+    "blocked",
+    "startups"
+  ],
+  "properties": {
+    "schema": {
+      "const": "qcl.host-resource-state.v3"
+    },
+    "policy_sha256": {
+      "type": "string",
+      "minLength": 1
+    },
+    "host_boot_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "grants": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "host_id",
+          "vm_id",
+          "owner_id",
+          "guest_bytes",
+          "active_floor_bytes",
+          "state"
+        ],
+        "properties": {
+          "host_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "vm_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "owner_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "guest_bytes": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "active_floor_bytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "state": {
+            "enum": [
+              "idle",
+              "active",
+              "ambiguous"
+            ]
+          }
+        }
+      }
+    },
+    "bindings": {
+      "type": "object",
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "vm_id",
+              "native_id",
+              "process_id",
+              "guest_boot_id",
+              "image_id",
+              "guest_kernel_id",
+              "host_kernel_id",
+              "qemu_version_id",
+              "backend_version_id",
+              "readback_version",
+              "config_fingerprint"
+            ],
+            "properties": {
+              "vm_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "native_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "process_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "guest_boot_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "image_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "guest_kernel_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "host_kernel_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "qemu_version_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "backend_version_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "readback_version": {
+                "type": "string",
+                "minLength": 1
+              },
+              "config_fingerprint": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "desired": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 1
+      }
+    },
+    "receipts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "request",
+          "phase",
+          "target_bytes",
+          "old_bytes",
+          "failure",
+          "finished",
+          "mutation_id",
+          "mutation_started_at",
+          "native_cleanup_confirmed",
+          "native_workload",
+          "native_context"
+        ],
+        "properties": {
+          "request": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "request_id",
+              "host_id",
+              "vm_id",
+              "owner_id",
+              "workload_bytes",
+              "workload_id"
+            ],
+            "properties": {
+              "request_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "host_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "vm_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "owner_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "workload_bytes": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "workload_id": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          "phase": {
+            "enum": [
+              "GROW_UNKNOWN",
+              "GUEST_ADMIT",
+              "HOST_GRANT",
+              "RELEASE",
+              "RUN",
+              "SHRINK_DEFERRED",
+              "SHRINK_READY",
+              "SHRINK_UNKNOWN"
+            ]
+          },
+          "target_bytes": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "old_bytes": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "failure": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "finished": {
+            "type": "boolean"
+          },
+          "mutation_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "mutation_started_at": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "native_cleanup_confirmed": {
+            "type": "boolean"
+          },
+          "native_workload": {
+            "anyOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "kind",
+                  "native_id",
+                  "generation"
+                ],
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "slurm_allocation",
+                      "systemd_build"
+                    ]
+                  },
+                  "native_id": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "generation": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "native_context": {
+            "anyOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "unit",
+                  "invocation_id",
+                  "cgroup",
+                  "host_boot_id",
+                  "mutation_id"
+                ],
+                "properties": {
+                  "unit": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "invocation_id": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "cgroup": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "host_boot_id": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "mutation_id": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "blocked": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "startups": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "phase",
+          "reservation_id",
+          "native_id",
+          "static_config_fingerprint",
+          "initial_peak_bytes"
+        ],
+        "properties": {
+          "phase": {
+            "enum": [
+              "cold_reserved",
+              "boot_unknown",
+              "running_quarantined",
+              "binding_ready"
+            ]
+          },
+          "reservation_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "native_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "static_config_fingerprint": {
+            "type": "string",
+            "minLength": 1
+          },
+          "initial_peak_bytes": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      }
+    }
+  }
+}

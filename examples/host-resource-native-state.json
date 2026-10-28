@@ -1,0 +1,94 @@
+{
+  "bindings": {
+    "vm-a": {
+      "backend_version_id": "backend-1",
+      "config_fingerprint": "config-1",
+      "guest_boot_id": "guest-boot-1",
+      "guest_kernel_id": "guest-kernel-1",
+      "host_kernel_id": "host-kernel-1",
+      "image_id": "image-1",
+      "native_id": "native-vm-a",
+      "process_id": "process-vm-a",
+      "qemu_version_id": "qemu-1",
+      "readback_version": "readback-v1",
+      "vm_id": "vm-a"
+    },
+    "vm-b": {
+      "backend_version_id": "backend-1",
+      "config_fingerprint": "config-1",
+      "guest_boot_id": "guest-boot-1",
+      "guest_kernel_id": "guest-kernel-1",
+      "host_kernel_id": "host-kernel-1",
+      "image_id": "image-1",
+      "native_id": "native-vm-b",
+      "process_id": "process-vm-b",
+      "qemu_version_id": "qemu-1",
+      "readback_version": "readback-v1",
+      "vm_id": "vm-b"
+    }
+  },
+  "blocked": null,
+  "desired": {
+    "vm-a": 512,
+    "vm-b": 256
+  },
+  "grants": [
+    {
+      "active_floor_bytes": 449,
+      "guest_bytes": 512,
+      "host_id": "synthetic-host",
+      "owner_id": "synthetic-owner",
+      "state": "active",
+      "vm_id": "vm-a"
+    },
+    {
+      "active_floor_bytes": 128,
+      "guest_bytes": 256,
+      "host_id": "synthetic-host",
+      "owner_id": "synthetic-owner",
+      "state": "idle",
+      "vm_id": "vm-b"
+    }
+  ],
+  "host_boot_id": "host-boot-1",
+  "policy_sha256": "31fdfe8f402f0094b55cc300255d0b31446dc3137483e5074987f798e469a5fb",
+  "receipts": [
+    {
+      "failure": null,
+      "finished": false,
+      "mutation_id": null,
+      "mutation_started_at": null,
+      "native_cleanup_confirmed": true,
+      "native_context": null,
+      "native_workload": null,
+      "old_bytes": 256,
+      "phase": "HOST_GRANT",
+      "request": {
+        "host_id": "synthetic-host",
+        "owner_id": "synthetic-owner",
+        "request_id": "request-1",
+        "vm_id": "vm-a",
+        "workload_bytes": 321,
+        "workload_id": "work-1"
+      },
+      "target_bytes": 512
+    }
+  ],
+  "schema": "qcl.host-resource-state.v3",
+  "startups": {
+    "vm-a": {
+      "initial_peak_bytes": 2048,
+      "native_id": "native-vm-a",
+      "phase": "binding_ready",
+      "reservation_id": null,
+      "static_config_fingerprint": "config-1"
+    },
+    "vm-b": {
+      "initial_peak_bytes": 2048,
+      "native_id": "native-vm-b",
+      "phase": "binding_ready",
+      "reservation_id": null,
+      "static_config_fingerprint": "config-1"
+    }
+  }
+}

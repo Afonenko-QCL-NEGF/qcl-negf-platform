@@ -1,0 +1,4 @@
+#!/bin/sh
+# Unprivileged parser may import only this public standalone expression; the
+# protected source/runtime are read by sudo authority after real credential join.
+exec {{ qcl_resource_python | quote }} -I -c 'import os,shlex,sys,base64,json; p=shlex.split(os.environ.get("SSH_ORIGINAL_COMMAND","")); assert len(p)==4 and p[0]=="/usr/local/libexec/qcl-negf-resource-rpc" and p[1]=="authority" and p[2] in {"request","status","reconcile","finish","launch-gate"}; assert len(p[3])<=262144; json.loads(base64.b64decode(p[3],altchars=b"-_",validate=True)); os.execv("/usr/bin/sudo",["sudo","-n","/usr/local/libexec/qcl-negf-resource-authority",p[2],p[3]])'

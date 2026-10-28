@@ -1,0 +1,14 @@
+{
+  "synthetic": true,
+  "slurm_oneline": "JobId=42 UserId=qcl-negf(3000) JobState=RUNNING NumNodes=1 NumTasks=1 NodeList=worker-a SubmitTime=2026-10-28T10:00:00 StartTime=2026-10-28T10:00:01 Restarts=0 MinMemoryNode=512M ArrayJobId=0 HetJobId=0\n",
+  "pve_config": {
+    "memory": 1024,
+    "balloon": 0,
+    "smbios1": "uuid=11111111-1111-4111-8111-111111111111",
+    "cores": 2,
+    "digest": "synthetic-digest"
+  },
+  "pve_status": { "status": "running", "pid": 1234, "maxmem": 1073741824, "mem": 1 },
+  "libvirt_xml": "<domain type=\"kvm\"><name>synthetic-domain</name><uuid>11111111-1111-4111-8111-111111111111</uuid><memory unit=\"KiB\">1048576</memory><currentMemory unit=\"KiB\">1048576</currentMemory><vcpu>2</vcpu><devices><memballoon model=\"none\"/></devices></domain>",
+  "libvirt_dommemstat": "actual 1048576\nrss 1\n"
+}
