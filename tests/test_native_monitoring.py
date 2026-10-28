@@ -197,8 +197,10 @@ def test_public_native_read_normalizes_actual_protected_cache_without_effects(mo
     service = dict(service_id='svc', active_state='active', sub_state='running', result='success',
                    invocation_id='synthetic', observed_at=100, coverage=m.coverage('svc', 100, status='fresh'))
     sample['services'] = [service]
-    storage = r.unknown_storage(100); storage.update(status='qualified', persist_enabled=True)
-    value = dict(config_generation=r.digest(c), **sample, journal_cursor=None, cgroups={}, storage=storage)
+    storage = r.unknown_storage(100); storage.update(status='qualified', persist_permitted=True)
+    from slurm_context import empty_context
+    value = dict(config_generation=r.digest(c), **sample, journal_cursor=None, cgroups={}, storage=storage,
+        current_context=empty_context(c,now=100),host_packets=[],sampler_boot_id='boot-a')
     wire = json.dumps(value).encode(); original = copy.deepcopy(value)
     monkeypatch.setattr(r, 'load_config', lambda: c)
     monkeypatch.setattr(release_trust, 'read_protected_file', lambda *a, **kw: wire)
@@ -220,7 +222,7 @@ def test_public_native_read_normalizes_actual_protected_cache_without_effects(mo
     assert packet['services'][0]['coverage']['status'] == expected
     assert packet['services'][0]['observed_at'] == 100
     assert packet['storage']['observed_at'] == 100
-    assert packet['storage']['persist_enabled'] is (now == 100)
+    assert packet['storage']['persist_permitted'] is (now == 100)
     assert json.loads(wire) == original  # timestamp/source cache never rewritten
 
 
@@ -246,3 +248,78 @@ def test_native_freshness_is_per_source_and_preserves_unknown_and_event_evidence
     assert view['vms'][1]['coverage']['status'] == 'unsupported'
     assert view['oom']['coverage']['status'] == 'inconsistent'
     assert view['oom']['events'] == [event] and native == original
+
+
+def test_structured_manager_unit_oom_is_observed_but_never_qemu_victim():
+    import native_monitoring as m
+    assert hasattr(m,'parse_manager_oom'), 'missing native unit OOM source'
+    record=dict(MESSAGE_ID='fe6faa94e7774663a0da52717891d8ef', UNIT='qemu-fixture.scope',
+        INVOCATION_ID='a'*32, _PID='1', _UID='0', _COMM='systemd', _EXE='/usr/lib/systemd/systemd',
+        _BOOT_ID='boot-a', __MONOTONIC_TIMESTAMP='2000000', __REALTIME_TIMESTAMP='100000000', __CURSOR='cursor-a')
+    bindings=[dict(unit_id='unit-a',unit='qemu-fixture.scope',invocation_id='a'*32,vm_id='vm-a',
+        manager_executable='/usr/lib/systemd/systemd',monotonic_us=3000000)]
+    event=m.parse_manager_oom([record],bindings,host_boot_id='boot-a')[0]
+    assert event['cause']=='native_unit_kernel_oom' and event['victim_kind']=='unknown'
+    assert event['confidence']=='observed' and event['vm_id']=='vm-a'
+    assert event['unit_invocation_id']=='a'*32
+    old={**record,'INVOCATION_ID':'b'*32}
+    assert m.parse_manager_oom([old],bindings,host_boot_id='boot-a')[0]['vm_id'] is None
+    for change in [dict(_PID='2'),dict(_UID='1000'),dict(_EXE='/fake/systemd'),dict(_BOOT_ID='other'),dict(__MONOTONIC_TIMESTAMP='4000000')]:
+        assert not m.parse_manager_oom([{**record,**change}],bindings,host_boot_id='boot-a')
+    record['MESSAGE_ID']='d989611b15e44c9dbf31e3c81256e4ed'
+    assert m.parse_manager_oom([record],bindings,host_boot_id='boot-a')[0]['cause']=='native_unit_oomd'
+    assert m.empty_native('host-a')['capabilities']['kernel_qemu_victim_join']['status']=='unsupported'
+
+
+@pytest.mark.parametrize('cycle_drift', [False,True])
+def test_actual_sampler_integrates_structured_unit_protocol_without_victim_guess(cycle_drift):
+    m=module('native_monitoring');c=config();c['scopes'].update(journal=True,manager_version='systemd 257 (257.13)',
+        units=[dict(unit_id='unit-a',unit='fixture.scope',vm_id=None,manager_executable='/usr/lib/systemd/systemd')])
+    record=dict(MESSAGE_ID='fe6faa94e7774663a0da52717891d8ef',UNIT='fixture.scope',INVOCATION_ID='a'*32,
+        _PID='1',_UID='0',_COMM='systemd',_EXE='/usr/lib/systemd/systemd',_BOOT_ID='boot-a',
+        __MONOTONIC_TIMESTAMP='1',__REALTIME_TIMESTAMP='90000000',__CURSOR='fixture-cursor')
+    class Sources(LiteralSources):
+        count=0
+        def run(self,argv,**kw):
+            self.calls.append(('run',argv))
+            if argv[0].endswith('journalctl'):return json.dumps(record)
+            if argv[1:]==['--version']:return 'systemd 257 (257.13)'
+            if argv[1]=='show':
+                self.count+=1
+                invocation='b' if cycle_drift and self.count>2 else 'a'
+                return 'Id=fixture.scope\nControlGroup=/qemu.slice/fixture.scope\nInvocationID='+invocation*32+'\n'
+            raise AssertionError('unexpected protocol argv')
+    s=Sources();native=m.NativeSampler(c,s,clock=lambda:100).sample()['native']
+    assert native['capabilities']['kernel_qemu_victim_join']['status']=='unsupported'
+    if cycle_drift:
+        assert native['capabilities']['systemd_manager_unit_oom']['status']=='inconsistent' and native['oom']['events']==[]
+    else:
+        assert native['capabilities']['systemd_manager_unit_oom']['status']=='fresh'
+        assert native['oom']['events'][0]['cause']=='native_unit_kernel_oom'
+        assert native['oom']['events'][0]['victim_kind']=='unknown'
+
+
+def test_unit_oom_does_not_replace_unknown_vm_loss_with_a_victim_claim():
+    m=module('native_monitoring');c=config()
+    c['scopes'].update(backend='pve',node='node-a',version='fixture-version',journal=True,
+        manager_version='systemd 257 (257.13)',vms=[dict(vm_id='vm-a',native_id='17',uuid='uuid-a')],
+        units=[dict(unit_id='unit-a',unit='fixture.scope',vm_id='vm-a',manager_executable='/usr/lib/systemd/systemd')])
+    record=dict(MESSAGE_ID='fe6faa94e7774663a0da52717891d8ef',UNIT='fixture.scope',INVOCATION_ID='a'*32,
+        _PID='1',_UID='0',_COMM='systemd',_EXE='/usr/lib/systemd/systemd',_BOOT_ID='boot-a',
+        __MONOTONIC_TIMESTAMP='1',__REALTIME_TIMESTAMP='90000000',__CURSOR='fixture-cursor')
+    class Sources(LiteralSources):
+        def process(self,pid):return dict(arguments=['uuid-a'],start_ticks=12,rss_bytes=4096)
+        def run(self,argv,**kw):
+            if argv[0].endswith('journalctl'):return json.dumps(record)
+            if argv[1:]==['--version']:return 'systemd 257 (257.13)'
+            if argv[1]=='show':return 'Id=fixture.scope\nControlGroup=/qemu.slice/fixture.scope\nInvocationID='+'a'*32+'\n'
+            if '/version' in argv:return 'fixture-version'
+            if any(x.endswith('/config') for x in argv):return json.dumps(dict(memory=1024,smbios1='uuid=uuid-a'))
+            if any(x.endswith('/status/current') for x in argv):return json.dumps(dict(status='paused',pid=43))
+            raise AssertionError('unexpected source command')
+    prior=m.empty_native('host-a',observed_at=80);prior['host_boot_id']='boot-a'
+    row=m.vm_row('vm-a');row.update(power_state='running',native_generation='boot-a:43:12');prior['vms']=[row]
+    value=m.NativeSampler(c,Sources(),clock=lambda:100,previous=dict(native=prior,journal_cursor=None,cgroups={})).sample()['native']
+    causes={e['cause'] for e in value['oom']['events']}
+    assert {'native_unit_kernel_oom','unknown_vm_loss'}<=causes
+    assert 'host_kernel_qemu_oom' not in causes

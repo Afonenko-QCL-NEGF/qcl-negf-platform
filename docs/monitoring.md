@@ -1,179 +1,191 @@
 # Наблюдение за кластером и best-effort telemetry
 
-P31 foundation добавляет bounded readonly projection и независимый sampler. Это source/API для
-будущего P32 backend; Portal/AiiDA/Runner пока к нему не подключены. Наблюдение не выдаёт разрешение
-на запуск и не заменяет Slurm, P20 grants, qualification или научную приёмку.
+P31 предоставляет bounded readonly projection, независимый sampler и optional технический collector.
+Наблюдение не выдаёт grants, не меняет Slurm/admission и не принимает научные результаты.
+Portal/AiiDA/Runner/P32 пока не подключены к этим API. Source/L и установленная native приёмка —
+разные gates. Полный P31 открыт: exact QEMU-victim lifetime protocol пока unsupported; installed
+capacity/identity/tool/journal/Slurm проверки ещё нужны. Disabled/unknown storage не мешает view.
 
-Состояние реализации: source/L fixtures доступны, installed/native проверки отдельно. **Полный P31
-открыт:** native producer, доказывающий backing/capacity/scientific reserve для persist, пока
-отсутствует. Mount/statvfs показывает реальные доступные байты, но не доказывает эти свойства.
-Поэтому installed persist остаётся disabled/unknown, включая отдельный mount; project quota —
-explicit unsupported. Это source gap, а не только пропущенная N проверка. Новый filesystem не
-является общим prerequisite: followup должен связать уже имеющуюся QCL allocation/native quota с
-доказанным backing и резервом. Synthetic capacity oracle в тестах не доступен через config/CLI и не
-является native producer.
-
-## Два независимых пути
-
-`qcl-negf-cluster-status --query-base64 TOKEN` запрашивает `qcl.cluster-query.v1` с exact fields:
-
-```json
-{ "schema": "qcl.cluster-query.v1", "request_id": null, "cursor": null, "limit": 64 }
-```
-
-Token — URL-safe base64 JSON, максимум 8 KiB; limit 1–128. Encoding не даёт полномочий. Отсутствуют
-параметры tool/config/file path, SSH target, command, unit, cgroup и caller UID.
-Неизвестные/duplicate fields, неверный role, environment-only identity и чужой cursor отвергаются.
-
-Public Python APIs, installed flat ops layout:
+## Public API и время
 
 ```python
 from cluster_projection import read_cluster_projection, validate_cluster_projection
-read_cluster_projection(*, request_id=None, cursor=None, limit=64)  # -> dict
-validate_cluster_projection(document)  # -> тот же dict или ValueError
+read_cluster_projection(*, request_id=None, cursor=None, limit=64)  # local cache only
+validate_cluster_projection(document)
 from native_monitoring import read_native_status
-read_native_status(*, cursor=None, limit=64)  # только сохранённый snapshot
-from monitoring_runtime import sample_native_status, read_telemetry_storage, maintain_telemetry_storage
+read_native_status(*, cursor=None, limit=64)
+from slurm_context import read_current_context
+read_current_context(*, cursor=None, limit=64)
+from monitoring_runtime import read_telemetry_storage, sample_native_status, maintain_telemetry_storage
 ```
 
-Readonly poll вызывает только public P20-B `read_resource_projection` и читает один protected P31
-cache. Он не запускает sampler, facts/refresh/reconcile, `fleet_health`, qualify, verify-path,
-release activation, NFS probe или solver. Нет scan receipt archives/history, сборки и записи cache
-на poll. `request_id` передаётся в exact B lookup. B DTO валидируется offline по его опубликованной
-schema и сохраняется целиком: P31 не открывает private owner/receipt JSON вторым путём.
+Wire schemas: `qcl.cluster-projection.v2`, `qcl.native-status.v2`, `qcl.telemetry-storage.v2`,
+`qcl.current-context.v1`; protected config — `qcl.monitoring-config.v2`. Closed definitions
+находятся в [cluster-projection.schema.json](../schemas/cluster-projection.schema.json) и
+[monitoring-config.schema.json](../schemas/monitoring-config.schema.json). Config/cache v1
+отвергаются; автоматической legacy migration нет. Actual site values/keys остаются в private config,
+public examples synthetic и disabled.
 
-Opt-in `qcl-negf-monitor-sample` — root systemd oneshot на existing enrolled host/guest. Он читает
-ограниченный native window, обновляет один latest snapshot в `/run/qcl-negf-monitoring`, bounded OOM
-ring и cursor. RuntimeDirectory не обещает сохранность после reboot. Ошибка/timeout оставляет
-прежний snapshot; дальнейший poll показывает stale/unknown. P11 command engine возвращает
-`CommandOutput(str)` с `output_bytes` (stdout + stderr); ошибка — `CommandFailure(record)`. Sampler
-учитывает bytes и failed command, сохраняет исходный failure record и не принимает partial stdout.
-SSH разбирает bounded typed error только после clean completed failure;
-timeout/truncation/неподтверждённый cleanup не дают `stale_cursor` reply. Ни sampler, ни collector
-не входят в Before/RequiredBy/PartOf solver/admission/release. Solver не ждёт telemetry
-HTTP/cleanup/fsync.
+Production poll/pagination читают только защищённый local latest snapshot. Они не делают SSH,
+observer RPC, native probe, P20 lookup, qualification, NFS write, activation, rehash или history
+scan. Controller sampler получает remote cached-observation packets через прежний fixed helper;
+remote observer читает **public** P20 `read_resource_projection` и свой P31 cache. B DTO v1 остаётся
+целым; private receipts/ledger вторым путём не читаются. Exact `request_id` lookup не выполняется из
+cached cluster view: при non-null request_id resource недоступен с reason, а native view остаётся.
+Admission/точный request lookup принадлежат B.
 
-## DTO, время, единицы и cursor
+Controller сохраняет bounded sequence resource pages с opaque B cursors и одинаковыми B state/
+native sample/boot generations. Он прекращает fetch при drift/error/общем deadline/byte budget. Если
+следующая страница не сохранена, view даёт partial + `resource_snapshot_partial`, без ложного next
+cursor. Missing host packet — unknown/null, не нулевой grant и не fresh empty VM list. Root cursor
+связан с config и **всем cached snapshot**, inner resource/native identity тоже проверяется; новый
+snapshot даёт `stale_cursor`. Limit1–128 ограничивает host/context pages; сохранённые nested B pages
+получены sampler с fixed limit64 и ограничены общим output budget.
 
-Output `qcl.cluster-projection.v1` описан в
-[cluster-projection.schema.json](../schemas/cluster-projection.schema.json). Host row содержит
-отдельные `resource`, `native`, `services`, `storage`, `graph_links`, `reasons`. `resource=null`
-означает отсутствие чтения B, не нулевой grant. `native=null` означает недоступный observer, а
-nullable measurements внутри native — отсутствие соответствующего измерения. Malformed observer
-packet даёт partial row и не скрывает остальные hosts. Причины имеют только bounded
-`{code,source_id}`; raw stderr, journal MESSAGE, argv, keys и private paths не выдаются.
+`read_at` — UTC seconds чтения view. `native.observed_at` — исходное native observation time; B
+observed_at — чтение B state, а не live RAM. Source coverage `controller-cache:<sha256(host_id)>`
+отдельно показывает успешный fetch time и controller boot; этот timestamp не освежает native
+measurement. Internal cache хранит controller sampler boot/config generation и remote native
+boot/sample/B state generation. Failed fetch без packet не получает fresh coverage.
 
-`read_at` — UTC Unix seconds формирования cluster ответа. B `observed_at` тоже время чтения B;
-policy/ledger RAM/H/F/O/pool не является текущим RAM measurement. Native/service/storage
-`observed_at` сохраняется со времени sampler; poll его не обновляет. Native host RAM bytes, QEMU RSS
-bytes, assigned/balloon bytes, configured bytes, configured maximum bytes и declared grant не
-взаимозаменяемы. CPU weight — dimensionless native value; vCPU count/online nullable. Source и
-protocol указаны защищённой enrollment, dynamic memory/CPU support из этих чисел не следует.
+Каждое readonly чтение нормализует copy: future timestamp → inconsistent/unknown, истёкший
+fresh_seconds → stale, missing/unsupported не становится fresh. Native/service/storage/context
+observed_at и historical OOM confidence сохраняются. Clock rollback/boot/gap не считаются свежим
+отсутствием событий. RAM total/available, QEMU RSS, assigned/balloon, config max, grant и technical
+allocation/reserve — разные byte величины; CPU weight dimensionless, vCPU count отдельно.
 
-Freshness threshold берётся из protected config. Future native timestamp — inconsistent; старый
-sample/service — stale. Public native read, local observer и cluster aggregate нормализуют
-host/VM/OOM/service coverage на копии при каждом чтении; source timestamps, sample generation и
-confidence исторических events сохраняются. Unknown/unsupported source не превращается в fresh от
-чтения. Stale storage не сообщает persist permission. Wall-clock rollback, boot change и потеря
-cursor не становятся «свежим отсутствием событий». Диагностика OOM разобрана в
-[oom-diagnostics.md](oom-diagnostics.md).
+## Fixed roles и sampler
 
-Outer cursor связывает registry generation, host offset и, при продолжении B page, opaque B cursor,
-B state generation и native sample generation. Изменение relevant generation требует restart page
-(`stale_cursor`). Переход к следующему host — новое независимое наблюдение, не global atomic
-snapshot всех hosts. Journal использует finite lookback/last-N и after-cursor; gap не запускает
-полный history scan. Response bytes/count и command/sample deadlines ограничены независимо от
-научных workloads. Это bounds telemetry buffers/processes, не campaign CPU/RAM/time/attempt quota.
+`qcl-negf-cluster-status --query-base64 TOKEN` использует прежний reader helper. Local context:
 
-## Runtime configuration и роли
+```text
+sudo -n -- /run/current-system/sw/bin/qcl-negf-monitor-context TOKEN
+```
 
-[monitoring-config.json.example](../examples/monitoring-config.json.example) — только synthetic,
-disabled/unqualified fixture, не рабочий inventory. Schema:
-[monitoring-config.schema.json](../schemas/monitoring-config.schema.json). Root site готовит
-`/etc/qcl-negf/monitoring/service.json` (root-owned, no symlink/writable parents, режим 0644, **без
-secret values**). Ключи и known_hosts — отдельные root-protected files. Source/store не содержит
-private inventory, credentials, qualification или measured native acceptance.
+TOKEN — URL-safe base64 closed `qcl.cluster-query.v1`:
+`{"schema":"qcl.cluster-query.v1","request_id":null,"cursor":null,"limit":64}`. Context helper →
+`main('context')`, controller-only, authenticated reader_uid. Ровно один token; нет client-selected
+path/tool/UID/job/unit/target/env. Sudo ancestry связывается с настоящим caller, одного SUDO_UID
+недостаточно. Reader/observer — разные existing nonroot accounts. SSH observer сохраняет restricted
+forced command, P11 strict trust/key checks и фиксированный private key; public read не вызывает
+этот transport.
 
-- `controller`: только выбранные logical targets; native VM/service/cgroup/journal scopes пусты.
-- `native_host`: P20 public read плюс local native sampler, exact backend/node/UUID scopes.
-- `worker`: guest services/cgroups; hypervisor VM inventory и P20 host reads отключены.
+Тот же timer → `qcl-negf-monitor-sample` → `main('sample')` запускает root fixed sampler без args.
+Controller делает enabled current-context RPC и bounded remote cache fetch; native_host/worker —
+прежние native sources. Один volatile `/run/qcl-negf-monitoring/latest.json`, bounded OOM ring, без
+DB/нового daemon. Ошибка оставляет прежний snapshot либо explicit unknown packet; poll покажет
+stale. P11 возвращает `CommandOutput(str)` с combined output_bytes; `CommandFailure(record)`
+учитывается в shared budget, partial stdout не принимается. Typed cursor reply допускается только
+для completed `failure=nonzero`, с прежними exit/cleanup/truncation/bytes guards.
 
-Configured reader/observer — distinct non-root UIDs и accounts, отдельно от grant authority. Local
-reader sudo разрешает только fixed read helper; observer — только observer helper.
-Sampler/maintenance не доступны через query. Реальная sudo process chain, executable, credentials,
-PID birth/cgroup и повторное наблюдение связывают UID; одного `SUDO_UID` мало.
+Sampler/maintenance/collector не входят в Before/RequiredBy/PartOf scientific services. Solver не
+ждёт telemetry HTTP/fsync/cleanup. Timeouts/output bounds и MemoryMax/CPUQuota относятся только к
+техническим services; campaign CPU/RAM/time/attempt quotas не вводятся.
 
-SSH key должен иметь `restrict,command=".../qcl-negf-monitor-ssh-observer"`. Exact original command:
-fixed configured marker `.../qcl-negf-monitor-rpc observe TOKEN`. Ни PTY/forwarding, ни inherited
-agent/interactive password, ни произвольный command не нужны. P11 strict trust transport
-переиспользуется с root-protected preinstalled known_hosts; bytes/key проверяются до и после
-roundtrip. Poll не создаёт trust snapshot. Native helper paths должны быть canonical executable
-root-owned paths; Nix store поддерживает только узкое P12 sticky-store exception. Generic symlink
-или writable tool path не принимается.
+## Slurm current context
 
-`graph_links` задаётся private config: HTTPS, exact same origin, без userinfo/query/fragment.
-Оператор передаёт проверенный URL; P31 не угадывает PVE endpoints из VMID и не читает RRD history.
-Публичные examples не содержат actual endpoint.
+Default disabled. Controller profile сейчас строго `25.11.8`. Native identity:
+`[scontrol, '--version']` и `[scontrol, 'show', 'config']`, только clean completed responses.
+Expected ClusterName из private config сверяется с единственной parsed строкой ClusterName;
+другой/duplicate/missing identity закрывает RPC. Raw config/stderr/CommandFailure record остаются в
+bounded ephemeral memory и не попадают в cache, receipt, log или exception text. Только allowlisted
+cluster/version identity и fixed status/reasons сохраняются в public context.
 
-## NixOS и существующий native host
+Далее fixed
+`squeue --local --array --noheader --states=all --user=<configured numeric UIDs>
+--format=%i|%U|%T|%r|%N`,
+selected simple jobs — `scontrol --oneliner show job ID`. Environment фиксирован: LC_ALL/LANG=C,
+TZ=UTC, SLURM_TIME_FORMAT=standard, protected SLURM_CONF; ambient credentials/Slurm overrides не
+наследуются. Bounds:128 rows/64KiB queue, первые32 simple job details по8KiB, весь context256KiB/5s
+включая stderr. Нет sacct, full show jobs, /proc/cgroup scan, stop proof, private P20 parser/ledger
+или historical archive.
 
-`qclNegf.monitoring.observation.enable` по умолчанию false. Package
-[nix/monitoring.nix](../nix/monitoring.nix) co-locates P31 source/schemas и неизменённый published
-resource source для P20/P11/P12 imports. Existing dedicated users, UID/config/key binding и forced
-SSH key предоставляет site. Module не создаёт enrollment или доверенные credentials.
+Arrays/heterogeneous IDs остаются видимы с unsupported detail; budget/missing/reused job даёт
+partial, не guessed generation. Per-node/per-CPU memory раздельно; unsuffixed native MB в этом
+profile — MiB, unknown dates nullable. Native memory0 (all-node/unbounded semantics) не выдаётся как
+zero bytes: memory nullable, detail partial с `slurm_memory_all_node`. Generation имеет namespace
+observation-only, **не** P20 admission proof; grants нельзя join по job ID. Чистый complete empty
+RPC даёт fresh empty context; failed acquisition сохраняет prior observed_at/jobs с unknown.
+Snapshot из последовательных RPC не объявляется атомарным. Cursor привязан к cached context
+generation/boot/cluster.
 
-`observation.sampler.enable` включает только независимый timer/oneshot; `intervalSeconds` — site
-setting. `storageMaintenance` — отдельный opt-in root retention unit. Sampler ограничен
-MemoryMax/CPUQuota/TimeoutStartSec; его failure не становится зависимостью scientific services. Read
-helper не запускает systemd/native commands.
+## Optional bounded capacity/backing/reserve
 
-[ansible/monitoring.yml](../ansible/monitoring.yml) — opt-in installation source для existing owned
-hosts. Он требует уже установленные Python/jsonschema/referencing и опубликованный P20 source,
-устанавливает own helpers/config и **disabled** unit. Не включает timer/service, не
-bootstrap/install dependencies, не provision quota/disk, не меняет P20 roles/hooks. Playbook
-копирует unchanged P11 protected-file dependency для unprivileged ingress; P20 public read
-исполняется privileged observer из прежнего owning source. Apply, UID collisions, canonical tool
-paths/permissions и SSH isolation проверяет infrastructure owner отдельно.
+Поддержан один native binding `preallocated_loop_linear_v1`: заранее подготовленный Root initialized
+backing file на ext4/linear LVM, loop с explicit hard sizelimit и ext4 filesystem, physical backing
+независимо от выбранных protected scientific devices. Это **optional** binding, не обязательный
+новый filesystem/framework для всей программы. `dedicated_mount` и `project_quota` без native
+producer здесь explicit unsupported. При unqualified/unknown persistence закрыта; readonly
+projection продолжает работать.
 
-## Collector, reserve и retention
+Native producer читает только metadata: no-follow root-owned regular file0600/nlink1/size B и
+allocated blocks; bounded initialized FIEMAP extent coverage без SYNC/holes/shared/unwritten flags;
+read-only LOOP_GET_STATUS64/BLKGETSIZE64, actual loop device↔mount dev↔FS UUID/geometry; LVM
+selected linear segments и sysfs LV→partition→physical WWID graph. Backing profile допускает direct
+PV partition/disk; промежуточный mapper/RAID stack unsupported, даже если верхний LV сообщает
+linear. Scientific graph может включать свой thin mapper. Config identities сверяются с native
+reads, `qualified:true` не существует. `tools.lvs` указывает canonical LVM multicall executable
+(обычно `/usr/sbin/lvm`); fixed subcommand `lvs --readonly --nohints ...`, не writable symlink.
+Missing/unknown/multipath identity, root thin/COW/shared allocation, wrong inode/offset/device,
+mount drift, syscall/tool/budget failure дают unknown. Distinct statvfs/mount сам по себе не proof.
+Science thin-pool data/metadata dependencies входят в выбранный physical graph; полного VM inventory
+scan нет. Science graph shared на том же physical disk не считается независимым.
 
-Existing optional node exporter остаётся отдельным readonly endpoint. Collector сохраняет
-best-effort Vector JSON HTTP `/events`, event bound 16 KiB, memory buffer256/drop_newest/no ack,
-service MemoryMax512M/CPUQuota100%. Это техническая telemetry, отдельная от scientific HDF5. Offline
-exporter `qcl-negf-telemetry-export`/PyArrow продолжает работать с переданными ему данными.
+Root отдельно готовит **собственную** allocation B, реальные initialized extents (одного fallocate с
+UNWRITTEN extents недостаточно), loop/mount identity, root-owned mount и data/state0770
+root:qcl-monitoring. Reserve directory0700 root:root/file0600 содержит initialized allocated R. R
+недоступен collector для unlink/truncate и отличается от free bytes. Data/state/reserve paths не
+перекрываются. Producer ничего не создаёт/не форматирует/не монтирует/не меняет quota. N stage
+устанавливает scope/identity и отсутствие external trim/replacement allocation, сверяет native
+tools/ABI/permissions и проверяет свой disposable scope. Не использовать чужой диск/VM, shared
+scientific thin pool или unknown file как fixture. Actual values не коммитить.
 
-QCL collector получает отдельный непривилегированный writer `qcl-monitoring`, state directory
-`/var/lib/qcl-negf-monitoring-vector`, payload scope `/var/log/qcl-negf-monitoring`. Source
-assertion отвергает объединение с unrelated Vector pipelines/journaldAccess. Existing unrelated
-Vector instance следует привязать отдельно; P31 не берёт его cleanup scope. Root ExecCondition
-разрешает этот file sink лишь после capacity gate и exact destination binding. **В текущем installed
-producer gate unknown/false, поэтому collector persistence не стартует.** HTTP/collector absence
-допустимо: producer не должен блокировать solver при telemetry failure.
+Whole loop FS задаёт hard bytes/inodes bound unprivileged writer; reserve file сохраняет недоступные
+writer блоки. `allocation_bytes` — logical hard allocation size, `allocated_reserve_bytes` —
+allocated protected reserve, `available_bytes` — наблюдавшиеся свободные байты для writer,
+`keep_free_bytes` — snapshot threshold; это не обещание будущего free пространства. При доказанной
+physical независимости `science_charge_bytes=0` только относительно явно выбранных science backings;
+общая свободная ёмкость science shared pool этим не квалифицируется.
 
-Storage view раздельно показывает actual observed fs maximum/used/available/inodes и отсутствие
-backing/reserve proof. JSON `qualified:true`, отдельный mount, свободные байты и age retention не
-доказывают reserve. Project quota в этой версии не читается/не создаётся. Shared/thin backing и
-scientific-output headroom требуют actual native source producer + review; это остаётся followup.
-Новый обязательный filesystem или общий storage framework не вводится.
+Existing own Vector instance: file sink `${allocationMount}/data`, data_dir/state внутри
+`${allocationMount}/state`; buffer256/drop_newest/no ack, event16KiB, MemoryMax512M.
+NoNewPrivileges, empty capabilities, ProtectSystem=strict/PrivateDevices и exact ReadWritePaths
+ограничивают writer. Все durable payload/state внутри hard boundary; sampler/collector stdout/
+stderr null, global journald policy/vacuum не меняется. Manager lifecycle overhead измеряется N.
+Никакие storage directories не создаются module tmpfiles автоматически.
 
-`read_telemetry_storage` не удаляет файлы. Maintenance при unknown/unqualified/full storage не
-prune. В квалифицированной internal fixture ветви retention касается только finite
-`events-YYYY-MM-DD.ndjson`: exact scope/owner, lstat/no symlink/hardlink, same inode/dev/mtime/size,
-не текущий день, age из root config. Foreign sentinel/symlink остаются, truncated enumeration —
-degraded. Runtime `storage.retention_seconds` — authority; старое `collector.retentionDays`
-оставлено для compatibility и не является capacity/retention proof. Никакого global journald
-vacuum/policy, scientific outputs/checkpoints/receipts или unrelated logs cleanup нет.
+Root ExecCondition разрешает persist только после свежего proof и exact writer properties. Existing
+sampler/maintenance при потере proof может stop --no-block **только подтверждённую own
+vector.service**, никогда foreign unit; public query не делает service actions. `persist_permitted`
+— permission, отдельно `collector_state` — наблюдавшийся active/inactive/unknown. Async stop не
+объявляется завершённым; unknown ownership не разрешает stop. Hard allocation изолирует writer между
+samples; внешние административные изменения Root требуют нового reconciliation.
 
-## Проверки и оставшиеся gates
+Retention касается только own finite `events-YYYY-MM-DD.ndjson` в data scope: owner/dev/inode/
+nlink/mtime/size, no symlink, не текущий день. State/reserve/foreign sentinels и scientific outputs
+не читаются/не удаляются. Unknown/full scope не prune. Никакого unrelated/global log vacuum.
 
-L: три owning pytest files и targeted existing telemetry_export/status_journal/P20 projection; Nix
-source evaluation `tests/infrastructure/monitoring.nix` на locked nixpkgs. Fixtures проверяют byte
-units, identity/cursor drift, malformed/large packets, journal gaps, guest counter generation,
-caller/role/token controls, shared/thin/unproved reserve и unrelated sentinel. Они не измеряют
-installed/native tools, latency, resource readiness или OOM на реальной VM.
+## Source, installation и gates
 
-OPEN SOURCE followup: native capacity/backing/reserve producer; proven QEMU birth/death interval для
-observed host-OOM join; supported Slurm current-context adapter (v1 его не опрашивает). N отдельно:
-actual config/UID/SSH, versions/tool paths, measured assigned/RSS/CPU semantics, repeated-poll no
-effects/self-cost, cache/journal continuity и owned safe ENOSPC/collector failure. Никакой real host
-OOM/VM loss не провоцируется; full P31 acceptance остаётся pending.
+[NixOS module](../modules/monitoring.nix) default off: observation/sampler/maintenance/collector
+включаются отдельно. `collector.allocationMount` — optional уже prepared path; missing binding
+остаётся unknown. Site предоставляет existing reader/observer UID/config/key; enrollment и secret
+bootstrap отсутствуют. [Ansible source](../ansible/monitoring.yml) требует prepared dependencies и
+published B/P11; не включает service/timer и не создаёт allocation. Optional collector unit
+сохраняется как `.source`, не заменяет live foreign vector.service; placement/ownership/activation —
+Root gate. HTTPS graph links — exact same-origin private config, endpoints не угадываются и history
+не читается.
+
+L: four owning pytest files с literal ioctl/LVM/sysfs/journal/Slurm protocols, real P11 str/failure
+controls, actual cache freshness, pagination/no-effects и foreign sentinel. Nix source eval
+`tests/infrastructure/monitoring.nix` проверяет disabled defaults/paths/sandbox/independence. Это не
+installed build/boot/latency/backing qualification. N отдельно: actual tools/binary mapping,
+config/UID/trust, prepared allocation capacity/guard/failure/sentinels, structured journal fields,
+current-own Slurm context и repeated-poll cost. Real host OOM/QEMU kill не провоцируется.
+
+| Утверждение                    | Свидетельство                                       | Ограничение                                                       | Решение                |
+| ------------------------------ | --------------------------------------------------- | ----------------------------------------------------------------- | ---------------------- |
+| Poll имеет native side effects | Public path читает только cache                     | Source/L, installed cost ещё N                                    | изменить               |
+| Capacity producer существует   | Native metadata/ioctl/LVM/sysfs path + raw controls | Optional allocation ещё должна пройти N                           | сохранить              |
+| Unit OOM равен QEMU victim     | Разные scope/identity protocols                     | Exact victim capability unsupported                               | данных недостаточно    |
+| Full P31 завершена             | Producers source и foundation API                   | Independent review/N/exact victim requirement/P32 wiring отдельно | дополнительно измерить |

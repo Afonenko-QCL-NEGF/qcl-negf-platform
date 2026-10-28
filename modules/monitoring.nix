@@ -2,6 +2,7 @@
 let
   cfg = config.qclNegf.monitoring;
   monitor = import ../nix/monitoring.nix { inherit pkgs; };
+  allocationMount = if cfg.collector.allocationMount == null then "/var/lib/qcl-negf-monitoring-unqualified" else cfg.collector.allocationMount;
   python = pkgs.python314.withPackages (p: [ p.pyarrow ]);
   exporter = pkgs.writeShellApplication {
     name = "qcl-negf-telemetry-export";
@@ -23,6 +24,7 @@ in {
     };
     collector = {
       enable = lib.mkEnableOption "best-effort Vector HTTP JSON collector on a permanent node";
+      allocationMount = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; description = "Optional already prepared QCL-only bounded mount; never created/provisioned by this module. Unknown proof keeps persistence disabled."; };
       address = lib.mkOption { type = lib.types.str; default = "127.0.0.1"; description = "Trusted-LAN listen address; disabled by default."; };
       port = lib.mkOption { type = lib.types.port; default = 8081; };
       retentionDays = lib.mkOption { type = lib.types.ints.positive; default = 7; description = "Compatibility setting; protected monitoring storage.retention_seconds governs P31 maintenance."; };
@@ -41,7 +43,7 @@ in {
       environment.systemPackages = [ monitor ];
       # No user/key/config is synthesized; the private site owns actual identities.
       security.sudo.extraRules = [
-        { users = [ cfg.observation.readerUser ]; commands = [ { command = "${monitor}/bin/qcl-negf-monitor-read *"; options = [ "NOPASSWD" ]; } ]; }
+        { users = [ cfg.observation.readerUser ]; commands = [ { command = "${monitor}/bin/qcl-negf-monitor-read *"; options = [ "NOPASSWD" ]; } { command = "${monitor}/bin/qcl-negf-monitor-context *"; options = [ "NOPASSWD" ]; } ]; }
         { users = [ cfg.observation.observerUser ]; commands = [ { command = "${monitor}/bin/qcl-negf-monitor-observer *"; options = [ "NOPASSWD" ]; } ]; }
       ];
     })
@@ -56,7 +58,7 @@ in {
           TimeoutStartSec = 310; MemoryMax = "128M"; CPUQuota = "25%";
           ProtectSystem = "strict"; ProtectHome = true; PrivateTmp = true;
           ReadWritePaths = [ "/run/qcl-negf-monitoring" ];
-          NoNewPrivileges = true;
+          NoNewPrivileges = true; StandardOutput = "null"; StandardError = "null";
         };
       };
       systemd.timers.qcl-negf-monitor-sample = {
@@ -71,6 +73,7 @@ in {
           ExecStart = "${monitor}/bin/qcl-negf-monitor-storage";
           TimeoutStartSec = 30; MemoryMax = "128M"; CPUQuota = "25%";
           ProtectHome = true; PrivateTmp = true; NoNewPrivileges = true;
+          StandardOutput = "null"; StandardError = "null";
         };
       };
       systemd.timers.qcl-negf-monitor-storage = {
@@ -90,7 +93,7 @@ in {
       services.vector = {
         enable = true;
         settings = {
-          data_dir = "/var/lib/qcl-negf-monitoring-vector";
+          data_dir = "${allocationMount}/state";
           sources.scientific = {
             type = "http_server";
             address = "${cfg.collector.address}:${toString cfg.collector.port}";
@@ -100,7 +103,7 @@ in {
           };
           sinks.telemetry = {
             type = "file"; inputs = [ "scientific" ];
-            path = "/var/log/qcl-negf-monitoring/events-%Y-%m-%d.ndjson";
+            path = "${allocationMount}/data/events-%Y-%m-%d.ndjson";
             encoding.codec = "json";
             buffer = { type = "memory"; max_events = 256; when_full = "drop_newest"; };
             acknowledgements.enabled = false;
@@ -112,10 +115,20 @@ in {
       systemd.services.vector.serviceConfig = {
         MemoryMax = "512M"; CPUQuota = "100%";
         DynamicUser = lib.mkForce false; User = "qcl-monitoring"; Group = "qcl-monitoring";
-        StateDirectory = lib.mkForce "qcl-negf-monitoring-vector";
+        # All durable collector output/state is inside the prepared hard boundary.
+        StateDirectory = lib.mkForce ""; LogsDirectory = lib.mkForce "";
+        CacheDirectory = lib.mkForce ""; RuntimeDirectory = lib.mkForce "";
+        ProtectSystem = lib.mkForce "strict"; ProtectHome = lib.mkForce true;
+        PrivateDevices = lib.mkForce true; PrivateTmp = lib.mkForce false;
+        NoNewPrivileges = lib.mkForce true; CapabilityBoundingSet = lib.mkForce [];
+        RootDirectory = lib.mkForce ""; RootImage = lib.mkForce "";
+        BindPaths = lib.mkForce []; BindReadOnlyPaths = lib.mkForce [];
+        TemporaryFileSystem = lib.mkForce [];
+        ReadWritePaths = lib.mkForce [ "${allocationMount}/data" "${allocationMount}/state" ];
+        StandardOutput = lib.mkForce "null"; StandardError = lib.mkForce "null";
         ExecCondition = [ "+${monitor}/bin/qcl-negf-monitor-storage-check" ];
       };
-      systemd.tmpfiles.rules = [ "d /var/log/qcl-negf-monitoring 0770 root qcl-monitoring -" ];
+      # No tmpfiles/mount/format: a missing allocation remains an explicit native gate.
       networking.firewall.interfaces.${config.qclNegf.privateInterface}.allowedTCPPorts = [ cfg.collector.port ];
     })
   ];

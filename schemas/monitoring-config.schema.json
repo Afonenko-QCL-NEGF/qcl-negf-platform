@@ -4,7 +4,7 @@
   "properties": {
     "schema": {
       "enum": [
-        "qcl.monitoring-config.v1"
+        "qcl.monitoring-config.v2"
       ]
     },
     "role": {
@@ -57,6 +57,24 @@
           "minLength": 2,
           "maxLength": 1024,
           "pattern": "^/[^\\n\\r\\u0000]+$"
+        },
+        "lvs": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 1024,
+          "pattern": "^/[^\\s\\u0000]+$"
+        },
+        "squeue": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 1024,
+          "pattern": "^/[^\\s\\u0000]+$"
+        },
+        "scontrol": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 1024,
+          "pattern": "^/[^\\s\\u0000]+$"
         }
       },
       "required": [
@@ -64,7 +82,10 @@
         "systemctl",
         "journalctl",
         "pvesh",
-        "virsh"
+        "virsh",
+        "lvs",
+        "squeue",
+        "scontrol"
       ]
     },
     "targets": {
@@ -258,6 +279,64 @@
         },
         "journal": {
           "type": "boolean"
+        },
+        "units": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "unit_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+              },
+              "unit": {
+                "type": "string",
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.@-]*\\.(scope|service)$"
+              },
+              "vm_id": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "manager_executable": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 1024,
+                "pattern": "^/[^\\s\\u0000]+$"
+              }
+            },
+            "required": [
+              "unit_id",
+              "unit",
+              "vm_id",
+              "manager_executable"
+            ]
+          }
+        },
+        "manager_version": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -269,7 +348,9 @@
         "vms",
         "services",
         "cgroups",
-        "journal"
+        "journal",
+        "units",
+        "manager_version"
       ]
     },
     "bounds": {
@@ -336,7 +417,8 @@
           "enum": [
             "unqualified",
             "dedicated_mount",
-            "project_quota"
+            "project_quota",
+            "preallocated_loop_linear_v1"
           ]
         },
         "directory": {
@@ -392,6 +474,145 @@
               "type": "null"
             }
           ]
+        },
+        "allocation": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "backing_file": {
+                  "type": "string",
+                  "minLength": 2,
+                  "maxLength": 1024,
+                  "pattern": "^/[^\\s\\u0000]+$"
+                },
+                "loop_device": {
+                  "type": "string",
+                  "minLength": 2,
+                  "maxLength": 1024,
+                  "pattern": "^/[^\\s\\u0000]+$"
+                },
+                "mount_path": {
+                  "type": "string",
+                  "minLength": 2,
+                  "maxLength": 1024,
+                  "pattern": "^/[^\\s\\u0000]+$"
+                },
+                "data_dir": {
+                  "type": "string",
+                  "minLength": 2,
+                  "maxLength": 1024,
+                  "pattern": "^/[^\\s\\u0000]+$"
+                },
+                "state_dir": {
+                  "type": "string",
+                  "minLength": 2,
+                  "maxLength": 1024,
+                  "pattern": "^/[^\\s\\u0000]+$"
+                },
+                "reserve_file": {
+                  "type": "string",
+                  "minLength": 2,
+                  "maxLength": 1024,
+                  "pattern": "^/[^\\s\\u0000]+$"
+                },
+                "backing_lv_uuid": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9]{6}(?:-[A-Za-z0-9]{4}){5}-[A-Za-z0-9]{6}$"
+                },
+                "backing_vg_uuid": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9]{6}(?:-[A-Za-z0-9]{4}){5}-[A-Za-z0-9]{6}$"
+                },
+                "filesystem_uuid": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$"
+                },
+                "maximum_bytes": {
+                  "type": "integer",
+                  "minimum": 4096,
+                  "maximum": 9223372036854775807,
+                  "multipleOf": 4096
+                },
+                "reserve_bytes": {
+                  "type": "integer",
+                  "minimum": 4096,
+                  "maximum": 9223372036854775807,
+                  "multipleOf": 4096
+                },
+                "host_keep_free_bytes": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9223372036854775807
+                },
+                "physical_ids": {
+                  "type": "array",
+                  "maxItems": 16,
+                  "items": {
+                    "type": "string",
+                    "pattern": "^wwid:[A-Za-z0-9_.:-]{1,256}$"
+                  }
+                },
+                "science_devices": {
+                  "type": "array",
+                  "maxItems": 32,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "device": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9223372036854775807
+                      },
+                      "lv_uuid": {
+                        "type": "string",
+                        "pattern": "^[A-Za-z0-9]{6}(?:-[A-Za-z0-9]{4}){5}-[A-Za-z0-9]{6}$"
+                      },
+                      "vg_uuid": {
+                        "type": "string",
+                        "pattern": "^[A-Za-z0-9]{6}(?:-[A-Za-z0-9]{4}){5}-[A-Za-z0-9]{6}$"
+                      },
+                      "physical_ids": {
+                        "type": "array",
+                        "maxItems": 16,
+                        "items": {
+                          "type": "string",
+                          "pattern": "^wwid:[A-Za-z0-9_.:-]{1,256}$"
+                        }
+                      }
+                    },
+                    "required": [
+                      "device",
+                      "lv_uuid",
+                      "vg_uuid",
+                      "physical_ids"
+                    ]
+                  }
+                }
+              },
+              "required": [
+                "backing_file",
+                "loop_device",
+                "mount_path",
+                "data_dir",
+                "state_dir",
+                "reserve_file",
+                "backing_lv_uuid",
+                "backing_vg_uuid",
+                "filesystem_uuid",
+                "maximum_bytes",
+                "reserve_bytes",
+                "host_keep_free_bytes",
+                "physical_ids",
+                "science_devices"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -402,7 +623,8 @@
         "retention_seconds",
         "minimum_inodes",
         "device",
-        "quota_project"
+        "quota_project",
+        "allocation"
       ]
     },
     "graph_links": {
@@ -440,6 +662,55 @@
           "origin"
         ]
       }
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "cluster_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "owner_uids": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2147483647
+          }
+        },
+        "slurm_conf": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 1024,
+          "pattern": "^/[^\\s\\u0000]+$"
+        },
+        "version_profile": {
+          "enum": [
+            "25.11.8"
+          ]
+        }
+      },
+      "required": [
+        "enabled",
+        "cluster_id",
+        "owner_uids",
+        "slurm_conf",
+        "version_profile"
+      ]
     }
   },
   "required": [
@@ -452,7 +723,8 @@
     "scopes",
     "bounds",
     "storage",
-    "graph_links"
+    "graph_links",
+    "context"
   ],
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://qcl.invalid/schemas/monitoring-config.schema.json"

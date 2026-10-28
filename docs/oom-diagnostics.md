@@ -1,64 +1,69 @@
 # OOM: источники, привязка и пределы вывода
 
-OOM DTO служит диагностике. Он не меняет grants/Slurm state, не возобновляет VM/job и не принимает
-научный результат по exit code. `137`, исчезновение VM и слово qemu сами по себе не доказывают OOM.
+OOM DTO диагностический: он не меняет grants/Slurm, не возобновляет VM/job и не принимает научный
+результат. Exit137, исчезновение VM, слово qemu и matching PID/unit сами по себе OOM не доказывают.
 
-| Cause                  | Необходимое первичное свидетельство                                                 | Что остаётся неизвестным                                      |
-| ---------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------------------- |
-| `host_kernel_qemu_oom` | kernel OOM kill + enrolled VM/PID birth и доказанный interval в том же boot         | Guest memory/cgroup cause и scientific acceptance             |
-| `guest_cgroup_oom`     | рост exact guest allocation `memory.events:oom_kill` в том же boot/inode/generation | Только baseline без previous snapshot не датирует OOM         |
-| `systemd_oomd`         | native oomd event + exact bound target cgroup/VM                                    | Это отдельная userspace pressure action, не kernel OOM        |
-| `unknown_vm_loss`      | ранее running VM больше не наблюдается и нет связанного kill evidence               | Это может быть observation failure/stop/reboot/другая причина |
-| `unknown`              | событие видно, но identity/time/scope join не доказан                               | Не подменяется guessed VM identity                            |
+| Cause                    | Первичное свидетельство                                                | Предел вывода                                                                 |
+| ------------------------ | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| `native_unit_kernel_oom` | Trusted systemd manager MESSAGE_ID + boot/UNIT/INVOCATION_ID           | Kernel oom_kill затронул unit; victim process/global host pressure неизвестны |
+| `native_unit_oomd`       | Отдельный structured unit OOMD MESSAGE_ID                              | Userspace pressure action в unit, не kernel OOM/QEMU victim                   |
+| `guest_cgroup_oom`       | Рост exact guest memory.events oom_kill в том же boot/inode/generation | Baseline/reset/reboot не датируют новый OOM                                   |
+| `host_kernel_qemu_oom`   | Exact durable QEMU lifetime + kernel victim join                       | Current native profile **unsupported**, runtime не производит этот диагноз    |
+| `systemd_oomd`           | Exact bound victim cgroup/lifetime                                     | Current exact QEMU join unsupported; unit event имеет отдельный cause выше    |
+| `unknown_vm_loss`        | Running VM перестала наблюдаться без bound kill evidence               | Может быть failure observation/stop/reboot/другая причина                     |
+| `unknown`                | Journal indication без доказанного identity/time join                  | VM/victim не угадываются                                                      |
 
-Event содержит event_id, cause/scope, nullable
-VM/workload/host_boot_id/guest_boot_id/time/generation, source_id, confidence и bounded reasons. Raw
-journal MESSAGE, чужие argv/PID command lines, credentials и log storage paths не выходят наружу.
-Kernel и oomd conflict в одном bound interval имеет confidence `indication`; отсутствие данных —
-`unknown`.
+Native v2 `capabilities` раздельно сообщает `systemd_manager_unit_oom` и `kernel_qemu_victim_join`.
+Последняя explicit unsupported/`lifetime_protocol_unavailable` для текущих PVE/libvirt profiles.
+Internal qmeventd peer PIDFD не durable public lifetime; PVE scope может содержать helpers. Scope
+end/MainPID/last sampled start tick не исключают PID reuse и не доказывают QEMU birth/death
+interval. Positive literal interval classifier — test oracle, не native producer. Это оставшийся
+SOURCE gap полной P31, а не только пропущенная N проверка.
 
-## Реализованный native foundation
+## Structured unit protocol
 
-Host `/proc/meminfo` MemTotal/MemAvailable нормируется kB×1024, boot читается до/после. PVE config
-memory/balloon — MiB×1048576; status balloon — bytes; `status.mem` не используется как RSS или
-assigned bytes. Scoped PVE PID читается без /proc scan, UUID argv и start ticks проверяются
-до/после. Libvirt XML units разбираются явно, UUID сверяется, DOCTYPE/ENTITY отвергается.
-`dommemstat actual` и `rss` — KiB×1024; currentMemory и maximum остаются отдельными полями. Libvirt
-PID/birth здесь не измеряется; vCPU online/hotplug completeness не предполагается.
+Supported manager profile — systemd257.13 с exact expected installed version transcript в private
+config. Source upstream version сам по себе installed binary/patch mapping не квалифицирует. Native
+sampler читает fixed `systemctl --version` и выбранные `show` Id/ControlGroup/InvocationID до/после
+journal window; missing/mismatch/cycle drift закрывают current association. Root-protected unit
+bindings указывают logical unit/native unit/expected manager executable и optional enrolled VM.
+Current VM association требует отдельного valid native VM observation; она не делает killed process
+QEMU.
 
-Exact native protocol transcript/version и enrollment задаёт protected site config. Несовпадение
-version даёт failure, missing qualification — unsupported. Services читаются только allowlisted
-`systemctl show` с fixed property list. Guest cgroup — protected exact path, boot/inode/ctime и
-allocation generation; baseline/counter reset/recreation не создаёт нового OOM event.
+Journal поля bounded: MESSAGE_ID, UNIT, INVOCATION_ID, _PID/_UID/_COMM/_EXE, _BOOT_ID,
+__MONOTONIC_TIMESTAMP, __REALTIME_TIMESTAMP, __CURSOR. Нужны manager PID1/root/systemd, exact
+configured executable/boot/unit, valid invocation и monotonic time не позже sample.
+`_SYSTEMD_INVOCATION_ID` sender не заменяет target `INVOCATION_ID`.
 
-Journal query — current boot, kernel transport/oomd service, finite last-N и lookback +
-after-cursor. Cursor vacuum/error даёт `journal_gap`, без полного history fallback. Initial/gap
-window не объявляет всю историю полной. Ring bounded, volatile snapshot теряется после reboot;
-telemetry retention не обещает incident evidence вне наблюдавшегося window.
+`fe6faa94e7774663a0da52717891d8ef` — unit kernel oom_kill counter message;
+`d989611b15e44c9dbf31e3c81256e4ed` — unit OOMD message. Historical invocation сохраняет observed
+unit event с vm_id=null, если current association к нему не подтверждена. Event содержит nullable
+unit_id/unit_invocation_id, victim_kind=unknown, boot/time/generation/confidence и fixed reasons.
+Raw MESSAGE, argv, credentials/private paths не выдаются. Только trusted kernel record без lifetime
+остаётся unknown; никакой matching PID/unit fallback не включается.
 
-**В v1 runtime нет producer доказанного PID death interval.** Последний sampled start tick не
-исключает reuse PID между samples. Поэтому runtime не передаёт такой guessed interval как proof в
-journal classifier: host QEMU kernel/OOMD события остаются identity-unbound/unknown, VM
-disappearance — unknown_vm_loss. Classifier observed/indication ветви покрыты literal fixtures с
-явным interval; это не N acceptance и не автоматический диагноз настоящего инцидента. Нужен узкий
-owning followup с native interval source; reading private P20 receipt или whole process/history scan
-не заменяет его.
+Journal query finite: current boot, last-N/lookback/after-cursor. Cursor vacuum/error → gap; нет
+whole history fallback. Initial/truncated window не объявляется complete. Ring volatile;
+restart/reboot/retention не обещают evidence за пределами наблюдавшегося window. Public чтение
+демотирует stale/future coverage, сохраняет event timestamp/generation/confidence.
 
-## Безопасная последовательность N acceptance
+## Остальные native измерения и приёмка
 
-Infrastructure owner сверяет installed source с опубликованным freeze и actual protected config:
-logical host/VM UUID, machine/boot, native tool/version, reader/observer UID и SSH restrictions.
-Затем на owned disposable scope измеряет byte mapping, repeated-poll latency/no effects, journal
-cursor/gaps и guest cgroup identity. Failure-control collector ENOSPC требует отдельного owned
-telemetry allocation и backing/reserve producer; чужие/shared logs не используются как fixture.
+Host MemTotal/MemAvailable — kB×1024, boot проверяется до/после. PVE config memory/balloon — MiB;
+status balloon — bytes; mem не выдаётся как RSS/assigned. Scoped QEMU PID/UUID argv/start ticks
+проверяются до/после без process scan. Libvirt XML units/UUID explicit, DOCTYPE/ENTITY rejected;
+dommemstat actual/rss — KiB, current/max memory отдельно, PID lifetime неизвестен. Services — только
+selected fixed properties. Guest cgroup baseline/delta связан с boot/inode/allocation.
 
-Сопоставление настоящего OOM допустимо по уже согласованному bounded incident evidence или
-безопасному disposable fixture. Synthetic logs не доказывают runtime. Не провоцировать host OOM,
-QEMU kill, stop occupied worker или потерю старых scientific outputs ради этой проверки.
+Infrastructure owner отдельно проверяет installed source/config/version, manager journal trusted
+fields и unit invocation. Literal fields не доказывают настоящий инцидент. Native acceptance
+использует harmless own scope или уже согласованный bounded incident evidence; не провоцировать host
+OOM/QEMU kill, не останавливать occupied worker, не читать scientific payload ради диагностики.
+Collector reserve/ENOSPC — только own qualified allocation по [monitoring](monitoring.md).
 
-| Утверждение                                              | Свидетельство                             | Ограничение                                | Решение                |
-| -------------------------------------------------------- | ----------------------------------------- | ------------------------------------------ | ---------------------- |
-| RSS/balloon/config/grant можно сравнивать как одно число | Разные native byte sources и B ledger     | Разная семантика и timestamps              | изменить               |
-| Исчезновение VM доказывает kernel OOM                    | Только last-seen/observation loss         | Cause не связан первичным evidence         | данных недостаточно    |
-| Guest OOM delta доступна без history scan                | Exact same-generation memory.events delta | Baseline/reboot/reset не датирует событие  | сохранить              |
-| Host-QEMU diagnosis полностью реализован                 | Literal classifier + sampled PID birth    | Proven death interval producer отсутствует | дополнительно измерить |
+| Утверждение                             | Свидетельство                             | Ограничение                                       | Решение             |
+| --------------------------------------- | ----------------------------------------- | ------------------------------------------------- | ------------------- |
+| Unit OOM можно наблюдать отдельно       | Structured manager message + invocation   | Installed mapping и N pending                     | сохранить           |
+| Unit OOM доказывает QEMU victim         | Scope может содержать helpers             | Durable victim protocol отсутствует               | изменить            |
+| Guest OOM delta не требует history scan | Exact same-generation counter delta       | Baseline не датирует событие                      | сохранить           |
+| Полная host-QEMU attribution готова     | Только sampled birth и literal classifier | Runtime capability unsupported; SOURCE gap открыт | данных недостаточно |

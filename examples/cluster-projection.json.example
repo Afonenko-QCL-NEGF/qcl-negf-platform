@@ -1,5 +1,5 @@
 {
-  "schema": "qcl.cluster-projection.v1",
+  "schema": "qcl.cluster-projection.v2",
   "read_at": 100,
   "status": "partial",
   "registry_generation": "registry-synthetic",
@@ -30,7 +30,7 @@
         "next_cursor": null
       },
       "native": {
-        "schema": "qcl.native-status.v1",
+        "schema": "qcl.native-status.v2",
         "observed_at": 100,
         "host_id": "host-a",
         "host_boot_id": "boot-synthetic",
@@ -63,11 +63,41 @@
           "reasons": []
         },
         "complete": true,
-        "next_cursor": null
+        "next_cursor": null,
+        "capabilities": {
+          "kernel_qemu_victim_join": {
+            "source_id": "kernel_qemu_victim_join",
+            "status": "unsupported",
+            "observed_at": null,
+            "host_boot_id": null,
+            "generation": null,
+            "complete": false,
+            "reasons": [
+              {
+                "code": "lifetime_protocol_unavailable",
+                "source_id": "kernel_qemu_victim_join"
+              }
+            ]
+          },
+          "systemd_manager_unit_oom": {
+            "source_id": "systemd_manager_unit_oom",
+            "status": "unsupported",
+            "observed_at": null,
+            "host_boot_id": null,
+            "generation": null,
+            "complete": false,
+            "reasons": [
+              {
+                "code": "unit_protocol_not_measured",
+                "source_id": "systemd_manager_unit_oom"
+              }
+            ]
+          }
+        }
       },
       "services": [],
       "storage": {
-        "schema": "qcl.telemetry-storage.v1",
+        "schema": "qcl.telemetry-storage.v2",
         "status": "unknown",
         "binding_kind": "unqualified",
         "maximum_bytes": null,
@@ -76,14 +106,19 @@
         "keep_free_bytes": null,
         "inodes_available": null,
         "retention_seconds": null,
-        "persist_enabled": false,
         "observed_at": 100,
         "reasons": [
           {
             "code": "capacity_not_qualified",
             "source_id": "telemetry"
           }
-        ]
+        ],
+        "persist_permitted": false,
+        "allocation_bytes": null,
+        "allocated_reserve_bytes": null,
+        "science_charge_bytes": null,
+        "capacity_generation": null,
+        "collector_state": "unknown"
       },
       "graph_links": [],
       "reasons": []
@@ -104,5 +139,6 @@
       }
     ],
     "reasons": []
-  }
+  },
+  "current_context": null
 }

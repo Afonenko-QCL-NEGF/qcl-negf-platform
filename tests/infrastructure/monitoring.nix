@@ -10,7 +10,7 @@ let
       fileSystems."/" = { device = "/dev/disk/by-label/synthetic-root"; fsType = "ext4"; };
       qclNegf.privateInterface = "cluster0";
       qclNegf.monitoring = {
-        nodeExporter = enabled; collector.enable = enabled;
+        nodeExporter = enabled; collector = { enable = enabled; allocationMount = "/owned/synthetic-telemetry"; };
         observation = { enable = enabled; sampler.enable = enabled; };
       };
     } ];
@@ -31,7 +31,15 @@ assert enabled.systemd.services.vector.serviceConfig.ExecCondition != [];
 assert !enabled.systemd.services.vector.serviceConfig.DynamicUser;
 assert enabled.systemd.services.vector.serviceConfig.User == "qcl-monitoring";
 assert !enabled.services.vector.journaldAccess;
-assert enabled.services.vector.settings.data_dir == "/var/lib/qcl-negf-monitoring-vector";
+assert enabled.systemd.services.vector.serviceConfig.StateDirectory == "";
+assert enabled.systemd.services.vector.serviceConfig.LogsDirectory == "";
+assert enabled.systemd.services.vector.serviceConfig.ProtectSystem == "strict";
+assert enabled.systemd.services.vector.serviceConfig.PrivateDevices;
+assert enabled.systemd.services.vector.serviceConfig.ReadWritePaths == [ "/owned/synthetic-telemetry/data" "/owned/synthetic-telemetry/state" ];
+assert enabled.systemd.services.vector.serviceConfig.StandardOutput == "null";
+assert enabled.systemd.services.qcl-negf-monitor-sample.serviceConfig.StandardOutput == "null";
+assert builtins.any (rule: builtins.any (cmd: builtins.match ".*qcl-negf-monitor-context.*" cmd.command != null) rule.commands) enabled.security.sudo.extraRules;
+assert enabled.services.vector.settings.data_dir == "/owned/synthetic-telemetry/state";
 assert enabled.services.vector.settings.sources.scientific.path == "/events";
 assert enabled.services.vector.settings.sources.scientific.framing.newline_delimited.max_length == 16384;
 assert enabled.services.vector.settings.sinks.telemetry.buffer.type == "memory";
