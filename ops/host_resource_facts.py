@@ -276,7 +276,7 @@ class NativeFactsProvider:
         require(set(enrolled)=={vm.vm_id for vm in self.policy.vms} and all(
             enrolled[vm.vm_id]['maximum_bytes']==vm.maximum_bytes for vm in self.policy.vms),
             'capacity_evidence','enrollment/native maxima must match policy exactly')
-        rows=self.sources.inventory(self.backend)
+        rows=self.sources.inventory(getattr(self.backend,'native_backend',self.backend))
         qemu={str(p['pid']) for p in self.sources.processes() if 'qemu-system-' in Path(p['executable']).name or Path(p['executable']).name in {'kvm','qemu-kvm'}}
         validate_inventory(rows,enrolled,agreement['foreign'],foreign_budget=self.policy.reserves.foreign_max_bytes,observed_qemu_pids=qemu)
         after=self.sources.host()
@@ -365,7 +365,10 @@ class NativeFactsProvider:
         evidence=HostEvidence(self.policy.host_id,self.policy.owner_id,host['boot_id'],policy_digest(self.policy),int(self.clock()),
             host['MemTotal'],self.policy.reserves.foreign_max_bytes,self.policy.capacity_evidence_ref,self.policy.owned_pool.agreement_ref,
             True,True,host['MemAvailable']>=self.policy.reserves.safety_bytes,fingerprint([host,rows,guests]),tuple(bindings),tuple(qualifications),live)
-        self.last=(evidence,guests);self._persist(evidence,guests)
+        self.last=(evidence,guests)
+        proofs=getattr(self,'native_proofs',None)
+        if proofs is not None:proofs.validate_state(owner_state,evidence=evidence)
+        self._persist(evidence,guests)
         return evidence
     def _persist(self,evidence,guests):
         # One bounded probe cache for status/RootNativeBoundary, not another grant ledger.
@@ -404,10 +407,10 @@ class NativeFactsProvider:
         return CompletionEvidence(req['vm_id'],g['identity_before']['boot_id'],req['workload_id'],g['observed_at'],0,True,True,
             g['memory']['MemTotal'],g['memory']['MemAvailable'],tuple(self.last[0].live_workloads[req['vm_id']]))
     def cleanup(self,request_id,*,owner_state):
-        # No installed backend task/lock protocol is qualified by this source alone.
-        # systemd inactive, matching RAM and CLI exit NEVER mint cleanup evidence.
-        # Existing typed administrative boundary remains available for exact proof.
-        return None
+        proofs=getattr(self,'native_proofs',None)
+        if proofs is None:return None
+        require(self.last is not None,'incomplete_probe','fresh native facts required before cleanup')
+        return proofs.cleanup(request_id,owner_state=owner_state,evidence=self.last[0])
 
 
 def scan_job_group(path,scope,processes):

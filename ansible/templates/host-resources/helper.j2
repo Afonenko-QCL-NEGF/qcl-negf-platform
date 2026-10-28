@@ -1,3 +1,3 @@
 #!/bin/sh
 # Root-owned fixed role. No user PYTHONPATH/current-directory imports.
-exec {{ qcl_resource_python | quote }} -I -c 'import sys; sys.path.insert(0,"/usr/local/lib/qcl-negf-host-resources"); {% if item == "start-hook" %}import host_resource_startup as m; sys.exit(m.hook_main()){% elif item == "admin" %}import host_resource_startup as m; sys.exit(m.admin_main()){% else %}import host_resource_service as m; sys.exit(m.main("{{ item }}")){% endif %}' "$@"
+exec {{ qcl_resource_python | quote }} -I -c 'import sys; sys.path.insert(0,"/usr/local/lib/qcl-negf-host-resources"); {% if item == "start-hook" %}import host_resource_startup as m; sys.exit(m.hook_main()){% elif item == "admin" %}import host_resource_startup as m; sys.exit(m.admin_main()){% elif item == "native-exec" %}import host_resource_native_cleanup as m; sys.exit(m.native_exec_main()){% else %}import host_resource_service as m; sys.exit(m.main("{{ item }}")){% endif %}' "$@"

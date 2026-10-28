@@ -131,11 +131,13 @@ class ProxmoxVM:
 class ProxmoxMemoryBackend:
     quantum_bytes = 1024**2
 
-    def __init__(self, runner, tool, node, vms, *, dynamic):
+    def __init__(self, runner, tool, node, vms, *, dynamic, local_only=False):
         require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", node or "") is not None,
                 "argv", "invalid Proxmox node")
         require(Path(tool).is_absolute(), "argv", "absolute pvesh path required")
         self.runner, self.tool, self.node, self.vms, self.dynamic = runner, tool, node, dict(vms), dynamic
+        require(type(local_only) is bool, "shape", "local_only must be explicit bool")
+        self.local_only = local_only
         for vm in self.vms.values():
             require(type(vm) is ProxmoxVM, "shape", "Proxmox enrollment required")
             integer(vm.vmid, "vmid", 1)
@@ -149,7 +151,7 @@ class ProxmoxMemoryBackend:
         return f"/nodes/{self.node}/qemu/{self.vms[vm_id].vmid}"
 
     def _run(self, arguments, timeout=30):
-        return self.runner.run([self.tool, *arguments, "--output-format", "json"],
+        return self.runner.run([self.tool, *(["--noproxy"] if self.local_only else []), *arguments, "--output-format", "json"],
                                timeout_seconds=timeout, max_output_bytes=MAX_OUTPUT_BYTES)
 
     def runtime_version(self):
@@ -188,9 +190,17 @@ class ProxmoxMemoryBackend:
         require(target_bytes % self.quantum_bytes == 0, "rounding", "PVE target must be full MiB")
         actual = self.readback(vm_id)
         require(actual == before and actual.running, "identity_mismatch", "PVE state changed before mutation")
-        self._run(["set", self._path(vm_id) + "/config", "--balloon",
-                   str(target_bytes // self.quantum_bytes), "--digest", before.revision], timeout_seconds)
+        self.runner.run(self.mutation_argv(vm_id, target_bytes, before), timeout_seconds=timeout_seconds,
+                        max_output_bytes=MAX_OUTPUT_BYTES)
         return self.readback(vm_id)
+
+    def mutation_argv(self, vm_id, target_bytes, before):
+        require(self.dynamic, "unsupported", "fixed reservation is never ballooned")
+        integer(target_bytes, "target_bytes", 1)
+        require(target_bytes % self.quantum_bytes == 0, "rounding", "PVE full MiB target required")
+        return (self.tool, *(("--noproxy",) if self.local_only else ()), "set", self._path(vm_id) + "/config",
+                "--balloon", str(target_bytes // self.quantum_bytes), "--digest", before.revision,
+                "--output-format", "json")
 
 
 @dataclass(frozen=True)
@@ -216,10 +226,11 @@ def libvirt_config_fingerprint(xml):
 class LibvirtMemoryBackend:
     quantum_bytes = 1024
 
-    def __init__(self, runner, tool, uri, vms, *, dynamic):
+    def __init__(self, runner, tool, uri, vms, *, dynamic, connect_endpoint=None):
         require(uri == "qemu:///system", "unsupported", "only authenticated local system libvirt supported")
         require(Path(tool).is_absolute(), "argv", "absolute virsh path required")
         self.runner, self.tool, self.uri, self.vms, self.dynamic = runner, tool, uri, dict(vms), dynamic
+        self.connect_endpoint = uri if connect_endpoint is None else connect_endpoint
         for vm in self.vms.values():
             require(type(vm) is LibvirtVM and re.fullmatch(r"[0-9a-fA-F-]{36}", vm.native_id) and
                     re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", vm.name),
@@ -230,8 +241,20 @@ class LibvirtMemoryBackend:
                 len(set(pid_files)) == len(pid_files),
                 "ownership", "one logical VM must identify one distinct domain/process")
 
+    @property
+    def connect_endpoint(self):
+        return self._connect_endpoint
+
+    @connect_endpoint.setter
+    def connect_endpoint(self, value):
+        require(type(value) is str and value in {"qemu:///system",
+                "qemu+unix:///system?socket=%2Frun%2Flibvirt%2Flibvirt-sock",
+                "qemu+unix:///system?socket=%2Frun%2Flibvirt%2Fvirtqemud-sock"},
+                "qualification", "exact local system libvirt endpoint required")
+        self._connect_endpoint = value
+
     def _run(self, arguments, timeout=30):
-        return self.runner.run([self.tool, "--connect", self.uri, *arguments],
+        return self.runner.run([self.tool, "--connect", self.connect_endpoint, *arguments],
                                timeout_seconds=timeout, max_output_bytes=MAX_OUTPUT_BYTES)
 
     def runtime_version(self):
@@ -295,9 +318,16 @@ class LibvirtMemoryBackend:
         require(target_bytes % self.quantum_bytes == 0, "rounding", "libvirt target must be full KiB")
         actual = self.readback(vm_id)
         require(actual == before and actual.running, "identity_mismatch", "libvirt state changed before mutation")
-        self._run(["setmem", self._vm(vm_id).native_id, str(target_bytes // 1024), "--live", "--config"],
-                  timeout_seconds)
+        self.runner.run(self.mutation_argv(vm_id, target_bytes, before), timeout_seconds=timeout_seconds,
+                        max_output_bytes=MAX_OUTPUT_BYTES)
         return self.readback(vm_id)
+
+    def mutation_argv(self, vm_id, target_bytes, before):
+        require(self.dynamic, "unsupported", "fixed reservation is never ballooned")
+        integer(target_bytes, "target_bytes", 1)
+        require(target_bytes % self.quantum_bytes == 0, "rounding", "libvirt full KiB target required")
+        return (self.tool, "--connect", self.connect_endpoint, "setmem", self._vm(vm_id).native_id,
+                str(target_bytes // self.quantum_bytes), "--live", "--config")
 
 
 def backend_from_config(config, runner, *, dynamic):

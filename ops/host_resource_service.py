@@ -146,13 +146,30 @@ def open_service():
     boundary=RootNativeBoundary(config['runtime']);policy,store,backend=boundary.open_owner()
     facts={**config['facts'],'backend_config':boundary.config['backend_config'],'state_directory':str(store.directory),
         'evidence':boundary.config['evidence'],'qualification':boundary.config['qualification'],'client_uid':config['client_uid']}
-    require(facts['readback_version']=='qcl.native-memory.fixed.v1','qualification','production readback protocol changed')
+    dynamic=policy.active_grant.mechanism=='qualified_dynamic'
+    expected='qcl.native-memory.balloon.v1' if dynamic else 'qcl.native-memory.fixed.v1'
+    require(facts['readback_version']==expected,'qualification','production readback protocol changed')
     tools=[boundary.config['backend_config']['tool'],*config['tools']]
-    runner=NativeCommandRunner(tools);provider=NativeFactsProvider(policy,facts,backend,runner)
-    # First production supported lane is fixed full maximum. A missing native
-    # task/lock cleanup proof producer is a SOURCE gap, never a qualified pass.
-    require(policy.active_grant.mechanism=='conservative_reservation','native_mutation_protocol',
-        'dynamic backend task/lock proof adapter is not implemented; full paid fixed maximum required')
+    proofs=None
+    if dynamic:
+        from host_resource_native_cleanup import (decode_config,NativeCleanupSources,
+            NativeMutationProofs,QualifiedMutationBackend)
+        from host_resource_backends import ProxmoxMemoryBackend,LibvirtMemoryBackend
+        cleanup=decode_config(config.get('native_cleanup'))
+        if type(backend) is ProxmoxMemoryBackend:
+            require(cleanup['protocol_id']=='pve-local-put-balloon-v1','qualification','PVE protocol mismatch')
+            backend.local_only=True
+        else:
+            require(type(backend) is LibvirtMemoryBackend and cleanup['protocol_id']=='libvirt-local-setmem-v1',
+                'qualification','local libvirt protocol required')
+        tools.append(cleanup['helper'])
+        runner=NativeCommandRunner(tools)
+        proofs=NativeMutationProofs(policy,store,backend,cleanup,runner,
+            sources=NativeCleanupSources(config,runner))
+        backend=QualifiedMutationBackend(backend,proofs)
+    else:runner=NativeCommandRunner(tools)
+    provider=NativeFactsProvider(policy,facts,backend,runner)
+    if proofs is not None:provider.native_proofs=proofs
     controller=HostResourceController(policy,store,backend)
     return NativeResourceService(controller,provider)
 

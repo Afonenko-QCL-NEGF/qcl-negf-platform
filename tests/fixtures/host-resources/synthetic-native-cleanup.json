@@ -1,0 +1,1087 @@
+{
+  "schema": "qcl.synthetic-native-cleanup-fixtures.v1",
+  "synthetic": true,
+  "note": "Synthetic source/peer/root facts only. No native qualification, inventory or scientific data.",
+  "cases": [
+    {
+      "protocol_id": "pve-local-put-balloon-v1",
+      "config": {
+        "schema": "qcl.host-resource-native-cleanup-config.v1",
+        "helper": "/protected/native-exec",
+        "qualification": "/protected/qualifications",
+        "protocol_id": "pve-local-put-balloon-v1"
+      },
+      "qualification_bundle": {
+        "schema": "qcl.host-resource-native-mutation-qualifications.v1",
+        "profiles": [
+          {
+            "schema": "qcl.host-resource-native-mutation-qualification.v1",
+            "protocol_id": "pve-local-put-balloon-v1",
+            "host_id": "synthetic-host",
+            "owner_id": "synthetic-owner",
+            "host_boot_id": "host-boot-1",
+            "policy_sha256": "31fdfe8f402f0094b55cc300255d0b31446dc3137483e5074987f798e469a5fb",
+            "binding": {
+              "vm_id": "vm-a",
+              "native_id": "native-vm-a",
+              "process_id": "process-vm-a",
+              "guest_boot_id": "guest-boot-1",
+              "image_id": "image-1",
+              "guest_kernel_id": "guest-kernel-1",
+              "host_kernel_id": "host-kernel-1",
+              "qemu_version_id": "qemu-1",
+              "backend_version_id": "backend-1",
+              "readback_version": "readback-v1",
+              "config_fingerprint": "config-1"
+            },
+            "source_ids": {
+              "cli": {
+                "path": "/protected/tool",
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              },
+              "client": {
+                "path": "/usr/share/perl5/PVE/QMPClient.pm",
+                "sha256": "dea717bbdebca302d6b5bea8d4d126bb9bbb4aa0784bc48ec56fc0c85780ad3f"
+              },
+              "driver": {
+                "path": "/usr/share/perl5/PVE/QemuServer.pm",
+                "sha256": "3cd036382bf796f996e74bf8206d57a0388056c63e7eab148fbd64a2b26e5912"
+              },
+              "protocol": {
+                "path": "/usr/share/perl5/PVE/API2/Qemu.pm",
+                "sha256": "33c9b0dca650341e76e39c85c8d54ba1ee38474266632a26c8921121f055697f"
+              },
+              "support": {
+                "API2/Qemu.pm": {
+                  "path": "/usr/share/perl5/PVE/API2/Qemu.pm",
+                  "sha256": "33c9b0dca650341e76e39c85c8d54ba1ee38474266632a26c8921121f055697f"
+                },
+                "QemuConfig.pm": {
+                  "path": "/usr/share/perl5/PVE/QemuConfig.pm",
+                  "sha256": "4e437fad79b04bd0b3dc6b1450e7b70ff60de4d3d7d7380e308852e0a874d0c8"
+                },
+                "QemuServer.pm": {
+                  "path": "/usr/share/perl5/PVE/QemuServer.pm",
+                  "sha256": "3cd036382bf796f996e74bf8206d57a0388056c63e7eab148fbd64a2b26e5912"
+                },
+                "QemuServer/Memory.pm": {
+                  "path": "/usr/share/perl5/PVE/QemuServer/Memory.pm",
+                  "sha256": "2025cae6ee0537b78a0799ffcd9423e3a8309549ddad6d368ea244b65d958cbd"
+                },
+                "QemuServer/Monitor.pm": {
+                  "path": "/usr/share/perl5/PVE/QemuServer/Monitor.pm",
+                  "sha256": "668ee99382f1eb18f98ed178e8ef68d121be814f47ce820c340e0d9e1a5d4763"
+                },
+                "QMPClient.pm": {
+                  "path": "/usr/share/perl5/PVE/QMPClient.pm",
+                  "sha256": "dea717bbdebca302d6b5bea8d4d126bb9bbb4aa0784bc48ec56fc0c85780ad3f"
+                },
+                "RPCEnvironment.pm": {
+                  "path": "/usr/share/perl5/PVE/RPCEnvironment.pm",
+                  "sha256": "36474324b346ef285a846df36fef936418231e8143413b509ae977d4dad4f55f"
+                },
+                "RESTEnvironment.pm": {
+                  "path": "/usr/share/perl5/PVE/RESTEnvironment.pm",
+                  "sha256": "57a2b3f15460d74fc813a73510c8bc409ec02683d577a851d76610928fc9e700"
+                },
+                "CLI/pvesh.pm": {
+                  "path": "/usr/share/perl5/PVE/CLI/pvesh.pm",
+                  "sha256": "dfff48157f503d2c75cee4afc71294d0f0e5d7af8093bc72261647c96e915818"
+                },
+                "ProcFSTools.pm": {
+                  "path": "/usr/share/perl5/PVE/ProcFSTools.pm",
+                  "sha256": "9ede6e7e13f640cad498374fc0d2d1a7cdac804dc809165b5b525e7996aa8c36"
+                },
+                "Tools.pm": {
+                  "path": "/usr/share/perl5/PVE/Tools.pm",
+                  "sha256": "ce4641907636040569b7de3f71f05e3e11d6614bb59470bfb5c9307c55db895f"
+                },
+                "AbstractConfig.pm": {
+                  "path": "/usr/share/perl5/PVE/AbstractConfig.pm",
+                  "sha256": "70432cce604f3bc7ff525c2c20028a97173394d5aa2b585c36b50d0761871494"
+                },
+                "API2/Tasks.pm": {
+                  "path": "/usr/share/perl5/PVE/API2/Tasks.pm",
+                  "sha256": "9d33bd4487c238246216536eadd8fbc01adc5d289ab5e11c59afca5dedb9f2ba"
+                }
+              }
+            },
+            "native_peer_identity": {
+              "kind": "pve_local",
+              "node": "synthetic-node",
+              "qemu_birth": {
+                "pid": 77,
+                "start_ticks": 10,
+                "boot_id": "host-boot-1"
+              }
+            },
+            "evidence_ref": "synthetic-source-qualified-protocol"
+          },
+          {
+            "schema": "qcl.host-resource-native-mutation-qualification.v1",
+            "protocol_id": "pve-local-put-balloon-v1",
+            "host_id": "synthetic-host",
+            "owner_id": "synthetic-owner",
+            "host_boot_id": "host-boot-1",
+            "policy_sha256": "31fdfe8f402f0094b55cc300255d0b31446dc3137483e5074987f798e469a5fb",
+            "binding": {
+              "vm_id": "vm-b",
+              "native_id": "native-vm-b",
+              "process_id": "process-vm-b",
+              "guest_boot_id": "guest-boot-1",
+              "image_id": "image-1",
+              "guest_kernel_id": "guest-kernel-1",
+              "host_kernel_id": "host-kernel-1",
+              "qemu_version_id": "qemu-1",
+              "backend_version_id": "backend-1",
+              "readback_version": "readback-v1",
+              "config_fingerprint": "config-1"
+            },
+            "source_ids": {
+              "cli": {
+                "path": "/protected/tool",
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              },
+              "client": {
+                "path": "/usr/share/perl5/PVE/QMPClient.pm",
+                "sha256": "dea717bbdebca302d6b5bea8d4d126bb9bbb4aa0784bc48ec56fc0c85780ad3f"
+              },
+              "driver": {
+                "path": "/usr/share/perl5/PVE/QemuServer.pm",
+                "sha256": "3cd036382bf796f996e74bf8206d57a0388056c63e7eab148fbd64a2b26e5912"
+              },
+              "protocol": {
+                "path": "/usr/share/perl5/PVE/API2/Qemu.pm",
+                "sha256": "33c9b0dca650341e76e39c85c8d54ba1ee38474266632a26c8921121f055697f"
+              },
+              "support": {
+                "API2/Qemu.pm": {
+                  "path": "/usr/share/perl5/PVE/API2/Qemu.pm",
+                  "sha256": "33c9b0dca650341e76e39c85c8d54ba1ee38474266632a26c8921121f055697f"
+                },
+                "QemuConfig.pm": {
+                  "path": "/usr/share/perl5/PVE/QemuConfig.pm",
+                  "sha256": "4e437fad79b04bd0b3dc6b1450e7b70ff60de4d3d7d7380e308852e0a874d0c8"
+                },
+                "QemuServer.pm": {
+                  "path": "/usr/share/perl5/PVE/QemuServer.pm",
+                  "sha256": "3cd036382bf796f996e74bf8206d57a0388056c63e7eab148fbd64a2b26e5912"
+                },
+                "QemuServer/Memory.pm": {
+                  "path": "/usr/share/perl5/PVE/QemuServer/Memory.pm",
+                  "sha256": "2025cae6ee0537b78a0799ffcd9423e3a8309549ddad6d368ea244b65d958cbd"
+                },
+                "QemuServer/Monitor.pm": {
+                  "path": "/usr/share/perl5/PVE/QemuServer/Monitor.pm",
+                  "sha256": "668ee99382f1eb18f98ed178e8ef68d121be814f47ce820c340e0d9e1a5d4763"
+                },
+                "QMPClient.pm": {
+                  "path": "/usr/share/perl5/PVE/QMPClient.pm",
+                  "sha256": "dea717bbdebca302d6b5bea8d4d126bb9bbb4aa0784bc48ec56fc0c85780ad3f"
+                },
+                "RPCEnvironment.pm": {
+                  "path": "/usr/share/perl5/PVE/RPCEnvironment.pm",
+                  "sha256": "36474324b346ef285a846df36fef936418231e8143413b509ae977d4dad4f55f"
+                },
+                "RESTEnvironment.pm": {
+                  "path": "/usr/share/perl5/PVE/RESTEnvironment.pm",
+                  "sha256": "57a2b3f15460d74fc813a73510c8bc409ec02683d577a851d76610928fc9e700"
+                },
+                "CLI/pvesh.pm": {
+                  "path": "/usr/share/perl5/PVE/CLI/pvesh.pm",
+                  "sha256": "dfff48157f503d2c75cee4afc71294d0f0e5d7af8093bc72261647c96e915818"
+                },
+                "ProcFSTools.pm": {
+                  "path": "/usr/share/perl5/PVE/ProcFSTools.pm",
+                  "sha256": "9ede6e7e13f640cad498374fc0d2d1a7cdac804dc809165b5b525e7996aa8c36"
+                },
+                "Tools.pm": {
+                  "path": "/usr/share/perl5/PVE/Tools.pm",
+                  "sha256": "ce4641907636040569b7de3f71f05e3e11d6614bb59470bfb5c9307c55db895f"
+                },
+                "AbstractConfig.pm": {
+                  "path": "/usr/share/perl5/PVE/AbstractConfig.pm",
+                  "sha256": "70432cce604f3bc7ff525c2c20028a97173394d5aa2b585c36b50d0761871494"
+                },
+                "API2/Tasks.pm": {
+                  "path": "/usr/share/perl5/PVE/API2/Tasks.pm",
+                  "sha256": "9d33bd4487c238246216536eadd8fbc01adc5d289ab5e11c59afca5dedb9f2ba"
+                }
+              }
+            },
+            "native_peer_identity": {
+              "kind": "pve_local",
+              "node": "synthetic-node",
+              "qemu_birth": {
+                "pid": 77,
+                "start_ticks": 10,
+                "boot_id": "host-boot-1"
+              }
+            },
+            "evidence_ref": "synthetic-source-qualified-protocol"
+          }
+        ]
+      },
+      "dispatch": {
+        "intent": {
+          "before_revision": "revision-1",
+          "binding": {
+            "backend_version_id": "backend-1",
+            "config_fingerprint": "config-1",
+            "guest_boot_id": "guest-boot-1",
+            "guest_kernel_id": "guest-kernel-1",
+            "host_kernel_id": "host-kernel-1",
+            "image_id": "image-1",
+            "native_id": "native-vm-a",
+            "process_id": "process-vm-a",
+            "qemu_version_id": "qemu-1",
+            "readback_version": "readback-v1",
+            "vm_id": "vm-a"
+          },
+          "host_boot_id": "host-boot-1",
+          "host_id": "synthetic-host",
+          "mutation_id": "33333333333333333333333333333333",
+          "native_context": {
+            "cgroup": "/system.slice/qcl-resource-11111111111111111111111111111111.service",
+            "host_boot_id": "host-boot-1",
+            "invocation_id": "22222222222222222222222222222222",
+            "mutation_id": "33333333333333333333333333333333",
+            "unit": "qcl-resource-11111111111111111111111111111111.service"
+          },
+          "old_bytes": 256,
+          "operation": "grow",
+          "owner_id": "synthetic-owner",
+          "policy_sha256": "31fdfe8f402f0094b55cc300255d0b31446dc3137483e5074987f798e469a5fb",
+          "protocol_id": "pve-local-put-balloon-v1",
+          "qualification_sha256": "8b92d36dff516a9be8fce84f1370c92e045464838502de2b56dcbfd9e9a6004e",
+          "request_id": "request-1",
+          "target_bytes": 512
+        },
+        "schema": "qcl.host-resource-native-dispatch.v1",
+        "worker_birth": {
+          "boot_id": "host-boot-1",
+          "pid": 101,
+          "start_ticks": 1
+        }
+      },
+      "returned_success": {
+        "cgroup": "/system.slice/qcl-resource-11111111111111111111111111111111.service",
+        "claimed_at": 100,
+        "cli_birth": {
+          "boot_id": "host-boot-1",
+          "pid": 102,
+          "start_ticks": 2
+        },
+        "intent": {
+          "before_revision": "revision-1",
+          "binding": {
+            "backend_version_id": "backend-1",
+            "config_fingerprint": "config-1",
+            "guest_boot_id": "guest-boot-1",
+            "guest_kernel_id": "guest-kernel-1",
+            "host_kernel_id": "host-kernel-1",
+            "image_id": "image-1",
+            "native_id": "native-vm-a",
+            "process_id": "process-vm-a",
+            "qemu_version_id": "qemu-1",
+            "readback_version": "readback-v1",
+            "vm_id": "vm-a"
+          },
+          "host_boot_id": "host-boot-1",
+          "host_id": "synthetic-host",
+          "mutation_id": "33333333333333333333333333333333",
+          "native_context": {
+            "cgroup": "/system.slice/qcl-resource-11111111111111111111111111111111.service",
+            "host_boot_id": "host-boot-1",
+            "invocation_id": "22222222222222222222222222222222",
+            "mutation_id": "33333333333333333333333333333333",
+            "unit": "qcl-resource-11111111111111111111111111111111.service"
+          },
+          "old_bytes": 256,
+          "operation": "grow",
+          "owner_id": "synthetic-owner",
+          "policy_sha256": "31fdfe8f402f0094b55cc300255d0b31446dc3137483e5074987f798e469a5fb",
+          "protocol_id": "pve-local-put-balloon-v1",
+          "qualification_sha256": "8b92d36dff516a9be8fce84f1370c92e045464838502de2b56dcbfd9e9a6004e",
+          "request_id": "request-1",
+          "target_bytes": 512
+        },
+        "intent_sha256": "ad0b706a1f22f9eaa36426ff9be11a9a6708dc6f5e0ed810d76fcf676aa870cf",
+        "local_cleanup_confirmed": true,
+        "native_peer": {
+          "kind": "pve_local",
+          "node": "synthetic-node",
+          "qemu_birth": {
+            "boot_id": "host-boot-1",
+            "pid": 77,
+            "start_ticks": 10
+          }
+        },
+        "phase": "RETURNED_SUCCESS",
+        "result_sha256": "e88e96ee69eb5cce7cbd59fef6945cd9c72752206030462e20eebb2fabe7de58",
+        "schema": "qcl.host-resource-native-cleanup-witness.v1",
+        "source_ids": {
+          "cli": {
+            "path": "/protected/tool",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "client": {
+            "path": "/usr/share/perl5/PVE/QMPClient.pm",
+            "sha256": "dea717bbdebca302d6b5bea8d4d126bb9bbb4aa0784bc48ec56fc0c85780ad3f"
+          },
+          "driver": {
+            "path": "/usr/share/perl5/PVE/QemuServer.pm",
+            "sha256": "3cd036382bf796f996e74bf8206d57a0388056c63e7eab148fbd64a2b26e5912"
+          },
+          "protocol": {
+            "path": "/usr/share/perl5/PVE/API2/Qemu.pm",
+            "sha256": "33c9b0dca650341e76e39c85c8d54ba1ee38474266632a26c8921121f055697f"
+          },
+          "support": {
+            "API2/Qemu.pm": {
+              "path": "/usr/share/perl5/PVE/API2/Qemu.pm",
+              "sha256": "33c9b0dca650341e76e39c85c8d54ba1ee38474266632a26c8921121f055697f"
+            },
+            "API2/Tasks.pm": {
+              "path": "/usr/share/perl5/PVE/API2/Tasks.pm",
+              "sha256": "9d33bd4487c238246216536eadd8fbc01adc5d289ab5e11c59afca5dedb9f2ba"
+            },
+            "AbstractConfig.pm": {
+              "path": "/usr/share/perl5/PVE/AbstractConfig.pm",
+              "sha256": "70432cce604f3bc7ff525c2c20028a97173394d5aa2b585c36b50d0761871494"
+            },
+            "CLI/pvesh.pm": {
+              "path": "/usr/share/perl5/PVE/CLI/pvesh.pm",
+              "sha256": "dfff48157f503d2c75cee4afc71294d0f0e5d7af8093bc72261647c96e915818"
+            },
+            "ProcFSTools.pm": {
+              "path": "/usr/share/perl5/PVE/ProcFSTools.pm",
+              "sha256": "9ede6e7e13f640cad498374fc0d2d1a7cdac804dc809165b5b525e7996aa8c36"
+            },
+            "QMPClient.pm": {
+              "path": "/usr/share/perl5/PVE/QMPClient.pm",
+              "sha256": "dea717bbdebca302d6b5bea8d4d126bb9bbb4aa0784bc48ec56fc0c85780ad3f"
+            },
+            "QemuConfig.pm": {
+              "path": "/usr/share/perl5/PVE/QemuConfig.pm",
+              "sha256": "4e437fad79b04bd0b3dc6b1450e7b70ff60de4d3d7d7380e308852e0a874d0c8"
+            },
+            "QemuServer.pm": {
+              "path": "/usr/share/perl5/PVE/QemuServer.pm",
+              "sha256": "3cd036382bf796f996e74bf8206d57a0388056c63e7eab148fbd64a2b26e5912"
+            },
+            "QemuServer/Memory.pm": {
+              "path": "/usr/share/perl5/PVE/QemuServer/Memory.pm",
+              "sha256": "2025cae6ee0537b78a0799ffcd9423e3a8309549ddad6d368ea244b65d958cbd"
+            },
+            "QemuServer/Monitor.pm": {
+              "path": "/usr/share/perl5/PVE/QemuServer/Monitor.pm",
+              "sha256": "668ee99382f1eb18f98ed178e8ef68d121be814f47ce820c340e0d9e1a5d4763"
+            },
+            "RESTEnvironment.pm": {
+              "path": "/usr/share/perl5/PVE/RESTEnvironment.pm",
+              "sha256": "57a2b3f15460d74fc813a73510c8bc409ec02683d577a851d76610928fc9e700"
+            },
+            "RPCEnvironment.pm": {
+              "path": "/usr/share/perl5/PVE/RPCEnvironment.pm",
+              "sha256": "36474324b346ef285a846df36fef936418231e8143413b509ae977d4dad4f55f"
+            },
+            "Tools.pm": {
+              "path": "/usr/share/perl5/PVE/Tools.pm",
+              "sha256": "ce4641907636040569b7de3f71f05e3e11d6614bb59470bfb5c9307c55db895f"
+            }
+          }
+        },
+        "terminal_at": 100,
+        "worker_birth": {
+          "boot_id": "host-boot-1",
+          "pid": 101,
+          "start_ticks": 1
+        }
+      },
+      "claimed_unknown": {
+        "cgroup": "/system.slice/qcl-resource-11111111111111111111111111111111.service",
+        "claimed_at": 100,
+        "cli_birth": {
+          "boot_id": "host-boot-1",
+          "pid": 102,
+          "start_ticks": 2
+        },
+        "intent": {
+          "before_revision": "revision-1",
+          "binding": {
+            "backend_version_id": "backend-1",
+            "config_fingerprint": "config-1",
+            "guest_boot_id": "guest-boot-1",
+            "guest_kernel_id": "guest-kernel-1",
+            "host_kernel_id": "host-kernel-1",
+            "image_id": "image-1",
+            "native_id": "native-vm-a",
+            "process_id": "process-vm-a",
+            "qemu_version_id": "qemu-1",
+            "readback_version": "readback-v1",
+            "vm_id": "vm-a"
+          },
+          "host_boot_id": "host-boot-1",
+          "host_id": "synthetic-host",
+          "mutation_id": "33333333333333333333333333333333",
+          "native_context": {
+            "cgroup": "/system.slice/qcl-resource-11111111111111111111111111111111.service",
+            "host_boot_id": "host-boot-1",
+            "invocation_id": "22222222222222222222222222222222",
+            "mutation_id": "33333333333333333333333333333333",
+            "unit": "qcl-resource-11111111111111111111111111111111.service"
+          },
+          "old_bytes": 256,
+          "operation": "grow",
+          "owner_id": "synthetic-owner",
+          "policy_sha256": "31fdfe8f402f0094b55cc300255d0b31446dc3137483e5074987f798e469a5fb",
+          "protocol_id": "pve-local-put-balloon-v1",
+          "qualification_sha256": "8b92d36dff516a9be8fce84f1370c92e045464838502de2b56dcbfd9e9a6004e",
+          "request_id": "request-1",
+          "target_bytes": 512
+        },
+        "intent_sha256": "ad0b706a1f22f9eaa36426ff9be11a9a6708dc6f5e0ed810d76fcf676aa870cf",
+        "local_cleanup_confirmed": false,
+        "native_peer": {
+          "kind": "pve_local",
+          "node": "synthetic-node",
+          "qemu_birth": {
+            "boot_id": "host-boot-1",
+            "pid": 77,
+            "start_ticks": 10
+          }
+        },
+        "phase": "CLAIMED",
+        "result_sha256": null,
+        "schema": "qcl.host-resource-native-cleanup-witness.v1",
+        "source_ids": {
+          "cli": {
+            "path": "/protected/tool",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "client": {
+            "path": "/usr/share/perl5/PVE/QMPClient.pm",
+            "sha256": "dea717bbdebca302d6b5bea8d4d126bb9bbb4aa0784bc48ec56fc0c85780ad3f"
+          },
+          "driver": {
+            "path": "/usr/share/perl5/PVE/QemuServer.pm",
+            "sha256": "3cd036382bf796f996e74bf8206d57a0388056c63e7eab148fbd64a2b26e5912"
+          },
+          "protocol": {
+            "path": "/usr/share/perl5/PVE/API2/Qemu.pm",
+            "sha256": "33c9b0dca650341e76e39c85c8d54ba1ee38474266632a26c8921121f055697f"
+          },
+          "support": {
+            "API2/Qemu.pm": {
+              "path": "/usr/share/perl5/PVE/API2/Qemu.pm",
+              "sha256": "33c9b0dca650341e76e39c85c8d54ba1ee38474266632a26c8921121f055697f"
+            },
+            "API2/Tasks.pm": {
+              "path": "/usr/share/perl5/PVE/API2/Tasks.pm",
+              "sha256": "9d33bd4487c238246216536eadd8fbc01adc5d289ab5e11c59afca5dedb9f2ba"
+            },
+            "AbstractConfig.pm": {
+              "path": "/usr/share/perl5/PVE/AbstractConfig.pm",
+              "sha256": "70432cce604f3bc7ff525c2c20028a97173394d5aa2b585c36b50d0761871494"
+            },
+            "CLI/pvesh.pm": {
+              "path": "/usr/share/perl5/PVE/CLI/pvesh.pm",
+              "sha256": "dfff48157f503d2c75cee4afc71294d0f0e5d7af8093bc72261647c96e915818"
+            },
+            "ProcFSTools.pm": {
+              "path": "/usr/share/perl5/PVE/ProcFSTools.pm",
+              "sha256": "9ede6e7e13f640cad498374fc0d2d1a7cdac804dc809165b5b525e7996aa8c36"
+            },
+            "QMPClient.pm": {
+              "path": "/usr/share/perl5/PVE/QMPClient.pm",
+              "sha256": "dea717bbdebca302d6b5bea8d4d126bb9bbb4aa0784bc48ec56fc0c85780ad3f"
+            },
+            "QemuConfig.pm": {
+              "path": "/usr/share/perl5/PVE/QemuConfig.pm",
+              "sha256": "4e437fad79b04bd0b3dc6b1450e7b70ff60de4d3d7d7380e308852e0a874d0c8"
+            },
+            "QemuServer.pm": {
+              "path": "/usr/share/perl5/PVE/QemuServer.pm",
+              "sha256": "3cd036382bf796f996e74bf8206d57a0388056c63e7eab148fbd64a2b26e5912"
+            },
+            "QemuServer/Memory.pm": {
+              "path": "/usr/share/perl5/PVE/QemuServer/Memory.pm",
+              "sha256": "2025cae6ee0537b78a0799ffcd9423e3a8309549ddad6d368ea244b65d958cbd"
+            },
+            "QemuServer/Monitor.pm": {
+              "path": "/usr/share/perl5/PVE/QemuServer/Monitor.pm",
+              "sha256": "668ee99382f1eb18f98ed178e8ef68d121be814f47ce820c340e0d9e1a5d4763"
+            },
+            "RESTEnvironment.pm": {
+              "path": "/usr/share/perl5/PVE/RESTEnvironment.pm",
+              "sha256": "57a2b3f15460d74fc813a73510c8bc409ec02683d577a851d76610928fc9e700"
+            },
+            "RPCEnvironment.pm": {
+              "path": "/usr/share/perl5/PVE/RPCEnvironment.pm",
+              "sha256": "36474324b346ef285a846df36fef936418231e8143413b509ae977d4dad4f55f"
+            },
+            "Tools.pm": {
+              "path": "/usr/share/perl5/PVE/Tools.pm",
+              "sha256": "ce4641907636040569b7de3f71f05e3e11d6614bb59470bfb5c9307c55db895f"
+            }
+          }
+        },
+        "terminal_at": null,
+        "worker_birth": {
+          "boot_id": "host-boot-1",
+          "pid": 101,
+          "start_ticks": 1
+        }
+      }
+    },
+    {
+      "protocol_id": "libvirt-local-setmem-v1",
+      "config": {
+        "schema": "qcl.host-resource-native-cleanup-config.v1",
+        "helper": "/protected/native-exec",
+        "qualification": "/protected/qualifications",
+        "protocol_id": "libvirt-local-setmem-v1"
+      },
+      "qualification_bundle": {
+        "schema": "qcl.host-resource-native-mutation-qualifications.v1",
+        "profiles": [
+          {
+            "schema": "qcl.host-resource-native-mutation-qualification.v1",
+            "protocol_id": "libvirt-local-setmem-v1",
+            "host_id": "synthetic-host",
+            "owner_id": "synthetic-owner",
+            "host_boot_id": "host-boot-1",
+            "policy_sha256": "31fdfe8f402f0094b55cc300255d0b31446dc3137483e5074987f798e469a5fb",
+            "binding": {
+              "vm_id": "vm-a",
+              "native_id": "native-vm-a",
+              "process_id": "process-vm-a",
+              "guest_boot_id": "guest-boot-1",
+              "image_id": "image-1",
+              "guest_kernel_id": "guest-kernel-1",
+              "host_kernel_id": "host-kernel-1",
+              "qemu_version_id": "qemu-1",
+              "backend_version_id": "backend-1",
+              "readback_version": "readback-v1",
+              "config_fingerprint": "config-1"
+            },
+            "source_ids": {
+              "cli": {
+                "path": "/protected/tool",
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              },
+              "client": {
+                "path": "/protected/tool",
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              },
+              "driver": {
+                "path": "/protected/tool",
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              },
+              "protocol": {
+                "path": "/protected/tool",
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              },
+              "support": {
+                "tools/virsh-domain.c": {
+                  "path": "/protected/sources/tools/virsh-domain.c",
+                  "sha256": "92e7e12f5301ce6267dd641e45048686189fb8589ca7ad168bd90499f05fdc39"
+                },
+                "src/libvirt-domain.c": {
+                  "path": "/protected/sources/src/libvirt-domain.c",
+                  "sha256": "974888fd2d6a87b96727645cc7212630b945b7ed2fb598a9f0cc8923fd4065fa"
+                },
+                "src/remote/remote_driver.c": {
+                  "path": "/protected/sources/src/remote/remote_driver.c",
+                  "sha256": "0db5a06f70493f2e6d84ef5070d92fade8cddf9181f9ea0fd093f88356994741"
+                },
+                "src/qemu/qemu_driver.c": {
+                  "path": "/protected/sources/src/qemu/qemu_driver.c",
+                  "sha256": "17a2dbfb6f36901fd2549cfc9451b4c35045983586584a9d738be0ccdc9e2337"
+                },
+                "src/qemu/qemu_monitor_json.c": {
+                  "path": "/protected/sources/src/qemu/qemu_monitor_json.c",
+                  "sha256": "37836f3799fe18fe1c68a4c2928879f92085dee550afdc2940100398c359618d"
+                },
+                "src/rpc/virnetclient.c": {
+                  "path": "/protected/sources/src/rpc/virnetclient.c",
+                  "sha256": "3d27f2fccf5963e8a9318ef8edd5fefc6634f38c34f777ce7033038cf294d539"
+                },
+                "src/remote/remote_daemon_dispatch.c": {
+                  "path": "/protected/sources/src/remote/remote_daemon_dispatch.c",
+                  "sha256": "df237fe56c440c4a2b53f8ab76487273185ecd88c18296b3b6357ed792a4b28d"
+                },
+                "src/remote/remote_protocol.x": {
+                  "path": "/protected/sources/src/remote/remote_protocol.x",
+                  "sha256": "2fd3184165828e1118ab90a8b9597eeb2f79f1b828a860fda6f13d04951304ec"
+                },
+                "src/rpc/gendispatch.pl": {
+                  "path": "/protected/sources/src/rpc/gendispatch.pl",
+                  "sha256": "22769797a68cb515fcbbe1cd80a12629c0fd66564036d9d22e2d714a9756b234"
+                },
+                "src/rpc/virnetclientprogram.c": {
+                  "path": "/protected/sources/src/rpc/virnetclientprogram.c",
+                  "sha256": "d6a8fde9d561d3462ba34a7be11fb01517a1f4518b95d07b0f3c636a937da250"
+                },
+                "src/remote/remote_sockets.c": {
+                  "path": "/protected/sources/src/remote/remote_sockets.c",
+                  "sha256": "8272998dbf22f8f4c1fc9315a72a40ee61a3874821018f3aff1601c97cab7fdb"
+                },
+                "src/remote/remote_sockets.h": {
+                  "path": "/protected/sources/src/remote/remote_sockets.h",
+                  "sha256": "0d42cfafbcc95a1794170a950dff6572b626ba01e7547cfab132d99d92ee576b"
+                },
+                "src/libvirt.c": {
+                  "path": "/protected/sources/src/libvirt.c",
+                  "sha256": "3edd4514cb34c7529dbfbdff99ea0cb7eddf6ffddc63f026531e5f7b3b2e201c"
+                }
+              }
+            },
+            "native_peer_identity": {
+              "kind": "libvirt_unix",
+              "socket_path": "/run/libvirt/libvirt-sock",
+              "socket_device": 1,
+              "socket_inode": 9,
+              "unit": "libvirtd.service",
+              "invocation_id": "cccccccccccccccccccccccccccccccc",
+              "daemon_birth": {
+                "pid": 77,
+                "start_ticks": 10,
+                "boot_id": "host-boot-1"
+              }
+            },
+            "evidence_ref": "synthetic-source-qualified-protocol"
+          },
+          {
+            "schema": "qcl.host-resource-native-mutation-qualification.v1",
+            "protocol_id": "libvirt-local-setmem-v1",
+            "host_id": "synthetic-host",
+            "owner_id": "synthetic-owner",
+            "host_boot_id": "host-boot-1",
+            "policy_sha256": "31fdfe8f402f0094b55cc300255d0b31446dc3137483e5074987f798e469a5fb",
+            "binding": {
+              "vm_id": "vm-b",
+              "native_id": "native-vm-b",
+              "process_id": "process-vm-b",
+              "guest_boot_id": "guest-boot-1",
+              "image_id": "image-1",
+              "guest_kernel_id": "guest-kernel-1",
+              "host_kernel_id": "host-kernel-1",
+              "qemu_version_id": "qemu-1",
+              "backend_version_id": "backend-1",
+              "readback_version": "readback-v1",
+              "config_fingerprint": "config-1"
+            },
+            "source_ids": {
+              "cli": {
+                "path": "/protected/tool",
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              },
+              "client": {
+                "path": "/protected/tool",
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              },
+              "driver": {
+                "path": "/protected/tool",
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              },
+              "protocol": {
+                "path": "/protected/tool",
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              },
+              "support": {
+                "tools/virsh-domain.c": {
+                  "path": "/protected/sources/tools/virsh-domain.c",
+                  "sha256": "92e7e12f5301ce6267dd641e45048686189fb8589ca7ad168bd90499f05fdc39"
+                },
+                "src/libvirt-domain.c": {
+                  "path": "/protected/sources/src/libvirt-domain.c",
+                  "sha256": "974888fd2d6a87b96727645cc7212630b945b7ed2fb598a9f0cc8923fd4065fa"
+                },
+                "src/remote/remote_driver.c": {
+                  "path": "/protected/sources/src/remote/remote_driver.c",
+                  "sha256": "0db5a06f70493f2e6d84ef5070d92fade8cddf9181f9ea0fd093f88356994741"
+                },
+                "src/qemu/qemu_driver.c": {
+                  "path": "/protected/sources/src/qemu/qemu_driver.c",
+                  "sha256": "17a2dbfb6f36901fd2549cfc9451b4c35045983586584a9d738be0ccdc9e2337"
+                },
+                "src/qemu/qemu_monitor_json.c": {
+                  "path": "/protected/sources/src/qemu/qemu_monitor_json.c",
+                  "sha256": "37836f3799fe18fe1c68a4c2928879f92085dee550afdc2940100398c359618d"
+                },
+                "src/rpc/virnetclient.c": {
+                  "path": "/protected/sources/src/rpc/virnetclient.c",
+                  "sha256": "3d27f2fccf5963e8a9318ef8edd5fefc6634f38c34f777ce7033038cf294d539"
+                },
+                "src/remote/remote_daemon_dispatch.c": {
+                  "path": "/protected/sources/src/remote/remote_daemon_dispatch.c",
+                  "sha256": "df237fe56c440c4a2b53f8ab76487273185ecd88c18296b3b6357ed792a4b28d"
+                },
+                "src/remote/remote_protocol.x": {
+                  "path": "/protected/sources/src/remote/remote_protocol.x",
+                  "sha256": "2fd3184165828e1118ab90a8b9597eeb2f79f1b828a860fda6f13d04951304ec"
+                },
+                "src/rpc/gendispatch.pl": {
+                  "path": "/protected/sources/src/rpc/gendispatch.pl",
+                  "sha256": "22769797a68cb515fcbbe1cd80a12629c0fd66564036d9d22e2d714a9756b234"
+                },
+                "src/rpc/virnetclientprogram.c": {
+                  "path": "/protected/sources/src/rpc/virnetclientprogram.c",
+                  "sha256": "d6a8fde9d561d3462ba34a7be11fb01517a1f4518b95d07b0f3c636a937da250"
+                },
+                "src/remote/remote_sockets.c": {
+                  "path": "/protected/sources/src/remote/remote_sockets.c",
+                  "sha256": "8272998dbf22f8f4c1fc9315a72a40ee61a3874821018f3aff1601c97cab7fdb"
+                },
+                "src/remote/remote_sockets.h": {
+                  "path": "/protected/sources/src/remote/remote_sockets.h",
+                  "sha256": "0d42cfafbcc95a1794170a950dff6572b626ba01e7547cfab132d99d92ee576b"
+                },
+                "src/libvirt.c": {
+                  "path": "/protected/sources/src/libvirt.c",
+                  "sha256": "3edd4514cb34c7529dbfbdff99ea0cb7eddf6ffddc63f026531e5f7b3b2e201c"
+                }
+              }
+            },
+            "native_peer_identity": {
+              "kind": "libvirt_unix",
+              "socket_path": "/run/libvirt/libvirt-sock",
+              "socket_device": 1,
+              "socket_inode": 9,
+              "unit": "libvirtd.service",
+              "invocation_id": "cccccccccccccccccccccccccccccccc",
+              "daemon_birth": {
+                "pid": 77,
+                "start_ticks": 10,
+                "boot_id": "host-boot-1"
+              }
+            },
+            "evidence_ref": "synthetic-source-qualified-protocol"
+          }
+        ]
+      },
+      "dispatch": {
+        "intent": {
+          "before_revision": "revision-1",
+          "binding": {
+            "backend_version_id": "backend-1",
+            "config_fingerprint": "config-1",
+            "guest_boot_id": "guest-boot-1",
+            "guest_kernel_id": "guest-kernel-1",
+            "host_kernel_id": "host-kernel-1",
+            "image_id": "image-1",
+            "native_id": "native-vm-a",
+            "process_id": "process-vm-a",
+            "qemu_version_id": "qemu-1",
+            "readback_version": "readback-v1",
+            "vm_id": "vm-a"
+          },
+          "host_boot_id": "host-boot-1",
+          "host_id": "synthetic-host",
+          "mutation_id": "33333333333333333333333333333333",
+          "native_context": {
+            "cgroup": "/system.slice/qcl-resource-11111111111111111111111111111111.service",
+            "host_boot_id": "host-boot-1",
+            "invocation_id": "22222222222222222222222222222222",
+            "mutation_id": "33333333333333333333333333333333",
+            "unit": "qcl-resource-11111111111111111111111111111111.service"
+          },
+          "old_bytes": 256,
+          "operation": "grow",
+          "owner_id": "synthetic-owner",
+          "policy_sha256": "31fdfe8f402f0094b55cc300255d0b31446dc3137483e5074987f798e469a5fb",
+          "protocol_id": "libvirt-local-setmem-v1",
+          "qualification_sha256": "b6e412fadb66d4a407ac0e615d955e71ade71d64857c19234b906727846cf9bf",
+          "request_id": "request-1",
+          "target_bytes": 512
+        },
+        "schema": "qcl.host-resource-native-dispatch.v1",
+        "worker_birth": {
+          "boot_id": "host-boot-1",
+          "pid": 101,
+          "start_ticks": 1
+        }
+      },
+      "returned_success": {
+        "cgroup": "/system.slice/qcl-resource-11111111111111111111111111111111.service",
+        "claimed_at": 100,
+        "cli_birth": {
+          "boot_id": "host-boot-1",
+          "pid": 102,
+          "start_ticks": 2
+        },
+        "intent": {
+          "before_revision": "revision-1",
+          "binding": {
+            "backend_version_id": "backend-1",
+            "config_fingerprint": "config-1",
+            "guest_boot_id": "guest-boot-1",
+            "guest_kernel_id": "guest-kernel-1",
+            "host_kernel_id": "host-kernel-1",
+            "image_id": "image-1",
+            "native_id": "native-vm-a",
+            "process_id": "process-vm-a",
+            "qemu_version_id": "qemu-1",
+            "readback_version": "readback-v1",
+            "vm_id": "vm-a"
+          },
+          "host_boot_id": "host-boot-1",
+          "host_id": "synthetic-host",
+          "mutation_id": "33333333333333333333333333333333",
+          "native_context": {
+            "cgroup": "/system.slice/qcl-resource-11111111111111111111111111111111.service",
+            "host_boot_id": "host-boot-1",
+            "invocation_id": "22222222222222222222222222222222",
+            "mutation_id": "33333333333333333333333333333333",
+            "unit": "qcl-resource-11111111111111111111111111111111.service"
+          },
+          "old_bytes": 256,
+          "operation": "grow",
+          "owner_id": "synthetic-owner",
+          "policy_sha256": "31fdfe8f402f0094b55cc300255d0b31446dc3137483e5074987f798e469a5fb",
+          "protocol_id": "libvirt-local-setmem-v1",
+          "qualification_sha256": "b6e412fadb66d4a407ac0e615d955e71ade71d64857c19234b906727846cf9bf",
+          "request_id": "request-1",
+          "target_bytes": 512
+        },
+        "intent_sha256": "ef07086a0385f0527e35f792334386b074cfdf629104960fa87ee965a8bc1ed3",
+        "local_cleanup_confirmed": true,
+        "native_peer": {
+          "daemon_birth": {
+            "boot_id": "host-boot-1",
+            "pid": 77,
+            "start_ticks": 10
+          },
+          "invocation_id": "cccccccccccccccccccccccccccccccc",
+          "kind": "libvirt_unix",
+          "socket_device": 1,
+          "socket_inode": 9,
+          "socket_path": "/run/libvirt/libvirt-sock",
+          "unit": "libvirtd.service"
+        },
+        "phase": "RETURNED_SUCCESS",
+        "result_sha256": "e88e96ee69eb5cce7cbd59fef6945cd9c72752206030462e20eebb2fabe7de58",
+        "schema": "qcl.host-resource-native-cleanup-witness.v1",
+        "source_ids": {
+          "cli": {
+            "path": "/protected/tool",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "client": {
+            "path": "/protected/tool",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "driver": {
+            "path": "/protected/tool",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "protocol": {
+            "path": "/protected/tool",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "support": {
+            "src/libvirt-domain.c": {
+              "path": "/protected/sources/src/libvirt-domain.c",
+              "sha256": "974888fd2d6a87b96727645cc7212630b945b7ed2fb598a9f0cc8923fd4065fa"
+            },
+            "src/libvirt.c": {
+              "path": "/protected/sources/src/libvirt.c",
+              "sha256": "3edd4514cb34c7529dbfbdff99ea0cb7eddf6ffddc63f026531e5f7b3b2e201c"
+            },
+            "src/qemu/qemu_driver.c": {
+              "path": "/protected/sources/src/qemu/qemu_driver.c",
+              "sha256": "17a2dbfb6f36901fd2549cfc9451b4c35045983586584a9d738be0ccdc9e2337"
+            },
+            "src/qemu/qemu_monitor_json.c": {
+              "path": "/protected/sources/src/qemu/qemu_monitor_json.c",
+              "sha256": "37836f3799fe18fe1c68a4c2928879f92085dee550afdc2940100398c359618d"
+            },
+            "src/remote/remote_daemon_dispatch.c": {
+              "path": "/protected/sources/src/remote/remote_daemon_dispatch.c",
+              "sha256": "df237fe56c440c4a2b53f8ab76487273185ecd88c18296b3b6357ed792a4b28d"
+            },
+            "src/remote/remote_driver.c": {
+              "path": "/protected/sources/src/remote/remote_driver.c",
+              "sha256": "0db5a06f70493f2e6d84ef5070d92fade8cddf9181f9ea0fd093f88356994741"
+            },
+            "src/remote/remote_protocol.x": {
+              "path": "/protected/sources/src/remote/remote_protocol.x",
+              "sha256": "2fd3184165828e1118ab90a8b9597eeb2f79f1b828a860fda6f13d04951304ec"
+            },
+            "src/remote/remote_sockets.c": {
+              "path": "/protected/sources/src/remote/remote_sockets.c",
+              "sha256": "8272998dbf22f8f4c1fc9315a72a40ee61a3874821018f3aff1601c97cab7fdb"
+            },
+            "src/remote/remote_sockets.h": {
+              "path": "/protected/sources/src/remote/remote_sockets.h",
+              "sha256": "0d42cfafbcc95a1794170a950dff6572b626ba01e7547cfab132d99d92ee576b"
+            },
+            "src/rpc/gendispatch.pl": {
+              "path": "/protected/sources/src/rpc/gendispatch.pl",
+              "sha256": "22769797a68cb515fcbbe1cd80a12629c0fd66564036d9d22e2d714a9756b234"
+            },
+            "src/rpc/virnetclient.c": {
+              "path": "/protected/sources/src/rpc/virnetclient.c",
+              "sha256": "3d27f2fccf5963e8a9318ef8edd5fefc6634f38c34f777ce7033038cf294d539"
+            },
+            "src/rpc/virnetclientprogram.c": {
+              "path": "/protected/sources/src/rpc/virnetclientprogram.c",
+              "sha256": "d6a8fde9d561d3462ba34a7be11fb01517a1f4518b95d07b0f3c636a937da250"
+            },
+            "tools/virsh-domain.c": {
+              "path": "/protected/sources/tools/virsh-domain.c",
+              "sha256": "92e7e12f5301ce6267dd641e45048686189fb8589ca7ad168bd90499f05fdc39"
+            }
+          }
+        },
+        "terminal_at": 100,
+        "worker_birth": {
+          "boot_id": "host-boot-1",
+          "pid": 101,
+          "start_ticks": 1
+        }
+      },
+      "claimed_unknown": {
+        "cgroup": "/system.slice/qcl-resource-11111111111111111111111111111111.service",
+        "claimed_at": 100,
+        "cli_birth": {
+          "boot_id": "host-boot-1",
+          "pid": 102,
+          "start_ticks": 2
+        },
+        "intent": {
+          "before_revision": "revision-1",
+          "binding": {
+            "backend_version_id": "backend-1",
+            "config_fingerprint": "config-1",
+            "guest_boot_id": "guest-boot-1",
+            "guest_kernel_id": "guest-kernel-1",
+            "host_kernel_id": "host-kernel-1",
+            "image_id": "image-1",
+            "native_id": "native-vm-a",
+            "process_id": "process-vm-a",
+            "qemu_version_id": "qemu-1",
+            "readback_version": "readback-v1",
+            "vm_id": "vm-a"
+          },
+          "host_boot_id": "host-boot-1",
+          "host_id": "synthetic-host",
+          "mutation_id": "33333333333333333333333333333333",
+          "native_context": {
+            "cgroup": "/system.slice/qcl-resource-11111111111111111111111111111111.service",
+            "host_boot_id": "host-boot-1",
+            "invocation_id": "22222222222222222222222222222222",
+            "mutation_id": "33333333333333333333333333333333",
+            "unit": "qcl-resource-11111111111111111111111111111111.service"
+          },
+          "old_bytes": 256,
+          "operation": "grow",
+          "owner_id": "synthetic-owner",
+          "policy_sha256": "31fdfe8f402f0094b55cc300255d0b31446dc3137483e5074987f798e469a5fb",
+          "protocol_id": "libvirt-local-setmem-v1",
+          "qualification_sha256": "b6e412fadb66d4a407ac0e615d955e71ade71d64857c19234b906727846cf9bf",
+          "request_id": "request-1",
+          "target_bytes": 512
+        },
+        "intent_sha256": "ef07086a0385f0527e35f792334386b074cfdf629104960fa87ee965a8bc1ed3",
+        "local_cleanup_confirmed": false,
+        "native_peer": {
+          "daemon_birth": {
+            "boot_id": "host-boot-1",
+            "pid": 77,
+            "start_ticks": 10
+          },
+          "invocation_id": "cccccccccccccccccccccccccccccccc",
+          "kind": "libvirt_unix",
+          "socket_device": 1,
+          "socket_inode": 9,
+          "socket_path": "/run/libvirt/libvirt-sock",
+          "unit": "libvirtd.service"
+        },
+        "phase": "CLAIMED",
+        "result_sha256": null,
+        "schema": "qcl.host-resource-native-cleanup-witness.v1",
+        "source_ids": {
+          "cli": {
+            "path": "/protected/tool",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "client": {
+            "path": "/protected/tool",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "driver": {
+            "path": "/protected/tool",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "protocol": {
+            "path": "/protected/tool",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "support": {
+            "src/libvirt-domain.c": {
+              "path": "/protected/sources/src/libvirt-domain.c",
+              "sha256": "974888fd2d6a87b96727645cc7212630b945b7ed2fb598a9f0cc8923fd4065fa"
+            },
+            "src/libvirt.c": {
+              "path": "/protected/sources/src/libvirt.c",
+              "sha256": "3edd4514cb34c7529dbfbdff99ea0cb7eddf6ffddc63f026531e5f7b3b2e201c"
+            },
+            "src/qemu/qemu_driver.c": {
+              "path": "/protected/sources/src/qemu/qemu_driver.c",
+              "sha256": "17a2dbfb6f36901fd2549cfc9451b4c35045983586584a9d738be0ccdc9e2337"
+            },
+            "src/qemu/qemu_monitor_json.c": {
+              "path": "/protected/sources/src/qemu/qemu_monitor_json.c",
+              "sha256": "37836f3799fe18fe1c68a4c2928879f92085dee550afdc2940100398c359618d"
+            },
+            "src/remote/remote_daemon_dispatch.c": {
+              "path": "/protected/sources/src/remote/remote_daemon_dispatch.c",
+              "sha256": "df237fe56c440c4a2b53f8ab76487273185ecd88c18296b3b6357ed792a4b28d"
+            },
+            "src/remote/remote_driver.c": {
+              "path": "/protected/sources/src/remote/remote_driver.c",
+              "sha256": "0db5a06f70493f2e6d84ef5070d92fade8cddf9181f9ea0fd093f88356994741"
+            },
+            "src/remote/remote_protocol.x": {
+              "path": "/protected/sources/src/remote/remote_protocol.x",
+              "sha256": "2fd3184165828e1118ab90a8b9597eeb2f79f1b828a860fda6f13d04951304ec"
+            },
+            "src/remote/remote_sockets.c": {
+              "path": "/protected/sources/src/remote/remote_sockets.c",
+              "sha256": "8272998dbf22f8f4c1fc9315a72a40ee61a3874821018f3aff1601c97cab7fdb"
+            },
+            "src/remote/remote_sockets.h": {
+              "path": "/protected/sources/src/remote/remote_sockets.h",
+              "sha256": "0d42cfafbcc95a1794170a950dff6572b626ba01e7547cfab132d99d92ee576b"
+            },
+            "src/rpc/gendispatch.pl": {
+              "path": "/protected/sources/src/rpc/gendispatch.pl",
+              "sha256": "22769797a68cb515fcbbe1cd80a12629c0fd66564036d9d22e2d714a9756b234"
+            },
+            "src/rpc/virnetclient.c": {
+              "path": "/protected/sources/src/rpc/virnetclient.c",
+              "sha256": "3d27f2fccf5963e8a9318ef8edd5fefc6634f38c34f777ce7033038cf294d539"
+            },
+            "src/rpc/virnetclientprogram.c": {
+              "path": "/protected/sources/src/rpc/virnetclientprogram.c",
+              "sha256": "d6a8fde9d561d3462ba34a7be11fb01517a1f4518b95d07b0f3c636a937da250"
+            },
+            "tools/virsh-domain.c": {
+              "path": "/protected/sources/tools/virsh-domain.c",
+              "sha256": "92e7e12f5301ce6267dd641e45048686189fb8589ca7ad168bd90499f05fdc39"
+            }
+          }
+        },
+        "terminal_at": null,
+        "worker_birth": {
+          "boot_id": "host-boot-1",
+          "pid": 101,
+          "start_ticks": 1
+        }
+      }
+    }
+  ]
+}

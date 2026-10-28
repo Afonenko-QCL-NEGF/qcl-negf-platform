@@ -12,6 +12,7 @@
     qcl_resource_authority_key: ""
     qcl_resource_backend: ""
     qcl_resource_private_directory: ""
+    qcl_resource_dynamic: false
   tasks:
     - name: Require reviewed installation and external protected private inputs
       ansible.builtin.assert:
@@ -55,6 +56,7 @@
         - host_resource_policy
         - host_resource_operations
         - host_resource_backends
+        - host_resource_native_cleanup
         - host_resource_facts
         - host_resource_client
         - host_resource_service
@@ -74,7 +76,7 @@
         owner: root
         group: root
         mode: "0755"
-      loop: [authority, worker, start-hook, admin]
+      loop: [authority, worker, native-exec, start-hook, admin]
     - name: Install unprivileged forced SSH command parser
       ansible.builtin.template:
         src: templates/host-resources/forced-command.j2
@@ -124,6 +126,15 @@
         group: root
         mode: "0600"
       loop: [service, runtime, policy, agreement, qualification]
+      no_log: true
+    - name: Copy explicit per-VM dynamic protocol qualification bundle
+      ansible.builtin.copy:
+        src: "{{ qcl_resource_private_directory }}/native-mutation-qualifications.json"
+        dest: /etc/qcl-negf/host-resources/native-mutation-qualifications.json
+        owner: root
+        group: root
+        mode: "0600"
+      when: qcl_resource_dynamic | bool
       no_log: true
     - name: Check unknown existing libvirt primary hook before providing drop-in
       ansible.builtin.stat:
