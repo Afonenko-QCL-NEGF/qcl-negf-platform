@@ -97,6 +97,17 @@ invalidate_qualification(*, runtime=RUNTIME, reason, deadline=None)
 соответствующие старые подтверждения; при ошибке сохраняются существующие свидетельства для сверки
 жизненного цикла. Успешная квалификация возвращает свидетельство и `ready:false`; активация заново
 проверяет состояние перед установлением готовности.
+Обычный `qcl-negf-worker-lifecycle startup` зарегистрированного worker также передаёт полный release
+envelope и текущий authoritative enrollment UUID в activation/check, включая idempotent check уже
+resumed boot. Four-field controller record отклоняется до DRAIN/copy; этот путь не выбирает legacy
+verification по потере metadata. Snapshot и финальное сравнение сохраняют
+source/closure/solver-build metadata даже при неизменных четырёх полях lifecycle identity. При new
+boot неизменённые artifact proofs могут переиспользоваться, но текущие activation health и boot
+binding проверяются заново. Missing/corrupt proof на check не ремонтируется, unknown intent не
+очищается, recovery attempt не создаётся. Source integration использует реальные P11 функции с
+synthetic OS/trust/native-command facts; actual Linux boot, enrollment и resource grant acceptance
+остаются отдельными native gates P22, без предположений о ещё не принятом P20/P14 API.
+
 
 Доставка до изменения требует точную версию `qcl-negf-local-update-capability-v3` с
 `artifact_qualification:true`. Старые установленные helpers не проходят предварительную проверку

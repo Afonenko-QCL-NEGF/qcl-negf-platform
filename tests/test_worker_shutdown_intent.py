@@ -5,6 +5,7 @@ import fcntl
 import json
 import multiprocessing
 import os
+import shlex
 from pathlib import Path
 import sys
 import tempfile
@@ -15,7 +16,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parents[1] / "ops"))
 import application_release as release
 import worker_lifecycle as worker
-from test_node_enrollment import CONTROLLER, WORKER, SECOND, TRUST, registry, pool, manifest_fixture
+from test_node_enrollment import CONTROLLER, WORKER, SECOND, TRUST, ENROLL_IDS, registry, pool, manifest_fixture
+from worker_startup_fixtures import ControllerFixture
 
 def authorized_event(node, record, authority):
     # Literal fake authenticated principal, separate from observed guest health.
@@ -45,8 +47,10 @@ class FakeCommands:
             if " activate " in args[-1]:
                 return ""
             if " check " in args[-1]:
+                words = shlex.split(args[-1])
+                selected = json.loads(base64.urlsafe_b64decode(words[words.index('--manifest-base64') + 1]))
                 return json.dumps({"schema": "qcl-negf-node-release-check-v1", "node_identity": actual,
-                                   "release": {**manifest_fixture(), "ready": True}})
+                                   "release": {**selected, "ready": True}})
         if args[0] == "squeue":
             return "\n".join(self.lines)
         if "verify-stop" in args:
@@ -67,7 +71,10 @@ class ShutdownIntentTests(unittest.TestCase):
         self.state = self.runtime / "shutdown"
         self.gate = self.runtime / "gate"
         self.gate.write_text(json.dumps({"open": True, "release_id": "release-a"}))
-        (self.runtime / "release.json").write_text(json.dumps({**manifest_fixture(), "ready": True}))
+        self.controller = ControllerFixture(release, self.runtime)
+        context = self.controller.patches()
+        context.__enter__()
+        self.addCleanup(context.__exit__, None, None, None)
         self.run = FakeCommands()
         self.enrollment = "/protected/enrollment.json"
         for name, callback in (("load_enrollment", lambda _: {"registry": registry(), "registry_sha256": "e" * 64, "known_hosts_bytes": b"synthetic"}),
@@ -211,7 +218,8 @@ class ShutdownIntentTests(unittest.TestCase):
             profile=self.runtime/'profile'
             with self.assertRaises(RuntimeError):
                 release.activate(manifest_fixture(),profile=profile,runtime=self.runtime,
-                    gate=self.gate,run=self.run)
+                    gate=self.gate,run=self.run,role='controller',
+                    expected_node_identity=CONTROLLER,enrollment_id=ENROLL_IDS[0])
             self.assertEqual(self.run.calls,before)
             self.no_resume()
         finally:
@@ -428,7 +436,7 @@ class ShutdownIntentTests(unittest.TestCase):
             try:
                 self.runtime = Path(temporary); self.state = self.runtime / "shutdown"; self.gate = self.runtime / "gate"
                 self.gate.write_text(json.dumps({"open": True, "release_id": "release-a"}))
-                (self.runtime / "release.json").write_text(json.dumps({**manifest_fixture(), "ready": True}))
+                self.controller.seed(self.runtime)
                 real_unlink = Path.unlink
                 def fail_marker(path, *args, **kwargs):
                     if path.name.endswith(".startup-admission-intent.json"):

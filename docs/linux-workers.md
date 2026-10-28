@@ -360,6 +360,17 @@ sudo qcl-negf-worker-lifecycle startup --node arch-worker \
 receipt; для возврата существующей машины нужны её реальные durable lifecycle records.
 Неизвестный transition сохраняет закрытый допуск и требует reconciliation.
 
+Обычный enrolled `startup` требует современный полный release envelope с closure hashes; four-field
+controller record отвергается до DRAIN/copy. Source/closure/solver-build metadata сохраняется
+целиком в snapshot и remote activation/check. Текущий enrollment UUID берётся из защищённого
+registry и передаётся P11 qualification на activate и оба check пути, включая повтор уже resumed
+boot. При той же permanent identity, enrollment, артефакте и kernel/modules/restore environment
+новый boot получает актуальную activation health с повторным использованием solver proof. Check не
+восстанавливает missing/corrupt proof и не запускает full verify/self-check. Metadata drift, stale
+identity или неизвестный intent не разрешают RESUME. Явный локальный P11 bootstrap остаётся
+отдельным путём. Эти source fixtures не заменяют native boot/enrollment/grant acceptance; P20/P14 и
+полный P22 onboarding квалифицируются отдельно.
+
 ## Конечный smoke и нормальный shutdown/return
 
 После native admission выполните отдельно назначенный non-scientific smoke с

@@ -412,6 +412,16 @@ def startup(node, target, *, enrollment, runtime=RUNTIME, gate=GATE, run=command
             delivery_output_bytes=delivery_output_bytes, deadline=deadline)
 
 
+def _startup_release(runtime):
+    """Normal enrolled startup never projects a modern release into legacy mode."""
+    current = release.unique_json(release.read_protected_file(
+        Path(runtime) / 'release.json', limit=65536), 65536)
+    expected = release.release_envelope(current)
+    if 'closures' not in expected:
+        raise ValueError('Enrolled startup requires full modern release metadata')
+    return expected
+
+
 def _startup_node_owned(node, target, *, enrollment, runtime, gate, run,
                         delivery_timeout_seconds, command_timeout_seconds,
                         command_output_bytes, delivery_output_bytes, deadline):
@@ -462,18 +472,20 @@ def _startup_node_owned(node, target, *, enrollment, runtime, gate, run,
         return release.bind_node_observation(binding, actual, prior_boot=prior_boot)
     runtime = Path(runtime)
     runtime.mkdir(parents=True, exist_ok=True)
-    snapshot = manifest(load(runtime / 'release.json'))
+    snapshot = _startup_release(runtime)
     with release.lifecycle_owner(runtime, operation='startup', release_id=snapshot['release_id'],
-            release_identity=snapshot, deadline=deadline) as owner:
+            release_identity=manifest(snapshot), deadline=deadline) as owner:
         bounded.owner = owner
         release.recheck_controller_authority(authority, run=bounded)
         release.lifecycle_guard(runtime, normal_intents=False, owner=owner)
         bound = probe()
-        expected = manifest(load(runtime / "release.json"))
+        expected = _startup_release(runtime)
         if expected != snapshot:
             raise ValueError('Release changed before startup acquired common owner')
         release._owner_before(owner)['gate'] = str(Path(gate).absolute())
-        guard(expected["release_id"], expected["solver_executable"], runtime / "release.json", gate)
+        current = guard(expected["release_id"], expected["solver_executable"], runtime / "release.json", gate)
+        if release.release_envelope(current) != expected:
+            raise ValueError('Release changed during startup guard')
         state_path = runtime / "shutdown" / (node + ".json")
         value = release.read_shutdown_intent(state_path, node) if state_path.exists() else None
         if value is not None:
@@ -492,6 +504,7 @@ def _startup_node_owned(node, target, *, enrollment, runtime, gate, run,
         encoded = base64.urlsafe_b64encode(json.dumps(expected).encode()).decode()
         expected_node = base64.urlsafe_b64encode(json.dumps(dict(bound["identity"])).encode()).decode()
         flags = ["--expected-node-identity-base64", expected_node,
+                 "--qualification-enrollment-id", binding["enrollment_id"],
                  "--command-timeout-seconds", str(command_timeout_seconds),
                  "--command-output-bytes", str(command_output_bytes),
                  "--delivery-timeout-seconds", str(max(0, deadline-time.monotonic()-2))]
@@ -501,6 +514,9 @@ def _startup_node_owned(node, target, *, enrollment, runtime, gate, run,
             actual = release.verify_node_envelope(bound, release.unique_json(raw), expected)
             probe(bound["identity"]["boot_id"])
             release.recheck_controller_authority(authority, run=bounded)
+            current = guard(expected["release_id"], expected["solver_executable"], runtime / "release.json", gate)
+            if release.release_envelope(current) != expected:
+                raise ValueError('Release changed during resumed startup check')
             return _public_startup(actual, node, bound, value)
         if value is None:
             value = {"schema": release.SHUTDOWN_SCHEMA, "origin": "initial_enrollment", "node": node,
@@ -540,7 +556,9 @@ def _startup_node_owned(node, target, *, enrollment, runtime, gate, run,
             except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
                 error.uncertain = True
                 raise
-            guard(expected["release_id"], expected["solver_executable"], runtime / "release.json", gate)
+            current = guard(expected["release_id"], expected["solver_executable"], runtime / "release.json", gate)
+            if release.release_envelope(current) != expected:
+                raise ValueError('Release changed before startup admission')
             release.deadline_check(deadline)
             release.lifecycle_guard(runtime, normal_intents=False, owner=owner)
             current = release.read_shutdown_intent(state_path, node)
@@ -550,7 +568,7 @@ def _startup_node_owned(node, target, *, enrollment, runtime, gate, run,
             # CR04 primitive protects terminal node replace/fsync failure after RESUME.
             resume_marker = runtime / "delivery-attempts" / (str(uuid.uuid4()) + ".startup-admission-intent.json")
             _exclusive_attempt_json(resume_marker, {"schema": "qcl-negf-admission-intent-v1",
-                "attempt_id": resume_marker.name.split(".")[0], "identity": expected, "node": node,
+                "attempt_id": resume_marker.name.split(".")[0], "identity": manifest(expected), "node": node,
                 "startup_event_id": event["event_id"]}, owner=owner)
             release._register_artifact(owner, resume_marker)
             value.update(return_boot_id=bound["identity"]["boot_id"], pending_action="resume")
