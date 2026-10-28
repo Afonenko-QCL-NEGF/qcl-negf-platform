@@ -96,6 +96,18 @@ assert api.serviceConfig.ReadWritePaths == disabledApi.serviceConfig.ReadWritePa
 assert builtins.attrNames configured.systemd.services == builtins.attrNames controller.systemd.services;
 assert controller.qclNegf.release.enable;
 assert worker.qclNegf.release.enable;
+assert controller.systemd.services."qcl-negf-delivery@".serviceConfig.Type == "exec";
+assert controller.systemd.services."qcl-negf-delivery@".serviceConfig.Restart == "no";
+assert controller.systemd.services."qcl-negf-delivery@".serviceConfig.KillMode == "control-group";
+assert controller.systemd.services."qcl-negf-delivery@".serviceConfig.TimeoutStartSec == "infinity";
+assert controller.systemd.services."qcl-negf-delivery@".partOf == [];
+assert !lib.elem "qcl-negf-api.service" controller.systemd.services."qcl-negf-delivery@".requires;
+assert !lib.elem "qcl-negf-aiida.service" controller.systemd.services."qcl-negf-delivery@".requires;
+assert lib.elem "qcl-negf-delivery-boot-reconcile.service" controller.systemd.services."qcl-negf-delivery@".requires;
+assert controller.systemd.services.qcl-negf-delivery-boot-reconcile.serviceConfig.RemainAfterExit;
+assert lib.elem "multi-user.target" controller.systemd.services.qcl-negf-delivery-boot-reconcile.wantedBy;
+assert !(worker.systemd.services ? "qcl-negf-delivery@");
+assert lib.hasInfix "run --request-id %i" controller.systemd.services."qcl-negf-delivery@".serviceConfig.ExecStart;
 assert lib.hasPrefix "/nix/store/" controller.systemd.services.qcl-negf-aiida.serviceConfig.ExecStart;
 assert lib.hasSuffix "-qcl-negf-aiida-start" controller.systemd.services.qcl-negf-aiida.serviceConfig.ExecStart;
 assert controller.systemd.services.qcl-negf-aiida.serviceConfig.EnvironmentFile == "-/var/lib/qcl-negf-admin/runtime/service.env";

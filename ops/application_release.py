@@ -2827,8 +2827,43 @@ def _finish_update_owned(expected,attempt_id,expected_node_identity,*,owner,runt
 
 def deliver_cli(expected, pool, run=command, *, enrollment, runtime=RUNTIME, gate=GATE,
                 delivery_timeout_seconds=1800.0, command_timeout_seconds=360.0,
-                command_output_bytes=1048576, delivery_output_bytes=8388608):
+                command_output_bytes=1048576, delivery_output_bytes=8388608,
+                request_context=None, progress=None):
     """Authority precondition precedes local writes and lock; no inventory fallback."""
+    if request_context is not None:
+        if not isinstance(request_context, dict) or set(request_context) != {'request_id','attempt_id','request_sha256','enrollment_sha256'}:
+            raise ValueError('Expected exact durable request context')
+        for key in ('request_id','attempt_id'):
+            if normalized_uuid(request_context[key]) != request_context[key] or uuid.UUID(request_context[key]).int == 0:
+                raise ValueError('Expected canonical request/attempt UUID')
+        for key in ('request_sha256','enrollment_sha256'):
+            if not isinstance(request_context[key],str) or not re.fullmatch('[0-9a-f]{64}',request_context[key]):
+                raise ValueError('Invalid durable request digest')
+        request_context = dict(request_context)
+    if progress is not None and (request_context is None or not callable(progress)):
+        raise ValueError('Progress requires a bound request and callback')
+    projection_errors = []
+    def notify(receipt, *, terminal=False):
+        if progress is None:
+            return
+        ref = 'delivery-attempts/'+request_context['attempt_id']+'.json'
+        value = {'schema':'qcl-negf-delivery-progress-v1',
+            **{key:request_context[key] for key in ('request_id','attempt_id','request_sha256')},
+            'phase':'engine_returned' if terminal else receipt.get('phase','preflight'),
+            'state':'completed' if terminal and receipt.get('status')=='completed' and receipt.get('open') is True else 'running',
+            'engine_receipt':ref,'original_failure_log':ref if receipt.get('status')=='failed' else None,
+            'admission_state':receipt.get('admission_state', 'open' if receipt.get('open') is True else
+                'closed' if receipt.get('gate_changed') and receipt.get('open') is False else 'not_observed'),
+            'pending_mutation':False if terminal and receipt.get('status')=='completed' else bool(
+                receipt.get('pending_command',{}).get('mutation') or receipt.get('pending_local_mutation') or
+                receipt.get('pending_stopped_observation') or receipt.get('admission_pending')),
+            'requires_reconciliation':bool(receipt.get('requires_reconciliation',False))}
+        try:
+            progress(value)
+        except (ValueError,RuntimeError,OSError,subprocess.SubprocessError) as error:
+            # Auxiliary publication is never a command/engine failure. In
+            # particular it cannot close admission after the last success action.
+            projection_errors.append(type(error).__name__)
     start = time.monotonic()
     for value in (delivery_timeout_seconds, command_timeout_seconds):
         if duration(value, "CLI timeout") <= 2:
@@ -2841,6 +2876,8 @@ def deliver_cli(expected, pool, run=command, *, enrollment, runtime=RUNTIME, gat
     authority = preflight_controller_authority(enrollment, pool, run=run, deadline=deadline,
         command_timeout_seconds=command_timeout_seconds, command_output_bytes=command_output_bytes,
         delivery_output_bytes=delivery_output_bytes, before_remote=lambda: lifecycle_guard(runtime))
+    if request_context is not None and request_context['enrollment_sha256'] != authority['registry_sha256']:
+        raise ValueError('Durable request enrollment changed before delivery')
     if {entry['enrollment_id'] for entry in pool['nodes']} != {entry['enrollment_id'] for entry in authority['registry']['nodes']}:
         raise ValueError('Whole update requires complete enrollment coverage; offline nodes cannot be skipped')
     if expected.get('requires_os_maintenance',False) is not False:
@@ -2852,13 +2889,20 @@ def deliver_cli(expected, pool, run=command, *, enrollment, runtime=RUNTIME, gat
                          release_identity=manifest(expected), deadline=deadline) as owner:
         recheck_controller_authority(authority, run=run)
         lifecycle_guard(runtime, owner=owner)
-        return _deliver_cli_locked(expected, pool, run, runtime=runtime, gate=gate, authority=authority,
+        result = _deliver_cli_locked(expected, pool, run, runtime=runtime, gate=gate, authority=authority,
             owner=owner, start=start, deadline=deadline, command_timeout_seconds=command_timeout_seconds,
-            command_output_bytes=command_output_bytes, delivery_output_bytes=delivery_output_bytes)
+            command_output_bytes=command_output_bytes, delivery_output_bytes=delivery_output_bytes,
+            request_context=request_context, notify=notify)
+        if request_context is not None:
+            notify(result, terminal=True)
+        if projection_errors:
+            result['projection_error'] = projection_errors[-1]
+        return result
 
 
 def _deliver_cli_locked(expected, pool, run, *, owner, runtime, gate, authority, start, deadline,
-                        command_timeout_seconds, command_output_bytes, delivery_output_bytes):
+                        command_timeout_seconds, command_output_bytes, delivery_output_bytes,
+                        request_context=None, notify=lambda *args, **kwargs: None):
     runtime = Path(runtime)
     _require_owner(owner, runtime=runtime, operation='whole_update',
                    release_identity=manifest(expected), deadline=deadline)
@@ -2866,8 +2910,10 @@ def _deliver_cli_locked(expected, pool, run, *, owner, runtime, gate, authority,
     attempts = runtime / "delivery-attempts"
     attempts.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(attempts, 0o700)
-    attempt_id = str(uuid.uuid4())
+    attempt_id = request_context['attempt_id'] if request_context is not None else str(uuid.uuid4())
     receipt_path = attempts / (attempt_id + ".json")
+    if os.path.lexists(receipt_path):
+        raise ValueError('Durable request attempt already exists; never replay or overwrite')
     intent_path = attempts / (attempt_id + ".admission-intent.json")
     receipt = {"schema": "qcl-negf-delivery-attempt-v1", "attempt_id": attempt_id,
                "manifest": expected, "identity": manifest(expected), "status": "running",
@@ -2879,6 +2925,8 @@ def _deliver_cli_locked(expected, pool, run, *, owner, runtime, gate, authority,
                    "inventory_id": authority["registry"]["inventory_id"],
                    "local_identity": authority["local_identity"], "remote_identity": authority["remote_identity"],
                    "trust_snapshot": dict(authority["trust_snapshot"])}}
+    if request_context is not None:
+        receipt['request_context'] = dict(request_context)
     raw_gate = read_admission(gate, missing=True)
     if raw_gate is not None:
         try:
@@ -2915,6 +2963,7 @@ def _deliver_cli_locked(expected, pool, run, *, owner, runtime, gate, authority,
         publish_json(receipt_path, receipt, mode=0o600, before=before)
         _register_artifact(owner, receipt_path)
         publish_json(runtime / "delivery-report.json", safe_summary(), before=before)
+        notify(receipt)
     checkpoint()
     native = run is command
     original_run = run
@@ -3272,7 +3321,9 @@ def _deliver_cli_locked(expected, pool, run, *, owner, runtime, gate, authority,
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["update","update-identity","update-capabilities","stop-update","stopped-identity","health-update","finish-update","prepare-initial", "qualify", "integrity-audit", "invalidate-qualification", "activate", "check", "guard", "node-check", "bootstrap-identity", "identity", "deliver"])
+    parser.add_argument("action", choices=["update","update-identity","update-capabilities","stop-update","stopped-identity","health-update","finish-update","prepare-initial", "qualify", "integrity-audit", "invalidate-qualification", "activate", "check", "guard", "node-check", "bootstrap-identity", "identity", "deliver", "delivery-status"])
+    parser.add_argument("--request-id")
+    parser.add_argument("--procedure", choices=["maintenance"])
     parser.add_argument("--update-attempt-id")
     parser.add_argument("--prior-update-attempt-id")
     parser.add_argument("--update-enrollment-id")
@@ -3295,6 +3346,23 @@ def main():
     parser.add_argument("--command-output-bytes", type=int, default=1048576)
     parser.add_argument("--delivery-output-bytes", type=int, default=8388608)
     args = parser.parse_args()
+    if args.action in ('update','deliver') and (not args.request_id or args.procedure != 'maintenance'):
+        parser.error('Delivery requires explicit --request-id UUID --procedure maintenance')
+    if args.action in ('update','deliver') and args.runtime != RUNTIME:
+        parser.error('Installed controller service uses the fixed runtime directory')
+    if args.action in ('update','deliver','delivery-status') and args.gate != GATE:
+        parser.error('Controller service uses the installed shared admission gate')
+    if args.action == 'delivery-status':
+        if not args.request_id:
+            parser.error('Status requires --request-id')
+        from delivery_requests import read_update_status, error_response
+        try:
+            result = read_update_status(args.request_id, runtime=args.runtime)
+        except (ValueError,RuntimeError,OSError,subprocess.SubprocessError) as error:
+            print(json.dumps(error_response(args.request_id,error),sort_keys=True))
+            raise SystemExit(1)
+        print(json.dumps(result, sort_keys=True))
+        return
     if args.action in ('stop-update','stopped-identity','update-identity','health-update','finish-update') or args.update_attempt_id:
         for value in (args.delivery_timeout_seconds,args.command_timeout_seconds):
             if duration(value,'Update duration')<=2:raise ValueError('Update duration must exceed cleanup reserve')
@@ -3332,24 +3400,36 @@ def main():
         return
     if bool(args.manifest) == bool(args.manifest_base64):
         parser.error("Provide exactly one --manifest or --manifest-base64")
-    manifest_value = (unique_json(update_scan.read(args.manifest,65536),65536) if update_scan else unique_json(Path(args.manifest).read_bytes(),65536)) if args.manifest else unique_json(base64.urlsafe_b64decode(args.manifest_base64),65536)
-    expected = release_envelope(manifest_value)
+    if args.action in ('update','deliver'):
+        from delivery_requests import error_response
+        try:
+            manifest_value = unique_json(local_metadata(args.manifest,65536),65536) if args.manifest else unique_json(base64.urlsafe_b64decode(args.manifest_base64),65536)
+            expected = release_envelope(manifest_value)
+        except (ValueError,RuntimeError,OSError,subprocess.SubprocessError) as error:
+            print(json.dumps(error_response(args.request_id,error),sort_keys=True))
+            raise SystemExit(1)
+    else:
+        manifest_value = (unique_json(update_scan.read(args.manifest,65536),65536) if update_scan else unique_json(Path(args.manifest).read_bytes(),65536)) if args.manifest else unique_json(base64.urlsafe_b64decode(args.manifest_base64),65536)
+        expected = release_envelope(manifest_value)
     expected_node = unique_json(base64.urlsafe_b64decode(args.expected_node_identity_base64), 16384) if args.expected_node_identity_base64 else None
     if args.action == "activate" and expected_node is not None and not args.update_attempt_id:
         assert_expected_node(expected_node, role=args.role, run=native_run)
     if args.action in ("deliver","update"):
         if not args.pool or not args.enrollment:
             parser.error("Delivery requires --pool v2 and protected --enrollment")
+        from delivery_requests import submit_update, REQUEST_SCHEMA, error_response
         try:
-            result = deliver_cli(manifest_value, load(args.pool), enrollment=args.enrollment,
-                runtime=args.runtime, gate=args.gate, delivery_timeout_seconds=args.delivery_timeout_seconds,
-                command_timeout_seconds=args.command_timeout_seconds,
-                command_output_bytes=args.command_output_bytes, delivery_output_bytes=args.delivery_output_bytes)
-        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
-            result = getattr(error, "delivery_summary", None)
-            if result is None:
-                result = {"open": None, "admission_state": "unknown", "requires_reconciliation": True}
-            result = {**result, "status": "failed", "error": type(error).__name__}
+            enrollment_raw = read_protected_file(args.enrollment)
+            result = submit_update({'schema':REQUEST_SCHEMA,'request_id':args.request_id,
+                'procedure':args.procedure,'manifest':manifest_value,'pool':unique_json(local_metadata(args.pool,65536),65536),
+                'enrollment':{'path':args.enrollment,'sha256':hashlib.sha256(enrollment_raw).hexdigest()},
+                'bounds':{'delivery_timeout_seconds':args.delivery_timeout_seconds,
+                    'command_timeout_seconds':args.command_timeout_seconds,
+                    'command_output_bytes':args.command_output_bytes,
+                    'delivery_output_bytes':args.delivery_output_bytes}}, runtime=args.runtime)
+        except (ValueError,RuntimeError,OSError,subprocess.SubprocessError) as error:
+            print(json.dumps(error_response(args.request_id,error),sort_keys=True))
+            raise SystemExit(1)
     elif args.action in ('stop-update','stopped-identity','update-identity','health-update','finish-update'):
         if (expected_node is None and args.action not in ('stopped-identity','update-identity')) or not args.update_attempt_id:parser.error('Update action requires bound identity and own attempt')
         if args.action=='stop-update':result=stop_update(expected,args.update_attempt_id,expected_node,runtime=args.runtime,gate=args.gate,run=native_run,deadline=action_deadline,prior_attempt_id=args.prior_update_attempt_id,enrollment_id=args.update_enrollment_id,metadata_budget=update_scan)
@@ -3395,7 +3475,7 @@ def main():
                                   expected_node_identity=expected_node,update_attempt_id=args.update_attempt_id,gate=args.gate,deadline=action_deadline,metadata_budget=update_scan,enrollment_id=qualification_enrollment)
                 _finish_owned(owner, deadline=action_deadline)
     print(json.dumps(result, sort_keys=True))
-    if args.action in ("deliver","update") and (result.get("status") != "completed" or not result.get("open")):
+    if args.action in ("deliver","update") and result.get("state") not in ("queued","running","completed"):
         raise SystemExit(1)
 
 

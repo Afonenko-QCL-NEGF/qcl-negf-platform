@@ -717,57 +717,39 @@ class ApplicationReleaseTests(unittest.TestCase):
             self.assertGreater(deadline,time.monotonic())
             self.assertLess(deadline,time.monotonic()+1801)
 
-    def test_final_combined_cli_failure_prints_current_unknown_and_blocks_retry(self):
-        self.gate.write_text(json.dumps({"open": True, "release_id": "old"}))
-        source, pool = self.runtime.parent / "manifest.json", self.runtime.parent / "pool.json"
-        source.write_text(json.dumps(delivery_manifest()))
-        pool.write_text(json.dumps(POOL))
-        run = DeliveryCommands(self.gate)
-        original_deliver = self.ops.deliver_cli
-        publish = self.ops.publish_json
-        admission = self.ops.publish_admission
-        opened = [False]
-        def injected_delivery(value, selected, **kwargs):
-            return original_deliver(value, selected, run=run, **kwargs)
-        def persistent_terminal(path, value, **kwargs):
-            if Path(path).parent.name == "delivery-attempts" and value.get("phase") == "finished":
-                raise OSError("persistent terminal failure")
-            return publish(path, value, **kwargs)
-        def failed_close(path, value, **kwargs):
-            if not value["open"] and opened[0]:
-                raise OSError("failed recovery close")
-            result = admission(path, value, **kwargs)
-            if value["open"]:
-                opened[0] = True
+    def test_final_combined_engine_failure_retains_current_unknown_and_blocks_retry(self):
+        # Public update now dispatches a service. Keep this regression at its
+        # owning engine boundary; service projection faults have separate fixtures.
+        self.gate.write_text(json.dumps({"open":True,"release_id":"old"}))
+        run=DeliveryCommands(self.gate)
+        publish,admission=self.ops.publish_json,self.ops.publish_admission
+        opened=[False]
+        def persistent_terminal(path,value,**kwargs):
+            if Path(path).parent.name=='delivery-attempts' and value.get('phase')=='finished':
+                raise OSError('persistent terminal failure')
+            return publish(path,value,**kwargs)
+        def failed_close(path,value,**kwargs):
+            if not value['open'] and opened[0]:
+                raise OSError('failed recovery close')
+            result=admission(path,value,**kwargs)
+            if value['open']:opened[0]=True
             return result
-        args = ["release", "deliver", "--manifest", str(source), "--pool", str(pool), "--enrollment", "/synthetic/enrollment.json",
-                "--runtime", str(self.runtime), "--gate", str(self.gate)]
-        with patch.object(sys, "argv", args), patch.object(self.ops, "deliver_cli", injected_delivery), \
-             patch.object(self.ops, "publish_json", persistent_terminal), \
-             patch.object(self.ops, "publish_admission", failed_close), patch("builtins.print") as printed:
-            with self.assertRaises(SystemExit) as caught:
-                self.ops.main()
-        self.assertEqual(caught.exception.code, 1)
-        payload = json.loads(printed.call_args.args[0])
-        self.assertIsNone(payload["open"])
-        self.assertEqual(payload["admission_state"], "unknown")
-        self.assertTrue(payload["critical_admission_failure"])
-        self.assertTrue(payload["requires_reconciliation"])
-        self.assertTrue(json.loads(self.gate.read_text())["open"])
-        self.assertFalse(json.loads((self.runtime / "delivery-report.json").read_text())["open"])
-        self.assertNotIn("manifest", payload)
-        self.assertNotIn("commands", payload)
-        before = list(run.calls)
-        with patch.object(sys, "argv", args), patch.object(self.ops, "deliver_cli", injected_delivery), \
-             patch("builtins.print") as retry_printed:
-            with self.assertRaises(SystemExit) as retry:
-                self.ops.main()
-        self.assertEqual(retry.exception.code, 1)
-        self.assertEqual(before, run.calls)
-        retry_payload = json.loads(retry_printed.call_args.args[0])
-        self.assertIsNone(retry_payload["open"])
-        self.assertTrue(retry_payload["requires_reconciliation"])
-        self.assertTrue(list((self.runtime / "delivery-attempts").glob("*.admission-intent.json")))
+        with patch.object(self.ops,'publish_json',persistent_terminal),patch.object(self.ops,'publish_admission',failed_close):
+            with self.assertRaises(OSError) as caught:
+                self.ops.deliver_cli(delivery_manifest(),POOL,run=run,runtime=self.runtime,gate=self.gate)
+        payload=caught.exception.delivery_summary
+        self.assertIsNone(payload['open'])
+        self.assertEqual(payload['admission_state'],'unknown')
+        self.assertTrue(payload['critical_admission_failure'])
+        self.assertTrue(payload['requires_reconciliation'])
+        self.assertTrue(json.loads(self.gate.read_bytes())['open'])
+        self.assertFalse(json.loads((self.runtime/'delivery-report.json').read_bytes())['open'])
+        self.assertNotIn('manifest',payload);self.assertNotIn('commands',payload)
+        before=list(run.calls)
+        with self.assertRaises(RuntimeError):
+            self.ops.deliver_cli(delivery_manifest(),POOL,run=run,runtime=self.runtime,gate=self.gate)
+        self.assertEqual(before,run.calls)
+        self.assertTrue(list((self.runtime/'delivery-attempts').glob('*.admission-intent.json')))
 
     def test_root_squashed_shared_gate_is_read_as_scientific_owner_without_relaxing_guards(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1206,21 +1188,23 @@ class ApplicationReleaseTests(unittest.TestCase):
                     self.ops.deliver_cli(value, POOL, runtime=self.runtime, gate=self.gate, run=lambda args: calls.append(args))
                 self.assertEqual(calls, [])
 
-    def test_cli_keeps_operational_cache_and_closure_fields_for_controller_prefetch(self):
+    def test_cli_keeps_operational_cache_and_closures_in_explicit_service_request(self):
+        import delivery_requests
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            source, pool = root / "release.json", root / "pool.json"
-            source.write_text(json.dumps(delivery_manifest()))
-            pool.write_text(json.dumps(POOL))
-            observed = []
-            def deliver(value, selected_pool, **kwargs):
-                observed.append((value, selected_pool))
-                return {"open": True, "status": "completed"}
-            args = ["qcl-negf-release", "deliver", "--manifest", str(source), "--pool", str(pool), "--enrollment", "/synthetic/enrollment.json",
-                    "--runtime", str(root / "runtime")]
-            with patch.object(sys, "argv", args), patch.object(self.ops, "deliver_cli", deliver), patch("builtins.print"):
+            root=Path(temporary)
+            source,pool=root/'release.json',root/'pool.json'
+            source.write_text(json.dumps(delivery_manifest()));pool.write_text(json.dumps(POOL))
+            observed=[]
+            def submit(value,**kwargs):
+                observed.append(value)
+                return {'state':'queued'}
+            args=['release','deliver','--manifest',str(source),'--pool',str(pool),
+                '--enrollment','/synthetic/enrollment.json','--request-id',
+                'd3986590-cf69-4ca8-af7c-c3e065241ad2','--procedure','maintenance']
+            with patch.object(sys,'argv',args),patch.object(delivery_requests,'submit_update',submit), \
+                 patch.object(self.ops,'read_protected_file',return_value=b'{}'),patch('builtins.print'):
                 self.ops.main()
-            self.assertEqual(observed, [(delivery_manifest(), POOL)])
+            self.assertEqual([(v['manifest'],v['pool']) for v in observed],[(delivery_manifest(),POOL)])
 
     def test_activation_publishes_only_after_identity_and_health_check_then_retry_is_idempotent(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1629,6 +1613,43 @@ class I14UpdateTests(unittest.TestCase):
         return self.ops.deliver_cli(delivery_manifest(),pool or self.pool,run=self.commands,
             enrollment='/synthetic/enrollment.json',runtime=self.runtime,gate=self.gate)
 
+    def test_p23_bound_attempt_and_post_commit_projection_failure_preserve_primary(self):
+        context={'request_id':'d3986590-cf69-4ca8-af7c-c3e065241ad2',
+            'attempt_id':'36213372-2a79-4f6c-b06c-3a67db985c59',
+            'request_sha256':'b'*64,'enrollment_sha256':self.context['registry_sha256']}
+        observed=[]
+        def projection(value):
+            observed.append(value)
+            primary=json.loads((self.runtime/'delivery-attempts'/(context['attempt_id']+'.json')).read_bytes())
+            self.assertEqual(primary['request_context'],context)
+            if value['state']=='completed':
+                self.assertEqual(primary['status'],'completed')
+                self.assertFalse((self.runtime/'delivery-attempts'/(context['attempt_id']+'.admission-intent.json')).exists())
+                raise OSError('auxiliary projection fsync after engine commit')
+        result=self.ops.deliver_cli(delivery_manifest(),self.pool,run=self.commands,
+            enrollment='/synthetic/enrollment.json',runtime=self.runtime,gate=self.gate,
+            request_context=context,progress=projection)
+        self.assertEqual(result['status'],'completed')
+        self.assertTrue(result['open'])
+        self.assertTrue(json.loads(self.gate.read_bytes())['open'])
+        self.assertEqual(result['attempt_id'],context['attempt_id'])
+        self.assertEqual(observed[-1]['state'],'completed')
+        self.assertTrue(all(type(v['pending_mutation']) is bool for v in observed))
+        self.assertEqual(result['projection_error'],'OSError')
+        self.assertEqual(json.loads(Path(result['receipt']).read_bytes())['status'],'completed')
+
+    def test_p23_wrong_enrollment_context_fails_before_engine_mutation(self):
+        before=self.gate.read_bytes()
+        context={'request_id':'d3986590-cf69-4ca8-af7c-c3e065241ad2',
+            'attempt_id':'36213372-2a79-4f6c-b06c-3a67db985c59',
+            'request_sha256':'b'*64,'enrollment_sha256':'0'*64}
+        with self.assertRaisesRegex(ValueError,'enrollment'):
+            self.ops.deliver_cli(delivery_manifest(),self.pool,run=self.commands,
+                enrollment='/synthetic/enrollment.json',runtime=self.runtime,gate=self.gate,
+                request_context=context,progress=lambda value:None)
+        self.assertEqual(self.gate.read_bytes(),before)
+        self.assertFalse(self.runtime.exists())
+
     def test_i14_requires_complete_enrollment_before_gate_change(self):
         before=self.gate.read_bytes()
         with self.assertRaisesRegex(ValueError,'enrollment'):
@@ -1709,8 +1730,8 @@ class I14UpdateTests(unittest.TestCase):
                 argv[argv.index('--runtime')+1]=str(self.runtime);argv[argv.index('--gate')+1]=str(self.gate)
                 with patch.object(sys,'argv',argv),patch.object(self.ops,'deliver_cli',side_effect=actual_guard) as operation,patch('builtins.print'):
                     with self.assertRaises(SystemExit):self.ops.main()
-                    self.assertEqual(operation.call_count,1)
-                    self.assertEqual(self.calls,[],"real incomplete enrollment guard before remote dispatch")
+                    self.assertEqual(operation.call_count,0)
+                    self.assertEqual(self.calls,[],"missing explicit request/procedure refuses before dispatch")
                     self.assertTrue(json.loads(self.gate.read_text())['open'])
 
     def test_i14_no_cancel_submit_retry_calls(self):
@@ -2941,15 +2962,10 @@ class I14WholeRepairTests(unittest.TestCase):
         for case in ('member1','memberNone','memberstring','systemdNone','systemd1','systemdlist'):
             with self.subTest(case=case),self.isolated_delivery_case():
                 self.corrupt_action='stop-update';self.bad_variant=case;self.bad_reached=0
-                original=self.ops.deliver_cli
-                def actual(*args,**kwargs):return original(*args,run=self.invalid_stopped,**kwargs)
-                manifest_path=self.root/('candidate-'+case+'.json');manifest_path.write_text(json.dumps(delivery_manifest()))
-                pool_path=self.root/('pool-'+case+'.json');pool_path.write_text(json.dumps(self.pool))
-                argv=['release','update','--manifest',str(manifest_path),'--pool',str(pool_path),'--enrollment','/synthetic/enrollment.json','--runtime',str(self.runtime),'--gate',str(self.gate)]
-                with patch.object(sys,'argv',argv),patch.object(self.ops,'deliver_cli',side_effect=actual),patch('builtins.print') as printed:
-                    with self.assertRaises(SystemExit) as failure:self.ops.main()
-                    self.assertEqual(failure.exception.code,1);self.assertTrue(printed.called)
-                    summary=json.loads(printed.call_args[0][0]);self.assertEqual(summary['remote_outcome'],'unknown');self.assertTrue(summary['requires_reconciliation'])
+                summary=self.ops.deliver_cli(delivery_manifest(),self.pool,run=self.invalid_stopped,
+                    enrollment='/synthetic/enrollment.json',runtime=self.runtime,gate=self.gate)
+                self.assertEqual(summary['remote_outcome'],'unknown')
+                self.assertTrue(summary['requires_reconciliation'])
                 self.assertEqual(self.bad_reached,1);record=self.receipt();self.assertEqual(record['status'],'failed');self.assertEqual(record['stopped_observation_failure']['action'],'stop-update')
                 self.assertLessEqual(len(record['stopped_observation_failure']['reason']),4096);self.no_later();self.assertFalse(json.loads(self.gate.read_text())['open'])
                 before=len(self.calls)

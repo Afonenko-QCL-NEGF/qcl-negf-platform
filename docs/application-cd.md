@@ -2,8 +2,9 @@
 
 The umbrella GitHub Actions workflow builds and checks immutable source artifacts. A local serial
 owner on the permanent controller performs whole-cluster update; it needs no GitHub deployment
-credential or delivery runner. This component adds no deploy daemon, discovery or revision lock
-catalog. The initial deployment is CPU-only and selects one release for the active pool.
+credential or delivery runner. The controller-owned delivery systemd service reuses the existing
+maintenance engine; it adds no discovery or revision lock catalog. See the Russian
+[delivery operations manual](delivery-operations.md) for request identity and interruption handling. The initial deployment is CPU-only and selects one release for the active pool.
 
 ## One-time image preparation
 
@@ -80,15 +81,16 @@ credentials. After manually cancelling both AiiDA `qcl_negf.plan` and `qcl_negf.
 workflows (including paused/waiting retries) and all Slurm jobs/queue, signal update locally:
 
 ```console
-sudo qcl-negf-release update --manifest /private/release.json --pool /private/pool-v2.json --enrollment /operator-protected/enrollment.json
+sudo qcl-negf-release update --request-id d3986590-cf69-4ca8-af7c-c3e065241ad2 --procedure maintenance --manifest /private/release.json --pool /private/pool-v2.json --enrollment /operator-protected/enrollment.json
 ```
 
-`deliver` is a compatibility alias of this same safe whole-cluster path; it cannot omit workers or
-bypass cancellation. Defaults are one 1800-second operation, 360-second bounded commands, 1 MiB
+`deliver` submits the same explicit maintenance request; it cannot omit workers or bypass the
+empty-work barrier. Both aliases require request ID and procedure; neither runs foreground delivery. Defaults are one 1800-second operation, 360-second bounded commands, 1 MiB
 per-command combined output and 8 MiB aggregate; deadlines never reset by node. These are
-engineering bounds, not a scientific CPU/RAM grant. An optional operator-owned standard
-`systemd-run` oneshot can detach the exact immutable command with `RuntimeMaxSec`; no new service or
-automatic admission opener is installed.
+engineering bounds, not a scientific CPU/RAM grant. The ordinary controller template service owns
+the whole operation outside the client TTY. It has no automatic restart/replay/admission opener.
+Read-only `delivery-status --request-id UUID` reads the bounded durable operation projection; queued
+is not completed. No soft-update fallback is implemented.
 
 Before maintenance, protected enrollment and readonly identity probes bind the actual local
 controller and all enrolled nodes. The controller then fetches both named closures with
@@ -138,7 +140,8 @@ same-generation IDLE and zero allocations on every worker precede gate opening. 
 state/reason/resource/generation changes remain closed. Own stop markers are removed after durable
 terminal success. Partial/unknown outcomes never auto-retry. Partial failure leaves it closed and
 publishes node statuses in `/var/lib/qcl-negf-admin/runtime/delivery-report.json`; for a known
-failure, fix the cause and explicitly repeat the same idempotent command. An uncertain outcome
+failure, fix the cause and explicitly submit a new request ID. Repeating an old exact request
+returns its original attempt/status without another dispatch. An uncertain outcome
 requires trusted reconciliation first. A repeated successful activation retains profile/Code
 identity and repeats checks. Application and solver profiles are reconciled independently. An
 identical retry repairs a missing or wrong solver GC root without changing the selected release,
@@ -205,7 +208,7 @@ flags are `--delivery-timeout-seconds`, `--command-timeout-seconds`, `--command-
 limits or a scientific solver budget. The existing 300-second self-check is unchanged.
 
 ```console
-sudo qcl-negf-release deliver --manifest release.json --pool pool-v2.json --enrollment /operator-protected/enrollment.json --delivery-timeout-seconds 1800 --command-timeout-seconds 360 --command-output-bytes 1048576 --delivery-output-bytes 8388608
+sudo qcl-negf-release deliver --request-id d3986590-cf69-4ca8-af7c-c3e065241ad2 --procedure maintenance --manifest release.json --pool pool-v2.json --enrollment /operator-protected/enrollment.json --delivery-timeout-seconds 1800 --command-timeout-seconds 360 --command-output-bytes 1048576 --delivery-output-bytes 8388608
 ```
 
 One monotonic controller deadline covers prefetch, every node and final admission. Native commands
@@ -245,8 +248,9 @@ writes; the prior intent is the independent guard. Selected command flags apply 
 and node-check as well as activate/check/deliver. Native SSH option parsing before dispatch is a
 known pre-child failure, not evidence of remote mutation.
 
-When recovery receipt writes also fail, CLI stdout carries the current safe in-memory
-unknown/critical summary. Without current evidence it reports unknown; it never infers a closed gate
+The engine retains its current safe in-memory unknown/critical summary when recovery writes fail;
+the service publishes a bounded operation projection when storage permits. Public submit stdout
+is the request status, not the former synchronous engine result. Without current evidence it reports unknown; it never infers a closed gate
 from an older delivery-report.json. Failure output excludes raw command output, environment and
 manifest data.
 
@@ -320,7 +324,7 @@ locks. Snapshots are conservatively retained, including unknown attempts; operat
 preserve references until reconciliation/child cleanup. Trusted root/operator mutation and hardware
 attestation are outside this contract.
 
-Before any runtime write/flock or fleet mutation, actual local controller must match sole
+Before any engine runtime write/flock or fleet mutation, actual local controller must match sole
 enrolled/selected controller; its remote observation must match local machine and boot. After
 protected enrollment and local-only binding, unresolved CR04 receipts are checked read-only before
 snapshot creation/remote probing; the check repeats under lock after full authority. No enrollment
