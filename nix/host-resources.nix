@@ -12,6 +12,7 @@ let
     cp ${../ops/host_resource_policy.py} "$out/ops/host_resource_policy.py"
     cp ${../ops/host_resource_operations.py} "$out/ops/host_resource_operations.py"
     cp ${../ops/host_resource_backends.py} "$out/ops/host_resource_backends.py"
+    cp ${../ops/host_resource_native_cleanup.py} "$out/ops/host_resource_native_cleanup.py"
     cp ${../ops/host_resource_facts.py} "$out/ops/host_resource_facts.py"
     cp ${../ops/host_resource_startup.py} "$out/ops/host_resource_startup.py"
     cp ${../ops/host_resource_service.py} "$out/ops/host_resource_service.py"
@@ -31,6 +32,7 @@ let
   authority = entry "qcl-negf-resource-authority" "import host_resource_service as m; sys.exit(m.main('authority'))";
   facts = entry "qcl-negf-resource-facts" "import host_resource_service as m; sys.exit(m.main('facts'))";
   worker = entry "qcl-negf-resource-worker" "import host_resource_service as m; sys.exit(m.main('worker'))";
+  nativeExec = entry "qcl-negf-resource-native-exec" "import host_resource_native_cleanup as m; sys.exit(m.native_exec_main())";
   admin = entry "qcl-negf-resource-admin" "import host_resource_startup as m; sys.exit(m.admin_main())";
   hook = entry "qcl-negf-resource-start-hook" "import host_resource_startup as m; sys.exit(m.hook_main())";
   sshClient = entry "qcl-negf-resource-ssh-client" "import host_resource_service as m; m.ssh_main('client')";
@@ -39,6 +41,6 @@ let
   projection = entry "qcl-negf-resource-projection" "import json; import host_resource_projection as m; print(json.dumps(m.read_resource_projection()))";
 in pkgs.symlinkJoin {
   name = "qcl-negf-host-resources";
-  paths = [ client clientRoot authority facts worker admin hook projection sshClient sshAuthority sshFacts ];
-  passthru = { inherit source; };
+  paths = [ client clientRoot authority facts worker nativeExec admin hook projection sshClient sshAuthority sshFacts ];
+  passthru = { inherit source nativeExec; };
 }

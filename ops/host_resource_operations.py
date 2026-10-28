@@ -793,8 +793,8 @@ class HostResourceController:
                 row["failure"] = getattr(exc, "code", type(exc).__name__)
                 native_record = getattr(exc, "native_record", None)
                 if needs_resize:
-                    row["native_cleanup_confirmed"] = (native_record is not None and
-                                                        native_record.get("cleanup_confirmed") is True)
+                    row["native_cleanup_confirmed"] = (not getattr(self.backend, "requires_native_cleanup_proof", False) and
+                        native_record is not None and native_record.get("cleanup_confirmed") is True)
                 if not row["native_cleanup_confirmed"]:
                     state["blocked"] = CLEANUP_BLOCK
                 secondary = None

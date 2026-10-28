@@ -1,0 +1,1028 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "intent",
+    "intent_sha256",
+    "phase",
+    "worker_birth",
+    "cli_birth",
+    "cgroup",
+    "source_ids",
+    "native_peer",
+    "claimed_at",
+    "terminal_at",
+    "local_cleanup_confirmed",
+    "result_sha256"
+  ],
+  "properties": {
+    "schema": {
+      "const": "qcl.host-resource-native-cleanup-witness.v1"
+    },
+    "intent": {
+      "$ref": "#/$defs/intent"
+    },
+    "intent_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "phase": {
+      "enum": [
+        "CLAIMED",
+        "RETURNED_SUCCESS"
+      ]
+    },
+    "worker_birth": {
+      "$ref": "#/$defs/birth"
+    },
+    "cli_birth": {
+      "$ref": "#/$defs/birth"
+    },
+    "cgroup": {
+      "$ref": "#/$defs/text"
+    },
+    "source_ids": {
+      "$ref": "#/$defs/sources"
+    },
+    "native_peer": {
+      "$ref": "#/$defs/peer"
+    },
+    "claimed_at": {
+      "$ref": "#/$defs/nonnegative"
+    },
+    "terminal_at": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/nonnegative"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "local_cleanup_confirmed": {
+      "type": "boolean"
+    },
+    "result_sha256": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/sha256"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "phase": {
+            "const": "CLAIMED"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "terminal_at": {
+            "type": "null"
+          },
+          "result_sha256": {
+            "type": "null"
+          },
+          "local_cleanup_confirmed": {
+            "const": false
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "terminal_at": {
+            "$ref": "#/$defs/nonnegative"
+          },
+          "result_sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "local_cleanup_confirmed": {
+            "const": true
+          }
+        }
+      }
+    }
+  ],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Afonenko-QCL-NEGF/qcl-negf-platform/schemas/host-resource-native-cleanup-witness.schema.json",
+  "title": "Private exact completed synchronous native mutation witness v1",
+  "description": "Structural contract only. Python checks identity joins, exact per-VM uniqueness, digests, trusted current source/peer/worker facts and fresh owned cleanup. No client input or native qualification inferred from this JSON.",
+  "$defs": {
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^\\s\\x00-\\x1f](?:[^\\x00-\\x1f]*[^\\s\\x00-\\x1f])?$"
+    },
+    "nonnegative": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9223372036854775807
+    },
+    "positive": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9223372036854775807
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "protocol": {
+      "enum": [
+        "libvirt-local-setmem-v1",
+        "pve-local-put-balloon-v1"
+      ]
+    },
+    "sourceRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "pattern": "^/(?!.*(?:^|/)\\.\\.(?:/|$))[^\\x00-\\x1f]+$"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "birth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pid",
+        "start_ticks",
+        "boot_id"
+      ],
+      "properties": {
+        "pid": {
+          "$ref": "#/$defs/positive"
+        },
+        "start_ticks": {
+          "$ref": "#/$defs/positive"
+        },
+        "boot_id": {
+          "$ref": "#/$defs/text"
+        }
+      }
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "vm_id",
+        "native_id",
+        "process_id",
+        "guest_boot_id",
+        "image_id",
+        "guest_kernel_id",
+        "host_kernel_id",
+        "qemu_version_id",
+        "backend_version_id",
+        "readback_version",
+        "config_fingerprint"
+      ],
+      "properties": {
+        "vm_id": {
+          "$ref": "#/$defs/text"
+        },
+        "native_id": {
+          "$ref": "#/$defs/text"
+        },
+        "process_id": {
+          "$ref": "#/$defs/text"
+        },
+        "guest_boot_id": {
+          "$ref": "#/$defs/text"
+        },
+        "image_id": {
+          "$ref": "#/$defs/text"
+        },
+        "guest_kernel_id": {
+          "$ref": "#/$defs/text"
+        },
+        "host_kernel_id": {
+          "$ref": "#/$defs/text"
+        },
+        "qemu_version_id": {
+          "$ref": "#/$defs/text"
+        },
+        "backend_version_id": {
+          "$ref": "#/$defs/text"
+        },
+        "readback_version": {
+          "$ref": "#/$defs/text"
+        },
+        "config_fingerprint": {
+          "$ref": "#/$defs/text"
+        }
+      }
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "unit",
+        "invocation_id",
+        "cgroup",
+        "host_boot_id",
+        "mutation_id"
+      ],
+      "properties": {
+        "unit": {
+          "type": "string",
+          "pattern": "^qcl-resource-[0-9a-f]{32}\\.service$"
+        },
+        "invocation_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "cgroup": {
+          "type": "string",
+          "pattern": "^/system.slice/qcl-resource-[0-9a-f]{32}\\.service$"
+        },
+        "host_boot_id": {
+          "$ref": "#/$defs/text"
+        },
+        "mutation_id": {
+          "$ref": "#/$defs/uuid"
+        }
+      }
+    },
+    "pvePeer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "node",
+        "qemu_birth"
+      ],
+      "properties": {
+        "kind": {
+          "const": "pve_local"
+        },
+        "node": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$"
+        },
+        "qemu_birth": {
+          "$ref": "#/$defs/birth"
+        }
+      }
+    },
+    "libvirtPeer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "socket_path",
+        "socket_device",
+        "socket_inode",
+        "unit",
+        "invocation_id",
+        "daemon_birth"
+      ],
+      "properties": {
+        "kind": {
+          "const": "libvirt_unix"
+        },
+        "socket_path": {
+          "enum": [
+            "/run/libvirt/virtqemud-sock",
+            "/run/libvirt/libvirt-sock"
+          ]
+        },
+        "socket_device": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "socket_inode": {
+          "$ref": "#/$defs/positive"
+        },
+        "unit": {
+          "enum": [
+            "virtqemud.service",
+            "libvirtd.service"
+          ]
+        },
+        "invocation_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "daemon_birth": {
+          "$ref": "#/$defs/birth"
+        }
+      }
+    },
+    "peer": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/pvePeer"
+        },
+        {
+          "$ref": "#/$defs/libvirtPeer"
+        }
+      ]
+    },
+    "pveSources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cli",
+        "client",
+        "driver",
+        "protocol",
+        "support"
+      ],
+      "properties": {
+        "cli": {
+          "$ref": "#/$defs/sourceRef"
+        },
+        "client": {
+          "$ref": "#/$defs/sourceRef"
+        },
+        "driver": {
+          "$ref": "#/$defs/sourceRef"
+        },
+        "protocol": {
+          "$ref": "#/$defs/sourceRef"
+        },
+        "support": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "API2/Qemu.pm",
+            "QemuConfig.pm",
+            "QemuServer.pm",
+            "QemuServer/Memory.pm",
+            "QemuServer/Monitor.pm",
+            "QMPClient.pm",
+            "RPCEnvironment.pm",
+            "RESTEnvironment.pm",
+            "CLI/pvesh.pm",
+            "ProcFSTools.pm",
+            "Tools.pm",
+            "AbstractConfig.pm",
+            "API2/Tasks.pm"
+          ],
+          "properties": {
+            "API2/Qemu.pm": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/sourceRef"
+                },
+                {
+                  "properties": {
+                    "sha256": {
+                      "const": "33c9b0dca650341e76e39c85c8d54ba1ee38474266632a26c8921121f055697f"
+                    }
+                  }
+                }
+              ]
+            },
+            "QemuConfig.pm": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/sourceRef"
+                },
+                {
+                  "properties": {
+                    "sha256": {
+                      "const": "4e437fad79b04bd0b3dc6b1450e7b70ff60de4d3d7d7380e308852e0a874d0c8"
+                    }
+                  }
+                }
+              ]
+            },
+            "QemuServer.pm": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/sourceRef"
+                },
+                {
+                  "properties": {
+                    "sha256": {
+                      "const": "3cd036382bf796f996e74bf8206d57a0388056c63e7eab148fbd64a2b26e5912"
+                    }
+                  }
+                }
+              ]
+            },
+            "QemuServer/Memory.pm": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/sourceRef"
+                },
+                {
+                  "properties": {
+                    "sha256": {
+                      "const": "2025cae6ee0537b78a0799ffcd9423e3a8309549ddad6d368ea244b65d958cbd"
+                    }
+                  }
+                }
+              ]
+            },
+            "QemuServer/Monitor.pm": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/sourceRef"
+                },
+                {
+                  "properties": {
+                    "sha256": {
+                      "const": "668ee99382f1eb18f98ed178e8ef68d121be814f47ce820c340e0d9e1a5d4763"
+                    }
+                  }
+                }
+              ]
+            },
+            "QMPClient.pm": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/sourceRef"
+                },
+                {
+                  "properties": {
+                    "sha256": {
+                      "const": "dea717bbdebca302d6b5bea8d4d126bb9bbb4aa0784bc48ec56fc0c85780ad3f"
+                    }
+                  }
+                }
+              ]
+            },
+            "RPCEnvironment.pm": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/sourceRef"
+                },
+                {
+                  "properties": {
+                    "sha256": {
+                      "const": "36474324b346ef285a846df36fef936418231e8143413b509ae977d4dad4f55f"
+                    }
+                  }
+                }
+              ]
+            },
+            "RESTEnvironment.pm": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/sourceRef"
+                },
+                {
+                  "properties": {
+                    "sha256": {
+                      "const": "57a2b3f15460d74fc813a73510c8bc409ec02683d577a851d76610928fc9e700"
+                    }
+                  }
+                }
+              ]
+            },
+            "CLI/pvesh.pm": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/sourceRef"
+                },
+                {
+                  "properties": {
+                    "sha256": {
+                      "const": "dfff48157f503d2c75cee4afc71294d0f0e5d7af8093bc72261647c96e915818"
+                    }
+                  }
+                }
+              ]
+            },
+            "ProcFSTools.pm": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/sourceRef"
+                },
+                {
+                  "properties": {
+                    "sha256": {
+                      "const": "9ede6e7e13f640cad498374fc0d2d1a7cdac804dc809165b5b525e7996aa8c36"
+                    }
+                  }
+                }
+              ]
+            },
+            "Tools.pm": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/sourceRef"
+                },
+                {
+                  "properties": {
+                    "sha256": {
+                      "const": "ce4641907636040569b7de3f71f05e3e11d6614bb59470bfb5c9307c55db895f"
+                    }
+                  }
+                }
+              ]
+            },
+            "AbstractConfig.pm": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/sourceRef"
+                },
+                {
+                  "properties": {
+                    "sha256": {
+                      "const": "70432cce604f3bc7ff525c2c20028a97173394d5aa2b585c36b50d0761871494"
+                    }
+                  }
+                }
+              ]
+            },
+            "API2/Tasks.pm": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/sourceRef"
+                },
+                {
+                  "properties": {
+                    "sha256": {
+                      "const": "9d33bd4487c238246216536eadd8fbc01adc5d289ab5e11c59afca5dedb9f2ba"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "libvirtSources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cli",
+        "client",
+        "driver",
+        "protocol",
+        "support"
+      ],
+      "properties": {
+        "cli": {
+          "$ref": "#/$defs/sourceRef"
+        },
+        "client": {
+          "$ref": "#/$defs/sourceRef"
+        },
+        "driver": {
+          "$ref": "#/$defs/sourceRef"
+        },
+        "protocol": {
+          "$ref": "#/$defs/sourceRef"
+        },
+        "support": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "tools/virsh-domain.c",
+            "src/libvirt-domain.c",
+            "src/remote/remote_driver.c",
+            "src/qemu/qemu_driver.c",
+            "src/qemu/qemu_monitor_json.c",
+            "src/rpc/virnetclient.c",
+            "src/remote/remote_daemon_dispatch.c",
+            "src/remote/remote_protocol.x",
+            "src/rpc/gendispatch.pl",
+            "src/rpc/virnetclientprogram.c",
+            "src/remote/remote_sockets.c",
+            "src/remote/remote_sockets.h",
+            "src/libvirt.c"
+          ],
+          "properties": {
+            "tools/virsh-domain.c": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/sourceRef"
+                },
+                {
+                  "properties": {
+                    "sha256": {
+                      "const": "92e7e12f5301ce6267dd641e45048686189fb8589ca7ad168bd90499f05fdc39"
+                    }
+                  }
+                }
+              ]
+            },
+            "src/libvirt-domain.c": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/sourceRef"
+                },
+                {
+                  "properties": {
+                    "sha256": {
+                      "const": "974888fd2d6a87b96727645cc7212630b945b7ed2fb598a9f0cc8923fd4065fa"
+                    }
+                  }
+                }
+              ]
+            },
+            "src/remote/remote_driver.c": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/sourceRef"
+                },
+                {
+                  "properties": {
+                    "sha256": {
+                      "const": "0db5a06f70493f2e6d84ef5070d92fade8cddf9181f9ea0fd093f88356994741"
+                    }
+                  }
+                }
+              ]
+            },
+            "src/qemu/qemu_driver.c": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/sourceRef"
+                },
+                {
+                  "properties": {
+                    "sha256": {
+                      "const": "17a2dbfb6f36901fd2549cfc9451b4c35045983586584a9d738be0ccdc9e2337"
+                    }
+                  }
+                }
+              ]
+            },
+            "src/qemu/qemu_monitor_json.c": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/sourceRef"
+                },
+                {
+                  "properties": {
+                    "sha256": {
+                      "const": "37836f3799fe18fe1c68a4c2928879f92085dee550afdc2940100398c359618d"
+                    }
+                  }
+                }
+              ]
+            },
+            "src/rpc/virnetclient.c": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/sourceRef"
+                },
+                {
+                  "properties": {
+                    "sha256": {
+                      "const": "3d27f2fccf5963e8a9318ef8edd5fefc6634f38c34f777ce7033038cf294d539"
+                    }
+                  }
+                }
+              ]
+            },
+            "src/remote/remote_daemon_dispatch.c": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/sourceRef"
+                },
+                {
+                  "properties": {
+                    "sha256": {
+                      "const": "df237fe56c440c4a2b53f8ab76487273185ecd88c18296b3b6357ed792a4b28d"
+                    }
+                  }
+                }
+              ]
+            },
+            "src/remote/remote_protocol.x": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/sourceRef"
+                },
+                {
+                  "properties": {
+                    "sha256": {
+                      "const": "2fd3184165828e1118ab90a8b9597eeb2f79f1b828a860fda6f13d04951304ec"
+                    }
+                  }
+                }
+              ]
+            },
+            "src/rpc/gendispatch.pl": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/sourceRef"
+                },
+                {
+                  "properties": {
+                    "sha256": {
+                      "const": "22769797a68cb515fcbbe1cd80a12629c0fd66564036d9d22e2d714a9756b234"
+                    }
+                  }
+                }
+              ]
+            },
+            "src/rpc/virnetclientprogram.c": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/sourceRef"
+                },
+                {
+                  "properties": {
+                    "sha256": {
+                      "const": "d6a8fde9d561d3462ba34a7be11fb01517a1f4518b95d07b0f3c636a937da250"
+                    }
+                  }
+                }
+              ]
+            },
+            "src/remote/remote_sockets.c": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/sourceRef"
+                },
+                {
+                  "properties": {
+                    "sha256": {
+                      "const": "8272998dbf22f8f4c1fc9315a72a40ee61a3874821018f3aff1601c97cab7fdb"
+                    }
+                  }
+                }
+              ]
+            },
+            "src/remote/remote_sockets.h": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/sourceRef"
+                },
+                {
+                  "properties": {
+                    "sha256": {
+                      "const": "0d42cfafbcc95a1794170a950dff6572b626ba01e7547cfab132d99d92ee576b"
+                    }
+                  }
+                }
+              ]
+            },
+            "src/libvirt.c": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/sourceRef"
+                },
+                {
+                  "properties": {
+                    "sha256": {
+                      "const": "3edd4514cb34c7529dbfbdff99ea0cb7eddf6ffddc63f026531e5f7b3b2e201c"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "sources": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/pveSources"
+        },
+        {
+          "$ref": "#/$defs/libvirtSources"
+        }
+      ]
+    },
+    "intent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "request_id",
+        "host_id",
+        "owner_id",
+        "host_boot_id",
+        "before_revision",
+        "mutation_id",
+        "operation",
+        "policy_sha256",
+        "binding",
+        "native_context",
+        "old_bytes",
+        "target_bytes",
+        "protocol_id",
+        "qualification_sha256"
+      ],
+      "properties": {
+        "request_id": {
+          "$ref": "#/$defs/text"
+        },
+        "host_id": {
+          "$ref": "#/$defs/text"
+        },
+        "owner_id": {
+          "$ref": "#/$defs/text"
+        },
+        "host_boot_id": {
+          "$ref": "#/$defs/text"
+        },
+        "before_revision": {
+          "$ref": "#/$defs/text"
+        },
+        "mutation_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "operation": {
+          "enum": [
+            "grow",
+            "shrink"
+          ]
+        },
+        "policy_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "binding": {
+          "$ref": "#/$defs/binding"
+        },
+        "native_context": {
+          "$ref": "#/$defs/context"
+        },
+        "old_bytes": {
+          "$ref": "#/$defs/positive"
+        },
+        "target_bytes": {
+          "$ref": "#/$defs/positive"
+        },
+        "protocol_id": {
+          "$ref": "#/$defs/protocol"
+        },
+        "qualification_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "qualification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "protocol_id",
+        "host_id",
+        "owner_id",
+        "host_boot_id",
+        "evidence_ref",
+        "policy_sha256",
+        "binding",
+        "source_ids",
+        "native_peer_identity"
+      ],
+      "properties": {
+        "schema": {
+          "const": "qcl.host-resource-native-mutation-qualification.v1"
+        },
+        "protocol_id": {
+          "$ref": "#/$defs/protocol"
+        },
+        "host_id": {
+          "$ref": "#/$defs/text"
+        },
+        "owner_id": {
+          "$ref": "#/$defs/text"
+        },
+        "host_boot_id": {
+          "$ref": "#/$defs/text"
+        },
+        "evidence_ref": {
+          "$ref": "#/$defs/text"
+        },
+        "policy_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "binding": {
+          "$ref": "#/$defs/binding"
+        },
+        "source_ids": {
+          "$ref": "#/$defs/sources"
+        },
+        "native_peer_identity": {
+          "$ref": "#/$defs/peer"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "protocol_id": {
+                "const": "pve-local-put-balloon-v1"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "source_ids": {
+                "$ref": "#/$defs/pveSources"
+              },
+              "native_peer_identity": {
+                "$ref": "#/$defs/pvePeer"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "protocol_id": {
+                "const": "libvirt-local-setmem-v1"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "source_ids": {
+                "$ref": "#/$defs/libvirtSources"
+              },
+              "native_peer_identity": {
+                "$ref": "#/$defs/libvirtPeer"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "qualificationBundle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "profiles"
+      ],
+      "properties": {
+        "schema": {
+          "const": "qcl.host-resource-native-mutation-qualifications.v1"
+        },
+        "profiles": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/qualification"
+          }
+        }
+      }
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "helper",
+        "qualification",
+        "protocol_id"
+      ],
+      "properties": {
+        "schema": {
+          "const": "qcl.host-resource-native-cleanup-config.v1"
+        },
+        "helper": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "qualification": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "protocol_id": {
+          "$ref": "#/$defs/protocol"
+        }
+      }
+    },
+    "dispatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "intent",
+        "worker_birth"
+      ],
+      "properties": {
+        "schema": {
+          "const": "qcl.host-resource-native-dispatch.v1"
+        },
+        "intent": {
+          "$ref": "#/$defs/intent"
+        },
+        "worker_birth": {
+          "$ref": "#/$defs/birth"
+        }
+      }
+    }
+  }
+}
