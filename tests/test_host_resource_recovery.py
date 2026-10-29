@@ -326,6 +326,9 @@ def test_real_namespace_validator_rejects_a_new_native_incarnation(tmp_path,chan
     d,m,c,b,store,e,s,f,r,req=fixture(tmp_path)
     target=store._read(s.proofs.path(req.mutation_id).with_suffix('.target.json'))
     source=d.NativeRecoverySources.__new__(d.NativeRecoverySources);source.s=s;source.profile=lambda t:{'protocol_id':d.LIBVIRT}
+    # This test isolates F1 native namespace/birth validation. The production
+    # attached-capture parser and descriptor checks have separate fixtures.
+    source.storage=type('SyntheticStorageBoundary',(),{'validate_retirement':lambda self,t: d.decode_storage_devices(t['storage_devices'])})()
     source.native=type('BirthReader',(),{'birth':lambda self,pid:dict(pid=pid,start_ticks=999,boot_id=e.host_boot_id)})()
     xml='<domain><name>synthetic-a</name><uuid>'+target['target']['uuid']+'</uuid><memory unit="bytes">2048</memory><currentMemory unit="bytes">512</currentMemory></domain>'
     if change!='static-config':target['config_sha256']=__import__('host_resource_backends').libvirt_config_fingerprint(__import__('xml.etree.ElementTree',fromlist=['']).fromstring(xml))
@@ -356,6 +359,7 @@ def test_other_vm_qualification_identity_is_not_a_true_flag(tmp_path,change):
 def test_real_namespace_validator_healthy_control_uses_old_birth(tmp_path):
     d,m,c,b,store,e,s,f,r,req=fixture(tmp_path);target=store._read(s.proofs.path(req.mutation_id).with_suffix('.target.json'))
     source=d.NativeRecoverySources.__new__(d.NativeRecoverySources);source.s=s;source.profile=lambda t:{'protocol_id':d.LIBVIRT}
+    source.storage=type('SyntheticStorageBoundary',(),{'validate_retirement':lambda self,t: d.decode_storage_devices(t['storage_devices'])})()
     source.native=type('BirthReader',(),{'birth':lambda self,pid:dict(pid=pid,start_ticks=10,boot_id=e.host_boot_id)})()
     xml='<domain><name>synthetic-a</name><uuid>'+target['target']['uuid']+'</uuid><memory unit="bytes">2048</memory><currentMemory unit="bytes">512</currentMemory></domain>'
     target['config_sha256']=__import__('host_resource_backends').libvirt_config_fingerprint(__import__('xml.etree.ElementTree',fromlist=['']).fromstring(xml))
@@ -535,10 +539,10 @@ def test_sealed_storage_shape_is_not_a_client_backing_proof(tmp_path,change):
     '<domain><devices><disk type="block"><source dev="/dev/disk/by-id/alias"/></disk></devices></domain>',
     '<domain><devices><disk type="network"><source protocol="rbd"/></disk></devices></domain>'
 ])
-def test_production_storage_closure_remains_source_hold_even_for_empty_top_xml(xml):
+def test_top_xml_without_process_local_qualified_capture_never_proves_closure(xml):
     import xml.etree.ElementTree as ET
     d=module();source=d.NativeRecoverySources.__new__(d.NativeRecoverySources)
-    with pytest.raises(__import__('host_resource_operations').ResourceError,match='source_protocol_unavailable'):
+    with pytest.raises(__import__('host_resource_operations').ResourceError,match='qualification'):
         source.storage_closure(ET.fromstring(xml))
 
 
@@ -561,6 +565,34 @@ def test_replacement_must_pass_native_storage_predicate_before_reservation(tmp_p
     f.replacement_storage=lambda native_id,target:copy.deepcopy(target['storage_devices'])
     with pytest.raises(m.ResourceError):s.reserve_replacement(req.recovery_id,'99999999-1111-4111-8111-111111111111')
     assert store.state_path.read_bytes()==before
+
+
+def test_final_replacement_barrier_runs_after_facts_and_before_save(tmp_path):
+    d,m,c,b,store,e,s,f,r,req=fixture(tmp_path);s.retire(req);before=store.state_path.read_bytes();calls=[]
+    original=f.replacement
+    def observed(*a,**kw):calls.append('facts');return original(*a,**kw)
+    f.replacement=observed
+    def changed(native,target):
+        assert calls==['facts'] and store.state_path.read_bytes()==before
+        calls.append('final-use');raise m.ResourceError('identity_mismatch','synthetic graph race at final barrier')
+    f.validate_replacement_use=changed
+    with pytest.raises(m.ResourceError):s.reserve_replacement(req.recovery_id,'99999999-1111-4111-8111-111111111111')
+    assert calls==['facts','final-use'] and store.state_path.read_bytes()==before
+
+
+def test_native_final_barrier_follows_durable_claim_and_keeps_unknown_charge(tmp_path):
+    from test_host_resource_native_cleanup import fixture as cleanup
+    n,m,c,b,store,e,proofs,sources,runner,profiles=cleanup(tmp_path,protocol='libvirt-local-setmem-v1')
+    checked=[]
+    def final(mutation_id):
+        claim=proofs.read(mutation_id);assert claim['phase']=='CLAIMED'
+        assert proofs.dispatch(mutation_id)['intent']==claim['intent']
+        checked.append(mutation_id);raise m.ResourceError('identity_mismatch','synthetic final storage use race')
+    sources.validate_target_use=final
+    c.request(request(m),e);result=c.grow('request-1',e)
+    assert result.phase=='GROW_UNKNOWN' and len(checked)==1 and not b.calls
+    row=store.load()['receipts'][0]
+    assert row['native_cleanup_confirmed'] is False and store.load()['grants'][0]['guest_bytes']==512
 
 
 @pytest.mark.parametrize('position',json.loads((Path(__file__).parent/'fixtures/host-resources/synthetic-recovery.json').read_text())['late_rpc_positions'])

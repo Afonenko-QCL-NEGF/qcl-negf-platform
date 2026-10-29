@@ -1,0 +1,123 @@
+---
+# SOURCE only: no image copy, qemu-img, define/start, hook, daemon/global policy.
+- name: Require separate reviewed B1 installation and existing dynamic F1 owner
+  ansible.builtin.assert:
+    that:
+      - qcl_resource_backend == 'libvirt'
+      - qcl_resource_dynamic | bool
+      - qcl_resource_storage | bool
+- name: Copy protected storage inputs without publishing private inventory
+  ansible.builtin.copy:
+    src: "{{ qcl_resource_private_directory }}/{{ item }}.json"
+    dest: "/etc/qcl-negf/host-resources/{{ item }}.json"
+    owner: root
+    group: root
+    mode: "0600"
+  loop: [storage-installs, storage-qualifications]
+  no_log: true
+- name: Establish protected storage receipt directory
+  ansible.builtin.file:
+    path: /var/lib/qcl-negf/host-resources/native-storage
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+- name: Reject adoption, reused account IDs, live tasks and ambiguous prior creation
+  ansible.builtin.command:
+    argv:
+      - "{{ qcl_resource_python }}"
+      - -I
+      - -c
+      - |
+        import sys,json,os,pwd,grp
+        from pathlib import Path
+        sys.path.insert(0,'/usr/local/lib/qcl-negf-host-resources')
+        import host_resource_storage as s
+        from host_resource_backends import read_root_json,trusted_root_path
+        from host_resource_operations import FileReceiptStore
+        root=Path('/var/lib/qcl-negf/host-resources/native-storage')
+        trusted_root_path(root,directory=True)
+        doc=s.decode_install_bundle(read_root_json('/etc/qcl-negf/host-resources/storage-installs.json'))
+        accounts=pwd.getpwall();groups=grp.getgrall();plan=[]
+        trusted_root_path('/usr/bin/nologin',executable=True)
+        for spec in doc['specs']:
+            dac=spec['dac'];receipt=root/(spec['install_id']+'.account.json')
+            expected=dict(schema='qcl.host-resource-storage-account.v1',install_id=spec['install_id'],spec_sha256=s.fingerprint(spec),dac=dac)
+            if receipt.exists():
+                s.require(read_root_json(receipt)==expected,'reconciliation_required','account creation receipt differs')
+                p=pwd.getpwnam(dac['user']);g=grp.getgrnam(dac['group'])
+                s.require(p.pw_uid==dac['uid'] and p.pw_gid==g.gr_gid==dac['gid'] and p.pw_dir=='/nonexistent' and p.pw_shell=='/usr/bin/nologin' and not g.gr_mem and [a.pw_name for a in accounts if a.pw_uid==dac['uid'] or a.pw_gid==dac['gid']]==[p.pw_name] and not any(p.pw_name in x.gr_mem for x in groups),'ownership','created account changed')
+                action='retain'
+            else:
+                s.require(not any(p.pw_name==dac['user'] or p.pw_uid==dac['uid'] or p.pw_gid==dac['gid'] for p in accounts) and not any(g.gr_name==dac['group'] or g.gr_gid==dac['gid'] for g in groups),'ownership','preexisting names/IDs cannot be adopted')
+                for process in Path('/proc').iterdir():
+                    if not process.name.isdigit():continue
+                    try:status=(process/'status').read_text()
+                    except FileNotFoundError:continue
+                    fields=dict(line.split(':',1) for line in status.splitlines() if ':' in line)
+                    s.require(dac['uid'] not in map(int,fields['Uid'].split()) and dac['gid'] not in [*map(int,fields['Gid'].split()),*map(int,fields['Groups'].split())],'ownership','reserved ID has existing task')
+                action='create'
+            parent=Path(spec['namespace_parent'])
+            trusted_root_path(parent if parent.exists() else parent.parent,directory=True)
+            plan.append(dict(action=action,receipt=expected,parent=str(parent),parent_exists=parent.exists()))
+        print(json.dumps(plan))
+  register: qcl_storage_account_plan
+  changed_when: false
+  no_log: true
+- name: Create only the new explicit dedicated group
+  ansible.builtin.group:
+    name: "{{ item.receipt.dac.group }}"
+    gid: "{{ item.receipt.dac.gid }}"
+    system: true
+    state: present
+  loop: "{{ qcl_storage_account_plan.stdout | from_json }}"
+  when: item.action == 'create'
+  no_log: true
+- name: Create only the new locked nonlogin identity without home or supplementary groups
+  ansible.builtin.user:
+    name: "{{ item.receipt.dac.user }}"
+    uid: "{{ item.receipt.dac.uid }}"
+    group: "{{ item.receipt.dac.group }}"
+    groups: ""
+    append: false
+    system: true
+    create_home: false
+    home: /nonexistent
+    shell: /usr/bin/nologin
+    password_lock: true
+  loop: "{{ qcl_storage_account_plan.stdout | from_json }}"
+  when: item.action == 'create'
+  no_log: true
+- name: Record exact new account creation durably without overwriting prior artifacts
+  ansible.builtin.command:
+    argv:
+      - "{{ qcl_resource_python }}"
+      - -I
+      - -c
+      - |
+        import sys,json,pwd,grp
+        from pathlib import Path
+        sys.path.insert(0,'/usr/local/lib/qcl-negf-host-resources')
+        from host_resource_operations import FileReceiptStore,require
+        from host_resource_recovery import immutable
+        store=FileReceiptStore.open_existing('/var/lib/qcl-negf/host-resources')
+        for item in json.load(sys.stdin):
+            r=item['receipt'];d=r['dac'];p=pwd.getpwnam(d['user']);g=grp.getgrnam(d['group'])
+            require(p.pw_uid==d['uid'] and p.pw_gid==g.gr_gid==d['gid'] and p.pw_shell=='/usr/bin/nologin' and p.pw_dir=='/nonexistent' and not g.gr_mem,'ownership','created account readback differs')
+            immutable(store,store.directory/'native-storage'/(r['install_id']+'.account.json'),r)
+    stdin: "{{ qcl_storage_account_plan.stdout }}"
+  changed_when: false
+  no_log: true
+- name: Create reviewed protected namespace parents only after no-adoption preflight
+  ansible.builtin.file:
+    path: "{{ item.parent }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  loop: "{{ qcl_storage_account_plan.stdout | from_json }}"
+  when: not item.parent_exists
+  no_log: true
+- name: Preserve separate Root import, define, bind and N-H0 through H8 gates
+  ansible.builtin.debug:
+    msg: Prepared dedicated DAC identities and protected inputs only. Run reviewed storage-import/definition/bind separately; no native acceptance was implied.

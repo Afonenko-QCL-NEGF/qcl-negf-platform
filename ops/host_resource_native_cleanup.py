@@ -358,6 +358,11 @@ class NativeCleanupSources:
     def target_before_exec(self,intent,dispatch,profile,backend,worker,cli):
         from host_resource_recovery import prepare_target_seal
         return prepare_target_seal(self,intent,dispatch,profile,backend,worker,cli)
+    def validate_target_use(self,mutation_id):
+        if self.config.get('native_storage') is None:return
+        owner=getattr(self,'storage_collector',None)
+        require(owner is not None,'qualification','configured process-local storage owner missing')
+        return owner.validate_target_use(mutation_id)
     def lock_released(self,backend,vm):
         if not hasattr(backend,'node'):return True  # libvirt EndJob is in its qualified successful RPC reply
         return _pve_lock_released(backend.vms[vm].vmid)
@@ -438,14 +443,21 @@ class NativeMutationProofs:
         worker,cli=self.sources.claim_process(intent.native_context)
         require(worker==dispatch['worker_birth'] and worker!=cli,'native_owner','actual root worker/CLI generation changed')
         doc=dict(schema=WITNESS_SCHEMA,intent=asdict(intent),intent_sha256=fingerprint(asdict(intent)),phase='CLAIMED',worker_birth=worker,cli_birth=cli,cgroup=intent.native_context['cgroup'],source_ids=p['source_ids'],native_peer=p['native_peer_identity'],claimed_at=self.sources.clock(),terminal_at=None,local_cleanup_confirmed=False,result_sha256=None)
-        capture=getattr(self.sources,'target_before_exec',None)
-        if capture is not None:
-            target=capture(intent,dispatch,p,self.backend,worker,cli)
-            if target is not None:
-                from host_resource_recovery import decode_target
-                decode_target(target);self.exclusive(self.path(mutation_id).with_suffix('.target.json'),target)
-        decode_witness(doc);self.exclusive(self.path(mutation_id),doc)
-        return self.backend.mutation_argv(intent.binding.vm_id,intent.target_bytes,before)
+        try:
+            capture=getattr(self.sources,'target_before_exec',None)
+            if capture is not None:
+                target=capture(intent,dispatch,p,self.backend,worker,cli)
+                if target is not None:
+                    from host_resource_recovery import decode_target
+                    decode_target(target);self.exclusive(self.path(mutation_id).with_suffix('.target.json'),target)
+            decode_witness(doc);self.exclusive(self.path(mutation_id),doc)
+            validate=getattr(self.sources,'validate_target_use',None)
+            if validate is not None:validate(mutation_id)
+            return self.backend.mutation_argv(intent.binding.vm_id,intent.target_bytes,before)
+        except BaseException:
+            storage=getattr(self.sources,'storage_collector',None)
+            if storage is not None and mutation_id in storage.handles:storage.handles[mutation_id].close()
+            raise
     def execute(self,intent,*,timeout_seconds):
         state=self.state();row=self.row(state,intent.mutation_id)
         require(self.intent(row,state,self.backend.readback(intent.binding.vm_id))==intent,'identity_mismatch','durable intent changed before dispatch')
