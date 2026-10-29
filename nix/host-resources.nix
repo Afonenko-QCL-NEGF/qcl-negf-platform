@@ -18,6 +18,8 @@ let
     cp ${../ops/image_stage.py} "$out/ops/image_stage.py"
     cp ${../ops/host_resource_native_cleanup.py} "$out/ops/host_resource_native_cleanup.py"
     cp ${../ops/host_resource_facts.py} "$out/ops/host_resource_facts.py"
+    cp ${../ops/native_attempt.py} "$out/ops/native_attempt.py"
+    cp ${../ops/slurm_job_evidence.py} "$out/ops/slurm_job_evidence.py"
     cp ${../ops/host_resource_startup.py} "$out/ops/host_resource_startup.py"
     cp ${../ops/host_resource_service.py} "$out/ops/host_resource_service.py"
     cp ${../ops/host_resource_client.py} "$out/ops/host_resource_client.py"

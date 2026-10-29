@@ -285,6 +285,9 @@ def root_main(role,argv=None):
             for executable in config['sudo_executables']:trusted_root_path(executable,executable=True)
             authenticate_sudo_caller(os.environ,parent_pid=os.getppid(),process=sources.process,
                 sudo_executables=tuple(config['sudo_executables']),allowed_uid=config['facts_uid'])
+        if action=='attempt-facts':
+            from native_attempt import read_attempt_facts
+            return read_attempt_facts(document)
         require(document=={} and action in {'guest-facts','guest-identity','scheduler-facts'},'action','facts route is read-only')
         if action=='guest-identity':return capture_guest_identity(config,LocalSources(config,None))
         sources=LocalSources(config,NativeCommandRunner(config['tools'],slurm_conf=config['slurm_conf']))
@@ -300,7 +303,7 @@ def ssh_main(role,*,helper_prefix='/run/current-system/sw/bin'):
     require(len(parts)==4 and parts[0]==helper_prefix+'/qcl-negf-resource-rpc' and parts[1]==role,
         'trust','unexpected SSH resource command')
     action,token=parts[2:];decode_token(token)
-    require(action in (ACTIONS if role!='facts' else {'guest-facts','guest-identity','scheduler-facts'}),'action','fixed resource action required')
+    require(action in (ACTIONS if role!='facts' else {'guest-facts','guest-identity','scheduler-facts','attempt-facts'}),'action','fixed resource action required')
     executable=helper_prefix+'/qcl-negf-resource-'+('client-root' if role=='client' else role)
     os.execvp('sudo',['sudo','-n',executable,action,token])
 

@@ -6,6 +6,91 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'ops'))
 from test_host_resource_operations import setup,guest,completion
 
 
+def test_attempt_facts_is_the_only_new_readonly_root_fact_action(monkeypatch):
+    import host_resource_service as s
+    import native_attempt as n
+    config = {'schema': 'qcl.host-resource-service.v1', 'role': 'guest', 'client_uid': 3000}
+    monkeypatch.setattr(s.os, 'geteuid', lambda: 0)
+    monkeypatch.delenv('SUDO_UID', raising=False)
+    monkeypatch.setattr(s, 'read_root_json', lambda path: config)
+    packet = {'version': 1, 'calcjob_uuid': '11111111-1111-4111-8111-111111111111',
+              'dispatch_id': '22222222-2222-4222-8222-222222222222', 'job_id': '42',
+              'generation': 'a' * 64, 'phase': 'status'}
+    import base64
+    import json
+    token = base64.urlsafe_b64encode(json.dumps(packet).encode()).decode()
+    calls = []
+    monkeypatch.setattr(n, 'read_attempt_facts', lambda document: calls.append(document) or {'version': 1})
+    assert s.root_main('facts', ['attempt-facts', token]) == {'version': 1}
+    assert calls == [packet]
+    with pytest.raises(s.ResourceError):
+        s.root_main('facts', ['submit', token])
+    assert calls == [packet]
+
+
+@pytest.mark.parametrize('inherited', [False, True])
+def test_rpc_trust_snapshot_root_and_shared_budget_preserve_default(monkeypatch, inherited):
+    import host_resource_facts as f
+    import native_attempt as n
+    route = dict(target='facts@worker', known_hosts='/protected/hosts', identity_file='/protected/key',
+                 helper='/fixed/qcl-negf-resource-rpc', role='facts')
+    class Trusted:
+        def __str__(self): return '/protected/key'
+        def stat(self): return type('Info', (), {'st_mode': 0o600})()
+    monkeypatch.setattr(f, 'trusted_root_path', lambda path, **kw: Trusted())
+    events = []
+    def read(path, **kwargs):
+        events.append(('read', kwargs)); return b'host key\n'
+    def freeze(raw, **kwargs):
+        events.append(('freeze', kwargs)); return {'path': '/protected/snapshot', 'sha256': 'a' * 64}
+    monkeypatch.setattr(f.command_engine, 'read_protected_file', read)
+    monkeypatch.setattr(f.command_engine, 'freeze_ssh_trust', freeze)
+    def ssh(target, argv, **kwargs):
+        return kwargs['run'](['ssh', 'fixed-target'])
+    monkeypatch.setattr(f.command_engine, 'ssh', ssh)
+    calls = []
+    def run(argv, **kwargs): calls.append(kwargs); return '{"observed":1}'
+    budget = n.Operation(dict(limits_for_rpc()))
+    extra = dict(trust_snapshot_root='/protected/local/trust-snapshots', existing_budget=budget) if inherited else {}
+    assert f.trusted_rpc(route, 'attempt-facts', {'version': 1}, run=run, **extra) == {'observed': 1}
+    assert events[0][1] == ({'budget': budget} if inherited else {})
+    assert events[1][1] == ({'snapshot_root': '/protected/local/trust-snapshots'} if inherited else {})
+    before = budget.bytes
+    assert f.trusted_rpc(route, 'attempt-facts', {}, run=run, **extra) == {'observed': 1}
+    assert (budget.bytes > before > 0) if inherited else budget.bytes == before == 0
+    assert all(call == dict(timeout_seconds=120, output_bytes=f.MAX_OUTPUT_BYTES) for call in calls)
+
+
+def limits_for_rpc():
+    return dict(request_bytes=65536, response_bytes=262144, script_bytes=65536,
+                metadata_bytes=8 * 1024 * 1024, memory_bytes=134217728,
+                operation_seconds=30, command_seconds=10, cleanup_seconds=1,
+                maximum_pids=256, maximum_calls=64, maximum_files=128)
+
+
+def test_rpc_inherited_limit_before_snapshot_and_primary_failure(monkeypatch):
+    import host_resource_facts as f
+    import native_attempt as n
+    route = dict(target='facts@worker', known_hosts='/protected/hosts', identity_file='/protected/key',
+                 helper='/fixed/qcl-negf-resource-rpc', role='facts')
+    class Trusted:
+        def stat(self): return type('Info', (), {'st_mode': 0o600})()
+    monkeypatch.setattr(f, 'trusted_root_path', lambda path, **kw: Trusted())
+    monkeypatch.setattr(f.command_engine, 'read_protected_file', lambda *a, **kw: b'host key\n')
+    monkeypatch.setattr(f.command_engine, 'freeze_ssh_trust', lambda *a, **kw: pytest.fail('snapshot after exhausted budget'))
+    budget = n.Operation(limits_for_rpc()); budget.bytes = budget.limits['metadata_bytes']
+    with pytest.raises(n.Hold):
+        f.trusted_rpc(route, 'attempt-facts', {}, run=lambda *a, **kw: pytest.fail('RPC after exhausted budget'),
+                      trust_snapshot_root='/protected/local/trust-snapshots', existing_budget=budget)
+    primary = OSError('original snapshot failure')
+    monkeypatch.setattr(f.command_engine, 'freeze_ssh_trust', lambda *a, **kw: (_ for _ in ()).throw(primary))
+    budget = n.Operation(limits_for_rpc())
+    with pytest.raises(OSError) as captured:
+        f.trusted_rpc(route, 'attempt-facts', {}, run=lambda *a, **kw: pytest.fail('RPC after failure'),
+                      trust_snapshot_root='/protected/local/trust-snapshots', existing_budget=budget)
+    assert captured.value is primary and budget.bytes > 0
+
+
 def service(tmp_path):
     from host_resource_service import NativeResourceService
     from host_resource_client import NativeWorkloadRef,NativeDemand
