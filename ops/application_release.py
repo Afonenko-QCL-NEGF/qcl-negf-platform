@@ -945,6 +945,13 @@ class _OwnerScan:
     def before(self):
         _owner_before(self.owner)
         self.budget.before()
+    @property
+    def actual_bytes(self):
+        return self.budget.actual_bytes
+    @actual_bytes.setter
+    def actual_bytes(self, value):
+        self.before()
+        self.budget.actual_bytes = value
     def __getattr__(self, name):
         value = getattr(self.budget, name)
         if not callable(value):
@@ -1059,6 +1066,121 @@ def quantum_context(value):
     }
     context['context_sha256'] = hashlib.sha256(sorted_ascii_json(context)).hexdigest()
     return context
+
+
+def retain_release_sources(expected, code_uuid_or_None, *, runtime, maximum_bytes,
+                           before, existing_metadata_budget=None):
+    """Retain actual-build metadata; this private helper grants no readiness.
+
+    Callers supply the existing lifecycle owner's boundary, and, when present,
+    its nonrefundable metadata budget. Cold prepare/workers have no Code UUID.
+    Files are never replaced or removed, including after uncertain publication.
+    """
+    if not callable(before):
+        raise ValueError('Source retention requires the lifecycle boundary')
+    maximum_bytes = output_bound(maximum_bytes)
+    envelope = release_envelope(expected)
+    if 'solver_build' not in envelope:
+        return None, None
+    code = None if code_uuid_or_None is None else normalized_uuid(code_uuid_or_None)
+    if code != code_uuid_or_None:
+        raise ValueError('Observed Code UUID must already be canonical')
+    raw = sorted_ascii_json(envelope['sources'])
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != envelope['solver_build']['source_graph_sha256']:
+        raise ValueError('Retained graph differs from actual solver build')
+    records = [('source-graph-' + digest + '.json', raw)]
+    if code is not None:
+        records.append(('release-' + envelope['release_id'] + '.json', sorted_ascii_json({
+            **envelope, 'code_uuid': code, 'quantum_runtime_context': quantum_context(envelope)})))
+    # Per-file and cumulative serialization ceilings are transport protections,
+    # not a storage/RAM grant. Reserve inherited accounting before any effect.
+    if any(len(data) > 65536 for _, data in records) or sum(len(data) for _, data in records) > maximum_bytes:
+        raise ValueError('Retained release metadata exceeds bound')
+    budget = existing_metadata_budget
+    def check():
+        before()
+        if budget is not None: budget.before()
+    class Boundary:
+        # Only the inherited callback, never a new accounting/grant owner.
+        def before(self): check()
+    check()
+    if budget is not None:
+        budget.reserve(sum(2 * len(data) + 1 for _, data in records))
+    runtime = Path(runtime)
+    with protected_directory(runtime, budget=Boundary()) as parent:
+        check()
+        try:
+            os.mkdir('records', 0o755, dir_fd=parent)
+        except FileExistsError:
+            pass
+        check()
+        directory = os.open('records', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                            dir_fd=parent)
+        try:
+            def directory_check():
+                check()
+                info = os.fstat(directory)
+                trusted_stat(info, directory=True)
+                named = os.stat('records', dir_fd=parent, follow_symlinks=False)
+                if _inode(info) != _inode(named):
+                    raise ValueError('Retained record directory changed')
+            directory_check()
+            check(); os.fsync(parent)
+            for name, data in records:
+                directory_check()
+                try:
+                    fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                 0o444, dir_fd=directory)
+                    created = True
+                except FileExistsError:
+                    check()
+                    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                                 dir_fd=directory)
+                    created = False
+                try:
+                    if created:
+                        offset = 0
+                        while offset < len(data):
+                            check()
+                            count = os.write(fd, data[offset:])
+                            if count <= 0:
+                                raise OSError('Retained metadata short write')
+                            offset += count
+                    # Retry may follow a lost fsync/reply; syncing identical
+                    # bytes makes no replacement or cleanup claim.
+                    if created:
+                        check(); os.fsync(fd)
+                    check(); os.lseek(fd, 0, os.SEEK_SET)
+                    check(); initial = os.fstat(fd)
+                    trusted_stat(initial, directory=False)
+                    if initial.st_nlink != 1 or initial.st_size != len(data) or initial.st_mode & 0o222:
+                        raise ValueError('Untrusted immutable retained record')
+                    observed = bytearray()
+                    while len(observed) <= len(data):
+                        check()
+                        chunk = os.read(fd, min(4096, len(data) + 1 - len(observed)))
+                        if budget is not None: budget.actual_bytes += len(chunk)
+                        check()
+                        if not chunk: break
+                        observed.extend(chunk)
+                    check(); final = os.fstat(fd)
+                    named = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                    signature = lambda info: (info.st_dev, info.st_ino, info.st_uid, info.st_mode,
+                        info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+                    if (signature(initial) != signature(final) or signature(final) != signature(named)
+                            or bytes(observed) != data or hashlib.sha256(observed).digest() != hashlib.sha256(data).digest()):
+                        raise ValueError('Retained metadata readback differs or changed')
+                    if not created:
+                        check(); os.fsync(fd)
+                finally:
+                    os.close(fd)
+                directory_check(); os.fsync(directory)
+            directory_check(); os.fsync(parent)
+            check()
+        finally:
+            os.close(directory)
+    return runtime / 'records' / records[0][0], (runtime / 'records' / records[1][0] if code is not None else None)
 
 
 def installed_manifest_sha256(output):
@@ -1599,6 +1721,13 @@ def _prepare_initial_owned(manifest_value, *, owner, profile=PROFILE, runtime=RU
             run(["nix-env", "--profile", str(path), "--set", selected])
         if path.resolve() != Path(selected):
             raise ValueError("Initial application or solver profile differs from the selected closure")
+    observed_code = None
+    if 'solver_build' in expected and role == 'controller' and current is not None and current.get('code_uuid') is not None:
+        if unique_json(read_protected_file(record), 65536) != current:
+            raise ValueError('Existing observed Code metadata changed')
+        observed_code = current['code_uuid']
+    retain_release_sources(expected, observed_code, runtime=runtime,
+        maximum_bytes=131072, before=before)
     if not os.path.lexists(environment):
         publish(environment, environment_text, before=before)
     if current is None:
@@ -1767,10 +1896,16 @@ def _activate_owned(manifest_value, *, owner, profile=PROFILE, runtime=RUNTIME,
         registered = json.loads(output.strip().splitlines()[-1])
         if registered.get("solver_executable") != expected["solver_executable"] or not registered.get("code_uuid"):
             raise ValueError("InstalledCode identity does not match the immutable solver")
+        if 'solver_build' in expected:
+            if normalized_uuid(registered['code_uuid']) != registered['code_uuid']:
+                raise ValueError('Observed InstalledCode UUID must already be canonical')
         if current is not None and manifest(current) == manifest(expected) and current.get('code_uuid') is not None and current['code_uuid'] != registered['code_uuid']:
             raise ValueError('Immutable InstalledCode UUID changed on identical release')
         identity["code_uuid"] = registered["code_uuid"]
         publish(allowed_codes_file, identity["code_uuid"] + "\n",before=action_budget.before if action_budget else None)
+    retain_release_sources(expected, identity.get('code_uuid'), runtime=runtime,
+        maximum_bytes=131072, before=action_budget.before,
+        existing_metadata_budget=action_budget)
     publish(runtime / "service.env", service_environment(expected, gate, runtime),
             before=action_budget.before if action_budget else None)
     # A prepared configuration may start slurmd for a closed release delivery.

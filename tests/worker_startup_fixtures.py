@@ -16,6 +16,7 @@ import time
 from unittest.mock import patch
 
 from test_node_enrollment import CONTROLLER, WORKER, ENROLL_IDS, manifest_fixture
+from test_application_release import retained_source_fixture_io
 
 ENVIRONMENT = {'kernel_release': '6.12-startup-fixture', 'kernel_path': '/nix/store/kernel/bzImage',
                'modules_path': '/nix/store/modules',
@@ -130,6 +131,10 @@ shared-gate exception remains covered by its existing owning release tests.
     @contextmanager
     def patches(self):
         generation = self.ops._process_generation
+        retain = self.ops.retain_release_sources
+        def retained(*args, **kwargs):
+            with retained_source_fixture_io(self.ops, self.runtime.parent):
+                return retain(*args, **kwargs)
         def read(path, limit=65536, **_):
             path = Path(path)
             if not path.is_relative_to(self.runtime):
@@ -138,7 +143,8 @@ shared-gate exception remains covered by its existing owning release tests.
             if len(raw) > limit:
                 raise ValueError('Synthetic worker metadata bound')
             return raw
-        with patch.object(self.ops, 'read_protected_file', read), \
+        with patch.object(self.ops, 'retain_release_sources', retained), \
+             patch.object(self.ops, 'read_protected_file', read), \
              patch.object(self.ops, 'observe_node_identity', lambda **_: dict(self.identity)), \
              patch.object(self.ops, '_process_generation', lambda: (*generation()[:2], self.identity['boot_id'])), \
              patch.object(self.ops, 'observe_qualification_environment', lambda **_: dict(self.environment)), \

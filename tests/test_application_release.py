@@ -16,6 +16,7 @@ import signal
 import shlex
 import base64
 import copy
+import hashlib
 import fcntl
 import multiprocessing
 import pickle
@@ -279,6 +280,13 @@ class NativeUpdateModel:
 
 
 def install_controller_config_io(test,root):
+    retain = getattr(test.ops, 'retain_release_sources', None)
+    if retain is not None:
+        def retained(*args, **kwargs):
+            with retained_source_fixture_io(test.ops, root):
+                return retain(*args, **kwargs)
+        hook = patch.object(test.ops, 'retain_release_sources', retained)
+        hook.start(); test.addCleanup(hook.stop)
     path=root/'controller-release-config.json'
     path.write_text(json.dumps({'role':'controller','email':'service@example.invalid',
         'allowed_codes_file':str(root/'controller-code-uuid'),
@@ -4087,3 +4095,319 @@ class OriginalUnitOriginEquivalenceTests(unittest.TestCase):
                 actual = copy.deepcopy(expected)
                 change(actual)
                 self.assertFalse(self.ops.origin_equivalent(expected, actual))
+
+
+@contextmanager
+def retained_source_fixture_io(ops, root):
+    """Synthetic root ownership only; real nofollow, modes, bytes and fsync run.
+
+    The temporary root's ancestors stand for installed protected ancestry. This
+    fixture gives no evidence about an installed namespace or reader access.
+    """
+    import release_trust
+    original = release_trust.trusted_stat
+    ancestors = {(p.stat().st_dev, p.stat().st_ino) for p in (root, *root.parents)}
+    def trusted(info, *, directory):
+        if directory and (info.st_dev, info.st_ino) in ancestors:
+            return
+        owned = {(entry.lstat().st_dev, entry.lstat().st_ino) for entry in root.rglob('*')}
+        if (info.st_dev, info.st_ino) not in owned or info.st_uid != os.geteuid():
+            raise ValueError('Foreign synthetic record owner')
+        class RootStat:
+            st_uid = 0
+            def __getattr__(self, key): return getattr(info, key)
+        original(RootStat(), directory=directory)
+    with patch.object(release_trust, 'trusted_stat', trusted), \
+         patch.object(ops, 'trusted_stat', trusted):
+        yield
+
+
+class RetainedReleaseSourcesTests(unittest.TestCase):
+    """G01–G12: actual retained bytes and fault syscalls; no native commands."""
+    setUpClass = classmethod(ApplicationReleaseTests.setUpClass.__func__)
+    RAW = (b'{"components":[{"path":"components/QCLNEGF.jl","revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",'
+           b'"url":"https://github.com/QCL/Core"},{"path":"components/QCLNEGFRunner.jl",'
+           b'"revision":"cccccccccccccccccccccccccccccccccccccccc","url":"https://github.com/QCL/Runner"}],'
+           b'"format":"qcl-negf.git-graph.v1","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}')
+    CODE = '12345678-1234-1234-1234-123456789abc'
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='p07-g-')
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.runtime = self.root / 'runtime'
+        self.runtime.mkdir()
+        self.value = {**delivery_manifest(False), 'sources': json.loads(self.RAW), 'solver_build': {
+            'source_graph_sha256': hashlib.sha256(self.RAW).hexdigest(),
+            'julia_manifest_sha256': 'd' * 64, 'drv_path': '/nix/store/solver.drv',
+            'output_path': '/nix/store/solver'}}
+        self.checks = 0
+
+    def before(self): self.checks += 1
+
+    def retain(self, code=CODE, **kwargs):
+        helper = getattr(self.ops, 'retain_release_sources', None)
+        self.assertTrue(callable(helper), 'G actual-build source retention helper is absent')
+        with retained_source_fixture_io(self.ops, self.root):
+            return helper(kwargs.pop('value', self.value), code, runtime=self.runtime,
+                maximum_bytes=kwargs.pop('maximum_bytes', 131072),
+                before=kwargs.pop('before', self.before), **kwargs)
+
+    def test_g01_raw_canonical_graph_and_historical_code_record(self):
+        graph, record = self.retain()
+        self.assertEqual(graph.name, 'source-graph-' + hashlib.sha256(self.RAW).hexdigest() + '.json')
+        self.assertEqual(graph.read_bytes(), self.RAW)
+        self.assertEqual(record.name, 'release-release-a.json')
+        historical = json.loads(record.read_bytes())
+        self.assertEqual({key: historical[key] for key in self.value}, self.value)
+        self.assertEqual(historical['code_uuid'], self.CODE)
+        self.assertEqual(historical['quantum_runtime_context']['source_graph_sha256'], hashlib.sha256(self.RAW).hexdigest())
+        self.assertEqual(set(historical), {*self.value, 'code_uuid', 'quantum_runtime_context'})
+        self.assertFalse((self.runtime / 'release.json').exists())
+        self.assertGreater(self.checks, 10)
+
+    def test_g02_build_hash_newline_and_wrong_code_refuse_before_effects(self):
+        for code, digest in ((self.CODE, '0' * 64), (self.CODE, hashlib.sha256(self.RAW + b'\n').hexdigest()),
+                             ('not-a-code', hashlib.sha256(self.RAW).hexdigest()),
+                             (self.CODE.upper(), hashlib.sha256(self.RAW).hexdigest()),
+                             (self.CODE.replace('-', ''), hashlib.sha256(self.RAW).hexdigest()),
+                             ('00000000-0000-0000-0000-000000000000', hashlib.sha256(self.RAW).hexdigest())):
+            with self.subTest(code=code, digest=digest):
+                value = copy.deepcopy(self.value)
+                value['solver_build']['source_graph_sha256'] = digest
+                with self.assertRaises(ValueError): self.retain(code, value=value)
+                self.assertEqual(list(self.runtime.iterdir()), [])
+
+    def test_g03_cold_prepare_and_worker_have_graph_without_code_placeholder(self):
+        graph, record = self.retain(None)
+        self.assertEqual(graph.read_bytes(), self.RAW)
+        self.assertIsNone(record)
+        self.assertEqual([p.name for p in graph.parent.iterdir()], [graph.name])
+        _, record = self.retain()
+        self.assertEqual(json.loads(record.read_bytes())['code_uuid'], self.CODE)
+
+    def test_g04_legacy_no_solver_build_makes_no_graph_claim(self):
+        self.assertEqual(self.retain(value=delivery_manifest(False)), (None, None))
+        self.assertEqual(list(self.runtime.iterdir()), [])
+
+    def test_g05_identical_retry_never_replaces_current_or_retained(self):
+        graph, record = self.retain()
+        current = self.runtime / 'release.json'
+        current.write_bytes(b'current untouched\n')
+        selected = [(path, path.stat().st_ino, path.stat().st_mtime_ns, path.read_bytes())
+                    for path in (graph, record, current)]
+        self.retain()
+        for path, inode, timestamp, raw in selected:
+            self.assertEqual((path.stat().st_ino, path.stat().st_mtime_ns, path.read_bytes()), (inode, timestamp, raw))
+        with self.assertRaises(ValueError): self.retain('22222222-2222-2222-2222-222222222222')
+        self.assertEqual(record.read_bytes(), selected[1][3])
+
+    def test_g06_conflict_symlink_partial_and_unprotected_records_keep_evidence(self):
+        graph, record = self.retain()
+        for target in (graph, record):
+            original = target.read_bytes()
+            for fault in ('collision', 'same_size', 'newline', 'formatted', 'partial', 'symlink', 'writable', 'hardlink'):
+                with self.subTest(target=target.name, fault=fault):
+                    target.unlink()
+                    if fault == 'symlink': target.symlink_to(self.root / 'absent')
+                    elif fault == 'hardlink':
+                        other = self.root / ('other-' + target.name)
+                        other.write_bytes(original); os.link(other, target)
+                    else:
+                        content = {'writable': original, 'partial': original[:3],
+                            'same_size': bytes([original[0] ^ 1]) + original[1:],
+                            'newline': original + b'\n',
+                            'formatted': json.dumps(json.loads(original), indent=2).encode()}
+                        target.write_bytes(content.get(fault, b'conflicting'))
+                        target.chmod(0o666 if fault == 'writable' else 0o444)
+                    with self.assertRaises((ValueError, OSError)): self.retain()
+                    self.assertTrue(os.path.lexists(target))
+                    target.unlink(); target.write_bytes(original); target.chmod(0o444)
+
+    def test_g07_no_clobber_short_write_and_fsync_failures_are_retained(self):
+        for fault in ('short_write', 'file_fsync', 'directory_fsync'):
+            with self.subTest(fault=fault):
+                runtime = self.runtime / fault; runtime.mkdir()
+                saved = self.runtime; self.runtime = runtime
+                write, sync = os.write, os.fsync
+                def fail_write(fd, raw):
+                    write(fd, raw[:3]); return 0
+                def fail_sync(fd):
+                    directory = __import__('stat').S_ISDIR(os.fstat(fd).st_mode)
+                    name = os.readlink('/proc/self/fd/' + str(fd))
+                    if (fault == 'file_fsync' and not directory) or (fault == 'directory_fsync' and name.endswith('/records')):
+                        raise OSError('original G fsync failure')
+                    return sync(fd)
+                try:
+                    with patch.object(os, 'write', fail_write if fault == 'short_write' else write), patch.object(os, 'fsync', fail_sync):
+                        with self.assertRaises(OSError): self.retain()
+                    self.assertTrue(any((runtime / 'records').iterdir()))
+                finally: self.runtime = saved
+
+    def test_g08_readback_mutation_and_lost_reply_preserve_original_records(self):
+        graph, record = self.retain()
+        raw_read = os.read
+        fired = []
+        def changed(fd, count):
+            result = raw_read(fd, count)
+            if not fired and os.readlink('/proc/self/fd/' + str(fd)) == str(graph):
+                fired.append(True); graph.chmod(0o644); graph.write_bytes(self.RAW + b' '); graph.chmod(0o444)
+            return result
+        with patch.object(os, 'read', changed):
+            with self.assertRaises(ValueError): self.retain()
+        self.assertEqual(graph.read_bytes(), self.RAW + b' ')
+        graph.chmod(0o644); graph.write_bytes(self.RAW); graph.chmod(0o444)
+        def lost_reply():
+            if record.exists(): raise OSError('lost G reply')
+        with self.assertRaisesRegex(OSError, 'lost G reply'): self.retain(before=lost_reply)
+        self.assertEqual(self.retain(), (graph, record))
+
+    def test_g09_bounds_and_inherited_budget_are_nonrefundable(self):
+        with self.assertRaises(ValueError): self.retain(maximum_bytes=len(self.RAW))
+        self.assertEqual(list(self.runtime.iterdir()), [])
+        budget = self.ops.UpdateScan(time.monotonic() + 30)
+        budget.CAP = 1
+        with self.assertRaises(ValueError): self.retain(existing_metadata_budget=budget)
+        self.assertEqual(list(self.runtime.iterdir()), [])
+        budget.CAP = 1048576
+        self.retain(existing_metadata_budget=budget)
+        before = budget.bytes
+        self.retain(existing_metadata_budget=budget)
+        self.assertGreater(budget.bytes, before)
+        self.assertGreater(budget.actual_bytes, 0)
+
+    def test_g10_cold_prepare_never_registers_and_controller_retains_after_registration(self):
+        install_controller_config_io(self, self.root)
+        profile, gate = self.root / 'profile', self.root / 'gate'
+        commands = InitialCommands()
+        def run(argv):
+            if argv[:3] == ['nix', 'path-info', '--json']:
+                return json.dumps({row['path']: {'narHash': row['narHash']} for row in self.value['closures']})
+            return commands(argv)
+        with patch.object(self.ops, 'installed_manifest_sha256', return_value='d' * 64):
+            cold = self.ops.prepare_initial(self.value, profile=profile, runtime=self.runtime,
+                gate=gate, role='controller', run=run)
+        graph = self.runtime / 'records' / ('source-graph-' + hashlib.sha256(self.RAW).hexdigest() + '.json')
+        self.assertEqual(graph.read_bytes(), self.RAW)
+        self.assertNotIn('code_uuid', cold)
+        self.assertFalse((self.runtime / 'records' / 'release-release-a.json').exists())
+        commands = Commands()
+        generation = self.ops._process_generation
+        def registered(argv):
+            if 'register_aiida.py' in ' '.join(argv):
+                self.assertFalse((self.runtime / 'records' / 'release-release-a.json').exists())
+            if argv[0] == 'systemctl':
+                historical = json.loads((self.runtime / 'records' / 'release-release-a.json').read_bytes())
+                self.assertEqual(historical['code_uuid'], self.CODE)
+                self.assertNotIn('ready', historical)
+            return commands(argv)
+        with patch.object(self.ops, '_process_generation', lambda: (*generation()[:2], CONTROLLER['boot_id'])), \
+             patch.object(self.ops, 'observe_node_identity', return_value=dict(CONTROLLER)), \
+             patch.object(self.ops, 'installed_manifest_sha256', return_value='d' * 64):
+            # Only the command boundary changes after cold preparation.
+            def activation(argv):
+                return run(argv) if argv[:3] == ['nix', 'path-info', '--json'] else registered(argv)
+            result = self.ops.activate(self.value, profile=profile, runtime=self.runtime,
+                gate=gate, role='controller', email='test@example.invalid', run=activation,
+                allowed_codes_file=self.root / 'code', expected_node_identity=CONTROLLER,
+                enrollment_id=ENROLL_IDS[0])
+        self.assertTrue(result['ready'])
+        historical = self.runtime / 'records' / 'release-release-a.json'
+        saved = (historical.stat().st_ino, historical.read_bytes())
+        self.assertEqual(json.loads(saved[1])['code_uuid'], self.CODE)
+        # Exact already-observed controller Code is reusable by cold prepare;
+        # it never creates another Code or changes retained bytes/readiness.
+        with patch.object(self.ops, 'installed_manifest_sha256', return_value='d' * 64):
+            prepared = self.ops.prepare_initial(self.value, profile=profile, runtime=self.runtime,
+                gate=gate, role='controller', run=run)
+        self.assertTrue(prepared['ready'])
+        self.assertEqual((historical.stat().st_ino, historical.read_bytes()), saved)
+
+    def test_g11_worker_lifecycle_and_retention_failure_keep_closed_admission(self):
+        install_controller_config_io(self, self.root)
+        profile, gate = self.root / 'profile', self.root / 'gate'
+        gate.write_text(json.dumps({'open': False, 'release_id': 'release-a'}))
+        commands = Commands()
+        generation = self.ops._process_generation
+        def run(argv):
+            if 'register_aiida.py' in ' '.join(argv): raise AssertionError('Worker registered Code')
+            if argv[:3] == ['nix', 'path-info', '--json']:
+                return json.dumps({row['path']: {'narHash': row['narHash']} for row in self.value['closures']})
+            return commands(argv)
+        with patch.object(self.ops, '_process_generation', lambda: (*generation()[:2], WORKER['boot_id'])), \
+             patch.object(self.ops, 'observe_node_identity', return_value=dict(WORKER)), \
+             patch.object(self.ops, 'installed_manifest_sha256', return_value='d' * 64):
+            args = dict(profile=profile, runtime=self.runtime, gate=gate, run=run,
+                expected_node_identity=WORKER, enrollment_id=ENROLL_IDS[1])
+            result = self.ops.activate(self.value, **args)
+            self.assertTrue(result['ready'])
+            graph = self.runtime / 'records' / ('source-graph-' + hashlib.sha256(self.RAW).hexdigest() + '.json')
+            self.assertEqual(graph.read_bytes(), self.RAW)
+            self.assertFalse((graph.parent / 'release-release-a.json').exists())
+            graph.chmod(0o644); graph.write_bytes(b'original conflict'); graph.chmod(0o444)
+            with self.assertRaises(ValueError): self.ops.activate(self.value, **args)
+        self.assertFalse(json.loads(gate.read_bytes())['open'])
+        self.assertFalse((self.runtime / 'release.json').exists())
+        self.assertEqual(graph.read_bytes(), b'original conflict')
+
+    def test_g12_source_only_release_keeps_actual_old_solver_graph(self):
+        graph, old = self.retain()
+        original = old.read_bytes()
+        value = copy.deepcopy(self.value)
+        value.update(release_id='source-only-new', application_path='/nix/store/new-application')
+        value['closures'][0]['path'] = '/nix/store/new-application'
+        other_graph, new = self.retain(value=value)
+        self.assertEqual(other_graph, graph)
+        self.assertEqual(old.read_bytes(), original)
+        self.assertEqual(json.loads(new.read_bytes())['sources'], json.loads(self.RAW))
+
+    def test_g13_owner_wrapped_budget_counts_actual_retained_readback(self):
+        inherited = self.ops.UpdateScan(time.monotonic() + 30)
+        with self.ops.lifecycle_owner(self.runtime, operation='activate', release_id='release-a',
+                release_identity=self.value, deadline=inherited.deadline) as owner:
+            budget = self.ops._OwnerScan(owner, inherited)
+            self.retain(existing_metadata_budget=budget,
+                before=lambda: self.ops._owner_before(owner))
+        self.assertGreater(inherited.actual_bytes, len(self.RAW))
+
+    def test_g14_boundary_expiry_and_readback_io_failure_keep_evidence(self):
+        def expired(): raise TimeoutError('original lifecycle deadline')
+        with self.assertRaisesRegex(TimeoutError, 'original lifecycle'): self.retain(before=expired)
+        self.assertEqual(list(self.runtime.iterdir()), [])
+        with patch.object(os, 'read', side_effect=OSError('original retained read failure')):
+            with self.assertRaisesRegex(OSError, 'original retained read'): self.retain()
+        graph = next((self.runtime / 'records').iterdir())
+        self.assertEqual(graph.read_bytes(), self.RAW)
+        self.retain()
+
+    def test_g15_lost_durable_directory_reply_reconciles_identical_bytes(self):
+        sync = os.fsync
+        def lost_reply(fd):
+            sync(fd)
+            if (os.readlink('/proc/self/fd/' + str(fd)).endswith('/records')
+                    and (self.runtime / 'records' / 'release-release-a.json').exists()):
+                raise OSError('original lost successful retention reply')
+        with patch.object(os, 'fsync', lost_reply):
+            with self.assertRaisesRegex(OSError, 'original lost successful'): self.retain()
+        saved = [(p, p.stat().st_ino, p.read_bytes()) for p in (self.runtime / 'records').iterdir()]
+        self.assertEqual(len(saved), 2)
+        self.retain()
+        for path, inode, raw in saved:
+            self.assertEqual((path.stat().st_ino, path.read_bytes()), (inode, raw))
+
+    def test_g16_partial_positive_syscalls_complete_and_directory_guards_refuse(self):
+        write = os.write
+        with patch.object(os, 'write', lambda fd, raw: write(fd, raw[:7])):
+            graph, record = self.retain()
+        self.assertEqual(graph.read_bytes(), self.RAW)
+        self.assertEqual(json.loads(record.read_bytes())['code_uuid'], self.CODE)
+        graph.parent.chmod(0o777)
+        try:
+            with self.assertRaises(ValueError): self.retain()
+        finally: graph.parent.chmod(0o755)
+        other = self.runtime / 'symlink-case'; other.mkdir()
+        (other / 'records').symlink_to(graph.parent, target_is_directory=True)
+        saved = self.runtime; self.runtime = other
+        try:
+            with self.assertRaises(OSError): self.retain()
+        finally: self.runtime = saved
