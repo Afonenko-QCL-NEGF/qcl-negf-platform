@@ -1,11 +1,23 @@
 { config, lib, pkgs, ... }:
 let cfg = config.qclNegf.cluster;
     active = cfg.controller || cfg.worker || cfg.submit;
+    native = cfg.nativeAttempts or { enable = false; };
+    nativePackage = import ../nix/native-attempt.nix { inherit pkgs; };
+    prolog = pkgs.writeShellScript "qcl-negf-native-prolog" ''
+      exec ${nativePackage}/bin/qcl-negf-native-attempt-hook prolog
+    '';
+    epilog = pkgs.writeShellScript "qcl-negf-native-epilog" ''
+      exec ${nativePackage}/bin/qcl-negf-native-attempt-hook epilog
+    '';
 in {
   options.qclNegf.cluster = {
     controller = lib.mkEnableOption "Slurm controller";
     worker = lib.mkEnableOption "Slurm compute daemon";
     submit = lib.mkEnableOption "Slurm submission tools";
+    nativeAttempts = {
+      enable = lib.mkEnableOption "fixed root Slurmd native attempt hooks";
+      policyFile = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; description = "Private worker policy runtime path; separately qualified with actual installed hook source."; };
+    };
     controllerHost = lib.mkOption { type = lib.types.str; default = "control"; description = "Resolvable short hostname of Slurm controller."; };
     nodes = lib.mkOption { type = lib.types.listOf lib.types.str; default = []; description = "Slurm NodeName lines, including measured CPU and RAM limits."; };
     partitions = lib.mkOption { type = lib.types.listOf lib.types.str; default = []; description = "Slurm PartitionName lines."; };
@@ -27,6 +39,23 @@ in {
     solverPackage = lib.mkOption { type = lib.types.nullOr lib.types.package; default = null; description = "Solver package installed identically on submit and compute hosts."; };
   };
   config = lib.mkMerge [
+    (lib.mkIf native.enable {
+      assertions = [
+        { assertion = cfg.worker && !config.qclNegf.application.nativeAttempts.enable; message = "Native worker hooks require the worker role and distinct controller policy."; }
+        { assertion = native.policyFile == "/etc/qcl-negf/native-attempt/policy.json"; message = "Native hooks require the protected fixed runtime policy file."; }
+        { assertion = builtins.sort builtins.lessThan (builtins.filter (line: builtins.match "[[:space:]]*(Prolog|Epilog)[[:space:]]*=.*" line != null) (lib.splitString "\n" config.services.slurm.extraConfig)) == builtins.sort builtins.lessThan [ "Prolog=${prolog}" "Epilog=${epilog}" ]; message = "Native hooks cannot overwrite or chain foreign Prolog/Epilog settings."; }
+      ];
+      environment.systemPackages = [ nativePackage ];
+      systemd.tmpfiles.rules = [
+        "d /var/lib/qcl-negf-native-attempt 0700 root root -"
+        "d /var/lib/qcl-negf-native-spool 0750 root qcl-negf -"
+        "d /etc/qcl-negf/native-attempt 0700 root root -"
+      ];
+      services.slurm.extraConfig = lib.mkAfter ''
+        Prolog=${prolog}
+        Epilog=${epilog}
+      '';
+    })
     (lib.mkIf active {
       qclNegf.enable = true;
       assertions = [

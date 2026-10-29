@@ -241,20 +241,39 @@ class LocalSources:
         return rows
 
 
-def trusted_rpc(route,action,payload,*,run):
+def trusted_rpc(route,action,payload,*,run,trust_snapshot_root=None,existing_budget=None):
     """Protected route only; existing P11 strict host-key snapshot and command engine."""
     import base64
-    require(action in {'guest-facts','guest-identity','scheduler-facts','request','status','reconcile','finish','launch-gate'},'action','fixed resource RPC action required')
+    require(action in {'guest-facts','guest-identity','scheduler-facts','attempt-facts','request','status','reconcile','finish','launch-gate'},'action','fixed resource RPC action required')
     require(set(route)=={'target','known_hosts','identity_file','helper','role'},'trust','enrolled RPC route required')
     require(re.fullmatch(r'[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+',route['target']), 'trust','fixed SSH target required')
+    if existing_budget is not None:existing_budget.before()
     key=trusted_root_path(route['identity_file']);known=trusted_root_path(route['known_hosts'])
     require(not key.stat().st_mode&0o077,'trust','private runtime key permissions')
-    snapshot=command_engine.freeze_ssh_trust(command_engine.read_protected_file(known))
+    if existing_budget is not None:existing_budget.before()
+    if existing_budget is None:
+        raw=command_engine.read_protected_file(known)
+    else:
+        raw=command_engine.read_protected_file(known,budget=existing_budget)
+        # Bounded original trust bytes, immutable snapshot copy and finite path bookkeeping.
+        existing_budget.reserve(3*len(raw)+16384)
+    if trust_snapshot_root is None:
+        snapshot=command_engine.freeze_ssh_trust(raw)
+    else:
+        # G retains the actual nofollow/root ancestry check and immutable write.
+        snapshot=command_engine.freeze_ssh_trust(raw,snapshot_root=trust_snapshot_root)
+    if existing_budget is not None:
+        existing_budget.before()
+        # Reserve before JSON/base64 allocation, not after materializing payload.
+        existing_budget.reserve(4*MAX_OUTPUT_BYTES)
     token=base64.urlsafe_b64encode(json.dumps(payload,separators=(',',':')).encode()).decode()
     require(len(token)<=MAX_OUTPUT_BYTES,'output_bound','RPC input bound')
+    if existing_budget is not None:
+        existing_budget.before();existing_budget.reserve(3*MAX_OUTPUT_BYTES)
     result=command_engine.ssh(route['target'],[route['helper'],route['role'],action,token],
         run=lambda argv:run([argv[0],'-oIdentitiesOnly=yes','-oIdentityAgent=none','-i',str(key),*argv[1:]],
             timeout_seconds=120,output_bytes=MAX_OUTPUT_BYTES),trust_snapshot=snapshot)
+    if existing_budget is not None:existing_budget.before()
     packet=strict_json(result);require(type(packet) is dict,'shape','bounded RPC object required')
     return packet
 
