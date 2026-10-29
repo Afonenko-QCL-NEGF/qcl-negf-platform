@@ -64,6 +64,14 @@ environment.overrideAttrs (old: {
     inherit captureRuntime;
   };
   postInstall = (old.postInstall or "") + ''
+    # mkVirtualEnv may link a singleton dependency's whole share directory.
+    # Add our metadata in this output, preserving the dependency's immutable tree.
+    if [ -L "$out/share" ]; then
+      qclShareSource="$(readlink -f "$out/share")"
+      rm "$out/share"
+      mkdir "$out/share"
+      cp -rs "$qclShareSource"/. "$out/share"/
+    fi
     mkdir -p "$out/share/qcl-negf"
     cat > "$out/share/qcl-negf/runtime.json" <<'JSON'
     ${builtins.toJSON {
