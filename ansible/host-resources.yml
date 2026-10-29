@@ -13,6 +13,7 @@
     qcl_resource_backend: ""
     qcl_resource_private_directory: ""
     qcl_resource_dynamic: false
+    qcl_resource_storage: false
   tasks:
     - name: Require reviewed installation and external protected private inputs
       ansible.builtin.assert:
@@ -58,6 +59,9 @@
         - host_resource_backends
         - host_resource_native_cleanup
         - host_resource_recovery
+        - host_resource_storage
+        - worker_distribution
+        - image_stage
         - host_resource_facts
         - host_resource_client
         - host_resource_service
@@ -142,6 +146,9 @@
         path: /etc/libvirt/hooks/qemu
       register: qcl_primary_hook
       when: qcl_resource_backend == 'libvirt'
+    - name: Prepare explicitly opted-in per-incarnation storage identities
+      ansible.builtin.include_tasks: tasks/host-resource-storage.yml
+      when: qcl_resource_storage | bool
     - name: Refuse overwriting or guessing existing primary hook ownership
       ansible.builtin.assert:
         that: not qcl_primary_hook.stat.exists

@@ -1,0 +1,216 @@
+{
+  "replies": {
+    "named": {
+      "return": [
+        {
+          "file": "/private/inc/root-vda.qcow2",
+          "node-name": "format",
+          "ro": false,
+          "drv": "qcow2",
+          "backing_file_depth": 0,
+          "children": [
+            {
+              "child": "file",
+              "node-name": "file"
+            }
+          ],
+          "active": true,
+          "encrypted": false,
+          "detect_zeroes": "off",
+          "bps": 0,
+          "bps_rd": 0,
+          "bps_wr": 0,
+          "iops": 0,
+          "iops_rd": 0,
+          "iops_wr": 0,
+          "image": {
+            "filename": "/private/inc/root-vda.qcow2",
+            "format": "qcow2",
+            "virtual-size": 1048576,
+            "format-specific": {
+              "type": "qcow2",
+              "data": {
+                "compat": "1.1",
+                "refcount-bits": 16,
+                "compression-type": "zlib"
+              }
+            }
+          },
+          "cache": {
+            "writeback": true,
+            "direct": false,
+            "no-flush": false
+          },
+          "write_threshold": 0
+        },
+        {
+          "file": "/private/inc/root-vda.qcow2",
+          "node-name": "file",
+          "ro": false,
+          "drv": "file",
+          "backing_file_depth": 0,
+          "children": [],
+          "active": true,
+          "encrypted": false,
+          "detect_zeroes": "off",
+          "bps": 0,
+          "bps_rd": 0,
+          "bps_wr": 0,
+          "iops": 0,
+          "iops_rd": 0,
+          "iops_wr": 0,
+          "image": {
+            "filename": "/private/inc/root-vda.qcow2",
+            "format": "file",
+            "virtual-size": 1048576
+          },
+          "cache": {
+            "writeback": true,
+            "direct": false,
+            "no-flush": false
+          },
+          "write_threshold": 0
+        }
+      ]
+    },
+    "debug": {
+      "return": {
+        "nodes": [
+          {
+            "id": 1,
+            "type": "block-backend",
+            "name": "virtio-disk0"
+          },
+          {
+            "id": 2,
+            "type": "block-driver",
+            "name": "format"
+          },
+          {
+            "id": 3,
+            "type": "block-driver",
+            "name": "file"
+          }
+        ],
+        "edges": [
+          {
+            "parent": 1,
+            "child": 2,
+            "name": "root",
+            "perm": [
+              "consistent-read",
+              "write"
+            ],
+            "shared-perm": [
+              "consistent-read",
+              "write-unchanged"
+            ]
+          },
+          {
+            "parent": 2,
+            "child": 3,
+            "name": "file",
+            "perm": [
+              "consistent-read",
+              "write"
+            ],
+            "shared-perm": [
+              "consistent-read",
+              "write-unchanged"
+            ]
+          }
+        ]
+      }
+    },
+    "block": {
+      "return": [
+        {
+          "device": "",
+          "qdev": "virtio-disk0",
+          "type": "unknown",
+          "removable": false,
+          "locked": false,
+          "inserted": {
+            "file": "/private/inc/root-vda.qcow2",
+            "node-name": "format",
+            "ro": false,
+            "drv": "qcow2",
+            "backing_file_depth": 0,
+            "children": [
+              {
+                "node-name": "file",
+                "child": "file"
+              }
+            ],
+            "active": true,
+            "encrypted": false,
+            "detect_zeroes": "off",
+            "bps": 0,
+            "bps_rd": 0,
+            "bps_wr": 0,
+            "iops": 0,
+            "iops_rd": 0,
+            "iops_wr": 0,
+            "image": {
+              "filename": "/private/inc/root-vda.qcow2",
+              "format": "qcow2",
+              "virtual-size": 1048576,
+              "format-specific": {
+                "type": "qcow2",
+                "data": {
+                  "compat": "1.1",
+                  "refcount-bits": 16,
+                  "compression-type": "zlib"
+                }
+              }
+            },
+            "cache": {
+              "writeback": true,
+              "direct": false,
+              "no-flush": false
+            },
+            "write_threshold": 0
+          }
+        }
+      ]
+    },
+    "jobs": {
+      "return": []
+    },
+    "block_jobs": {
+      "return": []
+    }
+  },
+  "roots": [
+    {
+      "target": "vda",
+      "node_id": "format",
+      "backend": "virtio-disk0"
+    }
+  ],
+  "offline": {
+    "filename": "/private/inc/root-vda.qcow2",
+    "format": "qcow2",
+    "virtual-size": 1048576,
+    "format-specific": {
+      "type": "qcow2",
+      "data": {
+        "compat": "1.1",
+        "refcount-bits": 16,
+        "compression-type": "zlib"
+      }
+    },
+    "children": [
+      {
+        "name": "file",
+        "info": {
+          "filename": "/private/inc/root-vda.qcow2",
+          "format": "file",
+          "virtual-size": 1048576,
+          "children": []
+        }
+      }
+    ]
+  },
+  "ring": "pos:\t0\nflags:\t02000002\nmnt_id:\t18\nino:\t1066\nSqMask:\t0x7f\nSqHead:\t0\nSqTail:\t0\nCachedSqHead:\t0\nCqMask:\t0xff\nCqHead:\t0\nCqTail:\t0\nCachedCqTail:\t0\nSQEs:\t0\nCQEs:\t0\nSqThread:\t-1\nSqThreadCpu:\t-1\nSqTotalTime:\t0\nSqWorkTime:\t0\nUserFiles:\t0\nUserBufs:\t0\nPollList:\nCqOverflowList:\nNAPI:\tdisabled\n"
+}

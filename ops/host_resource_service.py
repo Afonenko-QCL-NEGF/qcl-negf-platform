@@ -177,6 +177,13 @@ def open_service():
         require(proofs is not None,'qualification','retirement requires existing dynamic source owner')
         from host_resource_recovery import NativeRecoveryService
         service.recovery=NativeRecoveryService(controller,provider,proofs,config['native_recovery'],runner)
+    if config.get('native_storage') is not None:
+        require(proofs is not None and hasattr(service,'recovery'),'qualification','owned storage requires existing C/F1 owner')
+        from host_resource_storage import LibvirtStorageCollector
+        service.storage=LibvirtStorageCollector(controller,proofs.sources,proofs.backend,runner,config['native_storage'])
+        service.recovery.sources.storage=service.storage
+        proofs.sources.storage_collector=service.storage
+        proofs.sources.recovery_sources=service.recovery.sources
     return service
 
 

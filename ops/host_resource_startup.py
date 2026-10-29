@@ -294,6 +294,14 @@ def admin_main(argv=None):
     from host_resource_service import open_service
     require(os.geteuid()==0 and os.environ.get('SUDO_UID','0')=='0','root_required','administrative root only')
     args=list(sys.argv[1:] if argv is None else argv);require(bool(args),'shape','administrative action required')
+    if args[0] in {'storage-import','storage-definition','storage-bind'}:
+        require(len(args)==2,'action','storage preparation accepts one install UUID only')
+        from host_resource_storage import import_storage,storage_definition,bind_storage
+        action={'storage-import':import_storage,'storage-definition':storage_definition,'storage-bind':bind_storage}[args[0]]
+        result=action(args[1])
+        if type(result) is bytes:sys.stdout.buffer.write(result+b'\n')
+        else:print(json.dumps(result))
+        return 0
     if args[0] in {'retire','recovery-status','reserve-replacement'}:
         from host_resource_recovery import admin_recovery
         print(json.dumps(admin_recovery(args)));return 0

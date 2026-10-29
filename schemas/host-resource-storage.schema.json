@@ -1,0 +1,3290 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Private Root B1 storage protocols; source acceptance never native acceptance",
+  "$defs": {
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^\\s\\x00-\\x1f](?:[^\\x00-\\x1f]*[^\\s\\x00-\\x1f])?$"
+    },
+    "nonnegative": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9223372036854775807
+    },
+    "positive": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9223372036854775807
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "nativeUUID": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "sourceRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "pattern": "^/(?!.*(?:^|/)\\.\\.(?:/|$))[^\\x00-\\x1f]+$"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "birth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pid",
+        "start_ticks",
+        "boot_id"
+      ],
+      "properties": {
+        "pid": {
+          "$ref": "#/$defs/positive"
+        },
+        "start_ticks": {
+          "$ref": "#/$defs/positive"
+        },
+        "boot_id": {
+          "$ref": "#/$defs/text"
+        }
+      }
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "vm_id",
+        "native_id",
+        "process_id",
+        "guest_boot_id",
+        "image_id",
+        "guest_kernel_id",
+        "host_kernel_id",
+        "qemu_version_id",
+        "backend_version_id",
+        "readback_version",
+        "config_fingerprint"
+      ],
+      "properties": {
+        "vm_id": {
+          "$ref": "#/$defs/text"
+        },
+        "native_id": {
+          "$ref": "#/$defs/text"
+        },
+        "process_id": {
+          "$ref": "#/$defs/text"
+        },
+        "guest_boot_id": {
+          "$ref": "#/$defs/text"
+        },
+        "image_id": {
+          "$ref": "#/$defs/text"
+        },
+        "guest_kernel_id": {
+          "$ref": "#/$defs/text"
+        },
+        "host_kernel_id": {
+          "$ref": "#/$defs/text"
+        },
+        "qemu_version_id": {
+          "$ref": "#/$defs/text"
+        },
+        "backend_version_id": {
+          "$ref": "#/$defs/text"
+        },
+        "readback_version": {
+          "$ref": "#/$defs/text"
+        },
+        "config_fingerprint": {
+          "$ref": "#/$defs/text"
+        }
+      }
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "unit",
+        "invocation_id",
+        "cgroup",
+        "host_boot_id",
+        "mutation_id"
+      ],
+      "properties": {
+        "unit": {
+          "type": "string",
+          "pattern": "^qcl-resource-[0-9a-f]{32}\\.service$"
+        },
+        "invocation_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "cgroup": {
+          "type": "string",
+          "pattern": "^/system.slice/qcl-resource-[0-9a-f]{32}\\.service$"
+        },
+        "host_boot_id": {
+          "$ref": "#/$defs/text"
+        },
+        "mutation_id": {
+          "$ref": "#/$defs/uuid"
+        }
+      }
+    },
+    "pvePeer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "node",
+        "qemu_birth"
+      ],
+      "properties": {
+        "kind": {
+          "const": "pve_local"
+        },
+        "node": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$"
+        },
+        "qemu_birth": {
+          "$ref": "#/$defs/birth"
+        }
+      }
+    },
+    "libvirtPeer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "socket_path",
+        "socket_device",
+        "socket_inode",
+        "unit",
+        "invocation_id",
+        "daemon_birth"
+      ],
+      "properties": {
+        "kind": {
+          "const": "libvirt_unix"
+        },
+        "socket_path": {
+          "enum": [
+            "/run/libvirt/virtqemud-sock",
+            "/run/libvirt/libvirt-sock"
+          ]
+        },
+        "socket_device": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "socket_inode": {
+          "$ref": "#/$defs/positive"
+        },
+        "unit": {
+          "enum": [
+            "virtqemud.service",
+            "libvirtd.service"
+          ]
+        },
+        "invocation_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "daemon_birth": {
+          "$ref": "#/$defs/birth"
+        }
+      }
+    },
+    "peer": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/pvePeer"
+        },
+        {
+          "$ref": "#/$defs/libvirtPeer"
+        }
+      ]
+    },
+    "bounded": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[^\\u0000]+$"
+    },
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^/(?!.*(?:^|/)\\.\\.(?:/|$))[^\\u0000]+$"
+    },
+    "dac": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "uid",
+        "gid"
+      ],
+      "properties": {
+        "uid": {
+          "$ref": "#/$defs/positive"
+        },
+        "gid": {
+          "$ref": "#/$defs/positive"
+        }
+      }
+    },
+    "namespace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "device",
+        "inode",
+        "mount_id"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/path"
+        },
+        "device": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "inode": {
+          "$ref": "#/$defs/positive"
+        },
+        "mount_id": {
+          "$ref": "#/$defs/positive"
+        }
+      }
+    },
+    "disk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target",
+        "role",
+        "format",
+        "access",
+        "path",
+        "device",
+        "inode",
+        "mount_id",
+        "uid",
+        "gid",
+        "mode",
+        "nlink",
+        "creation_receipt_sha256"
+      ],
+      "properties": {
+        "target": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]{0,15}$"
+        },
+        "role": {
+          "enum": [
+            "root",
+            "scratch",
+            "seed",
+            "backing"
+          ]
+        },
+        "format": {
+          "enum": [
+            "raw",
+            "qcow2"
+          ]
+        },
+        "access": {
+          "enum": [
+            "ro",
+            "rw"
+          ]
+        },
+        "path": {
+          "$ref": "#/$defs/path"
+        },
+        "device": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "inode": {
+          "$ref": "#/$defs/positive"
+        },
+        "mount_id": {
+          "$ref": "#/$defs/positive"
+        },
+        "uid": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "gid": {
+          "$ref": "#/$defs/positive"
+        },
+        "mode": {
+          "enum": [
+            384,
+            288
+          ]
+        },
+        "nlink": {
+          "const": 1
+        },
+        "creation_receipt_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "role",
+        "format",
+        "access",
+        "path",
+        "device",
+        "inode",
+        "mount_id",
+        "uid",
+        "gid",
+        "mode",
+        "nlink",
+        "creation_receipt_sha256"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/bounded"
+        },
+        "role": {
+          "enum": [
+            "root",
+            "scratch",
+            "seed",
+            "backing"
+          ]
+        },
+        "format": {
+          "enum": [
+            "raw",
+            "qcow2"
+          ]
+        },
+        "access": {
+          "enum": [
+            "ro",
+            "rw"
+          ]
+        },
+        "path": {
+          "$ref": "#/$defs/path"
+        },
+        "device": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "inode": {
+          "$ref": "#/$defs/positive"
+        },
+        "mount_id": {
+          "$ref": "#/$defs/positive"
+        },
+        "uid": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "gid": {
+          "$ref": "#/$defs/positive"
+        },
+        "mode": {
+          "enum": [
+            384,
+            288
+          ]
+        },
+        "nlink": {
+          "const": 1
+        },
+        "creation_receipt_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "storageBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "host_id",
+        "owner_id",
+        "vm_id",
+        "domain_name",
+        "native_uuid",
+        "incarnation_id",
+        "namespace",
+        "dac",
+        "disks",
+        "install_receipt_sha256",
+        "definition_sha256",
+        "source_profile_sha256"
+      ],
+      "properties": {
+        "schema": {
+          "const": "qcl.host-resource-storage-binding.v1"
+        },
+        "host_id": {
+          "$ref": "#/$defs/bounded"
+        },
+        "owner_id": {
+          "$ref": "#/$defs/bounded"
+        },
+        "vm_id": {
+          "$ref": "#/$defs/bounded"
+        },
+        "domain_name": {
+          "$ref": "#/$defs/bounded"
+        },
+        "native_uuid": {
+          "$ref": "#/$defs/nativeUUID"
+        },
+        "incarnation_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "namespace": {
+          "$ref": "#/$defs/namespace"
+        },
+        "dac": {
+          "$ref": "#/$defs/dac"
+        },
+        "disks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/disk"
+          },
+          "maxItems": 64,
+          "minItems": 1
+        },
+        "install_receipt_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "definition_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_profile_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "bindings",
+        "qualification",
+        "install_specs"
+      ],
+      "properties": {
+        "schema": {
+          "const": "qcl.host-resource-storage-config.v1"
+        },
+        "bindings": {
+          "$ref": "#/$defs/path"
+        },
+        "qualification": {
+          "$ref": "#/$defs/path"
+        },
+        "install_specs": {
+          "$ref": "#/$defs/path"
+        }
+      }
+    },
+    "installDac": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "user",
+        "group",
+        "uid",
+        "gid"
+      ],
+      "properties": {
+        "user": {
+          "type": "string",
+          "pattern": "^[a-z_][a-z0-9_-]{0,30}$"
+        },
+        "group": {
+          "type": "string",
+          "pattern": "^[a-z_][a-z0-9_-]{0,30}$"
+        },
+        "uid": {
+          "$ref": "#/$defs/positive"
+        },
+        "gid": {
+          "$ref": "#/$defs/positive"
+        }
+      }
+    },
+    "fileRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "bytes",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[^\\u0000]+$"
+        },
+        "bytes": {
+          "$ref": "#/$defs/positive"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "artifactDisk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "target",
+        "role",
+        "format",
+        "access",
+        "file_ref"
+      ],
+      "properties": {
+        "kind": {
+          "const": "artifact"
+        },
+        "target": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]{0,15}$"
+        },
+        "role": {
+          "enum": [
+            "root",
+            "scratch",
+            "seed",
+            "backing"
+          ]
+        },
+        "format": {
+          "enum": [
+            "raw",
+            "qcow2"
+          ]
+        },
+        "access": {
+          "enum": [
+            "ro",
+            "rw"
+          ]
+        },
+        "file_ref": {
+          "$ref": "#/$defs/fileRef"
+        }
+      }
+    },
+    "scratchDisk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "target",
+        "role",
+        "format",
+        "access",
+        "virtual_bytes"
+      ],
+      "properties": {
+        "kind": {
+          "const": "fresh_scratch"
+        },
+        "target": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]{0,15}$"
+        },
+        "role": {
+          "const": "scratch"
+        },
+        "format": {
+          "enum": [
+            "raw",
+            "qcow2"
+          ]
+        },
+        "access": {
+          "const": "rw"
+        },
+        "virtual_bytes": {
+          "$ref": "#/$defs/positive"
+        }
+      }
+    },
+    "installSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "install_id",
+        "incarnation_id",
+        "vm_id",
+        "native_uuid",
+        "domain_name",
+        "namespace_parent",
+        "dac",
+        "distribution",
+        "disks",
+        "definition_ref",
+        "copy_budget_bytes",
+        "timeout_seconds"
+      ],
+      "properties": {
+        "install_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "incarnation_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "vm_id": {
+          "$ref": "#/$defs/bounded"
+        },
+        "native_uuid": {
+          "$ref": "#/$defs/nativeUUID"
+        },
+        "domain_name": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+        },
+        "namespace_parent": {
+          "$ref": "#/$defs/path"
+        },
+        "dac": {
+          "$ref": "#/$defs/installDac"
+        },
+        "distribution": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "bundle",
+            "expected_manifest_sha256"
+          ],
+          "properties": {
+            "bundle": {
+              "$ref": "#/$defs/path"
+            },
+            "expected_manifest_sha256": {
+              "$ref": "#/$defs/sha256"
+            }
+          }
+        },
+        "disks": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/artifactDisk"
+              },
+              {
+                "$ref": "#/$defs/scratchDisk"
+              }
+            ]
+          },
+          "maxItems": 64,
+          "minItems": 1
+        },
+        "definition_ref": {
+          "$ref": "#/$defs/sourceRef"
+        },
+        "copy_budget_bytes": {
+          "$ref": "#/$defs/positive"
+        },
+        "timeout_seconds": {
+          "$ref": "#/$defs/positive"
+        }
+      }
+    },
+    "installBundle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "host_id",
+        "owner_id",
+        "specs"
+      ],
+      "properties": {
+        "schema": {
+          "const": "qcl.host-resource-storage-installs.v1"
+        },
+        "host_id": {
+          "$ref": "#/$defs/bounded"
+        },
+        "owner_id": {
+          "$ref": "#/$defs/bounded"
+        },
+        "specs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/installSpec"
+          },
+          "maxItems": 64,
+          "minItems": 0
+        }
+      }
+    },
+    "sourceIds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "HAIO",
+        "HCHAR",
+        "HCHFE",
+        "HCHIO",
+        "HCPU",
+        "HDR",
+        "HFDM",
+        "HIO",
+        "HKVM",
+        "HMAIN",
+        "HMIG",
+        "HMISC",
+        "HMON",
+        "HPOOL",
+        "HPR",
+        "HRUN",
+        "HSEC",
+        "HSOCK",
+        "HVHOST",
+        "KBTRFS",
+        "KCG",
+        "KEXIT",
+        "KFDINFO",
+        "KFILE",
+        "KFORK",
+        "KFT",
+        "KIRQ",
+        "KKVM",
+        "KMAPS",
+        "KMM",
+        "KPROC",
+        "KRSRC",
+        "KUR",
+        "LB",
+        "LCMD",
+        "LDAC",
+        "LDOM",
+        "LDR",
+        "LEXEC",
+        "LFD",
+        "LMON",
+        "LNS",
+        "LPROC",
+        "LTERM",
+        "LUTIL",
+        "LXML",
+        "PF1",
+        "QAIO",
+        "QAPI",
+        "QB",
+        "QBACK",
+        "QBJ",
+        "QC",
+        "QCS",
+        "QDEV",
+        "QF",
+        "QI",
+        "QJAPI",
+        "QJOB",
+        "QLOCK",
+        "QQ",
+        "QRAW",
+        "QSN",
+        "QUR",
+        "QEMU_OBJECT/backends/hostmem-ram.c",
+        "QEMU_OBJECT/backends/hostmem.c",
+        "QEMU_OBJECT/include/system/hostmem.h",
+        "QEMU_OBJECT/backends/rng-random.c",
+        "QEMU_OBJECT/qapi/qom.json",
+        "QEMU_OBJECT/hw/core/machine.c",
+        "LIBVIRT_INVENTORY/tools/virsh-domain-monitor.c",
+        "LIBVIRT_INVENTORY/tools/virsh-pool.c",
+        "LIBVIRT_INVENTORY/tools/virsh-volume.c",
+        "LIBVIRT_INVENTORY/tools/virsh-snapshot.c",
+        "MASTER_QEMU/crypto/secret.c",
+        "MASTER_QEMU/crypto/secret_common.c",
+        "MASTER_QEMU/qapi/crypto.json",
+        "MASTER_LIBVIRT/src/qemu/qemu_alias.c",
+        "MASTER_LIBVIRT/src/qemu/qemu_conf.c"
+      ],
+      "properties": {
+        "HAIO": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "de3feb639616e371d5c11e26da45e2a5636de3401d12e62da3a8022fef0ec519"
+            }
+          }
+        },
+        "HCHAR": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "fa414b863afc85192e7eda2206e9e0cbce0822d608ddae9560e0e0528e8f7236"
+            }
+          }
+        },
+        "HCHFE": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "47d98ed0c25f342388cc276dcacbda4faeb9ea7a573c3f07b7bc75081be16b0b"
+            }
+          }
+        },
+        "HCHIO": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "8e9025f8181559f4bc665a82cee20c275776fa134f34c4a2b8bd45f14451feee"
+            }
+          }
+        },
+        "HCPU": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "d3ead98db2a9354e49217d631f316e95487f7ab156ab4be9adad32dd5fae4acc"
+            }
+          }
+        },
+        "HDR": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "d08595953bd0560ad5bc274731ea28eac9a54e2d610af8c8dc08e65dcaef6077"
+            }
+          }
+        },
+        "HFDM": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "56ea83f2b9bd0a59f24dfaa2c3e57ddfaf1e45bbe3e8f40f045363b89c922707"
+            }
+          }
+        },
+        "HIO": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "9218894fbdd34e456fa2c7ba71d7a3899e1c0ebb713d91153489518db547d578"
+            }
+          }
+        },
+        "HKVM": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "5bd7be012bd6a858c30c9bb6b7ec861cbce5e3e611b794aa32c4d25874a0a0f8"
+            }
+          }
+        },
+        "HMAIN": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "5209f230ab4a0d0794d3a2669b2a6d8154349283d8560eb8670044877122c242"
+            }
+          }
+        },
+        "HMIG": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "be90c932e045bc0fdd207acee1cc414c3ddea9e87f7663bc0b5f906030ca3888"
+            }
+          }
+        },
+        "HMISC": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "7bce935ac076d1b9e63bb105bdc3608c8126b025dba46f47d8ce7ec1772d99a1"
+            }
+          }
+        },
+        "HMON": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "50aa5ddf578e2e629cf5951d9937718fdfa187e28b21efab974fe2513fecbcff"
+            }
+          }
+        },
+        "HPOOL": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "cd7848272ace041fa9e991369b216657d7b7ba076f22b9029a204f60c42a8c75"
+            }
+          }
+        },
+        "HPR": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "f6514ffc8846511ae520b1f30ad9c4f9684fc198c52faa95e4147faefaf8fe7b"
+            }
+          }
+        },
+        "HRUN": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "cc0ceeffd2dd2b8c61eed5d9bf14c25d211c2259df3de537ebf8f2927c1ae7ab"
+            }
+          }
+        },
+        "HSEC": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "fa45c2fceb986158ed98d6c412efab6714604b58a2591782bcc3c8758f7aad46"
+            }
+          }
+        },
+        "HSOCK": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "24b67f6b8092a34befdbb50133fee9c41cfb6f8e3137aeb7f070272a76111bbf"
+            }
+          }
+        },
+        "HVHOST": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "8ff3ae4c8d4b4fce2f210f27a2ab58722e1e4de7ec6699659e852656943720a9"
+            }
+          }
+        },
+        "KBTRFS": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "bd7dec8b8b8fe0586a73a1c48bd4aa11cc3c14fea7d574017712776700bd9ba8"
+            }
+          }
+        },
+        "KCG": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "1f3198c8146f3b2046a77c22ef840b74c36fc9c1cc1482bd2cb250ada602be03"
+            }
+          }
+        },
+        "KEXIT": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "ecca06ee0bf8e50177e955788f183798fc7f82add2f609f8f961a30b31440595"
+            }
+          }
+        },
+        "KFDINFO": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "e8127d7f9ee087856eed281787eb2f470edd4861e1372a76f2e72d1d92669843"
+            }
+          }
+        },
+        "KFILE": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "4d06c4c911801f19846fb1e155c3eb90522c80dbc657f15212a8f7947cbeaca1"
+            }
+          }
+        },
+        "KFORK": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "b6ef045e24dd4c9b29b633cec6e45dedf15158940448ffec5fa81c28d283fe9e"
+            }
+          }
+        },
+        "KFT": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "f4395a9db6620f5b4ea7dea04088826f0e4edc3ac51228cbe06703d5aaabec4e"
+            }
+          }
+        },
+        "KIRQ": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "bd26c2971114ab22e096c8d88005151142ad3e4dd045727f1bb56059bc6db935"
+            }
+          }
+        },
+        "KKVM": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "607eae128bb389767e46fab409966cd4155fb1a12e3580e4864ec8276444978d"
+            }
+          }
+        },
+        "KMAPS": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "1c4e03e5ad6f07287c951cf7231840e4f7d5f70cd16806c913af946104a99a46"
+            }
+          }
+        },
+        "KMM": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "449b858385c7ece0ff88a8b41893efadb70a437fb8585a296c4ef0461a4c1545"
+            }
+          }
+        },
+        "KPROC": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "5aba6d410e9aee3283b9007e33668a99f5d4c506deffa8b9816be415966eca0b"
+            }
+          }
+        },
+        "KRSRC": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "64fec9b3f6bc2acf150619d7360926fb68f69b350602019fa20b4361add88c51"
+            }
+          }
+        },
+        "KUR": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "7e4540b9a3d457fa599834ad5754c0acfc533dd976a337ee0de4de16c4d5a7ec"
+            }
+          }
+        },
+        "LB": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "ecb7bedb37de96d18635397f72d98eb66b9402118e3354e82157c623eb5f1b0f"
+            }
+          }
+        },
+        "LCMD": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "680d735d02b236d040ecc72d81392c87d6f9a09121d90c8269c0749d9e0e0ebb"
+            }
+          }
+        },
+        "LDAC": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "154b1ca96d6c4c3316ebaec3450772a76970ea14bd357492973463e74b314e82"
+            }
+          }
+        },
+        "LDOM": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "1ac4a096ed2e8430f4aa04a18bfdabc8c8870fe0ef1ee828ecaac701d8a88a7f"
+            }
+          }
+        },
+        "LDR": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "17a2dbfb6f36901fd2549cfc9451b4c35045983586584a9d738be0ccdc9e2337"
+            }
+          }
+        },
+        "LEXEC": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "7da374df3b3085d34ddc63f383fa998353c607c2a72ca71b7ebd3def0ed6ac08"
+            }
+          }
+        },
+        "LFD": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "003a9845f88dc8601e040c23047abbbdcd638ce87ddb3172f2db9de88be70a1d"
+            }
+          }
+        },
+        "LMON": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "37836f3799fe18fe1c68a4c2928879f92085dee550afdc2940100398c359618d"
+            }
+          }
+        },
+        "LNS": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "0cd5dc6737fccfa421ce875b61bdb344f2d4c7a4afe0cb7d3c552d51b0551a09"
+            }
+          }
+        },
+        "LPROC": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "ff7f79fd8429ea3954f11709b3ac53858263fb8af9be499903f69d0fcd9379e5"
+            }
+          }
+        },
+        "LTERM": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "5f420c985f1ac65fac4c92e0d81990a8eee6b5d0888efdd64c00702e6030c0ca"
+            }
+          }
+        },
+        "LUTIL": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "34dfd0625ddb6f645df62a5f1a2e9a3f5332662ef056b24bd73dc4fa1acffc58"
+            }
+          }
+        },
+        "LXML": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "5f2bdcf4a6d43c70bd471f2a485d06c893c0f59c0ca95da567344491ce2080a7"
+            }
+          }
+        },
+        "PF1": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "887ac86830b7b75004c12baf9a02502a80f1fc0c326cd2c2090821acb77d61a8"
+            }
+          }
+        },
+        "QAIO": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "976bfc8deb2e888805184d84a7452bc7dc3310d89b95f62923e00cac71c21ed9"
+            }
+          }
+        },
+        "QAPI": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "22b1d036051344b7d3d13efe6d10da249e36c10ac31139f01a5635b80a001e98"
+            }
+          }
+        },
+        "QB": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "ff92b23632d0a43b55da99c1d81a24c97eadd10368a14010543562547bd3e2b3"
+            }
+          }
+        },
+        "QBACK": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "6ecbe68523d2eec780792b3dc7dbf7736f4dcb52ef9e8728f5fd3fd5633b5877"
+            }
+          }
+        },
+        "QBJ": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "c5c85852aa1697fd3330a174938464d1fa33e7a516b5765d60da21901a0c8463"
+            }
+          }
+        },
+        "QC": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "5c32e63cfd0a2330709dad76374b862ac22ccd8952f473e7ead80365668ae513"
+            }
+          }
+        },
+        "QCS": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "3e7055ef8d41dacd422291c6db3a589d9376688c3b69e23dec5c9e9aabba91d3"
+            }
+          }
+        },
+        "QDEV": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "8576ce411d38750a9ef59af14f2ed165b7dc78e3094e7713b52ebf2067d0f35f"
+            }
+          }
+        },
+        "QF": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "970575234caffc506bcb7fb320ff5de2837c673f0d6495d744e1bf28a94d5a4d"
+            }
+          }
+        },
+        "QI": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "80fb427d344317aaacce4c5670915d7a9e6d11abdd226fcf7ef795a76e55b6c1"
+            }
+          }
+        },
+        "QJAPI": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "d4691cad6d4ef116666964820670b5995a9b022b1a61707cdd282bf033fe2c06"
+            }
+          }
+        },
+        "QJOB": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "2bbd9b8b3cc0c4634ebb9118d57eb79aa2e748ea2038ac4ec27bee01a5b6eac4"
+            }
+          }
+        },
+        "QLOCK": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "0b1a4c2e45b7b8b5720458f9b853a59bee1c07cdf7102051fd1f0ef78c3923f0"
+            }
+          }
+        },
+        "QQ": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "b3bec38007548d323ee891ff8adf0b326731ec20f79f214bd03335761b915fea"
+            }
+          }
+        },
+        "QRAW": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "93c375a7679cbbc655208fb2936307390c6379dacdc1a3d34aaaedae488aa2d8"
+            }
+          }
+        },
+        "QSN": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "332aec8138f7cdb832ee225038d556e215e1b44f7df28d64d98f46fb0a6bc50d"
+            }
+          }
+        },
+        "QUR": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "fa18ab5687bfd2a5f7b263bc6edb42988ef7e72bff5cb2ab981d4c23c62f25e9"
+            }
+          }
+        },
+        "QEMU_OBJECT/backends/hostmem-ram.c": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "1eed956ce437f286b9fe3f0677b165f23d25898129b6ea2de8f857f04850a08b"
+            }
+          }
+        },
+        "QEMU_OBJECT/backends/hostmem.c": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "785258c441c0691978eb30e22a4ebae1b7a87e682adb8de06b3942a37a7aabd1"
+            }
+          }
+        },
+        "QEMU_OBJECT/include/system/hostmem.h": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "be5a95acbc1dfcfc61edbc7fa883c5498b77ea70858aada071f4283f1e6f42bd"
+            }
+          }
+        },
+        "QEMU_OBJECT/backends/rng-random.c": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "01944d4e40326e016388bf27bacb8ffcc90b2e0eefe841d3e3ae73444b7389cc"
+            }
+          }
+        },
+        "QEMU_OBJECT/qapi/qom.json": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "cd63b7670b98d9c7ed1ca14786e427d9d852f8da87f9604f5c9125fb6d9ab199"
+            }
+          }
+        },
+        "QEMU_OBJECT/hw/core/machine.c": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "189c891714f0928cdd6648f7d2799b529029345a4c47fcf1fc92adb01a9d6e27"
+            }
+          }
+        },
+        "LIBVIRT_INVENTORY/tools/virsh-domain-monitor.c": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "8ad8cc525f2a0f5eeca047bf835426b6d0867f998850da1c156f9e5bab03fd16"
+            }
+          }
+        },
+        "LIBVIRT_INVENTORY/tools/virsh-pool.c": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "951cdc090ab3652ab6a6a12560bde40a853cb0972ea401e7081a6f73e1be6610"
+            }
+          }
+        },
+        "LIBVIRT_INVENTORY/tools/virsh-volume.c": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "76b270d292569df1854ec8bbbdfee8802947f1209d5a79dbc998ebedbf95cea6"
+            }
+          }
+        },
+        "LIBVIRT_INVENTORY/tools/virsh-snapshot.c": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "67128b5c478407d77b359ee38d76730435b1790e3936032df63bbcb7fb715772"
+            }
+          }
+        },
+        "MASTER_QEMU/crypto/secret.c": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "edd3cb118753d5651baac7be0bf7baec8a0d2686a0f17892116a1fc603a00650"
+            }
+          }
+        },
+        "MASTER_QEMU/crypto/secret_common.c": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "3807b8fce266b849515e6fdf88bcaf6b10f9935fd0c93ebe20627f05a8d4a3de"
+            }
+          }
+        },
+        "MASTER_QEMU/qapi/crypto.json": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "f7056cf09b8e47690acd531e4f280e681f41a9f23a261703696e968b4e44853c"
+            }
+          }
+        },
+        "MASTER_LIBVIRT/src/qemu/qemu_alias.c": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "11e913c82cb16f48bf48be2390bb930f00a883866b5f2d25d3a6a131452405cc"
+            }
+          }
+        },
+        "MASTER_LIBVIRT/src/qemu/qemu_conf.c": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/path"
+            },
+            "sha256": {
+              "const": "764ee00c4b1591c5c074f382611179e398f731ab9619016bcdaeced02e57d2eb"
+            }
+          }
+        }
+      }
+    },
+    "toolIds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "virsh",
+        "qemu",
+        "qemu_img",
+        "libvirt_daemon",
+        "libvirt_driver",
+        "libvirt_client",
+        "liburing",
+        "kernel_config",
+        "kernel_notes",
+        "runtime_config",
+        "installation_mapping"
+      ],
+      "properties": {
+        "virsh": {
+          "$ref": "#/$defs/sourceRef"
+        },
+        "qemu": {
+          "$ref": "#/$defs/sourceRef"
+        },
+        "qemu_img": {
+          "$ref": "#/$defs/sourceRef"
+        },
+        "libvirt_daemon": {
+          "$ref": "#/$defs/sourceRef"
+        },
+        "libvirt_driver": {
+          "$ref": "#/$defs/sourceRef"
+        },
+        "libvirt_client": {
+          "$ref": "#/$defs/sourceRef"
+        },
+        "liburing": {
+          "$ref": "#/$defs/sourceRef"
+        },
+        "kernel_config": {
+          "$ref": "#/$defs/sourceRef"
+        },
+        "kernel_notes": {
+          "$ref": "#/$defs/sourceRef"
+        },
+        "runtime_config": {
+          "$ref": "#/$defs/sourceRef"
+        },
+        "installation_mapping": {
+          "$ref": "#/$defs/sourceRef"
+        }
+      }
+    },
+    "qualification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_id",
+        "subject",
+        "binding_sha256",
+        "policy_sha256",
+        "host_id",
+        "owner_id",
+        "host_boot_id",
+        "host_kernel_id",
+        "source_ids",
+        "tool_ids",
+        "native_peer_identity",
+        "filesystem_protocol",
+        "graph_protocol",
+        "holder_protocol",
+        "dac_protocol",
+        "evidence_ref"
+      ],
+      "properties": {
+        "protocol_id": {
+          "enum": [
+            "qemu-11.1.2-owned-live-v1",
+            "qemu-img-11.1.2-owned-offline-v1"
+          ]
+        },
+        "subject": {
+          "enum": [
+            "mutation",
+            "replacement"
+          ]
+        },
+        "binding_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "policy_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "host_id": {
+          "$ref": "#/$defs/bounded"
+        },
+        "owner_id": {
+          "$ref": "#/$defs/bounded"
+        },
+        "host_boot_id": {
+          "$ref": "#/$defs/bounded"
+        },
+        "host_kernel_id": {
+          "$ref": "#/$defs/bounded"
+        },
+        "source_ids": {
+          "$ref": "#/$defs/sourceIds"
+        },
+        "tool_ids": {
+          "$ref": "#/$defs/toolIds"
+        },
+        "native_peer_identity": {
+          "$ref": "#/$defs/libvirtPeer"
+        },
+        "filesystem_protocol": {
+          "const": "linux-btrfs-private-regular-v1"
+        },
+        "graph_protocol": {
+          "enum": [
+            "qemu-11.1.2-owned-live-v1",
+            "qemu-img-11.1.2-owned-offline-v1"
+          ]
+        },
+        "holder_protocol": {
+          "const": "linux-qemu-threads-buffered-owned-v1"
+        },
+        "dac_protocol": {
+          "const": "libvirt-12.8.0-static-dac-private-v1"
+        },
+        "evidence_ref": {
+          "$ref": "#/$defs/sourceRef"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "subject": {
+                "const": "mutation"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "protocol_id": {
+                "const": "qemu-11.1.2-owned-live-v1"
+              },
+              "graph_protocol": {
+                "const": "qemu-11.1.2-owned-live-v1"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "protocol_id": {
+                "const": "qemu-img-11.1.2-owned-offline-v1"
+              },
+              "graph_protocol": {
+                "const": "qemu-img-11.1.2-owned-offline-v1"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "qualificationBundle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "profiles"
+      ],
+      "properties": {
+        "schema": {
+          "const": "qcl.host-resource-storage-qualifications.v1"
+        },
+        "profiles": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/qualification"
+          },
+          "maxItems": 64,
+          "minItems": 1
+        }
+      }
+    },
+    "mutationSubject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "request_id",
+        "mutation_id",
+        "intent_sha256",
+        "dispatch_sha256",
+        "policy_sha256",
+        "host_boot_id",
+        "binding",
+        "worker_birth",
+        "cli_birth",
+        "native_context"
+      ],
+      "properties": {
+        "kind": {
+          "const": "mutation"
+        },
+        "request_id": {
+          "$ref": "#/$defs/bounded"
+        },
+        "mutation_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "intent_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "dispatch_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "policy_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "host_boot_id": {
+          "$ref": "#/$defs/bounded"
+        },
+        "binding": {
+          "$ref": "#/$defs/binding"
+        },
+        "worker_birth": {
+          "$ref": "#/$defs/birth"
+        },
+        "cli_birth": {
+          "$ref": "#/$defs/birth"
+        },
+        "native_context": {
+          "$ref": "#/$defs/context"
+        }
+      }
+    },
+    "replacementSubject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "recovery_id",
+        "archive_sha256",
+        "definition_sha256",
+        "storage_binding_sha256",
+        "policy_sha256",
+        "native_uuid",
+        "domain_name",
+        "host_boot_id"
+      ],
+      "properties": {
+        "kind": {
+          "const": "replacement"
+        },
+        "recovery_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "archive_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "definition_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "storage_binding_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "policy_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "native_uuid": {
+          "$ref": "#/$defs/nativeUUID"
+        },
+        "domain_name": {
+          "$ref": "#/$defs/bounded"
+        },
+        "host_boot_id": {
+          "$ref": "#/$defs/bounded"
+        }
+      }
+    },
+    "graph": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "roots",
+        "nodes",
+        "edges"
+      ],
+      "properties": {
+        "roots": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "target",
+              "node_id"
+            ],
+            "properties": {
+              "target": {
+                "$ref": "#/$defs/bounded"
+              },
+              "node_id": {
+                "$ref": "#/$defs/bounded"
+              }
+            }
+          },
+          "maxItems": 64,
+          "minItems": 1
+        },
+        "nodes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "driver",
+              "read_only",
+              "file_id"
+            ],
+            "properties": {
+              "id": {
+                "$ref": "#/$defs/bounded"
+              },
+              "driver": {
+                "enum": [
+                  "file",
+                  "raw",
+                  "qcow2"
+                ]
+              },
+              "read_only": {
+                "type": "boolean"
+              },
+              "file_id": {
+                "oneOf": [
+                  {
+                    "$ref": "#/$defs/bounded"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          },
+          "maxItems": 256,
+          "minItems": 1
+        },
+        "edges": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "parent",
+              "child",
+              "role"
+            ],
+            "properties": {
+              "parent": {
+                "$ref": "#/$defs/bounded"
+              },
+              "child": {
+                "$ref": "#/$defs/bounded"
+              },
+              "role": {
+                "enum": [
+                  "file",
+                  "backing"
+                ]
+              }
+            }
+          },
+          "maxItems": 512,
+          "minItems": 0
+        }
+      }
+    },
+    "fdRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "file_id",
+        "task_birth",
+        "fd",
+        "access"
+      ],
+      "properties": {
+        "kind": {
+          "const": "fd"
+        },
+        "file_id": {
+          "$ref": "#/$defs/bounded"
+        },
+        "task_birth": {
+          "$ref": "#/$defs/birth"
+        },
+        "fd": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "access": {
+          "enum": [
+            "ro",
+            "rw"
+          ]
+        }
+      }
+    },
+    "mapRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "file_id",
+        "task_birth",
+        "start",
+        "end",
+        "offset",
+        "permissions",
+        "access"
+      ],
+      "properties": {
+        "kind": {
+          "const": "map"
+        },
+        "file_id": {
+          "$ref": "#/$defs/bounded"
+        },
+        "task_birth": {
+          "$ref": "#/$defs/birth"
+        },
+        "start": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "end": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "offset": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "permissions": {
+          "type": "string",
+          "pattern": "^[-rwxps]{4}$"
+        },
+        "access": {
+          "enum": [
+            "ro",
+            "rw"
+          ]
+        }
+      }
+    },
+    "holder": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "birth",
+        "uid",
+        "gid",
+        "cgroup",
+        "mount_namespace",
+        "user_namespace",
+        "refs"
+      ],
+      "properties": {
+        "birth": {
+          "$ref": "#/$defs/birth"
+        },
+        "uid": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "gid": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "cgroup": {
+          "$ref": "#/$defs/bounded"
+        },
+        "mount_namespace": {
+          "$ref": "#/$defs/positive"
+        },
+        "user_namespace": {
+          "$ref": "#/$defs/positive"
+        },
+        "refs": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/fdRef"
+              },
+              {
+                "$ref": "#/$defs/mapRef"
+              }
+            ]
+          },
+          "maxItems": 8192,
+          "minItems": 0
+        }
+      }
+    },
+    "rawRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "slot",
+        "path",
+        "bytes",
+        "sha256"
+      ],
+      "properties": {
+        "slot": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{1,100}$"
+        },
+        "path": {
+          "$ref": "#/$defs/path"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 262144
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "ring": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "task_birth",
+        "fd",
+        "user_files",
+        "user_bufs",
+        "sq_thread",
+        "sq_mask",
+        "cq_mask",
+        "observed_poll_ops"
+      ],
+      "properties": {
+        "task_birth": {
+          "$ref": "#/$defs/birth"
+        },
+        "fd": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "user_files": {
+          "const": 0
+        },
+        "user_bufs": {
+          "const": 0
+        },
+        "sq_thread": {
+          "const": -1
+        },
+        "sq_mask": {
+          "const": 127
+        },
+        "cq_mask": {
+          "const": 255
+        },
+        "observed_poll_ops": {
+          "type": "array",
+          "items": {
+            "enum": [
+              6,
+              7,
+              11
+            ]
+          },
+          "maxItems": 8192,
+          "minItems": 0
+        }
+      }
+    },
+    "nativeObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "protocol_id",
+        "query_set",
+        "raw_refs",
+        "task_inventory_sha256",
+        "ring_observations",
+        "operation_owner"
+      ],
+      "properties": {
+        "schema": {
+          "const": "qcl.host-resource-storage-native-observation.v1"
+        },
+        "protocol_id": {
+          "enum": [
+            "qemu-11.1.2-owned-live-v1",
+            "qemu-img-11.1.2-owned-offline-v1"
+          ]
+        },
+        "query_set": {
+          "oneOf": [
+            {
+              "const": [
+                {
+                  "execute": "query-named-block-nodes",
+                  "arguments": {
+                    "flat": true
+                  }
+                },
+                {
+                  "execute": "x-debug-query-block-graph"
+                },
+                {
+                  "execute": "query-block",
+                  "arguments": {
+                    "flat": true
+                  }
+                },
+                {
+                  "execute": "query-jobs"
+                },
+                {
+                  "execute": "query-block-jobs"
+                }
+              ]
+            },
+            {
+              "const": [
+                {
+                  "execute": "qemu-img-info-per-file",
+                  "format": "explicit",
+                  "backing": "NO_BACKING"
+                }
+              ]
+            }
+          ]
+        },
+        "raw_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/rawRef"
+          },
+          "maxItems": 256,
+          "minItems": 1
+        },
+        "task_inventory_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "ring_observations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ring"
+          },
+          "maxItems": 4096,
+          "minItems": 0
+        },
+        "operation_owner": {
+          "$ref": "#/$defs/birth"
+        }
+      }
+    },
+    "capture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "subject",
+        "binding_sha256",
+        "profile_sha256",
+        "domain_inventory_sha256",
+        "pool_inventory_sha256",
+        "process_inventory_sha256",
+        "closure_sha256",
+        "native_peer_identity",
+        "started_at",
+        "completed_at",
+        "monotonic_start_ns",
+        "monotonic_end_ns",
+        "graph",
+        "files",
+        "holders",
+        "native_observation"
+      ],
+      "properties": {
+        "schema": {
+          "const": "qcl.host-resource-storage-capture.v1"
+        },
+        "subject": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/mutationSubject"
+            },
+            {
+              "$ref": "#/$defs/replacementSubject"
+            }
+          ]
+        },
+        "binding_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "profile_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "domain_inventory_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "pool_inventory_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "process_inventory_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "closure_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "native_peer_identity": {
+          "$ref": "#/$defs/libvirtPeer"
+        },
+        "started_at": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "completed_at": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "monotonic_start_ns": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "monotonic_end_ns": {
+          "$ref": "#/$defs/nonnegative"
+        },
+        "graph": {
+          "$ref": "#/$defs/graph"
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/file"
+          },
+          "maxItems": 64,
+          "minItems": 1
+        },
+        "holders": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/holder"
+          },
+          "maxItems": 4096,
+          "minItems": 0
+        },
+        "native_observation": {
+          "$ref": "#/$defs/nativeObservation"
+        }
+      }
+    },
+    "nativeCase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "case",
+        "result",
+        "host_boot_id",
+        "host_kernel_id",
+        "source_profile_sha256",
+        "evidence_refs",
+        "binding_sha256",
+        "subject"
+      ],
+      "properties": {
+        "schema": {
+          "const": "qcl.host-resource-storage-native-case.v1"
+        },
+        "case": {
+          "enum": [
+            "N-H0",
+            "N-H1",
+            "N-H2",
+            "N-H3",
+            "N-H4",
+            "N-H5",
+            "N-H6",
+            "N-H7",
+            "N-H8"
+          ]
+        },
+        "result": {
+          "const": "pass"
+        },
+        "host_boot_id": {
+          "$ref": "#/$defs/bounded"
+        },
+        "host_kernel_id": {
+          "$ref": "#/$defs/bounded"
+        },
+        "source_profile_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/sourceRef"
+          },
+          "maxItems": 256,
+          "minItems": 1
+        },
+        "binding_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "subject": {
+          "enum": [
+            "mutation",
+            "replacement"
+          ]
+        }
+      }
+    },
+    "nativeQualification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "protocol_id",
+        "cases",
+        "host_boot_id",
+        "host_kernel_id",
+        "mount_namespace",
+        "user_namespace",
+        "limits",
+        "authority"
+      ],
+      "properties": {
+        "schema": {
+          "const": "qcl.host-resource-storage-native-qualification.v1"
+        },
+        "protocol_id": {
+          "const": "linux-qemu-threads-buffered-owned-v1"
+        },
+        "cases": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "N-H0",
+            "N-H1",
+            "N-H2",
+            "N-H3",
+            "N-H4",
+            "N-H5",
+            "N-H6",
+            "N-H7",
+            "N-H8"
+          ],
+          "properties": {
+            "N-H0": {
+              "$ref": "#/$defs/sourceRef"
+            },
+            "N-H1": {
+              "$ref": "#/$defs/sourceRef"
+            },
+            "N-H2": {
+              "$ref": "#/$defs/sourceRef"
+            },
+            "N-H3": {
+              "$ref": "#/$defs/sourceRef"
+            },
+            "N-H4": {
+              "$ref": "#/$defs/sourceRef"
+            },
+            "N-H5": {
+              "$ref": "#/$defs/sourceRef"
+            },
+            "N-H6": {
+              "$ref": "#/$defs/sourceRef"
+            },
+            "N-H7": {
+              "$ref": "#/$defs/sourceRef"
+            },
+            "N-H8": {
+              "$ref": "#/$defs/sourceRef"
+            }
+          }
+        },
+        "host_boot_id": {
+          "$ref": "#/$defs/bounded"
+        },
+        "host_kernel_id": {
+          "$ref": "#/$defs/bounded"
+        },
+        "mount_namespace": {
+          "$ref": "#/$defs/positive"
+        },
+        "user_namespace": {
+          "$ref": "#/$defs/positive"
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "probe_seconds",
+            "max_rings"
+          ],
+          "properties": {
+            "probe_seconds": {
+              "$ref": "#/$defs/positive"
+            },
+            "max_rings": {
+              "$ref": "#/$defs/positive"
+            }
+          }
+        },
+        "authority": {
+          "const": "root-sole-lifecycle-owner-from-inode-birth-v1"
+        }
+      }
+    },
+    "account": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "install_id",
+        "spec_sha256",
+        "dac"
+      ],
+      "properties": {
+        "schema": {
+          "const": "qcl.host-resource-storage-account.v1"
+        },
+        "install_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "spec_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "dac": {
+          "$ref": "#/$defs/installDac"
+        }
+      }
+    },
+    "importIntent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "install_id",
+        "spec_sha256",
+        "account_sha256",
+        "namespace"
+      ],
+      "properties": {
+        "schema": {
+          "const": "qcl.host-resource-storage-import-intent.v1"
+        },
+        "install_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "spec_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "account_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "namespace": {
+          "$ref": "#/$defs/path"
+        }
+      }
+    },
+    "created": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "install_id",
+        "spec_sha256",
+        "target",
+        "path",
+        "artifact",
+        "virtual_bytes",
+        "identity"
+      ],
+      "properties": {
+        "schema": {
+          "const": "qcl.host-resource-storage-created.v1"
+        },
+        "install_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "spec_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "target": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]{0,15}$"
+        },
+        "path": {
+          "$ref": "#/$defs/path"
+        },
+        "artifact": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/fileRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "virtual_bytes": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/positive"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "identity": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "device",
+            "inode",
+            "mount_id",
+            "uid",
+            "gid",
+            "mode",
+            "nlink"
+          ],
+          "properties": {
+            "device": {
+              "$ref": "#/$defs/nonnegative"
+            },
+            "inode": {
+              "$ref": "#/$defs/positive"
+            },
+            "mount_id": {
+              "$ref": "#/$defs/positive"
+            },
+            "uid": {
+              "$ref": "#/$defs/nonnegative"
+            },
+            "gid": {
+              "$ref": "#/$defs/positive"
+            },
+            "mode": {
+              "enum": [
+                384,
+                288
+              ]
+            },
+            "nlink": {
+              "const": 1
+            }
+          }
+        }
+      }
+    },
+    "importComplete": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "install_id",
+        "spec_sha256",
+        "distribution_sha256",
+        "namespace",
+        "dac",
+        "disks",
+        "account_sha256"
+      ],
+      "properties": {
+        "schema": {
+          "const": "qcl.host-resource-storage-import.v1"
+        },
+        "install_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "spec_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "distribution_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "namespace": {
+          "$ref": "#/$defs/namespace"
+        },
+        "dac": {
+          "$ref": "#/$defs/dac"
+        },
+        "disks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/disk"
+          },
+          "maxItems": 64,
+          "minItems": 1
+        },
+        "account_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "definition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "install_id",
+        "spec_sha256",
+        "import_sha256",
+        "template_sha256",
+        "definition_sha256",
+        "xml",
+        "power_intent"
+      ],
+      "properties": {
+        "schema": {
+          "const": "qcl.host-resource-storage-definition.v1"
+        },
+        "install_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "spec_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "import_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "template_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "definition_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "xml": {
+          "type": "string",
+          "maxLength": 262144
+        },
+        "power_intent": {
+          "const": "stopped-no-autostart"
+        }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/config"
+    },
+    {
+      "$ref": "#/$defs/storageBinding"
+    },
+    {
+      "$ref": "#/$defs/installBundle"
+    },
+    {
+      "$ref": "#/$defs/qualificationBundle"
+    },
+    {
+      "$ref": "#/$defs/capture"
+    },
+    {
+      "$ref": "#/$defs/nativeQualification"
+    },
+    {
+      "$ref": "#/$defs/nativeCase"
+    },
+    {
+      "$ref": "#/$defs/account"
+    },
+    {
+      "$ref": "#/$defs/importIntent"
+    },
+    {
+      "$ref": "#/$defs/created"
+    },
+    {
+      "$ref": "#/$defs/importComplete"
+    },
+    {
+      "$ref": "#/$defs/definition"
+    }
+  ]
+}

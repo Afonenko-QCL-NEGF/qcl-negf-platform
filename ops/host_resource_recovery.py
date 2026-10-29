@@ -427,13 +427,23 @@ class NativeRecoveryService:
             target=decode_target(self.store._read(self.proofs.path(req.mutation_id).with_suffix('.target.json')))
             check_start_fence(self.store,'libvirt',uuid=native_id)
             vm=archived['request']['vm_id'];require(state['bindings'][vm] is None,'identity_mismatch','replacement already bound')
-            assert_storage_disjoint(target['storage_devices'],self.sources.replacement_storage(native_id,target))
-            spec=self.c._vm(vm);record=self.sources.replacement(native_id,owner_state=state,target=target)
-            require(record.vm_id==vm and record.native_id==native_id and record.observed_power_state=='stopped' and record.configured_max_bytes==record.initial_peak_bytes==spec.maximum_bytes,'startup_peak','full stopped replacement must match current protected enrollment')
-            state['startups'][vm].update(native_id=native_id,static_config_fingerprint=record.static_config_fingerprint,phase='cold_reserved',reservation_id=fingerprint([recovery_id,native_id,record.static_config_fingerprint]))
-            self.store.save(state)
-            from host_resource_startup import StartupManager
-            return StartupManager(self.c.policy,self.store,self.c.backend)._view(state,vm)
+            try:
+                if type(self.sources) is NativeRecoverySources:
+                    candidate=self.sources.replacement_storage(native_id,target,recovery_id=recovery_id)
+                else:candidate=self.sources.replacement_storage(native_id,target)  # explicit synthetic seam
+                assert_storage_disjoint(target['storage_devices'],candidate)
+                spec=self.c._vm(vm);record=self.sources.replacement(native_id,owner_state=state,target=target)
+                require(record.vm_id==vm and record.native_id==native_id and record.observed_power_state=='stopped' and record.configured_max_bytes==record.initial_peak_bytes==spec.maximum_bytes,'startup_peak','full stopped replacement must match current protected enrollment')
+                validate=getattr(self.sources,'validate_replacement_use',None)
+                if validate is not None:validate(native_id,target)
+                state['startups'][vm].update(native_id=native_id,static_config_fingerprint=record.static_config_fingerprint,phase='cold_reserved',reservation_id=fingerprint([recovery_id,native_id,record.static_config_fingerprint]))
+                self.store.save(state)
+                from host_resource_startup import StartupManager
+                return StartupManager(self.c.policy,self.store,self.c.backend)._view(state,vm)
+            finally:
+                if type(self.sources) is NativeRecoverySources:
+                    storage=getattr(self.sources,'storage',None)
+                    if storage is not None and native_id in storage.handles:storage.handles[native_id].close()
 
 
 class NativeRecoverySources:
@@ -506,6 +516,9 @@ class NativeRecoverySources:
         return p
     def validate_target(self,target):
         profile=self.profile(target);backend=self.s.proofs.backend;t=target['target']
+        storage=getattr(self,'storage',None)
+        require(storage is not None,'qualification','production retirement requires attached storage owner')
+        storage.validate_retirement(target)
         ids=backend._run(['list','--all','--uuid']).split()
         require(len(ids)==len(set(ids)),'incomplete_inventory','unique complete domain inventory')
         old_present=False
@@ -530,13 +543,21 @@ class NativeRecoverySources:
         raw=self.s.proofs.backend._run(['dumpxml',native_id,'--inactive'])
         require('<!DOCTYPE' not in raw and '<!ENTITY' not in raw,'shape','XML entities unsupported')
         xml=ET.fromstring(raw);require(xml.findtext('uuid')==native_id,'identity_mismatch','native XML identity differs');return xml
-    def storage_closure(self,xml):
-        # domain_conf.c:24424+ intentionally omits detected backing members from
-        # inactive XML. Neither a top disk nor an empty XML is a complete native
-        # block graph proof. The owning collector has not been accepted yet.
-        raise ResourceError('source_protocol_unavailable','complete qualified storage/backing/external-data collector is absent')
-    def replacement_storage(self,native_id,target):
-        return self.storage_closure(self._xml(native_id))
+    def storage_closure(self,xml,handle=None):
+        from host_resource_storage import StorageCaptureHandle
+        storage=getattr(self,'storage',None)
+        require(storage is not None and type(handle) is StorageCaptureHandle and handle.owner is storage and not handle.closed and xml.findtext('uuid')==handle.binding['native_uuid'],'qualification','same-process qualified storage capture required')
+        return [dict(path=f['path'],device=f['device'],inode=f['inode'],kind='local_regular') for f in handle.observation['files']]
+    def replacement_storage(self,native_id,target,*,recovery_id=None):
+        require(getattr(self,'storage',None) is not None and recovery_id is not None,'qualification','configured replacement capture owner required')
+        handle=self.storage.capture_replacement(recovery_id,native_id)
+        try:return self.storage_closure(self._xml(native_id),handle)
+        except BaseException:handle.close();raise
+    def validate_replacement_use(self,native_id,target):
+        require(getattr(self,'storage',None) is not None and native_id in self.storage.handles,'qualification','process-local replacement handle missing')
+        handle=self.storage.handles[native_id]
+        try:assert_storage_disjoint(target['storage_devices'],self.storage.validate_use(handle))
+        except BaseException:handle.close();raise
     def target_before_exec(self,intent,dispatch,p,backend,worker,cli):
         from host_resource_backends import libvirt_config_fingerprint
         profile=self._profile(asdict(intent.binding),intent.host_boot_id)
@@ -553,7 +574,12 @@ class NativeRecoverySources:
         for accel in xml.findall('devices/video/model/acceleration'):require(accel.get('accel3d','no')=='no','qualification','external 3D renderer unqualified')
         for interface in xml.findall('devices/interface'):
             driver=interface.find('driver');require(interface.get('type')=='user' or (driver is not None and driver.get('name')=='qemu'),'qualification','external vhost memory backing unqualified')
-        storage_devices=decode_storage_devices(self.storage_closure(xml))
+        require(getattr(self,'storage',None) is not None,'qualification','production target requires configured owned storage collector')
+        handle=self.storage.capture_mutation(intent,dispatch)
+        try:
+            self.storage.seal(handle)
+            storage_devices=decode_storage_devices(self.storage_closure(xml,handle))
+        except BaseException:handle.close();raise
         storage=fingerprint([ET.tostring(x,encoding='unicode') for x in xml.findall('devices/disk')])
         require(storage==profile['storage_namespace_sha256'],'qualification','exact private storage namespace changed')
         process=self.local.process(int(intent.binding.process_id))
@@ -634,6 +660,10 @@ class NativeRecoverySources:
 def prepare_target_seal(native_sources,intent,dispatch,profile,backend,worker,cli):
     config=native_sources.config.get('native_recovery')
     if config is None:return None
+    if native_sources.config.get('native_storage') is not None:
+        owner=getattr(native_sources,'recovery_sources',None)
+        require(owner is not None,'qualification','same-service recovery/storage owner missing')
+        return owner.target_before_exec(intent,dispatch,profile,backend,worker,cli)
     from host_resource_service import open_service
     # Existing source owner/factory; no recursion into claim/exec, no public path.
     service=open_service();return service.recovery.sources.target_before_exec(intent,dispatch,profile,backend,worker,cli)

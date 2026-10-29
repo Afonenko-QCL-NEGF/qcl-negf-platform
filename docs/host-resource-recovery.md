@@ -79,7 +79,7 @@ executable/birth/`-uuid`, scope inode/device/unit Invocation и storage XML meta
 **до исходного resize exec** вместе с immutable original dispatch. Target дополнительно требует
 `storage_devices`: exact metadata refs `{path, device, inode, kind}` с `kind=local_regular`,
 canonical paths и unique path/device+inode. Это только формат identity, не доказательство полноты
-backing closure. Block aliases (`st_rdev`), network/volume protocols, backing/external-data и shared
+backing closure. Block aliases (`st_rdev`), network/volume protocols, external-data и shared
 readonly templates не принимаются по этому формату. Историческая UNKNOWN без такого seal не
 усыновляется. Научные массивы не читаются.
 
@@ -149,19 +149,25 @@ lookup сначала проверяет exact текущую native generation,
 | Путь                                       | Source сейчас                                                                    | Ограничение / следующий gate                                                                                                                                                          |
 | ------------------------------------------ | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Fixed full-max и healthy C witness         | Существующие independent пути сохранены                                          | Их actual qualification не доказывает D recovery                                                                                                                                      |
-| Libvirt UUID/name retirement               | Controller/barrier/claim/fence/archive и conditional source boundary реализованы | Production storage closure producer отсутствует; до него SOURCE hold. Independent source review и N отдельно                                                                          |
+| Libvirt UUID/name retirement | Controller/barrier/claim/fence/archive и opt-in B1 collector реализованы | Independent source review, N-H0…H8 и owning output closure отдельно |
 | PVE lost-reply recovery                    | SOURCE hold, до controls                                                         | Detached qmeventd cleanup/restart и numeric PID fallback требуют exact per-client drain/confinement protocol; Python producer не выдумывает proof                                     |
-| Full storage/backing/external-data closure | Exact pre-exec seal/alias predicate и negative fixtures                          | Production collector отсутствует: даже empty XML не доказывает diskless closure; SOURCE followup                                                                                      |
+| Private raw/qcow2 file/backing closure | Strict QMP/offline decoder, creation binding, process-local FD barrier и attached capture | Только B1; external/shared/unknown graph HOLD; source не native qualification |
 | Affected workload output/staging closure   | Existing owning completion hook потребляется                                     | Текущий guest producer не выдаёт полный output receipt; P04/P07 producer остаётся SOURCE followup, production держит charge                                                           |
 | Dynamic low-idle/pressure/Slurm startup    | C/D source prerequisites                                                         | Root actual N: grant-before-guest-reject, assigned readback, protected aggregate floors, pressure и отсутствие Slurmd deadlock; capacity/admin agreement и fresh operational readback |
 
-Production `storage_closure` сейчас всегда возвращает SOURCE hold: в pinned libvirt
+Production opt-in [B1 storage collector](host-resource-storage.md) требует исходный attached
+`native-mutations/<mutation>.storage.json`, same-process capture handle и final use barrier после
+durable target/claim. Inactive XML по pinned libvirt
 `940c2352cec2f7759d73ad8725d3ce7f3651cbe9`, `src/conf/domain_conf.c`,
-`virDomainDiskBackingStoreFormat` (24424–24434) inactive XML намеренно пропускает detected backing
-members. Нет принятого полного block-graph collector даже для подтверждения diskless. Список/true
-flag из payload или tests этого не заменяет. Поэтому opt-in D не включают для реального worker до
-отдельного source producer; default fixed/C без D остаются независимыми. Retired target без нового
-sealed поля сохраняет hold; metadata не реконструируется после UNKNOWN.
+`virDomainDiskBackingStoreFormat` (24424–24434) намеренно пропускает detected backing members;
+поэтому он не используется как полная closure. Новый collector проверяет actual all-node graph,
+private creation/DAC/FD identities и holder/lifecycle exclusions. Empty/top XML без handle HOLD.
+При retirement исходный capture/profile/binding и raw refs повторно соединяются с target, native
+namespace и current holders; live graph проверяется до controls. Историческая UNKNOWN без нового
+private proof не реконструируется. Existing F1 birth+memory-scope quiescence остаётся обязательной;
+fd-empty/event/exit0 её не заменяют. Same-service callback сохраняет FD pins до final use. Replacement
+проверяется повторно перед reservation save. Wire/state/default C и фиксированные роли сохраняются.
+Source/build mapping и N-H0…H8 остаются отдельными gates; научные payload не читаются.
 
 PVE SOURCE gap — не утверждение об отсутствии native capability. Неподтверждённый installed build —
 N not_measured; отсутствующий output producer — SOURCE gap. Полный P20 остаётся OPEN. В native
