@@ -107,6 +107,41 @@ def group_cleanup_confirmed(group, end):
     return False
 
 
+def _command_child_status(process):
+    """Observe our unreaped session leader, without freeing its PID/PGID."""
+    try:
+        if process.returncode is not None or signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
+            return False, None
+        status = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        if os.getsid(process.pid) != process.pid or os.getpgid(process.pid) != process.pid:
+            return False, None
+        if status is None:
+            return True, None
+        if status.si_pid != process.pid:
+            return False, None
+        if status.si_code == os.CLD_EXITED:
+            return True, status.si_status
+        if status.si_code in (os.CLD_KILLED, os.CLD_DUMPED):
+            return True, -status.si_status
+    except (OSError, ValueError, AttributeError):
+        pass
+    return False, None
+
+
+def _command_exception_record(error, record):
+    """Diagnostics cannot replace an original exception or its prior record."""
+    try:
+        if not hasattr(error, "command_record"):
+            error.command_record = record
+            return
+    except BaseException:
+        pass
+    try:
+        error.add_note("Command cleanup_confirmed=" + str(record["cleanup_confirmed"]))
+    except BaseException:
+        pass
+
+
 def command(args, *, timeout_seconds=360.0, output_bytes=1048576,
             deadline=None, cleanup_seconds=2.0, env=None):
     """Bound only our local process group; killing SSH does not establish remote completion."""
@@ -124,10 +159,14 @@ def command(args, *, timeout_seconds=360.0, output_bytes=1048576,
               "cleanup_confirmed": True, "child_started": False, "output_bytes": 0}
     buffers = {"stdout": bytearray(), "stderr": bytearray()}
     process = None
+    primary = cleanup_error = None
     selector = selectors.DefaultSelector()
     try:
         if start >= end - cleanup_seconds:
             record["failure"] = "deadline"
+        elif signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
+            record["failure"] = "cleanup_unconfirmed"
+            record["cleanup_confirmed"] = False
         else:
             try:
                 process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -140,7 +179,15 @@ def command(args, *, timeout_seconds=360.0, output_bytes=1048576,
                 pipe = getattr(process, name)
                 os.set_blocking(pipe.fileno(), False)
                 selector.register(pipe, selectors.EVENT_READ, name)
-            while selector.get_map() or process.poll() is None:
+            while True:
+                owned, status = _command_child_status(process)
+                if not owned:
+                    record["failure"] = "cleanup_unconfirmed"
+                    record["cleanup_confirmed"] = False
+                    break
+                record["returncode"] = status
+                if not selector.get_map() and status is not None:
+                    break
                 remaining = end - cleanup_seconds - time.monotonic()
                 if remaining <= 0:
                     record["failure"] = "timeout"
@@ -159,33 +206,59 @@ def command(args, *, timeout_seconds=360.0, output_bytes=1048576,
                         break
                 if record["failure"]:
                     break
-            record["returncode"] = process.poll()
             if not record["failure"] and record["returncode"] != 0:
                 record["failure"] = "nonzero"
+    except BaseException as error:
+        primary = error
     finally:
-        # Even a successful immediate parent may have left descendants behind.
+        # WNOWAIT retains the direct child/session ownership anchor even when
+        # its leader has exited with inherited pipes. Signal exactly once before
+        # any wait/reap. Unknown or externally reaped identity cannot authorize
+        # a numeric PGID signal. Later group readback is observation only.
         if process is not None:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            try:
-                process.wait(timeout=max(.001, end - time.monotonic()))
-                record["returncode"] = process.returncode
-                record["cleanup_confirmed"] = group_cleanup_confirmed(process.pid, end)
-                if not record["cleanup_confirmed"]:
-                    record["failure"] = "cleanup_unconfirmed"
-            except subprocess.TimeoutExpired:
+                owned, _ = _command_child_status(process)
+                if not owned:
+                    record["cleanup_confirmed"] = False
+                else:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except BaseException as error:
+                        record["cleanup_confirmed"] = False
+                        cleanup_error = error
+                        if primary is None and not isinstance(error, Exception):
+                            primary = error
+                    process.wait(timeout=max(0.0, end - time.monotonic()))
+                    record["returncode"] = process.returncode
+                    confirmed = group_cleanup_confirmed(process.pid, end)
+                    record["cleanup_confirmed"] = record["cleanup_confirmed"] and confirmed
+            except BaseException as error:
                 record["cleanup_confirmed"] = False
-                record["failure"] = "cleanup_unconfirmed"
-            for name in buffers:
-                getattr(process, name).close()
-        selector.close()
+                if cleanup_error is None:
+                    cleanup_error = error
+                if primary is None and not isinstance(error, Exception):
+                    primary = error
+        resources = ([process.stdout, process.stderr] if process is not None else []) + [selector]
+        for resource in resources:
+            if resource is not None:
+                try:
+                    resource.close()
+                except BaseException as error:
+                    record["cleanup_confirmed"] = False
+                    if cleanup_error is None:
+                        cleanup_error = error
+                    if primary is None and not isinstance(error, Exception):
+                        primary = error
         record["elapsed_seconds"] = time.monotonic() - start
         for name, data in buffers.items():
             record[name] = data.decode(errors="ignore")
+        if not record["cleanup_confirmed"] and record["failure"] is None:
+            record["failure"] = "cleanup_unconfirmed"
+    if primary is not None:
+        _command_exception_record(primary, record)
+        raise primary
     if record["failure"]:
-        raise CommandFailure(record)
+        raise CommandFailure(record) from cleanup_error
     output = CommandOutput(record["stdout"])
     output.output_bytes = record["output_bytes"]
     return output
