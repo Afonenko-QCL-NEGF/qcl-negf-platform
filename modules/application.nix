@@ -49,6 +49,18 @@ let cfg = config.qclNegf.application;
     configuratorCgroupRoot = "/sys/fs/cgroup/" +
       lib.optionalString (slicePath != "") (slicePath + "/") + "qcl-negf-api.service";
     applicationProfile = "/nix/var/nix/profiles/qcl-negf-application";
+    aiidaRoot = "/var/lib/qcl-negf/aiida";
+    profileConfig = "${aiidaRoot}/.aiida/config.json";
+    profileAccess = "${aiidaRoot}/.aiida/access/${cfg.profile}";
+    profileLog = "${aiidaRoot}/.aiida/log";
+    nativeActorConfiguration = pkgs.writeText "qcl-negf-native-actor-launch.json" (builtins.toJSON {
+      schema = "qcl-negf.native-actor-launch.v1";
+      profile = cfg.profile;
+      aiida_path = aiidaRoot;
+      application_profile = applicationProfile;
+      jobs_root = config.qclNegf.cluster.jobDirectory;
+      client = nativePackage.clientLaunch;
+    });
     exportSpoolDirectory = "/var/lib/qcl-negf/exports";
     bootstrapUnits = lib.optional cfg.bootstrap.enable "qcl-negf-bootstrap.service";
     operations = pkgs.runCommand "qcl-negf-bootstrap-operations" {} ''
@@ -81,10 +93,19 @@ let cfg = config.qclNegf.application;
       exec ${pkgs.python314}/bin/python3 ${operations}/ops/runtime_bindings.py \
         --config ${launchConfiguration} --port ${toString cfg.api.port}
     '';
-    daemonStart = pkgs.writeShellScript "qcl-negf-aiida-start" ''
+    daemonStart = pkgs.writeShellScript "qcl-negf-aiida-start" (if native.enable then ''
+      set -eu
+      native_application="$(${pkgs.coreutils}/bin/readlink -e ${applicationProfile})"
+      case "$native_application" in
+        /nix/store/*) ;;
+        *) exit 78 ;;
+      esac
+      export PATH="$native_application/bin:$PATH"
+      exec "$native_application/bin/verdi" -p ${lib.escapeShellArg cfg.profile} daemon start --foreground
+    '' else ''
       export PATH=${applicationProfile}/bin:$PATH
       exec ${applicationProfile}/bin/verdi -p ${lib.escapeShellArg cfg.profile} daemon start --foreground
-    '';
+    '');
 in {
   options.qclNegf.application = {
     enable = lib.mkEnableOption "AiiDA scientific control service";
@@ -138,6 +159,7 @@ in {
     qclNegf.enable = true;
     assertions = [
       { assertion = !native.enable || (cfg.api.enable && native.policyFile == "/etc/qcl-negf/native-attempt/policy.json" && builtins.match "[A-Za-z0-9][A-Za-z0-9._-]{0,127}" native.resultPrefix != null); message = "Native attempts require the existing API, the protected fixed runtime policy and one new owned result prefix."; }
+      { assertion = !native.enable || (builtins.match "[A-Za-z0-9][A-Za-z0-9._-]{0,127}" cfg.profile != null && runtimePath config.qclNegf.cluster.jobDirectory); message = "Native actor selection requires a portable existing profile and normalized jobs root."; }
       { assertion = !savedEnabled || savedBound; message = "Saved results require an enabled API, explicit finite namespace/storage/retention/access binding, canonical runtime identity path, Computer UUIDs and the existing hard NFSv4 jobs mount."; }
       { assertion = !configuratorEnabled || cfg.api.enable; message = "Configurator requires the existing API; solver and Research bindings come from its protected active release descriptor."; }
       { assertion = !configuratorEnabled || lib.versionAtLeast config.systemd.package.version "254"; message = "Configurator DelegateSubgroup requires systemd >= 254."; }
@@ -179,15 +201,17 @@ in {
     };
     systemd.services."qcl-negf-native-attempt@" = lib.mkIf native.enable {
       description = "Bounded root ordinary attempt owner";
-      unitConfig.RequiresMountsFor = [ "/var/lib/qcl-negf-native-attempt" "/var/lib/qcl-negf-native-spool" config.qclNegf.cluster.jobDirectory native.policyFile ];
-      unitConfig.ConditionPathExists = native.policyFile;
+      unitConfig.RequiresMountsFor = [ "/var/lib/qcl-negf-native-attempt" "/var/lib/qcl-negf-native-spool" config.qclNegf.cluster.jobDirectory native.policyFile profileConfig profileAccess profileLog ];
+      unitConfig.ConditionPathExists = [ native.policyFile profileConfig profileAccess profileLog ];
+      environment.QCL_NEGF_NATIVE_ACTOR_CONFIG = toString nativeActorConfiguration;
       serviceConfig = {
-        User = "root"; Group = "root"; StandardInput = "socket"; StandardOutput = "socket";
+        User = "root"; Group = "root"; StandardInput = "socket"; StandardOutput = "socket"; StandardError = "journal";
         ExecStart = "${nativePackage}/bin/qcl-negf-native-attempt-serve";
         Restart = "no"; KillMode = "control-group"; RuntimeMaxSec = 90; TimeoutStopSec = 5;
         MemoryMax = 134217728; TasksMax = 16; UMask = "0077";
         ProtectSystem = "strict"; ProtectHome = true; PrivateTmp = true;
-        ReadWritePaths = [ "/var/lib/qcl-negf-native-attempt" "/var/lib/qcl-negf-native-spool" ];
+        ReadWritePaths = [ "/var/lib/qcl-negf-native-attempt" "/var/lib/qcl-negf-native-spool" profileAccess profileLog ];
+        ReadOnlyPaths = [ profileConfig ];
       };
     };
     systemd.services.qcl-negf-bootstrap = lib.mkIf cfg.bootstrap.enable {
@@ -261,6 +285,8 @@ in {
       environment = {
         AIIDA_PATH = "/var/lib/qcl-negf/aiida";
         SLURM_CONF = "${config.services.slurm.etcSlurm}/slurm.conf";
+      } // lib.optionalAttrs native.enable {
+        QCL_NEGF_NATIVE_JOBS_ROOT = config.qclNegf.cluster.jobDirectory;
       };
       path = [ pkgs.bash pkgs.openssh pkgs.slurm ] ++ lib.optional native.enable nativePackage;
       serviceConfig = {
@@ -273,7 +299,7 @@ in {
         ProtectSystem = "strict";
         ReadWritePaths = [ "/var/lib/qcl-negf" "/srv/qcl-negf" ];
       } // lib.optionalAttrs native.enable {
-        ReadOnlyPaths = [ nativePrefix ];
+        ReadOnlyPaths = [ nativePrefix profileConfig ];
       };
     };
     systemd.services.qcl-negf-api = lib.mkIf cfg.api.enable {
@@ -314,10 +340,10 @@ in {
         ProtectSystem = "strict";
         ReadWritePaths = [ "/var/lib/qcl-negf" ];
       } // lib.optionalAttrs native.enable {
-        ReadOnlyPaths = [ nativePrefix ];
+        ReadOnlyPaths = [ nativePrefix profileConfig ];
       } // lib.optionalAttrs savedBound {
         BindReadOnlyPaths = [ "${savedRoot}:${savedAlias}" ];
-        ReadOnlyPaths = [ savedRoot savedResults.storageIdentityFile ] ++ lib.optional native.enable nativePrefix;
+        ReadOnlyPaths = [ savedRoot savedResults.storageIdentityFile ] ++ lib.optionals native.enable [ nativePrefix profileConfig ];
       } // lib.optionalAttrs configuratorEnabled {
         Delegate = "cpu memory pids";
         DelegateSubgroup = "api";
