@@ -859,6 +859,11 @@ def write_frame(connection, document, budget, limit):
     connection.sendall(struct.pack('!I', len(raw)) + raw)
 
 
+def _original_input_limit(role, policy):
+    # Fixed original roles: only plan follows the existing capture plan allowance.
+    return 1048576 if role == 'plan' else policy['limits']['script_bytes'] if role == 'submit_script' else 65536
+
+
 def _owner_read(policy, launch, budget, *, controls=None):
     """Runs ONLY after dropping credentials in production; no root NFS access."""
     need(os.getuid() == os.geteuid() == policy['client_uid'], 'owner_read_credentials')
@@ -877,7 +882,7 @@ def _owner_read(policy, launch, budget, *, controls=None):
         original = os.fstat(parent); result = {}; script = None
         for role, name in FILES.items():
             claim = launch['files'][role]
-            limit = policy['limits']['script_bytes'] if role == 'submit_script' else 65536
+            limit = _original_input_limit(role, policy)
             need(claim['bytes'] <= limit, 'submitted_bound')
             fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
             try:
@@ -1246,9 +1251,12 @@ class NativeSources:
         need(admission.get('open') is True and admission.get('release_id')==launch['release_id'], 'native_admission_closed')
 
     def _actor_read(self, kind, calcjob, launch, context):
-        counts = [item['bytes'] for item in launch['files'].values()]
-        need(all(type(size) is int and 0<=size<=65536 for size in counts), 'actor_input_bound')
-        ceiling = 30*16384 + 8*sum(min(65537,4096*math.ceil(size/4096)+4096) for size in counts)
+        files = exact(launch['files'], FILES)
+        counts = [(files[role]['bytes'], _original_input_limit(role, self.policy)) for role in FILES]
+        need(all(type(size) is int and 0<=size<=cap for size,cap in counts), 'actor_input_bound')
+        # Prepay complete raw/JSON chunk and EOF workspace for each original role
+        # before the actor command; the inherited outer ledger can still refuse.
+        ceiling = 30*16384 + 8*sum(min(cap+1,4096*math.ceil(size/4096)+4096) for size,cap in counts)
         self.budget.reserve(ceiling)
         cfg = context['configuration']; app = context['app']
         argv = [self.policy['tools']['runuser'],'-u','qcl-negf','--',app+'/bin/qcl-negf-native-actor',

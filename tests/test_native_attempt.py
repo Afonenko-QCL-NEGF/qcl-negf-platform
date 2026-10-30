@@ -1623,3 +1623,93 @@ def test_q1_fixed_four_claim_domains_are_not_caller_authority(q1_joined,fault):
     result=s['owner'].qualify_close({**s['document'],'action':'close','controls':controls})
     assert result['state'] in ('hold','rejected') and result['controls'] is None
     assert not (s['store'].path(s['document']['calcjob_uuid'])/'close.json').exists()
+
+
+@pytest.mark.parametrize('role,cap', [('plan',1048576),('source_graph',65536),
+                                     ('native_execution',65536),('submit_script',65536)])
+@pytest.mark.parametrize('delta', [-1,0,1])
+def test_original_input_role_limits_and_full_raw_claims(tmp_path,role,cap,delta):
+    """A global cap raise or a plan still capped at64KiB breaks this reader check."""
+    m=module();launch=request()['launch'];work=tmp_path/'upload';work.mkdir()
+    launch['remote_workdir']=str(work)
+    for name,filename in m.FILES.items():
+        raw=b'{"original":true}\n'
+        if name==role:raw+=b' '*(cap+delta-len(raw))
+        (work/filename).write_bytes(raw)
+        launch['files'][name]=dict(bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest())
+    policy=dict(jobs_root=str(tmp_path),client_uid=os.getuid(),limits={**limits(),'metadata_bytes':8*1024*1024})
+    budget=m.Operation(policy['limits'])
+    if delta>0:
+        with pytest.raises(m.Hold,match='submitted_bound'):m._owner_read(policy,launch,budget)
+    else:
+        observed=m._owner_read(policy,launch,budget)
+        assert observed['files']==launch['files']
+        assert budget.actual_bytes==sum(row['bytes'] for row in launch['files'].values())
+        assert all((work/name).is_file() for name in m.FILES.values())
+
+
+@pytest.mark.parametrize('role,size,reason', [
+    ('plan',1048575,'operation_bound'),('plan',1048576,'operation_bound'),('plan',1048577,'actor_input_bound'),
+    ('source_graph',65537,'actor_input_bound'),('native_execution',65537,'actor_input_bound'),
+    ('submit_script',65537,'actor_input_bound')])
+def test_actor_role_limit_and_unchanged_outer_budget_hold_before_command(monkeypatch,role,size,reason):
+    m=module();launch=request()['launch'];launch['files'][role]['bytes']=size
+    policy=dict(tools={'runuser':'/nix/store/runuser'},limits={**limits(),'metadata_bytes':8*1024*1024})
+    budget=m.Operation(policy['limits']);source=m.NativeSources(policy,budget)
+    context=dict(app='/nix/store/app',configuration=dict(profile='existing',aiida_path='/existing'))
+    def forbidden(*args,**kw):raise AssertionError('actor must not start beyond role/outer bound')
+    monkeypatch.setattr(m.engine,'command',forbidden)
+    with pytest.raises(m.Hold,match=reason):source._actor_read('launch',request()['calcjob_uuid'],launch,context)
+    assert budget.calls==0
+    assert (budget.bytes>8*1024*1024) if reason=='operation_bound' else budget.bytes==0
+
+
+@pytest.mark.parametrize('outcome', ['success','failure','cancel'])
+def test_actor_actual_sizes_eof_workspace_prepay_is_exact_nonrefundable(monkeypatch,outcome):
+    """A stale64KiB min, missing EOF charge or postcommand reserve breaks accounting."""
+    m=module();launch=request()['launch']
+    for role,size in [('plan',113111),('source_graph',108),('native_execution',1048),('submit_script',4096)]:
+        launch['files'][role]['bytes']=size
+    policy=dict(tools={'runuser':'/nix/store/runuser'},limits={**limits(),'metadata_bytes':8*1024*1024})
+    budget=m.Operation(policy['limits']);source=m.NativeSources(policy,budget)
+    context=dict(app='/nix/store/app',configuration=dict(profile='existing',aiida_path='/existing'))
+    # Hand-derived chunk/EOF workspace: plan29*4096, graph8192, native8192,
+    # script8192, plus30 query slabs. Command has its separate fixed4*65536 debit.
+    ceiling=1638400
+    class Cancelled(BaseException):pass
+    def command(argv,**kw):
+        assert argv[-2:]==['--maximum-metadata-bytes',str(ceiling)]
+        assert budget.bytes==ceiling+262144 and budget.calls==1
+        assert kw['deadline']==budget.deadline
+        if outcome=='failure':raise m.engine.CommandFailure(dict(failure='timeout',cleanup_confirmed=False))
+        if outcome=='cancel':raise Cancelled()
+        output=m.engine.CommandOutput('{}');output.output_bytes=2;return output
+    monkeypatch.setattr(m.engine,'command',command)
+    if outcome=='success':assert source._actor_read('launch',request()['calcjob_uuid'],launch,context)==b'{}'
+    else:
+        with pytest.raises(m.engine.CommandFailure if outcome=='failure' else Cancelled):
+            source._actor_read('launch',request()['calcjob_uuid'],launch,context)
+    assert budget.bytes==1900544 and budget.calls==1 and budget.actual_bytes==0
+    # Exhaust the SAME nonrefundable ledger; no command or reset/refund follows.
+    budget.reserve(8*1024*1024-budget.bytes)
+    with pytest.raises(m.Hold,match='operation_bound'):
+        source._actor_read('launch',request()['calcjob_uuid'],launch,context)
+    assert budget.calls==1 and budget.bytes>8*1024*1024
+
+
+@pytest.mark.parametrize('fault', ['unknown_role','missing_role','unknown_claim','missing_bytes','negative','bool'])
+def test_launch12_invalid_claims_refuse_before_actor(monkeypatch,tmp_path,fault):
+    m=module();document=request();files=document['launch']['files']
+    if fault=='unknown_role':files['other']=copy.deepcopy(files['plan'])
+    if fault=='missing_role':del files['plan']
+    if fault=='unknown_claim':files['plan']['extra']=True
+    if fault=='missing_bytes':del files['plan']['bytes']
+    if fault=='negative':files['plan']['bytes']=-1
+    if fault=='bool':files['plan']['bytes']=True
+    def forbidden(*args,**kw):raise AssertionError('invalid Launch12 must not start actor')
+    monkeypatch.setattr(m.engine,'command',forbidden)
+    policy={'limits':limits()}
+    budget=m.Operation(policy['limits']);sources=m.NativeSources(policy,budget)
+    selected=m.OrdinaryAttemptOwner(policy,m.AttemptStore(tmp_path),sources,budget)
+    assert selected.submit(document)['state']=='rejected'
+    assert budget.calls==0 and not (tmp_path/'attempts').exists()
