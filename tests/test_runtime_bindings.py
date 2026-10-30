@@ -402,3 +402,48 @@ def test_authoritative_code_file_uses_bounded_native_read(tmp_path):
         environment={"QCL_NEGF_ALLOWED_CODES":"inherited"},target=lambda _:"/nix/store/app",
         execve=lambda executable,argv,env:observed.append(env["QCL_NEGF_ALLOWED_CODES"]))
     assert observed == ["11111111-1111-4111-8111-111111111111"]
+
+
+def test_cluster_cache_static_binding_clears_ambient_and_keeps_old_launch(monkeypatch):
+    module = runtime_module()
+    seen = []
+    base = dict(schema='qcl-negf-application-launch-v1', configurator=None, saved_results=None)
+    ambient = {'PATH':'/usr/bin', 'QCL_NEGF_CLUSTER_CACHE_EXECUTABLE':'/tmp/foreign'}
+    def execute(path, argv, env): seen.append(env)
+    module.launch(base, port=8080, environment=ambient, target=lambda _: '/nix/store/app', execve=execute)
+    assert 'QCL_NEGF_CLUSTER_CACHE_EXECUTABLE' not in seen[-1]
+    client = '/nix/store/immutable-monitor/bin/qcl-negf-cluster-cache-status'
+    monkeypatch.setattr(module, 'read_store_file', lambda path, limit=65536: b'#!/bin/sh\n')
+    module.launch({**base,'cluster_cache':{'executable':client}}, port=8080,
+        environment=ambient, target=lambda _: '/nix/store/app', execve=execute)
+    assert seen[-1]['QCL_NEGF_CLUSTER_CACHE_EXECUTABLE'] == client
+    module.launch({**base,'cluster_cache':None}, port=8080,
+        environment=ambient, target=lambda _: '/nix/store/app', execve=execute)
+    assert 'QCL_NEGF_CLUSTER_CACHE_EXECUTABLE' not in seen[-1]
+
+
+@pytest.mark.parametrize('binding', [{}, {'executable':'/tmp/client'},
+    {'executable':'/nix/store/monitor/bin/other-client'},
+    {'executable':'/nix/store/monitor/../bin/qcl-negf-cluster-cache-status'},
+    {'executable':'/nix/store/monitor/bin/qcl-negf-cluster-cache-status','extra':'authority'}])
+def test_bad_cluster_cache_binding_preserves_base_api_without_ambient_fallback(binding, capsys):
+    module = runtime_module(); seen=[]
+    module.launch(dict(schema='qcl-negf-application-launch-v1',configurator=None,saved_results=None,
+                       cluster_cache=binding), port=8080,
+        environment={'QCL_NEGF_CLUSTER_CACHE_EXECUTABLE':'/tmp/foreign'},
+        target=lambda _: '/nix/store/app', execve=lambda p,a,e:seen.append(e))
+    assert len(seen)==1 and 'QCL_NEGF_CLUSTER_CACHE_EXECUTABLE' not in seen[0]
+    assert capsys.readouterr().err == 'cluster cache binding unavailable: invalid_runtime_binding\n'
+
+
+def test_unreadable_cluster_cache_member_keeps_base_api_and_never_executes_probe(monkeypatch,capsys):
+    module=runtime_module();seen=[]
+    def unavailable(path,limit=65536):raise OSError('private path detail')
+    monkeypatch.setattr(module,'read_store_file',unavailable)
+    module.launch(dict(schema='qcl-negf-application-launch-v1',configurator=None,saved_results=None,
+        cluster_cache={'executable':'/nix/store/monitor/bin/qcl-negf-cluster-cache-status'}),port=8080,
+        environment={'QCL_NEGF_CLUSTER_CACHE_EXECUTABLE':'/tmp/foreign'},target=lambda _:'/nix/store/app',
+        run=lambda *a,**kw:pytest.fail('cluster binding executed native probe'),
+        execve=lambda p,a,e:seen.append(e))
+    assert len(seen)==1 and 'QCL_NEGF_CLUSTER_CACHE_EXECUTABLE' not in seen[0]
+    assert capsys.readouterr().err=='cluster cache binding unavailable: invalid_runtime_binding\n'

@@ -9,7 +9,9 @@ import os
 from pathlib import Path
 import re
 import shlex
+import socket
 import stat
+import struct
 import sys
 import time
 from urllib.parse import urlsplit
@@ -18,6 +20,10 @@ CONFIG = Path('/etc/qcl-negf/monitoring/service.json')
 CACHE = Path('/run/qcl-negf-monitoring/latest.json')
 SCHEMAS = Path(__file__).resolve().parents[1] / 'schemas'
 IDENTIFIER = r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}'
+PORTAL_CACHE_SOCKET = '/run/qcl-negf-monitoring-portal/read.sock'
+PORTAL_CACHE_SERVER_UID = 0
+PORTAL_CACHE_BYTES = 1048576
+PORTAL_CACHE_SECONDS = 5
 
 
 def reason(code, source_id):
@@ -1062,6 +1068,127 @@ def client_main(read_helper='/run/current-system/sw/bin/qcl-negf-monitor-read'):
     token = encode_query(decode_query(sys.argv[2])); c = load_config()
     validate_tool(c['tools']['sudo'])
     os.execve(c['tools']['sudo'], [c['tools']['sudo'], '-n', '--', read_helper, token], {'PATH': '/run/current-system/sw/bin:/usr/bin:/bin'})
+
+
+def _portal_timeout(connection, deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ValueError('monitoring_unavailable')
+    connection.settimeout(remaining)
+
+
+def _portal_frame(connection, limit, deadline):
+    raw = bytearray()
+    while True:
+        _portal_timeout(connection, deadline)
+        chunk = connection.recv(min(4096, limit + 1 - len(raw)))
+        if not chunk:
+            break
+        raw.extend(chunk)
+        if len(raw) > limit:
+            raise ValueError('monitoring_unavailable')
+    if not raw.endswith(b'\n') or raw.count(b'\n') != 1:
+        raise ValueError('monitoring_unavailable')
+    return bytes(raw[:-1])
+
+
+def _portal_query(token):
+    query = decode_query(token)
+    if query['request_id'] is not None:
+        raise ValueError('monitoring_unavailable')
+    # Bound the complete encoded query, including a potentially large cursor.
+    return query, encode_query(query)
+
+
+def _portal_error(error):
+    code = 'stale_cursor' if isinstance(error, ValueError) and str(error) == 'stale_cursor' else 'monitoring_unavailable'
+    return dict(schema='qcl.monitoring-error.v1', reason=code)
+
+
+def portal_cache_handle(connection):
+    """One authenticated cache-only query on an accepted local socket."""
+    deadline = time.monotonic() + PORTAL_CACHE_SECONDS
+    try:
+        _portal_timeout(connection, deadline)
+        if connection.family != socket.AF_UNIX:
+            raise ValueError('monitoring_unavailable')
+        _, uid, _ = struct.unpack('3i', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        expected = pwd.getpwnam('qcl-negf').pw_uid
+        if expected <= 0 or uid != expected:
+            raise ValueError('monitoring_unavailable')
+        token = _portal_frame(connection, 8193, deadline).decode('ascii')
+        query, _ = _portal_query(token)
+        _portal_timeout(connection, deadline)
+        from cluster_projection import read_cluster_projection, validate_cluster_projection
+        result = read_cluster_projection(request_id=None, cursor=query['cursor'], limit=query['limit'])
+        _portal_timeout(connection, deadline)
+        validate_cluster_projection(result)
+        raw = json.dumps(result, separators=(',', ':'), allow_nan=False).encode('utf-8')
+        if len(raw) > PORTAL_CACHE_BYTES:
+            raise ValueError('monitoring_unavailable')
+    except Exception as error:
+        raw = json.dumps(_portal_error(error), separators=(',', ':')).encode('ascii')
+    try:
+        _portal_timeout(connection, deadline)
+        connection.sendall(raw + b'\n')
+    except (OSError, ValueError):
+        # Timeout/disconnection cannot make a partial frame successful.
+        pass
+
+
+def portal_cache_server_main():
+    if os.geteuid() != 0 or len(sys.argv) != 1:
+        return 1
+    with socket.socket(fileno=os.dup(0)) as connection:
+        portal_cache_handle(connection)
+    return 0
+
+
+def portal_cache_decode_response(raw):
+    if len(raw) > PORTAL_CACHE_BYTES + 1 or not raw.endswith(b'\n') or raw.count(b'\n') != 1:
+        raise ValueError('monitoring_unavailable')
+    result = unique_json(raw[:-1])
+    if (isinstance(result, dict) and set(result) == {'schema', 'reason'}
+            and result['schema'] == 'qcl.monitoring-error.v1'
+            and result['reason'] in ('stale_cursor', 'monitoring_unavailable')):
+        raise ValueError(result['reason'])
+    from cluster_projection import validate_cluster_projection
+    return validate_cluster_projection(result)
+
+
+def portal_cache_query(token):
+    """Nonprivileged fixed-socket client; never reads private config/cache."""
+    _, token = _portal_query(token)
+    deadline = time.monotonic() + PORTAL_CACHE_SECONDS
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        _portal_timeout(connection, deadline)
+        connection.connect(PORTAL_CACHE_SOCKET)
+        _, uid, _ = struct.unpack('3i', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        if uid != PORTAL_CACHE_SERVER_UID:
+            raise ValueError('monitoring_unavailable')
+        _portal_timeout(connection, deadline)
+        connection.sendall(token.encode('ascii') + b'\n')
+        connection.shutdown(socket.SHUT_WR)
+        raw = _portal_frame(connection, PORTAL_CACHE_BYTES + 1, deadline) + b'\n'
+        _portal_timeout(connection, deadline)
+        result = portal_cache_decode_response(raw)
+        _portal_timeout(connection, deadline)
+        return result
+
+
+def portal_cache_client_main():
+    try:
+        if len(sys.argv) != 3 or sys.argv[1] != '--query-base64':
+            raise ValueError('monitoring_unavailable')
+        result = portal_cache_query(sys.argv[2])
+        raw = json.dumps(result, separators=(',', ':'), allow_nan=False)
+        if len(raw.encode('utf-8')) > PORTAL_CACHE_BYTES:
+            raise ValueError('monitoring_unavailable')
+        print(raw)
+        return 0
+    except Exception as error:
+        print(json.dumps(_portal_error(error), separators=(',', ':')), file=sys.stderr)
+        return 1
 
 
 def ssh_main(helper='/run/current-system/sw/bin/qcl-negf-monitor-rpc', observer_helper='/run/current-system/sw/bin/qcl-negf-monitor-observer'):

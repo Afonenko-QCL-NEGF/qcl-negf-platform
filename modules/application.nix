@@ -2,6 +2,7 @@
 let cfg = config.qclNegf.application;
     native = cfg.nativeAttempts or { enable = false; };
     nativePackage = import ../nix/native-attempt.nix { inherit pkgs; };
+    monitoringPackage = import ../nix/monitoring.nix { inherit pkgs; };
     nativePrefix = "${config.qclNegf.cluster.jobDirectory}/${native.resultPrefix or "native"}";
     configurator = cfg.api.configurator;
     configuratorEnabled = configurator.enable;
@@ -80,6 +81,9 @@ let cfg = config.qclNegf.application;
       schema = "qcl-negf-application-launch-v1";
       allowed_codes_file = cfg.api.allowedCodesFile;
       configurator = if configuratorEnabled then { cgroup_root = configuratorCgroupRoot; } else null;
+      cluster_cache = if config.qclNegf.monitoring.observation.portalCache.enable then {
+        executable = monitoringPackage.portalCacheClient;
+      } else null;
       saved_results = if savedBound then {
         binding_file = toString savedBinding;
         root = savedRoot;

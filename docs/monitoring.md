@@ -189,3 +189,58 @@ current-own Slurm context и repeated-poll cost. Real host OOM/QEMU kill не п
 | Capacity producer существует   | Native metadata/ioctl/LVM/sysfs path + raw controls | Optional allocation ещё должна пройти N                           | сохранить              |
 | Unit OOM равен QEMU victim     | Разные scope/identity protocols                     | Exact victim capability unsupported                               | данных недостаточно    |
 | Full P31 завершена             | Producers source и foundation API                   | Independent review/N/exact victim requirement/P32 wiring отдельно | дополнительно измерить |
+
+## P32: отдельный public cache transport для Portal
+
+Default off: `qclNegf.monitoring.observation.portalCache.enable = false`. Включение требует
+`observation.enable` и существующий enabled application/API account `qcl-negf`. Эта source
+capability ещё требует отдельной installed native проверки. Portal HTTP adapter/UI в этом PR
+не добавлены. Старый sudo reader/observer/sampler и protected config/cache сохраняются.
+
+Новый неизменяемый nonprivileged client:
+
+```text
+<immutable-monitor-client>/bin/qcl-negf-cluster-cache-status --query-base64 TOKEN
+```
+
+Аргументы ровно такие; TOKEN — тот же URL-safe unpadded base64 `qcl.cluster-query.v1`, максимум8192
+bytes, closed keys `schema, request_id, cursor, limit`. Здесь request_id только null; limit1–128;
+cursor — прежний opaque cache cursor. Один socket connection обслуживает один token+LF и half-close;
+второй frame/extra bytes/незакрытая строка отвергаются. Клиент не читает private config/cache и не
+запускает sudo/SSH. Fixed path `/run/qcl-negf-monitoring-portal/read.sock`, parent root0755,
+socket root:qcl-negf0660. Сервер SO_PEERCRED проверяет точный UID existing qcl-negf account (>0),
+не только group. Client требует peer UID0 (PID1 при socket activation допустим). User/UID/site
+не выбираются запросом или environment.
+
+Systemd Accept=true/MaxConnections4 запускает fixed root reader без args: NoNewPrivileges=true,
+capabilities empty, AF_UNIX only, ProtectSystem=strict, MemoryMax128M, TasksMax8, RuntimeMaxSec5s,
+TimeoutStopSec1s, Restart=no. Сервер только вызывает public
+`read_cluster_projection(request_id=None, cursor=..., limit=...)` и validator. Нет native probe,
+observer/P20 lookup, qualification, service mutation, NFS write, scientific read/rehash или
+history scan. Это новый узкий read ingress; old sudo ancestry/auth не ослаблены.
+
+Reply — полный UTF-8 JSON + LF/EOF, payload≤1048576 bytes. Success stdout — неизменённый
+`qcl.cluster-projection.v2`, включая valid unknown/partial/stale coverage. Client валидирует полный
+DTO по owning public schema; duplicate/nonfinite/extra JSON не принимается. Failure: stdout пуст,
+exit1, stderr только closed `qcl.monitoring-error.v1`, reason `stale_cursor` или
+`monitoring_unavailable`, без private diagnostics/partial data. Total socket deadline5s применяется
+перед connect/send/recv и последующим ответом. Exceeded deadline не разрешает следующий read/write.
+Размер query и null request_id проверяются до connect, peer identity — до request send; на сервере
+peer/frame/query/budget проверяются до cache reader. Сокеты закрываются context manager.
+
+Static `qcl-negf-application-launch-v1` допускает optional
+`cluster_cache: {"executable": "<direct immutable store client>/bin/qcl-negf-cluster-cache-status"}`
+или null. Отсутствующее поле старого descriptor равно null. Runtime launcher очищает inherited
+`QCL_NEGF_CLUSTER_CACHE_*`, проверяет закрытое значение и root-owned regular immutable store
+member без запуска, затем задаёт `QCL_NEGF_CLUSTER_CACHE_EXECUTABLE`. Module использует direct
+client derivation, поскольку symlinkJoin/bin — symlink, отвергаемый trusted reader. Неверная optional
+binding сохраняет base API с `cluster cache binding unavailable: invalid_runtime_binding`.
+Qualification/release readiness/solver/catalog/Results не требуются этому read binding.
+
+L fixtures используют только owned temporary AF_UNIX sockets. Existing local test UID явно
+подставлен вместо service/server UID; реальный kernel SO_PEERCRED остаётся прочитанным, но это не
+native authentication proof. Проверены query/frame/peer/error/bounds, cache-only missing unknown и
+stale pagination, direct client completion/close и old launch fallback. Actual service UID,
+NoNewPrivileges sandbox, package executable, native latency/memory fit и installed socket read
+проверяет Root отдельно. Нет утверждения, что operational state устанавливает science acceptance
+или что performance producer уже существует.

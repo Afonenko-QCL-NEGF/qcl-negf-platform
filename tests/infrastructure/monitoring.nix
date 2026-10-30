@@ -21,6 +21,9 @@ in
 assert builtins.all (x: x.assertion) enabled.assertions;
 assert !disabled.services.vector.enable;
 assert !disabled.services.prometheus.exporters.node.enable;
+assert !disabled.qclNegf.monitoring.observation.portalCache.enable;
+assert !(builtins.hasAttr "qcl-negf-monitor-portal-cache" disabled.systemd.sockets);
+assert !(builtins.hasAttr "qcl-negf-monitor-portal-cache@" enabled.systemd.services);
 assert !(builtins.hasAttr "qcl-negf-monitor-sample" disabled.systemd.services);
 assert enabled.systemd.services.qcl-negf-monitor-sample.serviceConfig.Type == "oneshot";
 assert enabled.systemd.services.qcl-negf-monitor-sample.serviceConfig.RuntimeDirectoryPreserve == "yes";

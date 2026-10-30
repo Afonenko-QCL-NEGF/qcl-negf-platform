@@ -138,7 +138,20 @@ def child_environment(environment):
     return {name: value for name, value in environment.items()
             if not name.startswith("QCL_NEGF_CONFIGURATOR_")
             and not name.startswith("QCL_NEGF_QUANTUM_RUNTIME_")
+            and not name.startswith("QCL_NEGF_CLUSTER_CACHE_")
             and name != "QCL_NEGF_SAVED_RESULTS_BINDING_FILE"}
+
+
+def cluster_cache_binding(value):
+    if (not isinstance(value, dict) or set(value) != {"executable"}
+            or not isinstance(value["executable"], str)
+            or not STORE_MEMBER.fullmatch(value["executable"])
+            or not re.fullmatch(r"/nix/store/[A-Za-z0-9][A-Za-z0-9+._?-]*/bin/qcl-negf-cluster-cache-status", value["executable"])):
+        raise ValueError("Invalid cluster cache binding")
+    # Validate immutable, root-owned, regular store member without executing it.
+    # The module binds the direct client derivation, not symlinkJoin's symlink.
+    read_store_file(value["executable"], limit=65536)
+    return {"QCL_NEGF_CLUSTER_CACHE_EXECUTABLE": value["executable"]}
 
 
 def saved_results_binding(value, *, run, read_protected):
@@ -221,7 +234,7 @@ def launch(config, *, port, environment=None, read_json=read_runtime_json,
     """Launch the active API with argv/env; unavailable optional features stay explicit."""
     if (not isinstance(config, dict)
             or not {"schema", "configurator", "saved_results"} <= set(config)
-            or not set(config) <= {"schema", "configurator", "saved_results", "allowed_codes_file"}
+            or not set(config) <= {"schema", "configurator", "saved_results", "allowed_codes_file", "cluster_cache"}
             or config["schema"] != "qcl-negf-application-launch-v1"
             or (config["configurator"] is not None and not isinstance(config["configurator"], dict))
             or (config["saved_results"] is not None and not isinstance(config["saved_results"], dict))
@@ -230,6 +243,11 @@ def launch(config, *, port, environment=None, read_json=read_runtime_json,
     selected = target(PROFILE)
     child = child_environment(os.environ if environment is None else environment)
     child["PATH"] = selected + "/bin:" + child.get("PATH", "")
+    if config.get("cluster_cache") is not None:
+        try:
+            child.update(cluster_cache_binding(config["cluster_cache"]))
+        except (OSError, ValueError, KeyError, TypeError):
+            print("cluster cache binding unavailable: invalid_runtime_binding", file=sys.stderr)
     allowed_codes = config.get("allowed_codes_file")
     if allowed_codes is not None:
         if not isinstance(allowed_codes, str) or not Path(allowed_codes).is_absolute():

@@ -28,8 +28,20 @@ let
   storage = entry "qcl-negf-monitor-storage" "sys.exit(m.main('maintain'))";
   storageCheck = entry "qcl-negf-monitor-storage-check" "sys.exit(m.main('storage-check'))";
   client = entry "qcl-negf-cluster-status" "m.client_main()";
+  # Separate nonprivileged ingress: no sudo/SSH tools or private config reads.
+  portalEntry = name: expression: pkgs.writeShellApplication {
+    inherit name;
+    runtimeInputs = [ python ];
+    text = ''exec ${python}/bin/python3 -I -B -c ${pkgs.lib.escapeShellArg "import sys; sys.path[:0] = ['${source}/ops', '${resources.source}/ops']; import monitoring_runtime as m; ${expression}"} "$@"'';
+  };
+  portalServer = portalEntry "qcl-negf-monitor-portal-cache-serve" "sys.exit(m.portal_cache_server_main())";
+  portalClient = portalEntry "qcl-negf-cluster-cache-status" "sys.exit(m.portal_cache_client_main())";
 in pkgs.symlinkJoin {
   name = "qcl-negf-monitoring";
-  paths = [ read context observer forced rpc sample storage storageCheck client ];
-  passthru = { inherit source; };
+  paths = [ read context observer forced rpc sample storage storageCheck client portalServer portalClient ];
+  passthru = {
+    inherit source;
+    # Direct regular immutable member; do not bind symlinkJoin's bin symlink.
+    portalCacheClient = "${portalClient}/bin/qcl-negf-cluster-cache-status";
+  };
 }

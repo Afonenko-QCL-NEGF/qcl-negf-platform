@@ -487,3 +487,238 @@ def test_storage_rechecks_completion_clock_with_actual_native_producer(started,o
         assert view['status']=='unknown' and view['reasons']==[dict(code=code,source_id='telemetry')]
     else:
         assert view['status']=='qualified' and view['reasons']==[]
+
+# Breaks caught: accepting the wrong kernel UID, a second request/frame, or
+# replacing a cache-only read with an observer/probe on an ordinary API poll.
+def portal_socket_fixture(monkeypatch):
+    import socket
+    from types import SimpleNamespace
+    m = module('monitoring_runtime')
+    # Explicit authority fixture only: kernel peer credentials stay real, but
+    # local test UID stands in for the enrolled service account and server UID.
+    monkeypatch.setattr(m.pwd, 'getpwnam', lambda name: SimpleNamespace(pw_uid=os.getuid())
+                        if name == 'qcl-negf' else pytest.fail('unexpected account'))
+    return m, socket
+
+
+def portal_query(m, **changes):
+    value = dict(schema='qcl.cluster-query.v1', request_id=None, cursor=None, limit=64)
+    value.update(changes)
+    return m.encode_query(value).encode() + b'\n'
+
+
+def portal_exchange(m, socket, frame):
+    left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        left.sendall(frame); left.shutdown(socket.SHUT_WR)
+        m.portal_cache_handle(right)
+        right.shutdown(socket.SHUT_WR)
+        raw = bytearray()
+        while chunk := left.recv(65536): raw.extend(chunk)
+        return json.loads(raw)
+    finally:
+        left.close(); right.close()
+
+
+def test_portal_socket_cache_read_keeps_unknown_and_observation_time(monkeypatch):
+    m, socket = portal_socket_fixture(monkeypatch)
+    cluster = module('cluster_projection')
+    c = config('controller')
+    from test_cluster_projection import target
+    c['targets'] = [target('host-a')]
+    monkeypatch.setattr(m, 'load_config', lambda: c)
+    monkeypatch.setattr(m, 'read_cache', lambda _: None)
+    def forbidden(*args, **kwargs): pytest.fail('public poll performed fresh effect')
+    for name in ('observe_local','observe_remote','sample_native_status','NativeSources'):
+        monkeypatch.setattr(m, name, forbidden)
+    result = portal_exchange(m, socket, portal_query(m))
+    assert result['schema'] == 'qcl.cluster-projection.v2'
+    assert result['status'] == 'unknown'
+    assert result['hosts'][0]['native'] is None and result['hosts'][0]['resource'] is None
+    assert result['hosts'][0]['reasons']
+    cluster.validate_cluster_projection(result)
+
+
+@pytest.mark.parametrize('frame', [b'', b'bad\n', b'A'*8193+b'\n', b'e30\nextra\n',
+    b'e30\n\n', b'e30', b'e30\r\n', b'\xff\n'], ids=['empty','bad-token','oversize','extra','second-line','unclosed','crlf','nonascii'])
+def test_portal_socket_rejects_unclosed_or_oversized_frame_before_cache(monkeypatch, frame):
+    m, socket = portal_socket_fixture(monkeypatch)
+    cluster = module('cluster_projection')
+    monkeypatch.setattr(cluster, 'read_cluster_projection', lambda **kw: pytest.fail('effect before validation'))
+    assert portal_exchange(m, socket, frame) == {'schema':'qcl.monitoring-error.v1','reason':'monitoring_unavailable'}
+
+
+def test_portal_socket_rejects_lookup_and_wrong_kernel_peer_before_cache(monkeypatch):
+    from types import SimpleNamespace
+    m, socket = portal_socket_fixture(monkeypatch)
+    cluster = module('cluster_projection')
+    monkeypatch.setattr(cluster, 'read_cluster_projection', lambda **kw: pytest.fail('unauthorized cache read'))
+    assert portal_exchange(m, socket, portal_query(m, request_id='exact-request'))['reason'] == 'monitoring_unavailable'
+    monkeypatch.setattr(m.pwd, 'getpwnam', lambda _: SimpleNamespace(pw_uid=os.getuid()+1))
+    assert portal_exchange(m, socket, portal_query(m))['reason'] == 'monitoring_unavailable'
+
+
+def test_portal_socket_stale_error_is_typed_and_redacts_other_errors(monkeypatch):
+    m, socket = portal_socket_fixture(monkeypatch)
+    cluster = module('cluster_projection')
+    def fail(**kw): raise ValueError('stale_cursor')
+    monkeypatch.setattr(cluster, 'read_cluster_projection', fail)
+    assert portal_exchange(m, socket, portal_query(m, cursor='opaque'))['reason'] == 'stale_cursor'
+    def private(**kw): raise RuntimeError('private config /secret/tool')
+    monkeypatch.setattr(cluster, 'read_cluster_projection', private)
+    assert portal_exchange(m, socket, portal_query(m)) == {'schema':'qcl.monitoring-error.v1','reason':'monitoring_unavailable'}
+
+
+def test_portal_socket_expired_deadline_has_no_read_or_write(monkeypatch):
+    m, socket = portal_socket_fixture(monkeypatch)
+    cluster = module('cluster_projection')
+    monkeypatch.setattr(cluster, 'read_cluster_projection', lambda **kw: pytest.fail('expired cache read'))
+    ticks = iter([0, 6, 6])
+    monkeypatch.setattr(m.time, 'monotonic', lambda: next(ticks, 6))
+    left, right = socket.socketpair()
+    try:
+        left.sendall(portal_query(m)); left.shutdown(socket.SHUT_WR)
+        m.portal_cache_handle(right)
+        right.shutdown(socket.SHUT_WR)
+        assert left.recv(1) == b''
+    finally: left.close(); right.close()
+
+
+@pytest.mark.parametrize('raw', [b'{}\n', b'{"schema":1,"schema":2}\n', b'{"x":NaN}\n',
+    b'{}\n{}\n', b'{}', b'x'*(1048577)+b'\n'], ids=['shape','duplicate','nonfinite','extra','unclosed','oversize'])
+def test_portal_client_rejects_bad_complete_response_without_partial_stdout(monkeypatch, raw, capsys):
+    m, socket = portal_socket_fixture(monkeypatch)
+    monkeypatch.setattr(m, 'portal_cache_query', lambda token: m.portal_cache_decode_response(raw))
+    monkeypatch.setattr(sys, 'argv', ['client','--query-base64',portal_query(m).decode().strip()])
+    assert m.portal_cache_client_main() == 1
+    out = capsys.readouterr()
+    assert out.out == '' and json.loads(out.err) == {'schema':'qcl.monitoring-error.v1','reason':'monitoring_unavailable'}
+
+
+def test_portal_client_uses_real_owned_unix_socket_and_closes(monkeypatch, tmp_path):
+    import threading
+    m, socket = portal_socket_fixture(monkeypatch)
+    # Root/PID1 server peer UID=0 is qualified separately. Test substitutes only
+    # that expected UID; the actual getsockopt(SO_PEERCRED) call is still real.
+    monkeypatch.setattr(m, 'PORTAL_CACHE_SERVER_UID', os.getuid())
+    path = str(tmp_path / 'cache.sock')
+    monkeypatch.setattr(m, 'PORTAL_CACHE_SOCKET', path)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(path); listener.listen(1)
+    seen = []
+    def serve():
+        connection, _ = listener.accept()
+        with connection:
+            frame = bytearray()
+            while chunk := connection.recv(8194): frame.extend(chunk)
+            seen.append(bytes(frame))
+            connection.sendall(b'{"schema":"qcl.monitoring-error.v1","reason":"stale_cursor"}\n')
+    worker = threading.Thread(target=serve); worker.start()
+    try:
+        with pytest.raises(ValueError, match='stale_cursor'):
+            m.portal_cache_query(portal_query(m).decode().strip())
+        worker.join(2)
+        assert not worker.is_alive() and seen == [portal_query(m)]
+    finally:
+        listener.close(); worker.join(2)
+        Path(path).unlink()
+
+
+def test_portal_client_rejects_invalid_query_before_connect(monkeypatch):
+    m, socket = portal_socket_fixture(monkeypatch)
+    monkeypatch.setattr(m.socket, 'socket', lambda *a, **k: pytest.fail('connect before query validation'))
+    with pytest.raises(ValueError): m.portal_cache_query('bad')
+    with pytest.raises(ValueError): m.portal_cache_query(portal_query(m, request_id='lookup').decode().strip())
+
+
+def test_portal_client_wrong_server_uid_fails_before_request(monkeypatch, tmp_path):
+    import threading
+    m, socket = portal_socket_fixture(monkeypatch)
+    path = str(tmp_path / 'wrong.sock'); monkeypatch.setattr(m,'PORTAL_CACHE_SOCKET',path)
+    monkeypatch.setattr(m,'PORTAL_CACHE_SERVER_UID',os.getuid()+1)
+    listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); listener.bind(path); listener.listen(1)
+    received=[]
+    def serve():
+        connection,_=listener.accept()
+        with connection: received.append(connection.recv(1))
+    worker=threading.Thread(target=serve); worker.start()
+    try:
+        with pytest.raises(ValueError,match='monitoring_unavailable'):
+            m.portal_cache_query(portal_query(m).decode().strip())
+        worker.join(2)
+        assert not worker.is_alive() and received==[b'']
+    finally: listener.close(); worker.join(2); Path(path).unlink()
+
+
+def test_portal_client_validates_full_dto_before_stdout_and_never_loads_config(monkeypatch,capsys):
+    m,socket=portal_socket_fixture(monkeypatch)
+    cluster=module('cluster_projection')
+    value=json.loads((ROOT/'examples/cluster-projection.json.example').read_text())
+    cluster.validate_cluster_projection(value)
+    for name in ('load_config','read_cache','sample_native_status','observe_remote'):
+        monkeypatch.setattr(m,name,lambda *a,**kw:pytest.fail('nonprivileged client opened private/fresh source'))
+    monkeypatch.setattr(m,'portal_cache_query',lambda token:m.portal_cache_decode_response(json.dumps(value).encode()+b'\n'))
+    monkeypatch.setattr(sys,'argv',['client','--query-base64',portal_query(m).decode().strip()])
+    assert m.portal_cache_client_main()==0
+    out=capsys.readouterr()
+    assert json.loads(out.out)==value and out.err==''
+
+
+def test_portal_server_overflow_never_relays_partial_or_private_payload(monkeypatch):
+    m,socket=portal_socket_fixture(monkeypatch)
+    cluster=module('cluster_projection')
+    value=json.loads((ROOT/'examples/cluster-projection.json.example').read_text())
+    monkeypatch.setattr(cluster,'read_cluster_projection',lambda **kw:value)
+    monkeypatch.setattr(m,'PORTAL_CACHE_BYTES',32)
+    result=portal_exchange(m,socket,portal_query(m))
+    assert result=={'schema':'qcl.monitoring-error.v1','reason':'monitoring_unavailable'}
+
+
+def test_portal_full_owned_socket_roundtrip_does_not_touch_private_client_sources(monkeypatch,tmp_path):
+    import threading
+    m,socket=portal_socket_fixture(monkeypatch)
+    cluster=module('cluster_projection')
+    value=json.loads((ROOT/'examples/cluster-projection.json.example').read_text())
+    monkeypatch.setattr(cluster,'read_cluster_projection',lambda **kw:copy.deepcopy(value))
+    monkeypatch.setattr(m,'load_config',lambda:pytest.fail('transport opened config itself'))
+    monkeypatch.setattr(m,'PORTAL_CACHE_SERVER_UID',os.getuid())
+    path=str(tmp_path/'round.sock'); monkeypatch.setattr(m,'PORTAL_CACHE_SOCKET',path)
+    listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); listener.bind(path); listener.listen(1)
+    failures=[]
+    def serve():
+        try:
+            connection,_=listener.accept()
+            with connection: m.portal_cache_handle(connection)
+        except Exception as error: failures.append(type(error).__name__)
+    worker=threading.Thread(target=serve);worker.start()
+    try:
+        result=m.portal_cache_query(portal_query(m).decode().strip())
+        assert result==value
+        worker.join(2)
+        assert not worker.is_alive() and failures==[]
+    finally:listener.close();worker.join(2);Path(path).unlink()
+
+
+def test_portal_client_timeout_closes_connection_and_redacts_detail(monkeypatch,tmp_path,capsys):
+    import threading
+    m,socket=portal_socket_fixture(monkeypatch)
+    monkeypatch.setattr(m,'PORTAL_CACHE_SERVER_UID',os.getuid())
+    monkeypatch.setattr(m,'PORTAL_CACHE_SECONDS',.05)
+    path=str(tmp_path/'timeout.sock');monkeypatch.setattr(m,'PORTAL_CACHE_SOCKET',path)
+    listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);listener.bind(path);listener.listen(1)
+    release=threading.Event(); closed=[]
+    def serve():
+        connection,_=listener.accept()
+        with connection:
+            while connection.recv(8194):pass
+            release.wait(1)
+            closed.append(connection.recv(1))
+    worker=threading.Thread(target=serve);worker.start()
+    monkeypatch.setattr(sys,'argv',['client','--query-base64',portal_query(m).decode().strip()])
+    try:
+        assert m.portal_cache_client_main()==1
+        out=capsys.readouterr()
+        assert out.out=='' and json.loads(out.err)=={'schema':'qcl.monitoring-error.v1','reason':'monitoring_unavailable'}
+        release.set();worker.join(2)
+        assert not worker.is_alive() and closed==[b'']
+    finally:release.set();listener.close();worker.join(2);Path(path).unlink()

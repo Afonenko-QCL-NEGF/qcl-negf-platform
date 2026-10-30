@@ -221,3 +221,35 @@ def test_fresh_context_does_not_hide_unknown_host_or_enabled_context_failure():
     assert view['status']=='partial' and view['hosts'][0]['native'] is None
     c['targets']=[]
     assert m.ClusterProjection(c,missing,current_context=context,clock=lambda:100).read()['status']=='ok'
+
+
+def test_socket_cached_pagination_preserves_b_dto_and_measurement_age(monkeypatch):
+    from test_monitoring_runtime import portal_socket_fixture, portal_exchange, portal_query
+    runtime, socket = portal_socket_fixture(monkeypatch)
+    c = config('controller'); c['targets'] = [target('host-a')]
+    sample = packet(); sample['resource'].update(state_generation='state-a', complete=False, next_cursor='b-next')
+    second = copy.deepcopy(sample); second['resource'].update(complete=True, next_cursor=None)
+    from slurm_context import empty_context
+    cache = dict(sampler_boot_id='controller-boot', current_context=empty_context(c, now=100),
+        host_packets=[dict(host_id='host-a',fetched_at=95,pages=[dict(cursor=None,packet=sample),dict(cursor='b-next',packet=second)])])
+    monkeypatch.setattr(runtime,'load_config',lambda:c)
+    monkeypatch.setattr(runtime,'read_cache',lambda _:copy.deepcopy(cache))
+    monkeypatch.setattr(runtime.time,'time',lambda:100)
+    # Constructor's default clock is bound at import, so use its explicit
+    # public clock seam instead of assuming a later time.time patch replaces it.
+    projection=module('cluster_projection')
+    constructor=projection.ClusterProjection
+    monkeypatch.setattr(projection,'ClusterProjection',lambda *a,**kw:constructor(*a,clock=lambda:100,**kw))
+    def forbidden(*a,**kw): pytest.fail('socket poll invoked fresh probe/P20/service effect')
+    for name in ('observe_local','observe_remote','sample_native_status','NativeSources'):
+        monkeypatch.setattr(runtime,name,forbidden)
+    first=portal_exchange(runtime,socket,portal_query(runtime,limit=1))
+    assert first['hosts'][0]['resource']==sample['resource']
+    assert first['read_at']==100 and first['hosts'][0]['native']['observed_at']==80
+    assert first['hosts'][0]['native']['coverage']['status']=='stale'
+    assert any(cov['observed_at']==95 for cov in first['coverage']['sources'])
+    next_page=portal_exchange(runtime,socket,portal_query(runtime,limit=1,cursor=first['next_cursor']))
+    assert next_page['hosts'][0]['resource']==second['resource']
+    cache['host_packets'][0]['pages'][0]['packet']['native']['sample_generation']='changed'
+    stale=portal_exchange(runtime,socket,portal_query(runtime,limit=1,cursor=first['next_cursor']))
+    assert stale=={'schema':'qcl.monitoring-error.v1','reason':'stale_cursor'}

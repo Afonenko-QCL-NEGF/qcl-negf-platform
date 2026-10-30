@@ -36,6 +36,14 @@ let
     }) extra ];
   };
   controller = (make "controller" {}).config;
+  cacheConfigured = (make "controller" {
+    qclNegf.monitoring.observation = { enable = true; portalCache.enable = true; };
+  }).config;
+  cacheSocket = cacheConfigured.systemd.sockets.qcl-negf-monitor-portal-cache.socketConfig;
+  cacheService = cacheConfigured.systemd.services."qcl-negf-monitor-portal-cache@";
+  cacheWithoutObservation = (make "controller" {
+    qclNegf.monitoring.observation.portalCache.enable = true;
+  }).config;
   configurator = extra: (make "controller" {
     imports = [ { qclNegf.application.api.configurator.enable = lib.mkDefault true; } extra ];
   }).config;
@@ -88,6 +96,26 @@ assert api.serviceConfig.DelegateSubgroup == "api";
 assert api.serviceConfig.KillMode == "control-group";
 assert api.serviceConfig.User == "qcl-negf";
 assert api.serviceConfig.NoNewPrivileges;
+assert !controller.qclNegf.monitoring.observation.portalCache.enable;
+assert !(controller.systemd.sockets ? qcl-negf-monitor-portal-cache);
+assert cacheConfigured.systemd.services.qcl-negf-api.serviceConfig.NoNewPrivileges;
+assert cacheConfigured.systemd.services.qcl-negf-api.serviceConfig.User == "qcl-negf";
+assert cacheConfigured.systemd.services.qcl-negf-api.serviceConfig.ReadWritePaths == disabledApi.serviceConfig.ReadWritePaths;
+assert cacheSocket.Accept && cacheSocket.MaxConnections == 4;
+assert cacheSocket.ListenStream == "/run/qcl-negf-monitoring-portal/read.sock";
+assert cacheSocket.SocketUser == "root" && cacheSocket.SocketGroup == "qcl-negf";
+assert cacheSocket.SocketMode == "0660" && cacheSocket.DirectoryMode == "0755";
+assert cacheService.serviceConfig.User == "root" && cacheService.serviceConfig.NoNewPrivileges;
+assert cacheService.serviceConfig.CapabilityBoundingSet == [];
+assert cacheService.serviceConfig.RestrictAddressFamilies == [ "AF_UNIX" ];
+assert cacheService.serviceConfig.ProtectSystem == "strict";
+assert cacheService.serviceConfig.RuntimeMaxSec == 5 && cacheService.serviceConfig.TimeoutStopSec == 1;
+assert cacheService.serviceConfig.TasksMax == 8 && cacheService.serviceConfig.MemoryMax == "128M";
+assert cacheService.serviceConfig.StandardInput == "socket" && cacheService.serviceConfig.StandardOutput == "socket";
+assert cacheService.serviceConfig.StandardError == "null";
+assert cacheService.before == [] && cacheService.partOf == [] && cacheService.requiredBy == [];
+assert !cacheConfigured.qclNegf.monitoring.observation.sampler.enable;
+assert builtins.any (entry: !entry.assertion && lib.hasPrefix "Portal cache" entry.message) cacheWithoutObservation.assertions;
 # Namespace admission is held by the existing unit, including the non-configurator API.
 assert api.serviceConfig.RestrictNamespaces;
 assert disabledApi.serviceConfig.RestrictNamespaces;

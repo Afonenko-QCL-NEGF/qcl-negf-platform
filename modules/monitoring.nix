@@ -16,6 +16,7 @@ in {
       enable = lib.mkEnableOption "bounded read-only P31 observation helpers";
       readerUser = lib.mkOption { type = lib.types.str; default = "qcl-monitor-reader"; description = "Existing dedicated local non-root reader; UID must match the protected config."; };
       observerUser = lib.mkOption { type = lib.types.str; default = "qcl-monitor-observer"; description = "Existing dedicated SSH identity; distinct from reader and grant roles."; };
+      portalCache.enable = lib.mkEnableOption "fixed local cache-only socket for the existing qcl-negf API account";
       sampler = {
         enable = lib.mkEnableOption "best-effort root sampler on an existing enrolled host/guest";
         intervalSeconds = lib.mkOption { type = lib.types.ints.positive; default = 30; };
@@ -64,6 +65,35 @@ in {
       systemd.timers.qcl-negf-monitor-sample = {
         wantedBy = [ "timers.target" ];
         timerConfig = { OnBootSec = "30s"; OnUnitInactiveSec = "${toString cfg.observation.sampler.intervalSeconds}s"; };
+      };
+    })
+    (lib.mkIf cfg.observation.portalCache.enable {
+      assertions = [ {
+        assertion = cfg.observation.enable && config.qclNegf.application.enable && config.qclNegf.application.api.enable;
+        message = "Portal cache socket requires observation and the existing enabled application API account.";
+      } ];
+      systemd.tmpfiles.rules = [ "d /run/qcl-negf-monitoring-portal 0755 root root -" ];
+      systemd.sockets.qcl-negf-monitor-portal-cache = {
+        description = "One authenticated cache-only monitoring query";
+        wantedBy = [ "sockets.target" ];
+        socketConfig = {
+          ListenStream = "/run/qcl-negf-monitoring-portal/read.sock";
+          SocketUser = "root"; SocketGroup = "qcl-negf"; SocketMode = "0660";
+          DirectoryMode = "0755"; Accept = true; MaxConnections = 4;
+        };
+      };
+      systemd.services."qcl-negf-monitor-portal-cache@" = {
+        description = "Bounded public monitoring cache reader";
+        serviceConfig = {
+          User = "root"; Group = "root";
+          StandardInput = "socket"; StandardOutput = "socket"; StandardError = "null";
+          ExecStart = "${monitor}/bin/qcl-negf-monitor-portal-cache-serve";
+          Restart = "no"; KillMode = "control-group";
+          RuntimeMaxSec = 5; TimeoutStopSec = 1; MemoryMax = "128M"; TasksMax = 8;
+          UMask = "0077"; NoNewPrivileges = true; CapabilityBoundingSet = [];
+          ProtectSystem = "strict"; ProtectHome = true; PrivateTmp = true;
+          RestrictAddressFamilies = [ "AF_UNIX" ];
+        };
       };
     })
     (lib.mkIf (cfg.observation.enable && cfg.observation.storageMaintenance) {
