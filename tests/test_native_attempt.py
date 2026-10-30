@@ -622,6 +622,131 @@ def test_actor_script_reference_and_budget_negatives_precede_claim(actor_bridge,
     assert not any('--parsable' in row[0] for row in state['calls'])
 
 
+# Exact synthetic presubmit bytes frozen by the AiiDA owner on 2026-10-30.
+# This exercises its actual literal output without importing mutable producer source.
+NATIVE_ORIGIN_SCRIPT = b"""#!/bin/bash
+#SBATCH --no-requeue
+#SBATCH --job-name="aiida-16"
+#SBATCH --get-user-env
+#SBATCH --output=_scheduler-stdout.txt
+#SBATCH --error=_scheduler-stderr.txt
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=1
+#SBATCH --time=01:00:00
+
+# ENVIRONMENT VARIABLES BEGIN ###
+export JULIA_NUM_THREADS='1'
+export OPENBLAS_NUM_THREADS='1'
+# ENVIRONMENT VARIABLES END ###
+
+/run/current-system/sw/bin/qcl-negf-release guard --release-id fixture-release --solver-executable /nix/store/synthetic/bin/qcl-negf || exit 78
+unset QCL_NEGF_CAPTURE_SPEC
+
+'/nix/store/synthetic/bin/qcl-negf' 'run-plan' 'plan.json' '/srv/qcl-negf/jobs/native/new-domain' '--execution-id' 'execution' '--source-graph' 'source-graph.json' '--native-execution' 'native-execution.json' '--native-calcjob-uuid' 'e3fd840b-a169-4061-ab35-0b68bd97215f'  > 'solver.stdout' 2> 'solver.stderr'
+"""
+NATIVE_ORIGIN_CALCJOB = 'e3fd840b-a169-4061-ab35-0b68bd97215f'
+
+
+def test_native_origin_actual_frozen_presubmit_literal_and_legacy_unmapped(monkeypatch):
+    m = module(); sources = m.NativeSources({'jobs_root':'/srv/qcl-negf/jobs'},m.Operation(limits()))
+    monkeypatch.setattr(sources,'origin',lambda path:path)
+    assert hashlib.sha256(NATIVE_ORIGIN_SCRIPT).hexdigest() == '4f15f14ac98ff6a5a7c38d2bc096ec4ee8165fa28052d12f372ac0eee8d05c6b'
+    launch = request()['launch']
+    launch.update(release_id='fixture-release',execution_id='execution',relative_execution_root='native/new-domain')
+    assert m._review_native_script(NATIVE_ORIGIN_SCRIPT,launch,'/nix/store/synthetic/bin/qcl-negf',
+        '/bin/bash',sources,calcjob_uuid=NATIVE_ORIGIN_CALCJOB) is None
+    # The old seven-argument class remains accepted without an origin assertion.
+    suffix = (" '--native-execution' 'native-execution.json' '--native-calcjob-uuid' '"+
+              NATIVE_ORIGIN_CALCJOB+"'").encode()
+    legacy = NATIVE_ORIGIN_SCRIPT.replace(suffix,b'')
+    assert legacy != NATIVE_ORIGIN_SCRIPT
+    assert m._review_native_script(legacy,launch,'/nix/store/synthetic/bin/qcl-negf',
+        '/bin/bash',sources,calcjob_uuid=request()['calcjob_uuid']) is None
+    assert not hasattr(sources,'_actor')
+
+
+@pytest.mark.parametrize('calcjob',[
+    NATIVE_ORIGIN_CALCJOB.upper(), NATIVE_ORIGIN_CALCJOB.replace('-',''),
+    NATIVE_ORIGIN_CALCJOB+'\n', '00000000-0000-0000-0000-000000000000', None])
+def test_native_origin_script_requires_canonical_authenticated_uuid(monkeypatch,calcjob):
+    m = module(); sources = m.NativeSources({'jobs_root':'/srv/qcl-negf/jobs'},m.Operation(limits()))
+    monkeypatch.setattr(sources,'origin',lambda path:path)
+    launch = request()['launch']
+    launch.update(release_id='fixture-release',execution_id='execution',relative_execution_root='native/new-domain')
+    script = NATIVE_ORIGIN_SCRIPT.replace(NATIVE_ORIGIN_CALCJOB.encode(),str(calcjob).encode())
+    with pytest.raises(m.Hold):
+        m._review_native_script(script,launch,'/nix/store/synthetic/bin/qcl-negf',
+            '/bin/bash',sources,calcjob_uuid=calcjob)
+
+
+def native_origin_bridge_script(state):
+    suffix = (" '--native-execution' 'native-execution.json' '--native-calcjob-uuid' '"+
+              state['document']['calcjob_uuid']+"'  >").encode()
+    return state['files']['submit_script'].replace(b'  >',suffix)
+
+
+def replace_bridge_script(state,script):
+    state['files']['submit_script'] = script
+    claim = dict(bytes=len(script),sha256=hashlib.sha256(script).hexdigest())
+    state['document']['launch']['files']['submit_script'] = claim
+    state['actor_launch']['files']['submit_script'] = copy.deepcopy(claim)
+
+
+@pytest.mark.parametrize('native_origin',[False,True])
+def test_native_origin_preflight_passes_actual_request_uuid(actor_bridge,monkeypatch,native_origin):
+    state=actor_bridge;m=state['m'];sources=state['sources'];document=state['document']
+    if native_origin: replace_bridge_script(state,native_origin_bridge_script(state))
+    original = m._review_native_script; observed=[]
+    def review(*args,**kwargs):
+        observed.append(kwargs.copy())
+        return original(*args,**kwargs)
+    monkeypatch.setattr(m,'_review_native_script',review)
+    assert sources.preflight(document['launch'],sources.budget,
+        calcjob_uuid=document['calcjob_uuid'],action='submit')==state['host']
+    assert observed==[{'calcjob_uuid':document['calcjob_uuid']}]
+    assert all(document['calcjob_uuid'] in row[0] for row in state['calls'])
+    assert not any(document['launch'][key]==document['calcjob_uuid'] for key in
+        ('request_id','native_execution_uuid','input_plan_uuid','source_graph_uuid','code_uuid'))
+
+
+@pytest.mark.parametrize('fault',[
+    'request_uuid','native_uuid','plan_uuid','missing_native','missing_calcjob','missing_value',
+    'native_alias','native_absolute','extra','duplicate','reordered','unquoted','doublequoted',
+    'substitution','extra_shell','environment','capture','scratch'])
+def test_native_origin_script_controls_hold_before_claim(actor_bridge,tmp_path,fault):
+    state=actor_bridge;m=state['m'];document=state['document'];launch=document['launch'];sources=state['sources']
+    script=native_origin_bridge_script(state)
+    native=b" '--native-execution' 'native-execution.json'"
+    calcjob=(" '--native-calcjob-uuid' '"+document['calcjob_uuid']+"'").encode()
+    if fault in {'request_uuid','native_uuid','plan_uuid'}:
+        key={'request_uuid':'request_id','native_uuid':'native_execution_uuid','plan_uuid':'input_plan_uuid'}[fault]
+        script=script.replace(calcjob,(" '--native-calcjob-uuid' '"+launch[key]+"'").encode())
+    if fault=='missing_native':script=script.replace(native,b'')
+    if fault=='missing_calcjob':script=script.replace(calcjob,b'')
+    if fault=='missing_value':script=script.replace(calcjob,b" '--native-calcjob-uuid'")
+    if fault=='native_alias':script=script.replace(b"'native-execution.json'",b"'./native-execution.json'")
+    if fault=='native_absolute':script=script.replace(b"'native-execution.json'",b"'/srv/qcl-negf/jobs/upload/one/native-execution.json'")
+    if fault=='extra':script=script.replace(b'  >',b" '--attempt' '1'  >")
+    if fault=='duplicate':script=script.replace(calcjob,calcjob+calcjob)
+    if fault=='reordered':script=script.replace(native+calcjob,calcjob+native)
+    if fault=='unquoted':script=script.replace(b"'--native-execution'",b'--native-execution')
+    if fault=='doublequoted':script=script.replace(b"'native-execution.json'",b'"native-execution.json"')
+    if fault=='substitution':script=script.replace(b"'native-execution.json'",b'"$(echo native-execution.json)"')
+    if fault=='extra_shell':script+=b'\necho unsafe\n'
+    if fault=='environment':script=script.replace(b"'run-plan'",b"QCL_ORIGIN=1 'run-plan'")
+    if fault=='capture':script=script.replace(b'unset QCL_NEGF_CAPTURE_SPEC',b"export QCL_NEGF_CAPTURE_SPEC='capture.json'")
+    if fault=='scratch':script=script.replace(b'  >',b" '--scratch-root' '/free/path'  >")
+    replace_bridge_script(state,script)
+    selected=m.OrdinaryAttemptOwner(sources.policy,m.AttemptStore(tmp_path),sources,sources.budget)
+    result=selected.submit(document)
+    assert result['state']=='hold' and not (tmp_path/'attempts').exists()
+    assert result['reason']==('native_scratch_binding_unavailable' if fault=='scratch' else
+                             'native_script' if fault=='extra_shell' else
+                             'native_script_guard' if fault=='capture' else 'native_script_argv')
+    assert not any('--parsable' in row[0] for row in state['calls'])
+
+
 @pytest.mark.parametrize('action',['reconcile','status','start','close'])
 def test_operational_original_input_reads_remain_possible_with_admission_closed(actor_bridge,action):
     state=actor_bridge;state['gate']=state['ready']=False;sources=state['sources']

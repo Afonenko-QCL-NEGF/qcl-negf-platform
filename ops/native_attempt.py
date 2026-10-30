@@ -734,8 +734,9 @@ def _caller_role(sources, row, argv, role, action, context):
              sources.origin(argv[0]) == row['executable'], 'application_origin')
 
 
-def _review_native_script(raw, launch, solver, bash, sources):
+def _review_native_script(raw, launch, solver, bash, sources, *, calcjob_uuid):
     """One stock script subset; never execute or interpret arbitrary shell."""
+    canonical_uuid(calcjob_uuid)
     lines = [line for line in raw.decode('utf-8').splitlines() if line]
     need(lines and lines[0].startswith('#!'), 'native_script')
     interpreter = lines.pop(0)[2:]
@@ -770,9 +771,13 @@ def _review_native_script(raw, launch, solver, bash, sources):
     # Stock Scheduler single-quotes every code argument. A free shell token or
     # extra flag never becomes authority by merely producing the same shlex words.
     literal = lambda word: "'"+word.replace("'", "'\"'\"'")+"'"
-    expected = ' '.join(literal(word) for word in argv)+"  > 'solver.stdout' 2> 'solver.stderr'"
+    native_argv = argv + ['--native-execution','native-execution.json','--native-calcjob-uuid',calcjob_uuid]
+    expected = [' '.join(literal(word) for word in words)+"  > 'solver.stdout' 2> 'solver.stderr'"
+                for words in (argv,native_argv)]
     if '--scratch-root' in lines[6]: raise Hold('native_scratch_binding_unavailable')
-    need(lines[6]==expected, 'native_script_argv')
+    # The legacy seven-argument class stays unmapped; neither branch is itself
+    # proof of invocation birth or of a qualified native producer.
+    need(lines[6] in expected, 'native_script_argv')
 
 
 def _reserve_private_record(value, budget, depth=0):
@@ -1300,7 +1305,8 @@ class NativeSources:
         script = base64.b64decode(submitted['script'],validate=True)
         need(len(script)==launch['files']['submit_script']['bytes'] and
              hashlib.sha256(script).hexdigest()==launch['files']['submit_script']['sha256'], 'submitted_digest')
-        _review_native_script(script,launch,envelope['solver_executable'],context['configuration']['client']['bash_executable'],self)
+        _review_native_script(script,launch,envelope['solver_executable'],context['configuration']['client']['bash_executable'],self,
+                              calcjob_uuid=calcjob_uuid)
         self._refresh_caller(action)
         self._actor = {'calcjob_uuid':calcjob_uuid,'action':action,'launch':actual,
                        'execution_sha256':hashlib.sha256(raw).hexdigest()}
