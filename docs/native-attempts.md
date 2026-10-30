@@ -96,8 +96,8 @@ are refused. Output is exactly policy.jobs_root/original relative root. Optional
 scratch remains HOLD until its original INPUT has an explicit public port.
 Resource admission remains Slurm's responsibility. New submit needs current
 ready release/admission; reconcile/status/start can observe a retained attempt
-with admission closed. Lost ACK never dispatches again. Q1/control transfer and
-cancel remain separate HOLD gates.
+with admission closed. Lost ACK never dispatches again. End-to-end Q1 retrieval
+needs the separate AiiDA consumer; cancel remains a separate HOLD gate.
 
 ## Durable dispatch and uncertainty
 
@@ -168,11 +168,61 @@ Shared UID and empty job cgroup alone do not close the allowed writer set.
 The controller rechecks actual service mount namespaces and all enrolled worker
 facts; Root still must qualify the actual site writer/storage/retention boundary.
 
-Even after physical stop and W1, `qualify_close` returns
-`q1_controls_unavailable`: agreed durable Q1 transfer-close controls and the
-actor/getter integration are not implemented in this scope. Supplied controls
-cannot mint CLOSED or scientific/creator acceptance. The close request allows
-at most five bounded control byte claims, never a directory/archive traversal.
+`qualify_close` closes four fixed byte claims after physical stop and W1. The
+close request and closed reply carry exactly these ordered `{path,bytes,sha256}`
+rows: `series_result.json`, `native-selection.json`, `_scheduler-stdout.txt` and
+`_scheduler-stderr.txt`. Their respective byte ceilings are 32 MiB, 256 KiB,
+64 KiB and 64 KiB; the unchanged aggregate operation budget can refuse a smaller
+packet. Boolean lengths, aliases, reordered/extra claims and a missing mandatory
+log are refused. Empty stock logs are allowed. Request claims remain untrusted
+expectations. The helper does not parse scientific schemas or accept results,
+selected sources, checkpoints or creator provenance.
+
+The first two files come only from the authenticated original launch's canonical
+result root; logs come from its separate original upload workdir. The same
+credential-drop child clears groups and reads all four via stable directory FDs,
+`O_NOFOLLOW`, regular single-link owner files without group/other write, exact
+length/hash and named-inode/ancestor readback. Root never opens their NFS payloads.
+Private observations retain the actual roots, FD signatures and read accounting;
+these observations add no public certificate or root-selection field.
+
+Close requires the existing claim, dispatch, trustworthy ACK, original allocation
+and captured live-before plus authenticated stop evidence. W1 runs before and
+after the four reads; current host, server/caller, worker boot, unit generation,
+storage and selected RO mount view must still agree. Changed, missing or unknown
+writers and replaced files/directories give HOLD. Close does not claim a new
+attempt, dispatch, repair partial records or retry a scientific failure.
+
+Under the existing metadata lock, exclusive `close-observation.json` is synced
+and read back before exclusive `close.json` is synced and read back. Each record
+keeps the existing 64 KiB ceiling. This ordered publication is not an atomic
+transaction across storage domains. Complete lost-ACK repetition requalifies
+current W1/generations and the same four bytes, then returns the unchanged stored
+reply. Observation-only, partial or conflicting publication gives HOLD without
+overwrite or blind repair. Original publication/read failures retain bounded
+protected diagnostics; a diagnostic sink failure cannot replace the primary HOLD.
+
+The transfer packet is five files in total: the four named files plus
+`native-close.json`. The latter is a projection of the protected Reply7 with
+receipt `UUID/close.json`, not an NFS input or a fifth claim: there is no selfhash.
+Stored/socket reply bytes use the existing canonical encoding without LF; the
+fixed client adds exactly one transport LF. The AiiDA consumer must authenticate
+and decode that closed reply and remove only this framing LF to retain the
+original payload. Partial/extra output is HOLD, never reserialized authority.
+
+Before forking, the original ledger prepays bounded copies and directory/file
+operations for both derived roots and the asserted four lengths. The child
+inherits the same deadline; credits are never reset or refunded. Actual read
+bytes are recorded separately. Neither the per-file ceiling nor a source fixture
+raises the original aggregate budget or proves native RSS/latency fit.
+
+A closed reply is operational byte/stop evidence, not a lease or a future-write
+certificate. The permanent managed output-domain claim and current W1 require
+Root's separately qualified finite writer/storage/RO/no-reuse retention boundary.
+`retention_ref` is a locator. Current access failure cannot turn a retained closed
+record into a fresh access pass. AiiDA getter lifetime, original creator joins,
+retained/cross-root sources, scientific acceptance and optional capture remain
+separate owning gates.
 
 ## Accounting and qualification
 
@@ -201,6 +251,6 @@ Before activation Root separately evaluates the actual roles/Nix oracle,
 builds the package, checks installed caller/socket/service generations and
 native hook/ACK causality, admits resources and qualifies synthetic lost-ACK,
 live-before, stop, overlapping-writer, NFS and mount-view negatives. AiiDA actor
-loading, Q1 transfer closure, recovery, release readiness and all scientific
+loading, end-to-end Q1 retrieval, recovery, release readiness and all scientific
 gates remain separate. No old results/history/checkpoint read or new solve is
 part of this backend's SOURCE/L verification.
