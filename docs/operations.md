@@ -1,5 +1,8 @@
 # Operating the cluster
 
+For VM agent installation, runtime acceptance and a non-disruptive diagnosis, see
+[Guest agent: установка, диагностика и восстановление](guest-agent.md).
+
 ## Identity, networks and storage
 
 Use a private network between storage, controller and workers. Resolve their short hostnames
