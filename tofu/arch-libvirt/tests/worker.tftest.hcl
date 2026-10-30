@@ -265,3 +265,51 @@ run "reject_extra_route_host_only_guest" {
   }
   expect_failures = [terraform_data.admission]
 }
+
+run "initial_definition_stays_off" {
+  command = plan
+  variables {
+    start_worker     = false
+    autostart_worker = false
+  }
+  assert {
+    condition     = !libvirt_domain.worker.running && !libvirt_domain.worker.autostart
+    error_message = "Initial definition must stay off until disks, cold reservation and start hook are qualified."
+  }
+}
+
+run "explicit_boot_without_host_autostart" {
+  command = plan
+  variables {
+    start_worker     = true
+    autostart_worker = false
+  }
+  assert {
+    condition     = libvirt_domain.worker.running && !libvirt_domain.worker.autostart
+    error_message = "A reviewed explicit boot must not silently enable host autostart."
+  }
+}
+
+run "explicit_autostart_keeps_current_domain_off" {
+  command = plan
+  variables {
+    start_worker     = false
+    autostart_worker = true
+  }
+  assert {
+    condition     = !libvirt_domain.worker.running && libvirt_domain.worker.autostart
+    error_message = "Autostart intent must not silently change the current power state."
+  }
+}
+
+run "reject_unknown_current_power_intent" {
+  command = plan
+  variables { start_worker = null }
+  expect_failures = [var.start_worker]
+}
+
+run "reject_unknown_autostart_intent" {
+  command = plan
+  variables { autostart_worker = null }
+  expect_failures = [var.autostart_worker]
+}

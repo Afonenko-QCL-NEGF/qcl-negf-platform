@@ -67,7 +67,7 @@ variable "ownership_verified" {
 variable "capacity_verified" {
   type        = bool
   default     = false
-  description = "Operator acknowledgement of fresh capacity/reserves and external resident grant admission, not native evidence."
+  description = "Operator acknowledgement of fresh capacity/reserves for this operation. Stopped definition prepares storage; power/autostart additionally require an external resident grant and protected hook. Not native evidence."
 }
 variable "mac" { type = string }
 variable "address" {
@@ -99,5 +99,23 @@ variable "ssh_public_keys" {
   validation {
     condition     = length(var.ssh_public_keys) > 0 && alltrue([for key in var.ssh_public_keys : startswith(key, "ssh-")])
     error_message = "Supply administrative SSH public keys."
+  }
+}
+variable "start_worker" {
+  type        = bool
+  default     = true
+  description = "Desired current power state, not a grant. Set false for initial definition; require actual cold reservation and the protected start hook before true."
+  validation {
+    condition     = var.start_worker != null
+    error_message = "Current power intent must be an explicit boolean, not null."
+  }
+}
+variable "autostart_worker" {
+  type        = bool
+  default     = true
+  description = "Desired host-boot autostart, not a grant. Keep false until the exact owned domain has a protected start permit/hook."
+  validation {
+    condition     = var.autostart_worker != null
+    error_message = "Host autostart intent must be an explicit boolean, not null."
   }
 }

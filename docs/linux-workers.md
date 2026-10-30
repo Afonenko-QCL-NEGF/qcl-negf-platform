@@ -259,20 +259,21 @@ interface-scoped daemon/callback ports и time/Munge/UID identity. Пустой 
 означают network acceptance.
 
 Перед boot владелец host проверяет allocation/DHCP exclusion и duplicate address; молчание ARP не
-исключает выключенный чужой узел. Поскольку текущий adapter запускает domain при apply, quarantine
-готовят заранее: node DRAIN, без automatic enrollment, jobs и RESUME. Network checks и последующая
-P11/P22 enrollment — разные gates.
+исключает выключенный чужой узел. Quarantine готовят до apply, разрешающего start/autostart: node
+DRAIN, без automatic enrollment, jobs и RESUME. Network checks и последующая P11/P22 enrollment —
+разные gates.
 
 ## Reviewed OpenTofu plan и один named guest
 
 Private `arch-libvirt.tfvars.json` должен содержать поля из
 [variables](../tofu/arch-libvirt/variables.tf): system `uri` через существующий SSH agent, LAN
 `bridge`, `pool_path`, actual `image_path`/`image_sha256`, root/scratch GiB, RAM MiB, равные
-resident min/start/max, vCPU, уникальный MAC, guest CIDR, gateway/DNS и административные public
-keys. Ownership/capacity acknowledgement оставляют false до сверки соответствующих actual private
-facts и policy/grant. Generated input publisher можно использовать только для того же site/image
-binding. Provider проверяет локальные image bytes перед upload. Сохраните полный Platform checkout и
-его provider lock; копирование одного `.tf` теряет контекст.
+resident min/start/max, vCPU, уникальный MAC, guest CIDR, gateway/DNS, явные desired power flags
+`start_worker`/`autostart_worker` и административные public keys. Ownership/capacity acknowledgement
+оставляют false до сверки соответствующих actual private facts и policy/grant. Generated input
+publisher можно использовать только для того же site/image binding. Provider проверяет локальные
+image bytes перед upload. Сохраните полный Platform checkout и его provider lock; копирование одного
+`.tf` теряет контекст.
 
 В выбранном `tofu/arch-libvirt` нет backend declaration. Один `TF_DATA_DIR` переносит
 plugins/metadata, но не устанавливает private state. Поэтому создайте **новый** защищённый working
@@ -320,7 +321,12 @@ names.
 Проверьте URI/bridge, domain/MAC/UUID, source image hash, root overlay, отдельный scratch и только
 новые назначенные ресурсы. Не должно быть удаления, замены или изменения чужих VM/дисков.
 Существующий pool и scratch защищены `prevent_destroy`; отказ не исправляется снятием защиты. Для
-прежнего state сначала согласуйте ownership/migration, не создавайте параллельный пустой state.
+прежнего state сначала согласуйте ownership/migration, не создавайте параллельный пустой state. При
+первой установке в private provider inputs явно задают `start_worker = false` и
+`autostart_worker = false`. Это намерение создать выключенное определение, не reservation или native
+proof. Значения по умолчанию остаются `true` ради прежнего resident-профиля; новый install не должен
+полагаться на них. Пример `site-base.json.example` явно задаёт оба `false`.
+
 После review применяют **этот saved plan**:
 
 ```sh
@@ -328,10 +334,27 @@ tofu -chdir="$MODULE" apply "$WORK/worker.tfplan"
 tofu -chdir="$MODULE" output -json > "$WORK/worker-output.json"
 ```
 
-Apply запускает guest и включает autostart. Поэтому capacity admission, image trust и initial
-quarantine нужны до apply. Это не dry run. При неизвестном результате сохраните state, plan, actual
-domain/disk identities и исходные logs; сначала reconcile, не повторяйте apply/destroy вслепую. Root
-replacement должен сохранять проверенный scratch; scratch всё равно не является резервной копией.
+Первый apply с обоими `false` создаёт pool, volumes, seed и выключенное определение domain. Он всё
+равно меняет storage и libvirt, поэтому ownership/capacity review, image trust и initial quarantine
+нужны до apply. На этом этапе capacity acknowledgement относится к подготовке storage/definition и
+не заменяет будущий resident grant. Перед boot отдельно подготовьте и проверьте принадлежащий этому
+domain scratch, сохраните actual domain UUID, static definition и полный stopped inventory. Штатный
+host resource owner выполняет `qcl-negf-resource-admin prepare` по защищённой private policy и
+полному maximum всех resident VM; protected native start hook должен быть установлен и привязан к
+этому domain. Новые UUID и поля provider inputs сами по себе не создают permit.
+
+Только после фактического cold reservation/hook readback обновите оба desired power flags в
+сохранённом private inputs файле до `true`, создайте **новый** saved plan и проверьте, что он
+включает только ожидаемый power/autostart transition без замены UUID, root или scratch. Применяют
+именно новый plan. Не оставляйте persisted inputs с `false` после намеренного перехода к resident:
+следующий apply снова запросит выключение. `start_worker` и `autostart_worker` независимы, поэтому
+для явно согласованного временного boot без host autostart можно задать `true`/`false`.
+
+Apply с `start_worker = true` запускает guest, с `autostart_worker = true` включает autostart; флаги
+не доказывают host grant или его защиту. Это не dry run. При неизвестном результате сохраните state,
+plan, actual domain/disk identities и исходные logs; сначала reconcile, не повторяйте apply/destroy
+вслепую. Root replacement должен сохранять проверенный scratch; scratch всё равно не является
+резервной копией.
 
 ## Первый boot, enrollment и допуск
 
