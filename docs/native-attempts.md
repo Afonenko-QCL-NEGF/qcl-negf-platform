@@ -106,7 +106,11 @@ shell remain refused. The original seven-argument class stays unmapped and
 receives no creator attribution. Accepting the new literal establishes only its
 join to the authenticated request and original submitted bytes; actual producer,
 virgin output/no-reuse, writer and source-origin qualification remain separate
-gates. This does not change the actor read bounds or make larger plans eligible.
+gates. The original plan role permits up to 1 MiB, matching the existing capture
+plan allowance; source graph/native execution remain at 64 KiB and submit script
+retains its policy cap, at most 64 KiB. Both actor input claims and the uploaded
+original reader apply these role limits. This Platform allowance alone does not
+qualify the owning AiiDA actor, installed producer or joined native input path.
 Resource admission remains Slurm's responsibility. New submit needs current
 ready release/admission; reconcile/status/start can observe a retained attempt
 with admission closed. Lost ACK never dispatches again. End-to-end Q1 retrieval
@@ -244,6 +248,13 @@ original deadline and finite byte/file/PID/command limits. Reads/hashes, JSON,
 base64, journals, command buffers and facts RPC copies consume inherited,
 nonrefundable metadata accounting; slabs are at most 64 KiB. Policy memory must
 fit the observed root service limit. This is accounting, not a RAM grant.
+Before each fixed actor query, the same operation prepays its existing query
+workspace plus eight times each declared original length rounded through the
+4096-byte read/EOF request, bounded by that role limit plus one byte. The command
+response charge remains separate. Failure or cancellation cannot refund these
+charges. The aggregate workspace remains 8 MiB (or a tighter policy); a plan at
+the 1 MiB role ceiling can exceed that aggregate and must HOLD before the actor
+command. File bytes and charged workspace are not physical I/O or measured RSS.
 Hard-NFS/fsync can be uninterruptible: the helper does not claim safe remote
 cleanup merely because its local deadline expired.
 
