@@ -94,6 +94,19 @@ release guard, reviewed unique stock headers, two thread exports, one literal
 solver argv and fixed redirections. Extra shell, custom directives or free flags
 are refused. Output is exactly policy.jobs_root/original relative root. Optional
 scratch remains HOLD until its original INPUT has an explicit public port.
+The literal `run-plan` arguments admit exactly two classes: the original seven
+arguments through `--source-graph source-graph.json`, or those same arguments
+followed, in order, by `--native-execution native-execution.json
+--native-calcjob-uuid UUID`. The latter has exactly eleven arguments; UUID must
+equal the actual authenticated request CalcJob UUID passed by
+`NativeSources.preflight`, independently of Launch file/hash assertions. Both
+classes retain the release guard and `unset QCL_NEGF_CAPTURE_SPEC`. Path aliases,
+alternate quoting, reordered/duplicate/missing flags, substitutions and extra
+shell remain refused. The original seven-argument class stays unmapped and
+receives no creator attribution. Accepting the new literal establishes only its
+join to the authenticated request and original submitted bytes; actual producer,
+virgin output/no-reuse, writer and source-origin qualification remain separate
+gates. This does not change the actor read bounds or make larger plans eligible.
 Resource admission remains Slurm's responsibility. New submit needs current
 ready release/admission; reconcile/status/start can observe a retained attempt
 with admission closed. Lost ACK never dispatches again. End-to-end Q1 retrieval
