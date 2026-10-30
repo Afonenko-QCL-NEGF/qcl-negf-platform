@@ -7,7 +7,7 @@ resource "terraform_data" "admission" {
     }
     precondition {
       condition     = var.capacity_verified
-      error_message = "Require fresh private host capacity/reserves, resident policy and grant admission before apply."
+      error_message = "Require fresh private host capacity/reserves and reviewed admission for the planned storage or resident operation before apply."
     }
     precondition {
       condition     = filesha256(var.image_path) == var.image_sha256
@@ -76,8 +76,8 @@ resource "libvirt_volume" "seed" {
 resource "libvirt_domain" "worker" {
   name                = "arch-worker"
   type                = "kvm"
-  running             = true
-  autostart           = true
+  running             = var.start_worker
+  autostart           = var.autostart_worker
   memory              = var.memory_mib
   memory_unit         = "MiB"
   current_memory      = var.resident_memory.startup_mib
