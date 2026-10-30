@@ -4411,3 +4411,317 @@ class RetainedReleaseSourcesTests(unittest.TestCase):
         try:
             with self.assertRaises(OSError): self.retain()
         finally: self.runtime = saved
+
+
+class CommandChildOwnershipTests(unittest.TestCase):
+    """Real own children; fault injection is confined to unavailable OS outcomes."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ops = importlib.util.module_from_spec(SPEC)
+        SPEC.loader.exec_module(cls.ops)
+
+    @contextmanager
+    def capture(self, *, select_error=None, deny_signal=False, wait_error=None):
+        children, selectors, signals, lost = [], [], [], []
+        popen = self.ops.subprocess.Popen
+        factory = self.ops.selectors.DefaultSelector
+        killpg = os.killpg
+
+        def spawn(*args, **kwargs):
+            child = popen(*args, **kwargs)
+            children.append(child)
+            if wait_error is not None:
+                wait = child.wait
+                interrupted = False
+
+                def wait_once(*args, **kwargs):
+                    nonlocal interrupted
+                    if not interrupted:
+                        interrupted = True
+                        raise wait_error
+                    return wait(*args, **kwargs)
+
+                child.wait = wait_once
+            return child
+
+        def selector():
+            result = factory(); selectors.append(result)
+            if select_error is not None:
+                select = result.select
+                calls = 0
+
+                def interrupted(timeout=None):
+                    nonlocal calls
+                    calls += 1
+                    if calls > 1:
+                        raise select_error
+                    return select(timeout)
+
+                result.select = interrupted
+            return result
+
+        def signal_group(group, value):
+            if value != 0:
+                child = children[-1]
+                try:
+                    # This independent kernel probe must still see our direct
+                    # child. Never send a test signal to a freed numeric group.
+                    os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                    owned = child.returncode is None and os.getsid(child.pid) == os.getpgid(child.pid) == group
+                except (ChildProcessError, ProcessLookupError):
+                    owned = False
+                signals.append((group, value, owned))
+                if not owned:
+                    lost.append(group)
+                    return
+                if deny_signal:
+                    if isinstance(deny_signal, BaseException):
+                        raise deny_signal
+                    raise PermissionError("controlled own group signal denied")
+            return killpg(group, value)
+
+        try:
+            with patch.object(self.ops.subprocess, 'Popen', spawn), \
+                    patch.object(self.ops.selectors, 'DefaultSelector', selector), \
+                    patch.object(self.ops.os, 'killpg', signal_group):
+                yield children, selectors, signals, lost
+        finally:
+            for child in children:
+                try:
+                    os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                    if os.getsid(child.pid) == os.getpgid(child.pid) == child.pid:
+                        killpg(child.pid, signal.SIGKILL)
+                except (ChildProcessError, ProcessLookupError):
+                    pass
+                child.wait(timeout=1)
+                for stream in (child.stdout, child.stderr):
+                    if stream is not None:
+                        stream.close()
+            for item in selectors:
+                item.close()
+
+    def test_cmd_healthy_exit_retains_direct_child_until_only_group_signal(self):
+        with self.capture() as (children, selectors, signals, lost):
+            result = self.ops.command([sys.executable, '-c', "print('healthy')"],
+                                      timeout_seconds=1, cleanup_seconds=.2)
+            self.assertEqual(result, 'healthy\n')
+            self.assertIs(type(result), self.ops.CommandOutput)
+            self.assertEqual(result.output_bytes, 8)
+            self.assertEqual(lost, [], "command reaped its ownership anchor before a mutating signal")
+            self.assertEqual([(value, owned) for _, value, owned in signals], [(signal.SIGKILL, True)])
+            self.assertEqual(children[0].returncode, 0)
+            self.assertTrue(children[0].stdout.closed and children[0].stderr.closed)
+            self.assertIsNone(selectors[0].get_map())
+
+    def test_cmd_exited_leader_retains_inherited_pipe_group_ownership(self):
+        # A short-lived descendant is also finite on the deliberately broken
+        # baseline, whose after-reap signal is suppressed by the safety probe.
+        code = ("import os,time; child=os.fork(); print('prefix',flush=True); "
+                "os._exit(0) if child else time.sleep(.4)")
+        with self.capture() as (children, _, signals, lost):
+            with self.assertRaises(self.ops.CommandFailure) as caught:
+                self.ops.command([sys.executable, '-c', code], timeout_seconds=.2,
+                                 cleanup_seconds=.08, output_bytes=4096)
+            self.assertEqual(caught.exception.record['failure'], 'timeout')
+            self.assertIn('prefix', caught.exception.record['stdout'])
+            self.assertEqual(lost, [], "exited leader was reaped while its pipes were inherited")
+            self.assertEqual([(value, owned) for _, value, owned in signals], [(signal.SIGKILL, True)])
+            self.assertTrue(caught.exception.record['cleanup_confirmed'])
+            self.assertEqual(children[0].returncode, 0)
+
+    def test_cmd_baseexception_identity_and_prefix_survive_denied_cleanup(self):
+        original = KeyboardInterrupt('original selector interruption')
+        original.__cause__ = ValueError('original cause')
+        with self.capture(select_error=original, deny_signal=True) as (children, selectors, _, _):
+            try:
+                self.ops.command([sys.executable, '-c',
+                                  "import os,time; os.write(1,b'first-prefix\\n'); time.sleep(10)"],
+                                 timeout_seconds=1, cleanup_seconds=.2)
+            except BaseException as observed:
+                self.assertIs(observed, original)
+                self.assertIs(observed.__cause__, original.__cause__)
+                self.assertEqual(observed.command_record['stdout'], 'first-prefix\n')
+                self.assertFalse(observed.command_record['cleanup_confirmed'])
+            else:
+                self.fail('original BaseException was swallowed')
+            self.assertTrue(children[0].stdout.closed and children[0].stderr.closed)
+            self.assertIsNone(selectors[0].get_map())
+
+    def test_cmd_nonzero_primary_is_not_replaced_by_cleanup_unknown(self):
+        with self.capture(), patch.object(self.ops, 'group_cleanup_confirmed', return_value=False):
+            with self.assertRaises(self.ops.CommandFailure) as caught:
+                self.ops.command([sys.executable, '-c',
+                                  "import sys; print('original-error',file=sys.stderr); sys.exit(7)"],
+                                 timeout_seconds=1, cleanup_seconds=.2)
+            self.assertEqual(caught.exception.record['failure'], 'nonzero')
+            self.assertEqual(caught.exception.record['returncode'], 7)
+            self.assertEqual(caught.exception.record['stderr'], 'original-error\n')
+            self.assertFalse(caught.exception.record['cleanup_confirmed'])
+
+    def test_cmd_unknown_direct_child_or_session_never_signals_group(self):
+        for query in ('waitid', 'getpgid', 'getsid'):
+            with self.subTest(query=query), self.capture() as (children, _, signals, _):
+                with patch.object(self.ops.os, query, side_effect=PermissionError('unknown child generation')):
+                    with self.assertRaises(self.ops.CommandFailure) as caught:
+                        self.ops.command([sys.executable, '-c', 'import time; time.sleep(10)'],
+                                         timeout_seconds=.3, cleanup_seconds=.1)
+                self.assertEqual(signals, [], 'unknown ownership must not reach any mutating group signal')
+                self.assertFalse(caught.exception.record['cleanup_confirmed'])
+                self.assertTrue(children[0].stdout.closed and children[0].stderr.closed)
+
+    def test_cmd_wait_and_cleanup_baseexceptions_close_resources(self):
+        for phase in ('wait', 'cleanup'):
+            original = SystemExit('original ' + phase)
+            with self.subTest(phase=phase), self.capture(wait_error=original if phase == 'wait' else None) as captured:
+                children, selectors, _, _ = captured
+                boundary = (patch.object(self.ops, 'group_cleanup_confirmed', side_effect=original)
+                            if phase == 'cleanup' else ExitStack())
+                with boundary:
+                    try:
+                        self.ops.command([sys.executable, '-c', "print('original-output')"],
+                                         timeout_seconds=1, cleanup_seconds=.2)
+                    except BaseException as observed:
+                        self.assertIs(observed, original)
+                        self.assertEqual(observed.command_record['stdout'], 'original-output\n')
+                        self.assertFalse(observed.command_record['cleanup_confirmed'])
+                    else:
+                        self.fail('cleanup BaseException was swallowed')
+                self.assertTrue(children[0].stdout.closed and children[0].stderr.closed)
+                self.assertIsNone(selectors[0].get_map())
+
+    def test_cmd_read_baseexception_keeps_original_stream_prefix(self):
+        original = KeyboardInterrupt('original read interruption')
+        read = os.read
+        calls = 0
+
+        def interrupted(fd, size):
+            nonlocal calls
+            # Popen reads its exec-error pipe before returning the child. The
+            # boundary here is only one of the real captured stdout/stderr fds.
+            child_fds = {s.fileno() for child in children for s in (child.stdout, child.stderr)}
+            if fd in child_fds:
+                calls += 1
+                if calls > 1:
+                    raise original
+            return read(fd, size)
+
+        with self.capture() as (children, selectors, _, _), patch.object(os, 'read', interrupted):
+            try:
+                self.ops.command([sys.executable, '-c',
+                                  "import os,time; os.write(1,b'first-prefix\\n'); os.write(2,b'second\\n'); time.sleep(10)"],
+                                 timeout_seconds=1, cleanup_seconds=.2)
+            except BaseException as observed:
+                self.assertIs(observed, original)
+                self.assertIn('first-prefix', observed.command_record['stdout'])
+                self.assertTrue(observed.command_record['cleanup_confirmed'])
+            else:
+                self.fail('read BaseException was swallowed')
+            self.assertTrue(children[0].stdout.closed and children[0].stderr.closed)
+            self.assertIsNone(selectors[0].get_map())
+
+    def test_cmd_existing_record_and_unwritable_diagnostics_preserve_primary(self):
+        class Unwritable(KeyboardInterrupt):
+            def __setattr__(self, name, value):
+                if name == 'command_record':
+                    raise RuntimeError('diagnostic attribute unavailable')
+                super().__setattr__(name, value)
+
+            def add_note(self, note):
+                raise RuntimeError('diagnostic note unavailable')
+
+        existing = KeyboardInterrupt('already recorded')
+        marker = {'existing': 'original'}
+        existing.command_record = marker
+        for original in (existing, Unwritable('do not mask me')):
+            with self.subTest(original=type(original).__name__), self.capture(select_error=original):
+                try:
+                    self.ops.command([sys.executable, '-c',
+                                      "import os,time; os.write(1,b'prefix\\n'); time.sleep(10)"],
+                                     timeout_seconds=1, cleanup_seconds=.2)
+                except BaseException as observed:
+                    self.assertIs(observed, original)
+                    if original is existing:
+                        self.assertIs(observed.command_record, marker)
+                        self.assertTrue(any('cleanup_confirmed=True' in note for note in observed.__notes__))
+                else:
+                    self.fail('original exception was swallowed')
+
+    def test_cmd_original_deadline_and_pre_spawn_failure_are_bounded(self):
+        with self.capture() as (children, _, signals, _):
+            with self.assertRaises(self.ops.CommandFailure) as caught:
+                self.ops.command([sys.executable, '-c', 'raise AssertionError()'],
+                                 timeout_seconds=1, cleanup_seconds=.2, deadline=time.monotonic() - .01)
+            self.assertEqual(caught.exception.record['failure'], 'deadline')
+            self.assertFalse(caught.exception.record['child_started'])
+            self.assertTrue(caught.exception.record['cleanup_confirmed'])
+            self.assertEqual((children, signals), ([], []))
+        start = time.monotonic()
+        with self.capture(), self.assertRaises(self.ops.CommandFailure) as caught:
+            self.ops.command([sys.executable, '-c', 'import time; time.sleep(10)'],
+                             timeout_seconds=2, cleanup_seconds=.1, deadline=start + .3)
+        self.assertEqual(caught.exception.record['failure'], 'timeout')
+        self.assertTrue(caught.exception.record['cleanup_confirmed'])
+        self.assertLess(time.monotonic() - start, .7)
+
+    def test_cmd_externally_reaped_child_cannot_authorize_numeric_group(self):
+        with self.capture() as (children, _, signals, _):
+            spawn = self.ops.subprocess.Popen
+
+            def already_reaped(*args, **kwargs):
+                child = spawn(*args, **kwargs)
+                child.wait(timeout=1)
+                return child
+
+            with patch.object(self.ops.subprocess, 'Popen', already_reaped):
+                with self.assertRaises(self.ops.CommandFailure) as caught:
+                    self.ops.command([sys.executable, '-c', 'pass'], timeout_seconds=1, cleanup_seconds=.2)
+            self.assertFalse(caught.exception.record['cleanup_confirmed'])
+            self.assertEqual(signals, [], 'freed PID/PGID cannot authorize cleanup')
+            self.assertEqual(children[0].returncode, 0)
+
+    def test_cmd_unknown_sigchld_reaper_blocks_before_child_spawn(self):
+        for handler in (signal.SIG_IGN, lambda *_: None):
+            with self.subTest(handler=handler), self.capture() as (children, _, signals, _):
+                with patch.object(self.ops.signal, 'getsignal', return_value=handler):
+                    with self.assertRaises(self.ops.CommandFailure) as caught:
+                        self.ops.command([sys.executable, '-c', 'pass'], timeout_seconds=1, cleanup_seconds=.2)
+                self.assertFalse(caught.exception.record['child_started'])
+                self.assertFalse(caught.exception.record['cleanup_confirmed'])
+                self.assertEqual((children, signals), ([], []))
+
+    def test_cmd_healthy_unknown_cleanup_and_spawn_error_are_distinct(self):
+        with self.capture(), patch.object(self.ops, 'group_cleanup_confirmed', return_value=False):
+            with self.assertRaises(self.ops.CommandFailure) as caught:
+                self.ops.command([sys.executable, '-c', "print('healthy-prefix')"],
+                                 timeout_seconds=1, cleanup_seconds=.2)
+            self.assertEqual(caught.exception.record['failure'], 'cleanup_unconfirmed')
+            self.assertEqual(caught.exception.record['returncode'], 0)
+            self.assertEqual(caught.exception.record['stdout'], 'healthy-prefix\n')
+            self.assertFalse(caught.exception.record['cleanup_confirmed'])
+        with tempfile.TemporaryDirectory() as temporary, self.capture() as (children, selectors, signals, _):
+            with self.assertRaises(self.ops.CommandFailure) as caught:
+                self.ops.command([str(Path(temporary) / 'missing-executable')],
+                                 timeout_seconds=1, cleanup_seconds=.2)
+            self.assertEqual(caught.exception.record['failure'], 'spawn')
+            self.assertFalse(caught.exception.record['child_started'])
+            self.assertTrue(caught.exception.record['cleanup_confirmed'])
+            self.assertEqual((children, signals), ([], []))
+            self.assertIsNone(selectors[0].get_map())
+
+    def test_cmd_cleanup_baseexception_does_not_replace_earlier_primary(self):
+        original = KeyboardInterrupt('first primary')
+        cleanup = SystemExit('secondary cleanup interruption')
+        with self.capture(select_error=original, deny_signal=cleanup) as (children, selectors, _, _):
+            try:
+                self.ops.command([sys.executable, '-c',
+                                  "import os,time; os.write(1,b'original-prefix\\n'); time.sleep(10)"],
+                                 timeout_seconds=.5, cleanup_seconds=.1)
+            except BaseException as observed:
+                self.assertIs(observed, original)
+                self.assertFalse(observed.command_record['cleanup_confirmed'])
+                self.assertEqual(observed.command_record['stdout'], 'original-prefix\n')
+            else:
+                self.fail('primary exception was swallowed')
+            self.assertTrue(children[0].stdout.closed and children[0].stderr.closed)
+            self.assertIsNone(selectors[0].get_map())
