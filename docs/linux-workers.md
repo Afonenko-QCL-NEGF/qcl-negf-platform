@@ -76,6 +76,13 @@ console и guest-agent channel. Locked Nixpkgs QEMU guest profile предост
 private SSH host keys, enrollment/gate/ready records; отсутствие этих данных подтверждается
 content/first-boot проверкой, не одним импортом module.
 
+Guest-agent channel объявляет UNIX source и virtio target `org.qemu.guest_agent.0`, оставляя socket
+mode/path за libvirt. В inactive XML libvirt может убрать source mode/path; pinned provider 0.9.9
+возвращает отсутствующий mode как `null`. Поэтому module не задаёт `mode = "bind"` или runtime path
+и не скрывает drift через `ignore_changes`. Schema/mock plan checks не заменяют actual inactive
+apply/readback. Если прежний apply завершился inconsistent result после определения domain, сначала
+сохраните и сопоставьте actual UUID/XML/state; не повторяйте apply или замену ресурсов вслепую.
+
 Профиль допускает private site-bound image, но не содержит Munge/SSH private key bytes. Пример
 secret unit ожидает отдельно доставленный `/var/lib/qcl-negf-secrets/munge.key` и копирует его в
 `/run/secrets` с owner munge, mode 0400. До такой доставки unit и Slurm остаются закрыты. Никаких

@@ -97,6 +97,7 @@ resource "libvirt_domain" "worker" {
     # Libvirt allocates PTY source paths; only the guest target is declarative.
     serials  = [{ target = { port = 0 } }]
     consoles = [{ target = { type = "serial", port = 0 } }]
-    channels = [{ source = { unix = { mode = "bind" } }, target = { virt_io = { name = "org.qemu.guest_agent.0" } } }]
+    # Libvirt owns the guest-agent socket mode/path, including inactive XML normalization.
+    channels = [{ source = { unix = {} }, target = { virt_io = { name = "org.qemu.guest_agent.0" } } }]
   }
 }
