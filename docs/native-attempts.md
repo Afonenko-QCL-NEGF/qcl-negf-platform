@@ -185,7 +185,7 @@ Shared UID and empty job cgroup alone do not close the allowed writer set.
 The controller rechecks actual service mount namespaces and all enrolled worker
 facts; Root still must qualify the actual site writer/storage/retention boundary.
 
-`qualify_close` closes four fixed byte claims after physical stop and W1. The
+The version 1 `qualify_close` closes four fixed byte claims after physical stop and W1. The
 close request and closed reply carry exactly these ordered `{path,bytes,sha256}`
 rows: `series_result.json`, `native-selection.json`, `_scheduler-stdout.txt` and
 `_scheduler-stderr.txt`. Their respective byte ceilings are 32 MiB, 256 KiB,
@@ -219,7 +219,7 @@ reply. Observation-only, partial or conflicting publication gives HOLD without
 overwrite or blind repair. Original publication/read failures retain bounded
 protected diagnostics; a diagnostic sink failure cannot replace the primary HOLD.
 
-The transfer packet is five files in total: the four named files plus
+The version 1 transfer packet is five files in total: the four named files plus
 `native-close.json`. The latter is a projection of the protected Reply7 with
 receipt `UUID/close.json`, not an NFS input or a fifth claim: there is no selfhash.
 Stored/socket reply bytes use the existing canonical encoding without LF; the
@@ -240,6 +240,78 @@ Root's separately qualified finite writer/storage/RO/no-reuse retention boundary
 record into a fresh access pass. AiiDA getter lifetime, original creator joins,
 retained/cross-root sources, scientific acceptance and optional capture remain
 separate owning gates.
+
+## Q1T: optional technical metadata, версия 2
+
+Версия 2 расширяет только существующий parser `close`. Запрос имеет ровно поля
+`version,action,calcjob_uuid,launch,controls,technical_control`, где `version=2`,
+`action="close"`, а `launch` сохраняет исходную форму. Успешный ответ имеет ровно
+`version,state,calcjob_uuid,receipt_ref,job,controls,technical_control,reason`.
+Четыре scientific controls, их порядок, integer lengths и потолки остаются прежними.
+Другие actions используют версию 1; нового daemon или UI close нет.
+
+`technical_control` — одна из двух закрытых форм:
+
+```json
+{"status":"present","path":"performance-source.json","bytes":"123","sha256":"<64 lowercase hex>"}
+{"status":"absent","path":"performance-source.json","reason":"not_published"}
+```
+
+Для `present` поле `bytes` — каноническая десятичная строка UInt64 от `"0"` до
+`"1048576"`: без знака, пробелов и ведущих нулей. JSON number и boolean не
+допускаются. Это длина целого исходного файла, а hash относится к тем же полным
+байтам. Пустой существующий файл имеет `present` с `bytes="0"`; отсутствие не
+означает нулевую нагрузку или нулевые метрики. `absent` подтверждается только
+реальным отсутствием фиксированного leaf в исходном workdir после W1. Оно не
+препятствует закрытию и последующему scientific/control retrieval по прежним
+четырём controls.
+
+Ожидания caller не являются доказательством. Credential-drop child читает
+`performance-source.json` только из отдельного исходного `remote_workdir`, рядом
+с scheduler logs. Путь нельзя выбрать клиентом или перенести в result root.
+Применяются тот же `O_NOFOLLOW`, regular/single-link/owner/permissions контроль,
+удержанные directory FDs, полная длина/hash, named-inode и ancestor readback.
+Leaf и его родители должны оставаться стабильными; неизвестные writers,
+изменённые bytes, symlink, hardlink, чужой owner и несоответствие
+`present/absent` дают HOLD. W1 и generation/readback проверки выполняются до и
+после общего чтения. Private witness сохраняет technical observation, root/FD
+signatures и фактический I/O вместе с прежними controls.
+
+Platform рассматривает payload как непрозрачные bytes: schema/index semantics,
+CREATE/INPUT provenance и producer origin проверяют Contracts/AiiDA. Совпадение
+hash само по себе их не устанавливает. Отсутствующий optional leaf не заменяет
+обязательные scientific files и не скрывает ошибку их чтения.
+
+Невалидная или неподдерживаемая версия запроса отвергается до durable effects.
+Валидный v2 close получает exact8 reply; при `hold/rejected` оба поля `controls`
+и `technical_control` равны `null`. Здесь `null` означает «не подтверждено», а
+не наблюдённое отсутствие. Fixed client требует совпадения версии reply с
+версией запроса и не принимает v1 как v2. Encoding без LF и единственный
+transport LF сохраняются.
+
+Прежние v1 requests и scientific close receipts сохраняют исходную семантику.
+Старый `close.json` никогда не переименовывается и не становится technical
+authority: запрос иной версии к уже закрытому attempt даёт HOLD с сохранением
+обоих исходных records. Повтор того же v2 close заново проверяет W1 и полный
+technical file либо отсутствие, затем возвращает неизменённый receipt. Поздняя
+публикация после сохранённого `absent`, смена bytes или partial publication не
+перезаписывает прежнее свидетельство. Порядок exclusive observation → receipt,
+fsync/readback, потолки records 64 KiB, сохранение первичной ошибки и отказ от
+ремонта неопределённого publication остаются прежними.
+
+Technical read, workspace/copies и дополнительные file operations оплачиваются
+из исходного невозвратного ledger до fork. Потолок leaf 1 MiB не увеличивает
+aggregate metadata/memory/deadline limits: даже допустимый файл может не
+поместиться в текущий operation budget и дать HOLD до child/read. Cleanup
+uncertainty сохраняет primary failure и не разрешает closed reply.
+
+SOURCE/L проверка: подготовленный Python environment, команда
+`python -m pytest -p no:cacheprovider tests/test_native_attempt.py -q` с
+`PYTHONDONTWRITEBYTECODE=1`. Fixtures выполняют owner/store/credential-drop
+fork/FD путь только на собственных temporary files с подставленными OS/RPC
+наблюдениями; реального backend close, DB/ORM, NFS или services здесь нет.
+AiiDA exact-v2 consumer/retrieval, installed/native qualification, R5 и все
+научные gates остаются отдельными проверками Root.
 
 ## Accounting and qualification
 

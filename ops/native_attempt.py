@@ -31,6 +31,8 @@ SOCKET = '/run/qcl-negf/native-attempt.sock'
 FILES = {'plan': 'plan.json', 'source_graph': 'source-graph.json',
          'native_execution': 'native-execution.json', 'submit_script': '_aiidasubmit.sh'}
 CLOSE_FILES = ('series_result.json', 'native-selection.json', '_scheduler-stdout.txt', '_scheduler-stderr.txt')
+TECHNICAL_FILE = 'performance-source.json'
+TECHNICAL_LIMIT = 1048576
 ID = r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}'
 SHA = r'[0-9a-f]{64}'
 JOB = r'[1-9][0-9]{0,9}'
@@ -161,9 +163,15 @@ class Operation:
 
 
 def validate_request(document):
-    exact(document, {'version', 'action', 'calcjob_uuid', 'launch', 'controls'})
-    need(type(document['version']) is int and document['version'] == 1)
+    need(type(document) is dict and type(document.get('version')) is int and document['version'] in (1,2))
+    version = document['version']
+    keys = {'version', 'action', 'calcjob_uuid', 'launch', 'controls'}
+    exact(document, keys | ({'technical_control'} if version == 2 else set()))
     need(document['action'] in {'submit', 'reconcile', 'start', 'close', 'status'})
+    if version == 2:
+        need(document['action'] == 'close')
+        _close_controls(document['controls'])
+        _technical_control(document['technical_control'])
     canonical_uuid(document['calcjob_uuid'])
     launch = exact(document['launch'], {'request_id', 'run_uuid', 'execution_id', 'transport_attempt',
                     'code_uuid', 'release_id', 'native_execution_uuid', 'input_plan_uuid',
@@ -191,9 +199,13 @@ def validate_request(document):
     return document
 
 
-def reply(document, state, *, job=None, reason=None, receipt=None, controls=None):
-    return dict(version=1, state=state, calcjob_uuid=document.get('calcjob_uuid'), receipt_ref=receipt,
-                job=job, controls=controls, reason=reason)
+def reply(document, state, *, job=None, reason=None, receipt=None, controls=None, technical_control=None):
+    version = 2 if type(document.get('version')) is int and document['version'] == 2 and document.get('action') == 'close' else 1
+    result = dict(version=version, state=state, calcjob_uuid=document.get('calcjob_uuid'), receipt_ref=receipt,
+                  job=job, controls=controls, reason=reason)
+    if version == 2:
+        result['technical_control'] = technical_control
+    return result
 
 
 def validate_job(job):
@@ -214,9 +226,17 @@ def validate_job(job):
 
 
 def validate_reply(document):
-    exact(document, {'version', 'state', 'calcjob_uuid', 'receipt_ref', 'job', 'controls', 'reason'})
-    need(type(document['version']) is int and document['version'] == 1 and
-         document['state'] in {'bound', 'started', 'closed', 'hold', 'rejected'}, 'reply_shape')
+    need(type(document) is dict and type(document.get('version')) is int and document['version'] in (1,2), 'reply_shape')
+    version = document['version']
+    keys = {'version', 'state', 'calcjob_uuid', 'receipt_ref', 'job', 'controls', 'reason'}
+    exact(document, keys | ({'technical_control'} if version == 2 else set()))
+    need(document['state'] in ({'closed','hold','rejected'} if version == 2 else
+                              {'bound','started','closed','hold','rejected'}), 'reply_shape')
+    if version == 2:
+        if document['state'] == 'closed':
+            _technical_control(document['technical_control'])
+        else:
+            need(document['technical_control'] is None, 'reply_shape')
     if document['calcjob_uuid'] is not None:
         canonical_uuid(document['calcjob_uuid'])
     if document['receipt_ref'] is not None:
@@ -249,6 +269,19 @@ def _close_controls(controls):
              matches(row['sha256'], SHA), 'q1_controls_unavailable')
         result.append(dict(row))
     return result
+
+
+def _technical_control(value):
+    need(type(value) is dict, 'q1_technical_unavailable')
+    if value.get('status') == 'present':
+        exact(value, {'status','path','bytes','sha256'})
+        need(matches(value['bytes'], r'0|[1-9][0-9]{0,19}') and int(value['bytes']) <= TECHNICAL_LIMIT and
+             matches(value['sha256'], SHA), 'q1_technical_unavailable')
+    else:
+        exact(value, {'status','path','reason'})
+        need(value['status'] == 'absent' and value['reason'] == 'not_published', 'q1_technical_unavailable')
+    need(value['path'] == TECHNICAL_FILE, 'q1_technical_unavailable')
+    return dict(value)
 
 
 def signature(info):
@@ -598,11 +631,16 @@ class OrdinaryAttemptOwner:
         previous = _read_close_record(self.store,calcjob,budget)
         retained = _read_close_payload(self.store,calcjob,'close-observation.json',budget)
         need((previous is None)==(retained is None), 'q1_close_publication_unknown')
+        need(previous is None or previous[0]['version']==document['version'], 'q1_close_conflict')
         need(observed['identity']['identity']['machine_id']==job['worker_machine_id'] and
              observed['identity']['identity']['boot_id']==job['worker_boot_id'], 'worker_generation_changed')
         before = self.sources.close_writers(job,launch,observed,budget)
-        readback = _read_submitted_files_as_owner(self.policy,launch,budget,controls=controls)
+        technical = document.get('technical_control')
+        options = {} if document['version'] == 1 else {'technical_control':technical}
+        readback = _read_submitted_files_as_owner(self.policy,launch,budget,controls=controls,**options)
         need(readback['controls']==controls, 'q1_control_changed')
+        if document['version'] == 2:
+            need(readback['technical_control']==technical, 'q1_technical_changed')
         need(self.sources.qualify()==context, 'controller_generation_changed')
         _authenticate_server(self.sources)
         caller = self.sources._refresh_caller('close')
@@ -620,7 +658,8 @@ class OrdinaryAttemptOwner:
              'writer_domain_not_closed')
         need([(r['node'],r['reply']['identity']['identity']) for r in before['workers']]==
              [(r['node'],r['reply']['identity']['identity']) for r in after['workers']], 'worker_generation_changed')
-        candidate = validate_reply(reply(document,'closed',job=job,controls=controls,receipt=calcjob+'/close.json'))
+        candidate = validate_reply(reply(document,'closed',job=job,controls=controls,technical_control=technical,
+                                         receipt=calcjob+'/close.json'))
         _reserve_private_record(candidate,budget)
         raw = encoded(candidate); digest = hashlib.sha256(raw).hexdigest()
         if previous is not None:
@@ -864,11 +903,12 @@ def _original_input_limit(role, policy):
     return 1048576 if role == 'plan' else policy['limits']['script_bytes'] if role == 'submit_script' else 65536
 
 
-def _owner_read(policy, launch, budget, *, controls=None):
+def _owner_read(policy, launch, budget, *, controls=None, technical_control=None):
     """Runs ONLY after dropping credentials in production; no root NFS access."""
     need(os.getuid() == os.geteuid() == policy['client_uid'], 'owner_read_credentials')
     if controls is not None:
-        return _owner_close_read(policy,launch,budget,controls)
+        return _owner_close_read(policy,launch,budget,controls,technical_control=technical_control)
+    need(technical_control is None, 'q1_technical_unavailable')
     work = path_value(launch['remote_workdir'], absolute=True)
     need(within(work, policy['jobs_root']) and work != policy['jobs_root'], 'upload_namespace')
     # Walk every component using directory FDs. Symlinks, including parent aliases, fail.
@@ -906,9 +946,10 @@ def _owner_read(policy, launch, budget, *, controls=None):
             os.close(directory)
 
 
-def _owner_close_read(policy, launch, budget, controls):
+def _owner_close_read(policy, launch, budget, controls, *, technical_control=None):
     need(os.getuid()==os.geteuid()==policy['client_uid'], 'owner_read_credentials')
     controls = _close_controls(controls); rows = []; roots = []; actual = []
+    technical = None if technical_control is None else _technical_control(technical_control)
     initial_bytes, initial_files = budget.actual_bytes, budget.files
     result = path_value(policy['jobs_root']+'/'+launch['relative_execution_root'],absolute=True)
     work = path_value(launch['remote_workdir'],absolute=True)
@@ -935,6 +976,26 @@ def _owner_close_read(policy, launch, budget, controls):
                     rows.append(dict(path=claim['path'],root=role,signature=signature(info)))
                     del raw
                 finally:os.close(fd)
+            if role == 'workdir' and technical is not None:
+                try:
+                    budget.file()
+                    fd = os.open(TECHNICAL_FILE,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC,dir_fd=parent)
+                except FileNotFoundError:
+                    observed = dict(status='absent',path=TECHNICAL_FILE,reason='not_published')
+                else:
+                    try:
+                        need(technical['status']=='present', 'q1_technical_changed')
+                        raw,info = read_fd(fd,int(technical['bytes']),budget)
+                        need(info.st_uid==policy['client_uid'] and not info.st_mode&0o022 and
+                             signature(info)==signature(os.stat(TECHNICAL_FILE,dir_fd=parent,follow_symlinks=False)),
+                             'q1_file_identity')
+                        observed = dict(status='present',path=TECHNICAL_FILE,bytes=str(len(raw)),
+                                        sha256=hashlib.sha256(raw).hexdigest())
+                        rows.append(dict(path=TECHNICAL_FILE,root=role,signature=signature(info)))
+                        del raw
+                    finally:
+                        os.close(fd)
+                need(observed==technical, 'q1_technical_changed')
             need(signature(directory)==signature(os.fstat(parent)), 'q1_directory_changed')
             for ancestor,name,info in walked:
                 need(signature(info)==signature(os.stat(name,dir_fd=ancestor,follow_symlinks=False)), 'q1_directory_changed')
@@ -943,22 +1004,30 @@ def _owner_close_read(policy, launch, budget, controls):
         finally:
             os.close(parent)
             for ancestor,_,_ in walked:os.close(ancestor)
-    return dict(controls=actual,roots=roots,files=rows,
-                io=dict(actual_bytes=budget.actual_bytes-initial_bytes,file_operations=budget.files-initial_files))
+    result = dict(controls=actual,roots=roots,files=rows,
+                  io=dict(actual_bytes=budget.actual_bytes-initial_bytes,file_operations=budget.files-initial_files))
+    if technical is not None:
+        result['technical_control'] = technical
+    return result
 
 
-def _read_submitted_files_as_owner(policy, launch, budget, *, controls=None):
+def _read_submitted_files_as_owner(policy, launch, budget, *, controls=None, technical_control=None):
     import selectors
     need(os.geteuid() == 0, 'root_required')
     # Reserve the complete bounded child envelope before forking. Charges never reset.
     cap = min(policy['limits']['response_bytes'], 131072 if controls is None else 65536)
+    technical = None if technical_control is None else _technical_control(technical_control)
+    need(technical is None or controls is not None, 'q1_technical_unavailable')
+    technical_bytes = int(technical['bytes']) if technical is not None and technical['status']=='present' else 0
     if controls is not None:
         controls = _close_controls(controls)
         paths = (path_value(policy['jobs_root']+'/'+launch['relative_execution_root'],absolute=True),
                  path_value(launch['remote_workdir'],absolute=True))
         depth = sum(len(Path(path).parts)-1 for path in paths)
         budget.reserve(8*(sum(row['bytes'] for row in controls)+4)+16*65536+4096*(depth+4)+8*len(encoded(controls)))
-        for _ in range(8*depth+64):budget.file()
+        if technical is not None:
+            budget.reserve(8*(technical_bytes+1)+8*len(encoded(technical))+65536)
+        for _ in range(8*depth+64+(8 if technical is not None else 0)):budget.file()
     else:
         budget.reserve(cap * 3); budget.file()
     read_end, write_end = os.pipe2(os.O_CLOEXEC)
@@ -967,7 +1036,8 @@ def _read_submitted_files_as_owner(policy, launch, budget, *, controls=None):
         initial_actual = budget.actual_bytes
         try:
             os.close(read_end); os.setgroups([]); os.setgid(policy['client_uid']); os.setuid(policy['client_uid'])
-            raw = encoded(_owner_read(policy, launch, budget,controls=controls)) if controls is not None else encoded(_owner_read(policy, launch, budget))
+            options = {} if technical is None else {'technical_control':technical}
+            raw = encoded(_owner_read(policy, launch, budget,controls=controls,**options)) if controls is not None else encoded(_owner_read(policy, launch, budget))
             need(len(raw) <= cap, 'owner_read_bound')
             offset = 0
             while offset < len(raw):
@@ -1002,7 +1072,8 @@ def _read_submitted_files_as_owner(policy, launch, budget, *, controls=None):
                     failure = strict_json(raw.decode()) if raw else dict(failure='unknown child outcome')
                     if 'actual_bytes' in failure:
                         count=failure['actual_bytes']
-                        need(type(count) is int and 0<=count<=sum(row['bytes'] for row in controls)+4, 'owner_read_bound')
+                        need(type(count) is int and 0<=count<=sum(row['bytes'] for row in controls)+technical_bytes+
+                             4+(1 if technical is not None else 0), 'owner_read_bound')
                         budget.actual_bytes+=count
                     primary = engine.CommandFailure(failure);_preclaim_diagnostic(primary)
                     raise Hold('owner_read_failed') from primary
@@ -1011,7 +1082,7 @@ def _read_submitted_files_as_owner(policy, launch, budget, *, controls=None):
         result = strict_json(raw.decode())
         if controls is not None:
             count = result['io']['actual_bytes']
-            need(type(count) is int and 0<=count<=sum(row['bytes'] for row in controls), 'owner_read_bound')
+            need(type(count) is int and 0<=count<=sum(row['bytes'] for row in controls)+technical_bytes, 'owner_read_bound')
             budget.actual_bytes += count
         return result
     finally:
@@ -1743,12 +1814,18 @@ def _authenticate_server(sources):
 
 
 def handle_connection(connection):
-    budget = _bootstrap_operation(); document = {}; result = None
+    budget = _bootstrap_operation(); document = {}; result = None; validated = False; request_invalid = False
     try:
         policy = _load_policy('controller', budget); sources = NativeSources(policy, budget)
         sources.qualify(); _authenticate_server(sources)
         document = read_frame(connection, budget, policy['limits']['request_bytes'])
-        action = validate_request(document)['action']
+        try:
+            action = validate_request(document)['action']
+        except (Hold, TypeError, ValueError, KeyError) as error:
+            request_invalid = type(document) is dict and not (
+                type(document.get('version')) is int and document['version'] == 1)
+            raise Hold('shape') from error
+        validated = True
         sources._caller = authenticate_socket_peer(connection,policy,sources,action=action)
         owner = OrdinaryAttemptOwner(policy, AttemptStore(policy['private_root']), sources, budget)
         result = {'submit': owner.submit, 'reconcile': owner.reconcile, 'start': owner.observe_start,
@@ -1756,7 +1833,10 @@ def handle_connection(connection):
     except (Hold, OSError, ValueError, ResourceError, KeyError, engine.CommandFailure) as error:
         reason = error.reason if isinstance(error, Hold) else getattr(error, 'code', 'native_observation_failed')
         if isinstance(error,engine.CommandFailure): _preclaim_diagnostic(error)
-        result = reply({}, 'hold', reason=reason)
+        # Keep the v1 pre-owner Reply7 byte semantics; only validated v2 carries
+        # the close request context into a noncompleted Reply8.
+        context = document if validated and document['version'] == 2 else {}
+        result = reply(context, 'rejected' if request_invalid else 'hold', reason=reason)
     write_frame(connection, result, budget, budget.limits['response_bytes'])
 
 
@@ -1767,12 +1847,15 @@ def server_main():
     return 0
 
 
-def _client_operation():
+def _client_operation(context=None):
     need(len(sys.argv) == 2 and sys.argv[1] in {'submit', 'reconcile', 'start', 'close', 'status'}, 'client_arguments')
     budget = _bootstrap_operation()
     raw = sys.stdin.buffer.read(65537); need(0 < len(raw) <= 65536, 'frame_bound')
     document = validate_request(strict_json(raw.decode('utf-8')))
     need(document['action'] == sys.argv[1], 'client_action')
+    # Local failure retains only validated v2 identity, never server observations.
+    if context is not None and document['version'] == 2:
+        context.update(version=2, action='close', calcjob_uuid=document['calcjob_uuid'])
     with protected_directory(Path(SOCKET).parent, budget=budget) as parent:
         first = os.stat(Path(SOCKET).name, dir_fd=parent, follow_symlinks=False)
         need(stat.S_ISSOCK(first.st_mode) and first.st_uid == 0 and first.st_gid == 3000 and
@@ -1785,17 +1868,19 @@ def _client_operation():
             write_frame(connection, document, budget, 65536); connection.shutdown(socket.SHUT_WR)
             result = read_frame(connection, budget, 262144)
     validate_reply(result)
+    need(result['version']==document['version'], 'reply_version')
     need(result['calcjob_uuid'] in (None, document['calcjob_uuid']), 'reply_binding')
     print(encoded(result).decode())
     return 0 if result['state'] in {'bound', 'started', 'closed'} else 75
 
 
 def client_main():
+    context = {}
     try:
-        return _client_operation()
+        return _client_operation(context)
     except (Hold, OSError, ValueError, ResourceError, KeyError) as error:
         reason = error.reason if isinstance(error, Hold) else getattr(error, 'code', 'transport_outcome_unknown')
-        print(encoded(reply({}, 'hold', reason=reason)).decode())
+        print(encoded(reply(context, 'hold', reason=reason)).decode())
         return 75
 
 

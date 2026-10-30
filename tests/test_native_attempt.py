@@ -1157,7 +1157,8 @@ def test_attempt_facts_uses_existing_flat_guest_config_not_a_new_nested_policy(m
 
 def test_client_unknown_transport_returns_typed_hold_and_no_retry(monkeypatch, capsys):
     m = module(); calls = []
-    def disconnected():
+    def disconnected(context):
+        assert context=={}
         calls.append('one'); raise OSError('lost response')
     monkeypatch.setattr(m, '_client_operation', disconnected, raising=False)
     assert m.client_main() == 75
@@ -1397,11 +1398,12 @@ def q1_joined(tmp_path,monkeypatch):
         before={'original_live_before':'RPC fixture'},after={'whole_stop':'RPC fixture'},writer_snapshot=inventory)
     import host_resource_facts as facts
     monkeypatch.setattr(facts,'trusted_rpc',lambda *args,**kw:copy.deepcopy(packet))
-    fake_reader=m._read_submitted_files_as_owner;opened=m.os.open;uid=os.getuid();euid=os.geteuid()
+    fake_reader=m._read_submitted_files_as_owner;uid=os.getuid();euid=os.geteuid()
     # This tests the production fork/FD code using only our synthetic child and
     # own temp files. Real UID3000/NFS qualification remains Root's native gate.
-    def owner_reader(p,launch,budget,*,controls=None):
+    def owner_reader(p,launch,budget,*,controls=None,technical_control=None):
         if controls is None:return fake_reader(p,launch,budget)
+        opened=m.os.open
         child={'dropped':False}
         with monkeypatch.context() as patch:
             patch.setattr(m.os,'geteuid',lambda:uid if child['dropped'] else 0)
@@ -1414,11 +1416,369 @@ def q1_joined(tmp_path,monkeypatch):
                     return opened(namespace,*args,**kw)
                 return opened(path,*args,**kw)
             patch.setattr(m.os,'open',open_path)
-            return real_reader({**p,'client_uid':uid},launch,budget,controls=controls)
+            options={} if technical_control is None else {'technical_control':technical_control}
+            return real_reader({**p,'client_uid':uid},launch,budget,controls=controls,**options)
     monkeypatch.setattr(m,'_read_submitted_files_as_owner',owner_reader)
     state.update(store=store,controls=controls,result=result,work=work,packet=packet,job=job,journal=journal,unit=unit)
     state['owner']=m.OrdinaryAttemptOwner(policy,store,source,source.budget)
     return state
+
+
+def q1t_document(state, raw=b'{"original":"technical index bytes"}\n'):
+    document={**state['document'],'version':2,'action':'close','controls':copy.deepcopy(state['controls'])}
+    if raw is None:
+        document['technical_control']={'status':'absent','path':'performance-source.json','reason':'not_published'}
+    else:
+        path=state['work']/'performance-source.json';path.write_bytes(raw);path.chmod(0o640)
+        document['technical_control']={'status':'present','path':'performance-source.json',
+            'bytes':str(len(raw)),'sha256':hashlib.sha256(raw).hexdigest()}
+    return document
+
+
+@pytest.mark.parametrize('raw',[None,b'',b'{"original":"technical index bytes"}\n'])
+def test_q1t_v2_closes_only_observed_present_whole_bytes_or_actual_absence(q1_joined,raw):
+    s=q1_joined;m=s['m'];document=q1t_document(s,raw)
+    closed=s['owner'].qualify_close(document)
+    assert closed['state']=='closed' and closed['version']==2
+    assert set(closed)=={'version','state','calcjob_uuid','receipt_ref','job','controls','technical_control','reason'}
+    assert closed['technical_control']==document['technical_control'] and closed['controls']==s['controls']
+    assert m.validate_reply(closed)==closed
+    directory=s['store'].path(document['calcjob_uuid']);receipt=(directory/'close.json').read_bytes()
+    witness=json.loads((directory/'close-observation.json').read_bytes())
+    assert witness['control_read']['technical_control']==document['technical_control']
+    assert witness['control_read']['io']['actual_bytes']==sum(c['bytes'] for c in s['controls'])+(0 if raw is None else len(raw))
+    assert witness['reply_sha256']==hashlib.sha256(receipt).hexdigest()
+    assert [r['root'] for r in witness['control_read']['files'] if r['path']=='performance-source.json']==([] if raw is None else ['workdir'])
+
+
+@pytest.mark.parametrize('mutate',[
+    lambda r:r.update(version=3),
+    lambda r:r.update(version=True),
+    lambda r:r.update(action='status',controls=None),
+    lambda r:r['technical_control'].update(path='../performance-source.json'),
+    lambda r:r['technical_control'].update(bytes=1),
+    lambda r:r['technical_control'].update(bytes='01'),
+    lambda r:r['technical_control'].update(bytes='1048577'),
+    lambda r:r['technical_control'].update(bytes='18446744073709551616'),
+    lambda r:r['technical_control'].update(verified=True),
+    lambda r:r.update(technical_control={'status':'absent','path':'performance-source.json','reason':'zero'}),
+    lambda r:r.update(technical_control=None),
+    lambda r:r['controls'].reverse(),
+])
+def test_q1t_bad_wire_is_rejected_before_preflight_lock_or_durable_effects(tmp_path,monkeypatch,mutate):
+    m=module();first,_=owner(tmp_path)
+    document=request('close');document.update(version=2,
+        controls=[dict(path=name,bytes=0,sha256='0'*64) for name in
+            ('series_result.json','native-selection.json','_scheduler-stdout.txt','_scheduler-stderr.txt')],
+        technical_control=dict(status='present',path='performance-source.json',bytes='1',sha256='0'*64))
+    mutate(document)
+    monkeypatch.setattr(first.sources,'preflight',lambda *a,**kw:pytest.fail('invalid wire reached preflight'))
+    result=first.qualify_close(document)
+    assert result['state']=='rejected' and not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize('valid',[True,False])
+def test_q1t_socket_failure_preserves_v2_shape_only_after_valid_request(monkeypatch,valid):
+    m=module();document=request('close');document.update(version=2,
+        controls=[dict(path=name,bytes=0,sha256='0'*64) for name in
+            ('series_result.json','native-selection.json','_scheduler-stdout.txt','_scheduler-stderr.txt')],
+        technical_control=dict(status='absent',path='performance-source.json',reason='not_published'))
+    if not valid:document['version']=3
+    sources=type('SocketSources',(),{'qualify':lambda self:None})()
+    monkeypatch.setattr(m,'_load_policy',lambda *a:{'limits':limits()})
+    monkeypatch.setattr(m,'NativeSources',lambda *a:sources)
+    monkeypatch.setattr(m,'_authenticate_server',lambda *a:None)
+    monkeypatch.setattr(m,'read_frame',lambda *a:document)
+    def peer(*args,**kwargs):raise m.Hold('peer_origin')
+    monkeypatch.setattr(m,'authenticate_socket_peer',peer)
+    captured=[];monkeypatch.setattr(m,'write_frame',lambda connection,result,*a:captured.append(result))
+    m.handle_connection(object());result=captured[0]
+    assert result['version']==(2 if valid else 1)
+    assert result['state']==('hold' if valid else 'rejected')
+    if valid:assert result['technical_control'] is None and result['controls'] is None
+
+
+@pytest.mark.parametrize('version,state',[(True,'rejected'),(1.0,'rejected'),(False,'rejected'),
+    (2.0,'rejected'),(3,'rejected'),('1','rejected'),(1,'hold')])
+def test_q1t_server_classifies_only_integer_v1_as_legacy_before_authentication(monkeypatch,version,state):
+    m=module();document=request('close');document['version']=version
+    sources=type('SocketSources',(),{'qualify':lambda self:None})()
+    monkeypatch.setattr(m,'_load_policy',lambda *a:{'limits':limits()})
+    monkeypatch.setattr(m,'NativeSources',lambda *a:sources)
+    monkeypatch.setattr(m,'_authenticate_server',lambda *a:None)
+    monkeypatch.setattr(m,'read_frame',lambda *a:document)
+    monkeypatch.setattr(m,'authenticate_socket_peer',lambda *a,**kw:pytest.fail('invalid request reached authentication'))
+    monkeypatch.setattr(m,'AttemptStore',lambda *a:pytest.fail('invalid request reached durable store'))
+    captured=[];monkeypatch.setattr(m,'write_frame',lambda connection,result,*a:captured.append(result))
+    m.handle_connection(object());result=captured[0]
+    assert result=={'version':1,'state':state,'calcjob_uuid':None,'receipt_ref':None,
+        'job':None,'controls':None,'reason':'shape'}
+
+
+@pytest.mark.parametrize('version',[1,2])
+@pytest.mark.parametrize('fault',['namespace','connect','response_frame'])
+def test_q1t_client_main_transport_errors_preserve_only_validated_v2_context(monkeypatch,capsys,version,fault):
+    import io
+    from contextlib import contextmanager
+    m=module();document=request('close')
+    document['controls']=[dict(path=name,bytes=0,sha256='0'*64) for name in
+        ('series_result.json','native-selection.json','_scheduler-stdout.txt','_scheduler-stderr.txt')]
+    if version==2:
+        document.update(version=2,technical_control=dict(status='absent',path='performance-source.json',reason='not_published'))
+    raw=m.encoded(document);stdin=io.BytesIO(raw);calls=[]
+    monkeypatch.setattr(m.sys,'argv',['client','close'])
+    monkeypatch.setattr(m.sys,'stdin',type('Input',(),{'buffer':stdin})())
+    @contextmanager
+    def directory(*args,**kw):
+        if fault=='namespace':calls.append('namespace');raise OSError('primary synthetic namespace failure')
+        yield 999
+    class Connection:
+        def __enter__(self):return self
+        def __exit__(self,*args):pass
+        def settimeout(self,value):pass
+        def connect(self,path):
+            calls.append('connect')
+            if fault=='connect':raise OSError('primary synthetic connect failure')
+        def shutdown(self,how):pass
+        def getsockopt(self,*args):return struct.pack('3i',1,0,0)
+    info=os.stat_result((m.stat.S_IFSOCK|0o660,1,1,1,0,3000,0,1,1,1))
+    monkeypatch.setattr(m,'protected_directory',directory)
+    monkeypatch.setattr(m.os,'stat',lambda *a,**kw:info)
+    monkeypatch.setattr(m.socket,'socket',lambda *a:Connection())
+    monkeypatch.setattr(m,'write_frame',lambda *a:None)
+    def failed_frame(*args):calls.append('response_frame');raise m.Hold('frame_bound')
+    monkeypatch.setattr(m,'read_frame',failed_frame)
+    assert m.client_main()==75
+    output=capsys.readouterr().out;result=json.loads(output)
+    expected={'version':version,'state':'hold','calcjob_uuid':document['calcjob_uuid'] if version==2 else None,
+        'receipt_ref':None,'job':None,'controls':None,
+        'reason':'frame_bound' if fault=='response_frame' else 'transport_outcome_unknown'}
+    if version==2:expected['technical_control']=None
+    assert result==expected and output.encode()==m.encoded(expected)+b'\n'
+    assert stdin.tell()==len(raw) and calls==({'namespace':['namespace'],'connect':['connect'],
+        'response_frame':['connect','response_frame']}[fault])
+
+
+@pytest.mark.parametrize('raw',[b'{',b'\xff',b'{"version":2,"version":2}',
+    b'{"version":true}',b'{"version":1.0}',b'{"version":2.0}',b'{"version":3}'])
+def test_q1t_client_main_early_invalid_parse_never_gains_v2_context_or_transport(monkeypatch,capsys,raw):
+    import io
+    m=module();monkeypatch.setattr(m.sys,'argv',['client','close'])
+    monkeypatch.setattr(m.sys,'stdin',type('Input',(),{'buffer':io.BytesIO(raw)})())
+    monkeypatch.setattr(m,'protected_directory',lambda *a,**kw:pytest.fail('invalid input reached transport'))
+    assert m.client_main()==75
+    result=json.loads(capsys.readouterr().out)
+    assert set(result)=={'version','state','calcjob_uuid','receipt_ref','job','controls','reason'}
+    assert result['version']==1 and result['state']=='hold' and result['calcjob_uuid'] is None and result['controls'] is None
+
+
+@pytest.mark.parametrize('fault',['hash','missing','unexpected_present','symlink','hardlink','writable','oversize','owner','ancestor'])
+def test_q1t_technical_foreign_or_changed_file_never_publishes_receipt(q1_joined,monkeypatch,fault):
+    s=q1_joined;m=s['m'];document=q1t_document(s);path=s['work']/'performance-source.json'
+    if fault=='hash':document['technical_control']['sha256']='0'*64
+    if fault=='missing':path.unlink()
+    if fault=='unexpected_present':document['technical_control']={'status':'absent','path':'performance-source.json','reason':'not_published'}
+    if fault=='symlink':path.rename(path.with_name('original'));path.symlink_to('original')
+    if fault=='hardlink':os.link(path,path.with_name('alias'))
+    if fault=='writable':path.chmod(0o666)
+    if fault=='oversize':path.write_bytes(b'x'*1048577)
+    inode=path.stat().st_ino if fault in ('owner','ancestor') else None;fstat=m.os.fstat;read=m.read_fd
+    if fault=='owner':
+        def info(fd):
+            result=fstat(fd)
+            if result.st_ino==inode:
+                values=list(result);values[4]=os.getuid()+1;return os.stat_result(values)
+            return result
+        monkeypatch.setattr(m.os,'fstat',info)
+    if fault=='ancestor':
+        def reading(fd,limit,budget):
+            result=read(fd,limit,budget)
+            if fstat(fd).st_ino==inode:
+                s['work'].rename(s['work'].with_name('retained'));s['work'].mkdir()
+            return result
+        monkeypatch.setattr(m,'read_fd',reading)
+    result=s['owner'].qualify_close(document)
+    assert result['version']==2 and result['state']=='hold' and result['technical_control'] is None
+    assert result['controls'] is None and not (s['store'].path(document['calcjob_uuid'])/'close.json').exists()
+
+
+@pytest.mark.parametrize('fault',['replace','tamper','absent_published','late_writer'])
+def test_q1t_late_file_or_writer_change_cannot_certify_technical_context(q1_joined,monkeypatch,fault):
+    s=q1_joined;m=s['m'];document=q1t_document(s,None if fault=='absent_published' else b'original')
+    path=s['work']/'performance-source.json';read=m.read_fd;opened=m.os.open
+    if fault=='absent_published':
+        def open_path(name,*args,**kw):
+            if name=='performance-source.json':
+                path.write_bytes(b'late');path.chmod(0o640)
+                raise FileNotFoundError('leaf was absent before late publish')
+            return opened(name,*args,**kw)
+        monkeypatch.setattr(m.os,'open',open_path)
+    elif fault in ('replace','tamper'):
+        inode=path.stat().st_ino
+        def reading(fd,limit,budget):
+            value=read(fd,limit,budget)
+            if os.fstat(fd).st_ino==inode:
+                if fault=='replace':path.unlink()
+                path.write_bytes(value[0] if fault=='replace' else b'tampered');path.chmod(0o640)
+            return value
+        monkeypatch.setattr(m,'read_fd',reading)
+    else:
+        reader=m._read_submitted_files_as_owner
+        def reading_owner(*args,**kwargs):
+            value=reader(*args,**kwargs)
+            if kwargs.get('technical_control') is not None:
+                s['packet']['writer_snapshot']['jobs']['99']=dict(owner_uid=3000,submit_time='foreign',terminal=False)
+            return value
+        monkeypatch.setattr(m,'_read_submitted_files_as_owner',reading_owner)
+    result=s['owner'].qualify_close(document)
+    assert result['state']=='hold' and result['technical_control'] is None
+    assert not (s['store'].path(document['calcjob_uuid'])/'close.json').exists()
+
+
+@pytest.mark.parametrize('first_version,second_version,changed',[(2,2,False),(2,2,True),(1,2,False),(2,1,False)])
+def test_q1t_retry_preserves_exact_receipts_and_never_relabels_v1(q1_joined,first_version,second_version,changed):
+    s=q1_joined;m=s['m'];document=q1t_document(s)
+    if first_version==1:document.pop('technical_control');document['version']=1
+    closed=s['owner'].qualify_close(document);assert closed['state']=='closed'
+    directory=s['store'].path(document['calcjob_uuid'])
+    before={name:(directory/name).read_bytes() for name in ('close.json','close-observation.json')}
+    document=q1t_document(s,b'changed' if changed else b'{"original":"technical index bytes"}\n')
+    if second_version==1:document.pop('technical_control');document['version']=1
+    source=copy.copy(s['sources']);source.budget=m.Operation(source.policy['limits']);source.budget.read=s['sources'].budget.read
+    result=m.OrdinaryAttemptOwner(source.policy,s['store'],source,source.budget).qualify_close(document)
+    if first_version==second_version and not changed:assert result==closed
+    else:assert result['state']=='hold' and result['reason']=='q1_close_conflict'
+    assert {name:(directory/name).read_bytes() for name in before}==before
+
+
+def test_q1t_cleanup_uncertainty_retains_primary_failure_and_no_close(q1_joined,monkeypatch):
+    s=q1_joined;m=s['m'];document=q1t_document(s)
+    primary=dict(failure='timeout',stdout='original W1 prefix',cleanup_confirmed=False)
+    def failed(*args):raise m.engine.CommandFailure(primary)
+    monkeypatch.setattr(s['sources'],'close_writers',failed)
+    result=s['owner'].qualify_close(document)
+    assert result['state']=='hold' and result['technical_control'] is None
+    directory=s['store'].path(document['calcjob_uuid']);failures=list(directory.glob('observation-failure-*.json'))
+    import base64
+    assert len(failures)==1 and json.loads(base64.b64decode(json.loads(failures[0].read_bytes())['original_prefix_base64']))==primary
+    assert not (directory/'close.json').exists() and not (directory/'close-observation.json').exists()
+
+
+def test_q1t_partial_publication_is_not_repaired_or_overwritten(q1_joined,monkeypatch):
+    s=q1_joined;m=s['m'];document=q1t_document(s);put=s['store'].put
+    def failed(calcjob,name,value,budget):
+        put(calcjob,name,value,budget)
+        if name=='close-observation.json':raise OSError('original v2 publication uncertainty')
+    monkeypatch.setattr(s['store'],'put',failed)
+    result=s['owner'].qualify_close(document)
+    assert result['state']=='hold' and result['technical_control'] is None
+    directory=s['store'].path(document['calcjob_uuid']);original=(directory/'close-observation.json').read_bytes()
+    monkeypatch.setattr(s['store'],'put',put)
+    monkeypatch.setattr(m.os,'fork',lambda:pytest.fail('partial publication must not reread'))
+    result=s['owner'].qualify_close(document)
+    assert result['state']=='hold' and result['reason']=='q1_close_publication_unknown'
+    assert (directory/'close-observation.json').read_bytes()==original and not (directory/'close.json').exists()
+
+
+@pytest.mark.parametrize('reply_version',[1,2])
+def test_q1t_fixed_client_requires_exact_v2_reply_without_v1_fallback(q1_joined,monkeypatch,capsys,reply_version):
+    import io
+    from contextlib import contextmanager
+    s=q1_joined;m=s['m'];document=q1t_document(s)
+    result=s['owner'].qualify_close(document);assert result['state']=='closed'
+    if reply_version==1:result.pop('technical_control');result['version']=1
+    @contextmanager
+    def directory(*args,**kwargs):yield 999
+    class Connection:
+        def __enter__(self):return self
+        def __exit__(self,*args):pass
+        def settimeout(self,value):pass
+        def connect(self,path):assert path=='/run/qcl-negf/native-attempt.sock'
+        def shutdown(self,how):pass
+        def getsockopt(self,*args):return struct.pack('3i',1,0,0)
+    info=os.stat_result((m.stat.S_IFSOCK|0o660,1,1,1,0,3000,0,1,1,1))
+    monkeypatch.setattr(m,'protected_directory',directory)
+    monkeypatch.setattr(m.os,'stat',lambda *args,**kw:info)
+    monkeypatch.setattr(m.socket,'socket',lambda *args:Connection())
+    monkeypatch.setattr(m.sys,'argv',['client','close'])
+    monkeypatch.setattr(m.sys,'stdin',type('Input',(),{'buffer':io.BytesIO(m.encoded(document))})())
+    monkeypatch.setattr(m,'write_frame',lambda connection,value,*args:None)
+    monkeypatch.setattr(m,'read_frame',lambda *args:result)
+    if reply_version==1:
+        with pytest.raises(m.Hold,match='reply_version'):m._client_operation()
+        assert capsys.readouterr().out==''
+    else:
+        assert m._client_operation()==0
+        assert capsys.readouterr().out.encode()==m.encoded(result)+b'\n'
+
+
+@pytest.mark.parametrize('delta',[-1,0])
+def test_q1t_technical_cap_keeps_original_full_byte_hash_with_sufficient_existing_credit(q1_joined,delta):
+    s=q1_joined;m=s['m'];raw=b'x'*(1048576+delta);document=q1t_document(s,raw)
+    source=s['sources'];source.policy['limits']['metadata_bytes']=32*1024*1024
+    budget=m.Operation(source.policy['limits']);budget.read=source.budget.read;source.budget=budget
+    result=m.OrdinaryAttemptOwner(source.policy,s['store'],source,budget).qualify_close(document)
+    assert result['state']=='closed' and result['technical_control']==document['technical_control']
+
+
+def test_q1t_technical_budget_is_charged_before_any_child_or_payload_open(monkeypatch):
+    m=module();budget=m.Operation({**limits(),'maximum_files':2048})
+    policy=dict(limits=budget.limits,jobs_root='/srv/qcl-negf/jobs')
+    controls=[dict(path=name,bytes=0,sha256='0'*64) for name in
+        ('series_result.json','native-selection.json','_scheduler-stdout.txt','_scheduler-stderr.txt')]
+    technical=dict(status='present',path='performance-source.json',bytes='1048576',sha256='0'*64)
+    monkeypatch.setattr(m.os,'geteuid',lambda:0)
+    def forbidden(*args):pytest.fail('aggregate refusal must precede pipe/fork/payload open')
+    monkeypatch.setattr(m.os,'pipe2',forbidden);monkeypatch.setattr(m.os,'fork',forbidden)
+    with pytest.raises(m.Hold,match='operation_bound'):
+        m._read_submitted_files_as_owner(policy,request()['launch'],budget,controls=controls,technical_control=technical)
+    assert budget.bytes>budget.limits['metadata_bytes']
+
+
+def test_q1t_additional_leaf_file_credit_is_charged_before_fork(monkeypatch):
+    m=module();budget=m.Operation({**limits(),'maximum_files':152})
+    policy=dict(limits=budget.limits,jobs_root='/srv/qcl-negf/jobs')
+    controls=[dict(path=name,bytes=0,sha256='0'*64) for name in
+        ('series_result.json','native-selection.json','_scheduler-stdout.txt','_scheduler-stderr.txt')]
+    technical=dict(status='absent',path='performance-source.json',reason='not_published')
+    monkeypatch.setattr(m.os,'geteuid',lambda:0)
+    def forbidden(*args):pytest.fail('technical file debit must precede pipe/fork')
+    monkeypatch.setattr(m.os,'pipe2',forbidden);monkeypatch.setattr(m.os,'fork',forbidden)
+    with pytest.raises(m.Hold,match='operation_file_bound'):
+        m._read_submitted_files_as_owner(policy,request()['launch'],budget,controls=controls,technical_control=technical)
+    assert budget.files>152
+
+
+def test_q1t_absence_retry_and_later_publication_preserve_original_absent_receipt(q1_joined):
+    s=q1_joined;m=s['m'];document=q1t_document(s,None)
+    first=s['owner'].qualify_close(document);assert first['state']=='closed'
+    directory=s['store'].path(document['calcjob_uuid']);original=(directory/'close.json').read_bytes()
+    for publish in (False,True):
+        source=copy.copy(s['sources']);source.budget=m.Operation(source.policy['limits']);source.budget.read=s['sources'].budget.read
+        if publish:q1t_document(s,b'late index')
+        result=m.OrdinaryAttemptOwner(source.policy,s['store'],source,source.budget).qualify_close(document)
+        if publish:assert result['state']=='hold' and result['technical_control'] is None
+        else:assert result==first
+        assert (directory/'close.json').read_bytes()==original
+
+
+@pytest.mark.parametrize('mutate',[
+    lambda r:r.update(version=True),
+    lambda r:r.update(version=1),
+    lambda r:r.update(state='bound'),
+    lambda r:r.update(technical_control=None),
+    lambda r:r['technical_control'].update(bytes=0),
+    lambda r:r['technical_control'].update(bytes='00'),
+    lambda r:r['technical_control'].update(path='/performance-source.json'),
+    lambda r:r['technical_control'].update(extra=True),
+    lambda r:r.update(technical_control={'status':'absent','path':'performance-source.json','reason':'not_published','bytes':'0'}),
+    lambda r:r['controls'].reverse(),
+])
+def test_q1t_reply_rejects_malformed_or_v1_relabelled_technical_authority(q1_joined,mutate):
+    s=q1_joined;m=s['m'];document=q1t_document(s,b'')
+    result=s['owner'].qualify_close(document);assert result['state']=='closed'
+    mutate(result)
+    with pytest.raises(m.Hold):m.validate_reply(result)
 
 
 def test_q1_actual_owner_w1_credential_fd_store_and_lost_close_ack(q1_joined):
