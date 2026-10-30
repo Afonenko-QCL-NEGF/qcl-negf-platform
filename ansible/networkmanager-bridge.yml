@@ -1,0 +1,79 @@
+---
+# SOURCE: stage a reviewed bundle only. Never reload/activate NM or install into
+# live NetworkManager directories. Actual installation needs its own checkpoint,
+# owned-file rollback, console recovery, the shared guard lock and native gates.
+- name: Stage explicit NetworkManager bridge bundle without changing the network
+  hosts: qcl_nm_bridge_hosts
+  become: true
+  gather_facts: false
+  vars:
+    qcl_nm_stage: false
+    qcl_nm_stage_directory: ""
+    qcl_nm_bridge_name: ""
+    qcl_nm_bridge_uuid: ""
+    qcl_nm_port_uuid: ""
+    qcl_nm_permanent_mac: ""
+  tasks:
+    - name: Require reviewed private profile identities and a fresh private stage
+      ansible.builtin.assert:
+        that:
+          - qcl_nm_stage | bool
+          - qcl_nm_stage_directory is match('^/var/lib/qcl-negf/nm-bridge-stage/[A-Za-z0-9][A-Za-z0-9_.-]*$')
+          - qcl_nm_bridge_name is match('^[A-Za-z0-9_.-]{1,15}$')
+          - qcl_nm_bridge_uuid is match('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+          - qcl_nm_port_uuid is match('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+          - qcl_nm_bridge_uuid != qcl_nm_port_uuid
+          - qcl_nm_permanent_mac is match('^([0-9a-f]{2}:){5}[0-9a-f]{2}$')
+    - name: Inspect trusted stage ancestors without following symlinks
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+      loop:
+        - /var
+        - /var/lib
+        - /var/lib/qcl-negf
+        - /var/lib/qcl-negf/nm-bridge-stage
+      register: qcl_nm_parent_stats
+    - name: Refuse unsafe or unrelated writable stage ancestors
+      ansible.builtin.assert:
+        that:
+          - not item.stat.exists or (item.stat.isdir and not item.stat.islnk and item.stat.uid == 0 and item.stat.mode in ['0700', '0750', '0755'])
+      loop: "{{ qcl_nm_parent_stats.results }}"
+    - name: Inspect destination without following symlinks
+      ansible.builtin.stat:
+        path: "{{ qcl_nm_stage_directory }}"
+        follow: false
+      register: qcl_nm_stage_stat
+    - name: Refuse replacement of an existing stage or unrelated directory
+      ansible.builtin.assert:
+        that: [not qcl_nm_stage_stat.stat.exists]
+    - name: Create private stage only
+      ansible.builtin.file:
+        path: "{{ qcl_nm_stage_directory }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      when: not ansible_check_mode
+    - name: Stage source and fixed entry point together
+      ansible.builtin.copy:
+        src: "../ops/{{ item }}"
+        dest: "{{ qcl_nm_stage_directory }}/{{ item }}"
+        owner: root
+        group: root
+        mode: "0600"
+      loop: [linux_bridge_nm.py, qcl-negf-nm-bridge-guard]
+      when: not ansible_check_mode
+    - name: Render profiles and scoped configuration in the private stage
+      ansible.builtin.template:
+        src: "templates/networkmanager/{{ item }}.j2"
+        dest: "{{ qcl_nm_stage_directory }}/{{ item }}"
+        owner: root
+        group: root
+        mode: "0600"
+      loop:
+        - bridge.nmconnection
+        - uplink.nmconnection
+        - bridge-device.conf
+        - dispatcher-guard
+      when: not ansible_check_mode

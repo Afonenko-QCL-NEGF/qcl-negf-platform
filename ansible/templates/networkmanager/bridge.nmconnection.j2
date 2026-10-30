@@ -1,0 +1,22 @@
+[connection]
+id=qcl-bridge
+uuid={{ qcl_nm_bridge_uuid }}
+type=bridge
+interface-name={{ qcl_nm_bridge_name }}
+autoconnect=false
+autoconnect-ports=0
+autoconnect-retries=1
+
+[bridge]
+stp=false
+
+[ipv4]
+method=auto
+dhcp-client-id=01:{{ qcl_nm_permanent_mac }}
+route-metric=600
+dhcp-timeout=30
+may-fail=false
+
+[ipv6]
+method=auto
+route-metric=600

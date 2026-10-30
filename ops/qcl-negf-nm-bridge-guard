@@ -1,0 +1,9 @@
+#!/usr/bin/python3 -I
+"""Fixed installed entry point; sibling module in the protected installation."""
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from linux_bridge_nm import main
+
+raise SystemExit(main())

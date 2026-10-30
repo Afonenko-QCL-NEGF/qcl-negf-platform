@@ -1,0 +1,8 @@
+#!/bin/sh
+# Post events only. Arguments are hints; the guard reads actual NM/kernel owner.
+case "$2" in
+  up|down|reapply|dhcp4-change|dhcp6-change)
+    exec /usr/local/libexec/qcl-negf-nm-bridge-guard --reconcile --interface "$1" --event "$2"
+    ;;
+esac
+exit 0
