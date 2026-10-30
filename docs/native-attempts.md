@@ -1,18 +1,20 @@
 # Ordinary native attempts
 
 `ops/native_attempt.py` is an opt-in operational owner for one existing CalcJob
-UUID. It does not construct an AiiDA process, accept science, load a DB profile,
-cancel jobs or retry a scientific failure. The ordinary scheduler lifecycle
-remains the only attempt owner. The published AiiDA component still needs its
-separate scheduler/transport and authenticated actor-input integration.
+UUID. It does not construct an AiiDA process, accept science, cancel jobs or retry
+a scientific failure. The ordinary scheduler lifecycle remains the only attempt
+owner. The published AiiDA native actor supplies immutable INPUT/CALL/CREATE
+joins through its public `launch` and `execution` reads.
 
-The current production `NativeSources.preflight` deliberately ends with
-`actor_input_binding_unavailable` after checking the native environment and G
-retained source records. No actor loader exists at this boundary yet. A request
-dictionary, protected policy, qualification receipt or Python constructor does
-not replace that loader. Consequently this source is **not an installed or
-production-qualified submission path**. SOURCE/L fixtures exercise the actual
-fixed adapters with explicit synthetic kernel/command observations.
+`NativeSources.preflight` binds the actual request UUID/action to two fixed
+`APP/bin/qcl-negf-native-actor --profile PROFILE` queries as qcl-negf. It uses the
+existing profile and authentic G-selected APP, compares exact public Launch and
+original execution bytes, full input references, Code/release/source-graph and
+storage identity, then reviews original uploaded metadata/script before the first
+durable claim. Access/build/retention strings remain locators. A request dict or
+Python constructor never qualifies a native backend. SOURCE/L tests do not prove
+installed APP, caller qualification, DB latency, import RSS or operational fit.
+Missing/unqualified sources remain HOLD; this is not installed qualification.
 
 ## Fixed ingress and ownership
 
@@ -36,19 +38,66 @@ worker-role contents. Foreign Prolog/Epilog settings conflict explicitly.
 
 The socket `/run/qcl-negf/native-attempt.sock` is root:qcl-negf 0660. A single
 connection creates `qcl-negf-native-attempt@.service`: root, no restart, 90 s,
-128 MiB, 16 tasks, `KillMode=control-group`, and write access only to the two
-local attempt directories. Existing daemon/API `NoNewPrivileges=true` remains.
+128 MiB, 16 tasks, `KillMode=control-group`, and write access to the two local
+attempt directories plus the existing profile's access-record subdirectory and
+reviewed log directory. Existing daemon/API `NoNewPrivileges=true` remains.
 Both controller services get a read-only view of the new canonical result
 prefix; uploads use distinct existing workdirs. NFS exports and `root_squash`
 are unchanged.
 
-Authentication compares `SO_PEERCRED` with double kernel PID/birth/UID/cgroup
-captures, actual daemon unit InvocationID/ControlGroup/MainPID and immutable APP
-launch origin. It rejects an API, shell or reused process with the same UID.
+Authentication joins `SO_PEERCRED` through an actual bounded PPID/birth chain:
+fixed generated Python-I-c client, optional exact S1 Bash hop, APP daemon worker,
+circus and the qualified daemon MainPID/Invocation. Kernel executable origins,
+exact role argv and selected AIIDA_PATH/jobs-root environment are read twice;
+stable generations are compared independently of raw CPU/context counters.
+Pinned AiiDA 2.9.2 starts MainPID with the configured AIIDA_PATH base and passes
+the config directory `base/.aiida` to circus/worker and inherited shell/client.
+Those exact values follow the authenticated roles; arbitrary path normalization
+or aliases are refused. Jobs root stays exactly the generated value for all roles.
+It rejects an API, manual shell or reused process with the same UID.
+Native daemon startup resolves the existing root profile once, then execs
+immutable APP/bin/verdi and puts that immutable bin directory first on PATH.
+The live MainPID/circus/worker argv must name this APP; a current profile alias
+or shared canonical core script cannot certify an already-loaded APP after a
+profile retarget. Unknown wrapper/title forms remain HOLD. Native-off startup
+keeps the original launch behavior.
 The root helper rechecks its own template invocation and paid limits. Under
 socket activation client-observed peer PID1 is legitimate; UID0 and the
 protected socket inode/ancestry matter. A root-owned JSON expectation is not
 sufficient by itself.
+Original command failures before owner construction, including the unit
+Environment query, retain a bounded original-record prefix/hash/length and cleanup
+uncertainty on protected stderr/journal. The public reply stays HOLD without
+diagnostic contents, attempt creation or retry. If the diagnostic sink itself
+fails, it cannot replace the primary HOLD; delivery is not claimed in that case.
+
+The same Nix generator produces the client expression and private actor launch
+configuration; no manual source-hash registry or API launch-envelope extension
+is used. The qualified root unit selects this immutable file. The daemon gets
+QCL_NEGF_NATIVE_JOBS_ROOT from cluster.jobDirectory only when native is enabled;
+actual selected environment and private policy must agree. Mutable service.env
+does not become authority.
+
+Read-only actor queries allow standard existing-profile PID access records and
+file-log open/rotation. There is no profile bootstrap, maintenance, unknown-lock
+deletion or whole-profile RW. The selected config.json is mounted read-only in
+server/daemon/API views; bounded FD/hash readback joins the actual namespaces.
+The default log directory is shared; its directory RW scope for rotation is
+explicit, not per-file kernel confinement. Its existing membership/ownership,
+actual profile generation and logging DB effects need native qualification.
+Unexpected DB-data writes require HOLD and an owning logging/read-loader port.
+No SQL-enforced read-only claim is made. Standard access/log growth, rotation,
+import RSS and DB latency must be measured before installed acceptance.
+
+Only a finite stock Slurm script subset is admitted: fixed interpreter/original
+release guard, reviewed unique stock headers, two thread exports, one literal
+solver argv and fixed redirections. Extra shell, custom directives or free flags
+are refused. Output is exactly policy.jobs_root/original relative root. Optional
+scratch remains HOLD until its original INPUT has an explicit public port.
+Resource admission remains Slurm's responsibility. New submit needs current
+ready release/admission; reconcile/status/start can observe a retained attempt
+with admission closed. Lost ACK never dispatches again. Q1/control transfer and
+cancel remain separate HOLD gates.
 
 ## Durable dispatch and uncertainty
 
@@ -89,8 +138,8 @@ the key and returns HOLD; a repeated key never issues another `sbatch`.
 Reconciliation can use a durable original ACK. No comment-only/lost-ACK causal
 fallback is qualified here. Empty `squeue`/`sacct`, elapsed time and local child
 cleanup never prove that a remote submit did not happen. A later trustworthy
-ID belongs to this same CalcJob; the future AiiDA adapter must pause ordinary
-backoff on HOLD and let existing `execmanager` set that ID after same-UUID play.
+ID belongs to this same CalcJob; the published AiiDA adapter pauses ordinary
+backoff on HOLD and lets existing `execmanager` set that ID after same-UUID play.
 
 ## Start, stop and finite writer closure
 

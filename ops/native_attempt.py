@@ -13,6 +13,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shlex
 import socket
 import stat
 import struct
@@ -408,6 +409,21 @@ def parse_ack(output, cluster):
     return {'job_id': match[1], 'cluster': match[2] or cluster}
 
 
+def _preclaim_diagnostic(error, retained=None):
+    """Best-effort protected stderr; a sink failure cannot replace primary HOLD."""
+    try:
+        if retained is None:
+            raw = encoded(error.record)
+            retained = {'original_prefix_base64':base64.b64encode(raw[:24576]).decode('ascii'),
+                        'original_bytes':len(raw),'original_sha256':hashlib.sha256(raw).hexdigest(),
+                        'truncated':len(raw)>24576}
+        print('native-attempt preclaim HOLD: ' + encoded(retained).decode('ascii'), file=sys.stderr)
+    except BaseException:
+        # The original failure still determines HOLD; there is no dispatch,
+        # alternate logger, public diagnostic payload or new retry authority.
+        pass
+
+
 class OrdinaryAttemptOwner:
     def __init__(self, policy, store, sources, budget):
         self.policy, self.store, self.sources, self.budget = policy, store, sources, budget
@@ -420,7 +436,7 @@ class OrdinaryAttemptOwner:
             return reply({}, 'rejected', reason='shape')
         calcjob = document['calcjob_uuid']; launch = document['launch']
         try:
-            context = self.sources.preflight(launch, self.budget)
+            context = self.sources.preflight(launch, self.budget, calcjob_uuid=calcjob, action=action)
             with self.store.locked(calcjob, self.budget):
                 claim = self.store.read(calcjob, 'claim.json', self.budget)
                 if claim is not None:
@@ -486,16 +502,19 @@ class OrdinaryAttemptOwner:
                 return reply(document, 'bound', job=job, receipt=receipt)
         except (Hold, ResourceError, OSError, ValueError, KeyError, engine.CommandFailure) as error:
             reason = error.reason if isinstance(error, Hold) else getattr(error, 'code', 'native_observation_failed')
-            if isinstance(error, engine.CommandFailure) and claimed:
+            if isinstance(error, engine.CommandFailure):
                 raw = encoded(error.record)
                 retained = {'original_prefix_base64': base64.b64encode(raw[:24576]).decode('ascii'),
                             'original_bytes': len(raw), 'original_sha256': hashlib.sha256(raw).hexdigest(),
                             'truncated': len(raw) > 24576}
-                try:
-                    self.store.put(calcjob, 'observation-failure-' + uuid.uuid4().hex + '.json', retained, self.budget)
-                except BaseException as secondary:
-                    error.journal_error = repr(secondary)
-                    raise error
+                if claimed:
+                    try:
+                        self.store.put(calcjob, 'observation-failure-' + uuid.uuid4().hex + '.json', retained, self.budget)
+                    except BaseException as secondary:
+                        error.journal_error = repr(secondary)
+                        raise error
+                else:
+                    _preclaim_diagnostic(error,retained)
             # Read-only retained identity remains useful after current policy or
             # native observation failed. It is explicitly not current authority.
             if job is None:
@@ -574,18 +593,132 @@ def load_native_attempt_policy(role):
     return _load_policy(role, _bootstrap_operation())
 
 
-def authenticate_socket_peer(connection, policy, sources):
+def _caller_generation(row):
+    need(engine.process_state_class(row) == 'live', 'peer_not_live')
+    need(type(row['pid']) is int and type(row['start_ticks']) is int and row['start_ticks'] > 0, 'peer_credentials')
+    return {key: row[key] for key in ('pid','ppid','start_ticks','uids','cgroup','executable','comm')}
+
+
+def _caller_role(sources, row, argv, role, action, context):
+    cfg = context['configuration']; client = cfg['client']
+    if role == 'client':
+        need(argv == client['argv_prefix'] + [action] and row['executable'] == sources.origin(client['argv_prefix'][0]),
+             'peer_client_origin')
+        return
+    if role == 'shell':
+        alias = '/run/current-system/sw/bin/qcl-negf-native-attempt-client'
+        need(sources.origin(alias) == sources.origin(client['entrypoint']) and
+             row['executable'] == sources.origin(client['bash_executable']) and
+             argv == ['bash','--noprofile','--norc','-c',shlex.join([alias,action])], 'peer_shell_origin')
+        return
+    tail = {'worker':['daemon','worker'], 'circus':['daemon','start-circus','1','--foreground'],
+            'main':['daemon','start','--foreground']}[role]
+    suffix = ['-p',cfg['profile'],*tail]
+    # A currently resolved mutable profile or shared canonical core script
+    # cannot certify which APP this already-running Python loaded at startup.
+    entrypoints = {context['app']+'/bin/verdi'}
+    need(row['executable'] == sources.qualification['unit_origins'][sources.policy['daemon_unit']]['executable'],
+         'application_origin')
+    if len(argv) == len(suffix) + 1:
+        need(argv[0] in entrypoints and sources.origin(argv[0]) == row['executable'] and argv[1:] == suffix,
+             'application_origin')
+    else:
+        need(len(argv) == len(suffix)+2 and argv[1] in entrypoints and argv[2:] == suffix and
+             sources.origin(argv[0]) == row['executable'], 'application_origin')
+
+
+def _review_native_script(raw, launch, solver, bash, sources):
+    """One stock script subset; never execute or interpret arbitrary shell."""
+    lines = [line for line in raw.decode('utf-8').splitlines() if line]
+    need(lines and lines[0].startswith('#!'), 'native_script')
+    interpreter = lines.pop(0)[2:]
+    need(interpreter in (bash,'/run/current-system/sw/bin/bash') and
+         sources.origin(interpreter)==sources.origin(bash), 'native_script_interpreter')
+    sources.origin('/run/current-system/sw/bin/qcl-negf-release')
+    headers = {}
+    while lines and lines[0].startswith('#SBATCH '):
+        line = lines.pop(0)[len('#SBATCH '):]; key,sep,value = line.partition('=')
+        need(key not in headers, 'native_script_directive')
+        allowed = {'--no-requeue','--job-name','--get-user-env','--output','--error','--nodes',
+                   '--ntasks-per-node','--cpus-per-task','--partition','--account','--qos','--time','--mem'}
+        need(key in allowed, 'native_script_directive'); headers[key] = value
+        if key in ('--no-requeue','--get-user-env'): need(not sep, 'native_script_directive')
+        elif key=='--job-name': need(re.fullmatch(r'"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}"',value), 'native_script_directive')
+        elif key in ('--partition','--account','--qos'): need(matches(value,ID), 'native_script_directive')
+        elif key=='--time': need(re.fullmatch(r'(?:[0-9]+-)?[0-9]{2}:[0-5][0-9]:[0-5][0-9]',value), 'native_script_directive')
+        elif key=='--mem': need(re.fullmatch(r'[0-9]+',value), 'native_script_directive')
+    need(headers.get('--no-requeue')=='' and '--job-name' in headers and
+         headers.get('--output')=='_scheduler-stdout.txt' and headers.get('--error')=='_scheduler-stderr.txt' and
+         headers.get('--nodes')==headers.get('--ntasks-per-node')=='1' and
+         re.fullmatch(r'[1-9][0-9]*',headers.get('--cpus-per-task','')), 'native_script_resources')
+    need(len(lines)==7 and lines[0]=='# ENVIRONMENT VARIABLES BEGIN ###' and
+         lines[3]=='# ENVIRONMENT VARIABLES END ###', 'native_script')
+    expected_exports = {"export JULIA_NUM_THREADS='"+headers['--cpus-per-task']+"'", "export OPENBLAS_NUM_THREADS='1'"}
+    need(set(lines[1:3])==expected_exports, 'native_script_environment')
+    guard = ('/run/current-system/sw/bin/qcl-negf-release guard --release-id '+shlex.quote(launch['release_id'])+
+             ' --solver-executable '+shlex.quote(solver)+' || exit 78')
+    need(lines[4]==guard and lines[5]=='unset QCL_NEGF_CAPTURE_SPEC', 'native_script_guard')
+    argv = [solver,'run-plan','plan.json',sources.policy['jobs_root']+'/'+launch['relative_execution_root'],
+            '--execution-id',launch['execution_id'],'--source-graph','source-graph.json']
+    # Stock Scheduler single-quotes every code argument. A free shell token or
+    # extra flag never becomes authority by merely producing the same shlex words.
+    literal = lambda word: "'"+word.replace("'", "'\"'\"'")+"'"
+    expected = ' '.join(literal(word) for word in argv)+"  > 'solver.stdout' 2> 'solver.stderr'"
+    if '--scratch-root' in lines[6]: raise Hold('native_scratch_binding_unavailable')
+    need(lines[6]==expected, 'native_script_argv')
+
+
+def _reserve_private_record(value, budget, depth=0):
+    """Prepay only the existing journal's JSON encoding, with no new codec."""
+    need(depth<=16, 'private_record_bound'); budget.reserve(32)
+    if type(value) is str: budget.reserve(12*len(value))
+    elif type(value) is int: budget.reserve(value.bit_length()*30103//100000+2)
+    elif type(value) is dict:
+        for key,item in value.items():
+            need(type(key) is str, 'private_record_bound')
+            _reserve_private_record(key,budget,depth+1); _reserve_private_record(item,budget,depth+1)
+    elif type(value) in (list,tuple):
+        for item in value: _reserve_private_record(item,budget,depth+1)
+    else: need(value is None or type(value) in (bool,int,float), 'private_record_bound')
+
+
+def authenticate_socket_peer(connection, policy, sources, *, action):
     pid, uid, gid = struct.unpack('3i', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
     need(pid > 0 and uid == gid == policy['client_uid'], 'peer_credentials')
-    first = sources.process(pid); unit = sources.unit(policy['daemon_unit'])
-    need(first['uids'] == [uid] * 4 and first['pid'] == pid and first['start_ticks'] > 0,
-         'peer_credentials')
+    context = sources.actor_context(); unit = sources.unit(policy['daemon_unit'])
     need(unit['ActiveState'] == 'active' and matches(unit['InvocationID'], r'[0-9a-f]{32}') and
-         int(unit['MainPID']) > 0 and engine.daemon_scope_bound(first['cgroup'], unit['ControlGroup']), 'peer_unit')
-    sources.application_origin(first)
-    second = sources.process(pid); second_unit = sources.unit(policy['daemon_unit'])
-    need(first == second and unit == second_unit, 'peer_generation_changed')
-    return first
+         int(unit['MainPID']) > 0, 'peer_unit')
+    chain = []; current = pid; seen = set()
+    for _ in range(16):
+        need(current > 1 and current not in seen, 'peer_ancestry')
+        seen.add(current); row = sources.process(current); _caller_generation(row)
+        need(row['pid'] == current and row['uids'] == [uid]*4 and
+             engine.daemon_scope_bound(row['cgroup'],unit['ControlGroup']), 'peer_unit')
+        argv = sources.command_line(current); env = sources.selected_environment(current)
+        chain.append({'process':row,'argv':argv,'environment':env})
+        if current == int(unit['MainPID']): break
+        current = row['ppid']
+    else: raise Hold('peer_ancestry_bound')
+    need(len(chain) in (4,5), 'peer_ancestry')
+    roles = ['client'] + (['shell'] if len(chain)==5 else []) + ['worker','circus','main']
+    for index,(entry,role) in enumerate(zip(chain,roles)):
+        row = entry['process']; _caller_role(sources,row,entry['argv'],role,action,context)
+        # Pinned AiiDA 2.9.2 MainPID starts with the configured base, while
+        # DaemonClient.get_env propagates its actual config dir to descendants.
+        cfg = context['configuration']
+        need(entry['environment'] == {'AIIDA_PATH':cfg['aiida_path']+('' if role=='main' else '/.aiida'),
+                                     'QCL_NEGF_NATIVE_JOBS_ROOT':cfg['jobs_root']}, 'peer_environment')
+        if index+1 < len(chain):
+            parent = chain[index+1]['process']
+            need(row['ppid'] == parent['pid'] and parent['start_ticks'] <= row['start_ticks'], 'peer_birth_join')
+        need(_caller_generation(row) == _caller_generation(sources.process(row['pid'])) and
+             entry['argv'] == sources.command_line(row['pid']) and
+             entry['environment'] == sources.selected_environment(row['pid']), 'peer_generation_changed')
+    profile = sources.profile_view(int(unit['MainPID']),context)
+    need(unit == sources.unit(policy['daemon_unit']) and context == sources.actor_context() and
+         profile == sources.profile_view(int(unit['MainPID']),context), 'peer_generation_changed')
+    sources._connection = connection
+    return {'pid':pid,'chain':chain,'unit':unit,'application':context,'profile':profile}
 
 
 def read_frame(connection, budget, limit):
@@ -713,6 +846,118 @@ class NativeSources:
                                    env={'PATH': '/empty', 'LANG': 'C', 'LC_ALL': 'C',
                                         'SLURM_CONF': self.policy['slurm']['config_file']})
 
+    def origin(self, path):
+        return engine.public_binary_origin(self.budget,path)['path']
+
+    def command_line(self, pid):
+        raw = self.budget.read('/proc/'+str(pid)+'/cmdline',16384)
+        need(raw.endswith(b'\0'), 'peer_command_line')
+        return [part.decode('utf-8') for part in raw[:-1].split(b'\0')]
+
+    def selected_environment(self, pid):
+        raw = self.budget.read('/proc/'+str(pid)+'/environ',65536); result = {}
+        for entry in raw.split(b'\0'):
+            key,sep,value = entry.partition(b'=')
+            if key in (b'AIIDA_PATH',b'QCL_NEGF_NATIVE_JOBS_ROOT'):
+                name = key.decode('ascii'); need(sep and name not in result, 'peer_environment')
+                result[name] = value.decode('utf-8')
+        return result  # Other environment entries, including secrets, are never retained.
+
+    def actor_configuration(self):
+        need(hasattr(self,'_server_unit'), 'server_unit')
+        path = os.environ.get('QCL_NEGF_NATIVE_ACTOR_CONFIG'); path_value(path,absolute=True)
+        environment = self.run([self.policy['tools']['systemctl'],'show',self._server_unit,'--property=Environment','--value'])
+        selected = [entry for entry in shlex.split(environment) if entry.startswith('QCL_NEGF_NATIVE_ACTOR_CONFIG=')]
+        need(selected == ['QCL_NEGF_NATIVE_ACTOR_CONFIG='+path], 'actor_configuration')
+        origin = engine.public_binary_origin(self.budget,path,executable=False)['path']
+        raw = engine.immutable_public_bytes(self.budget,origin,65536)
+        cfg = exact(strict_json(raw.decode()), {'schema','profile','aiida_path','application_profile','jobs_root','client'})
+        need(cfg['schema'] == 'qcl-negf.native-actor-launch.v1' and matches(cfg['profile'],ID) and
+             cfg['aiida_path'] == '/var/lib/qcl-negf/aiida' and
+             cfg['application_profile'] == '/nix/var/nix/profiles/qcl-negf-application' and
+             cfg['jobs_root'] == self.policy['jobs_root'], 'actor_configuration')
+        client = exact(cfg['client'], {'entrypoint','argv_prefix','bash_executable'})
+        prefix = client['argv_prefix']
+        need(type(prefix) is list and len(prefix)==4 and prefix[1:3]==['-I','-c'] and
+             type(prefix[3]) is str and 0<len(prefix[3])<=8192, 'actor_configuration')
+        for executable in (prefix[0],client['entrypoint'],client['bash_executable']):
+            need(type(executable) is str and executable.startswith('/nix/store/'), 'actor_configuration')
+            self.origin(executable)
+        return cfg
+
+    def actor_context(self):
+        cfg = self.actor_configuration()
+        raw = protected_read(Path(self.policy['release_runtime'])/'release.json',self.budget)
+        app = engine.release_envelope(strict_json(raw.decode()))['application_path']
+        profile = cfg['application_profile']
+        origin = engine.public_binary_origin(self.budget,profile+'/bin/verdi')
+        need(any(path==app and stat.S_ISDIR(info[2]) and info[3]==0 for path,info,_ in origin['chain']), 'application_profile_changed')
+        need(any(path==profile and stat.S_ISLNK(info[2]) and info[3]==0 for path,info,_ in origin['chain']), 'application_profile_changed')
+        for path,info,_ in origin['chain']:
+            # Store admission belongs to the existing public immutable-origin
+            # reader. The managed store directory may be group-writable; this
+            # bridge protects the mutable profile selectors, without changing it.
+            need(info[3]==0 and (path=='/nix/store' or stat.S_ISLNK(info[2]) or not info[2]&0o022),
+                 'application_profile_changed')
+        self.origin(app+'/bin/qcl-negf-native-actor')
+        return {'configuration':cfg,'app':app,'profile_origin':origin,'release_sha256':hashlib.sha256(raw).hexdigest()}
+
+    def profile_view(self, main_pid, context):
+        cfg = context['configuration']; views = []
+        for pid in (os.getpid(),main_pid):
+            parent = os.open('/proc/'+str(pid)+'/root',os.O_RDONLY|os.O_DIRECTORY)
+            try:
+                for part in (cfg['aiida_path'].lstrip('/')+'/.aiida').split('/'):
+                    self.budget.file(); child = os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
+                    info = os.fstat(child)
+                    if info.st_uid not in (0,self.policy['client_uid']) or info.st_mode&0o022:
+                        os.close(child); raise Hold('profile_path')
+                    os.close(parent); parent = child
+                fd = os.open('config.json',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=parent)
+                try:
+                    raw,info = read_fd(fd,65536,self.budget)
+                    need(info.st_uid in (0,self.policy['client_uid']) and not info.st_mode&0o022 and
+                         signature(info)==signature(os.stat('config.json',dir_fd=parent,follow_symlinks=False)), 'profile_config')
+                    identity = signature(info)
+                finally: os.close(fd)
+                for path in ('access/'+cfg['profile'],'log'):
+                    directory = parent; opened = []
+                    try:
+                        for part in path.split('/'):
+                            self.budget.file(); directory = os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=directory)
+                            opened.append(directory); info = os.fstat(directory)
+                            need(info.st_uid==self.policy['client_uid'] and not info.st_mode&0o022, 'profile_operational_path')
+                        if path=='log':
+                            with os.scandir(directory) as iterator:
+                                for item in iterator:
+                                    self.budget.file()
+                                    need(re.fullmatch(re.escape('aiida-'+cfg['profile']+'.log')+r'(?:\.(?:[1-9]|10))?',item.name),
+                                         'profile_log_namespace')
+                                    info = os.stat(item.name,dir_fd=directory,follow_symlinks=False)
+                                    need(stat.S_ISREG(info.st_mode) and info.st_nlink==1 and
+                                         info.st_uid==self.policy['client_uid'] and not info.st_mode&0o022, 'profile_log_namespace')
+                    finally:
+                        for directory in reversed(opened): os.close(directory)
+                rows = self.budget.read('/proc/'+str(pid)+'/mountinfo',65536).decode().splitlines()
+                wanted = cfg['aiida_path']+'/.aiida/config.json'
+                need(any(line.split(' - ',1)[0].split()[4]==wanted and
+                         'ro' in line.split(' - ',1)[0].split()[5].split(',') for line in rows), 'profile_config_not_readonly')
+                need(identity == signature(os.stat('config.json',dir_fd=parent,follow_symlinks=False)), 'profile_config_changed')
+                views.append({'identity':identity,'sha256':hashlib.sha256(raw).hexdigest()})
+            finally: os.close(parent)
+        need(views[0]==views[1], 'profile_view_changed')
+        return views[0]
+
+    def _refresh_caller(self, action):
+        need(hasattr(self,'_connection'), 'peer_missing')
+        fresh = authenticate_socket_peer(self._connection,self.policy,self,action=action)
+        def stable(packet):
+            return {'chain':[(_caller_generation(row['process']),row['argv'],row['environment']) for row in packet['chain']],
+                    **{key:packet[key] for key in ('unit','application','profile')}}
+        if hasattr(self,'_caller'): need(stable(self._caller)==stable(fresh), 'peer_generation_changed')
+        self._caller = fresh
+        return fresh
+
     def process(self, pid):
         row = engine.process_record(self.budget, Path('/proc') / str(pid))
         raw = self.budget.read(Path('/proc') / str(pid) / 'stat').decode()
@@ -726,7 +971,8 @@ class NativeSources:
             return value
         # Keep original raw process samples in privileged journals/facts, never
         # expose them as a standalone caller-created certificate.
-        return {**{key: row[key] for key in ('pid', 'uids', 'start_ticks', 'cgroup', 'executable')},
+        need(fields[0] == row['state'], 'process_changed')
+        return {**{key: row[key] for key in ('pid', 'uids', 'start_ticks', 'cgroup', 'executable', 'state', 'comm')},
                 'ppid': int(fields[1]), 'observations': retain(row['observations'])}
 
     def host(self):
@@ -752,18 +998,6 @@ class NativeSources:
             need(origin == expected['fragment_path'] and hashlib.sha256(
                 engine.immutable_public_bytes(self.budget, origin, 65536)).hexdigest() == expected['fragment_sha256'], 'unit_origin')
         return values
-
-    def application_origin(self, process):
-        need(self.qualification is not None, 'native_qualification_missing')
-        expected = self.qualification['unit_origins'][self.policy['daemon_unit']]['executable']
-        need(process['executable'] == expected and expected.startswith('/nix/store/'), 'application_origin')
-        # Kernel executable alone may be a shared Python. Actual immutable verdi
-        # launch path must also occur in the live daemon command line.
-        current = strict_json(protected_read(Path(self.policy['release_runtime']) / 'release.json', self.budget).decode())
-        app = engine.release_envelope(current)['application_path']
-        executable = engine.public_binary_origin(self.budget, app + '/bin/verdi')['path']
-        command = self.budget.read('/proc/' + str(process['pid']) + '/cmdline', 16384).split(b'\0')
-        need(os.fsencode(app + '/bin/verdi') in command or os.fsencode(executable) in command, 'application_origin')
 
     def qualify(self):
         policy = self.policy
@@ -814,8 +1048,37 @@ class NativeSources:
         need(rows, 'mount_not_observed')
         return max(rows, key=lambda row: row[0])[1]
 
-    def preflight(self, launch, budget):
+    def _submit_admission(self, launch):
+        current = strict_json(protected_read(Path(self.policy['release_runtime'])/'release.json',self.budget).decode())
+        need(current.get('ready') is True and current.get('release_id')==launch['release_id'] and
+             current.get('code_uuid')==launch['code_uuid'], 'native_admission_closed')
+        gate = Path(self.policy['jobs_root'])/'.release-admission.json'
+        # Existing G credential switch for its fixed NFS gate, no root-squash bypass.
+        need(gate==engine.GATE, 'native_admission_namespace')
+        with engine.admission_reader(gate):
+            admission = strict_json(self.budget.read(gate,65536).decode())
+        need(admission.get('open') is True and admission.get('release_id')==launch['release_id'], 'native_admission_closed')
+
+    def _actor_read(self, kind, calcjob, launch, context):
+        counts = [item['bytes'] for item in launch['files'].values()]
+        need(all(type(size) is int and 0<=size<=65536 for size in counts), 'actor_input_bound')
+        ceiling = 30*16384 + 8*sum(min(65537,4096*math.ceil(size/4096)+4096) for size in counts)
+        self.budget.reserve(ceiling)
+        cfg = context['configuration']; app = context['app']
+        argv = [self.policy['tools']['runuser'],'-u','qcl-negf','--',app+'/bin/qcl-negf-native-actor',
+                '--profile',cfg['profile'],kind,calcjob,'--maximum-metadata-bytes',str(ceiling)]
+        output = self.budget.command(argv,run=engine.command,output_bytes=65536,
+            env={'AIIDA_PATH':cfg['aiida_path'],'PATH':app+'/bin:/empty','LANG':'C','LC_ALL':'C'})
+        need(type(output) is engine.CommandOutput, 'actor_output_unqualified')
+        raw = output.encode('utf-8')
+        need(type(getattr(output,'output_bytes',None)) is int and output.output_bytes==len(raw), 'actor_output_partial')
+        return raw
+
+    def preflight(self, launch, budget, *, calcjob_uuid, action):
+        canonical_uuid(calcjob_uuid)
+        need(action in {'submit','reconcile','status','start','close'} and budget is self.budget, 'actor_request')
         host = self.qualify(); policy = self.policy
+        peer = self._refresh_caller(action); context = peer['application']
         root = policy['jobs_root'] + '/' + launch['relative_execution_root']
         need(within(launch['relative_execution_root'], policy['native_result_prefix']) and
              within(launch['remote_workdir'], policy['jobs_root']) and
@@ -830,9 +1093,37 @@ class NativeSources:
         need(hashlib.sha256(graph).hexdigest() == graph_hash == launch['files']['source_graph']['sha256'] and
              len(graph) == launch['files']['source_graph']['bytes'], 'release_graph_changed')
         need(retained['quantum_runtime_context'] == engine.quantum_context(envelope), 'release_binding_changed')
-        # No actor loader exists in the published AiiDA c744 source. The request
-        # cannot assert sealed INPUT/CALL provenance or reviewed script admission.
-        raise Hold('actor_input_binding_unavailable')
+        if action=='submit': self._submit_admission(launch)
+        actual = strict_json(self._actor_read('launch',calcjob_uuid,launch,context).decode())
+        need(actual==launch, 'actor_launch_changed')
+        raw = self._actor_read('execution',calcjob_uuid,launch,context)
+        need(len(raw)==launch['files']['native_execution']['bytes'] and
+             hashlib.sha256(raw).hexdigest()==launch['files']['native_execution']['sha256'], 'actor_execution_changed')
+        native = strict_json(raw.decode())  # The fixed public actor owns full scientific-schema validation.
+        need(native['schema']=='qcl-negf.aiida-native-execution.v1' and native['request_id']==launch['request_id'] and
+             native['execution_id']==launch['execution_id'], 'actor_execution_binding')
+        for key,node in (('input_plan','input_plan_uuid'),('source_graph','source_graph_uuid')):
+            role = 'plan' if key=='input_plan' else key
+            need(native[key]=={'node_uuid':launch[node],'bytes':str(launch['files'][role]['bytes']),
+                               'sha256':launch['files'][role]['sha256']}, 'actor_original_reference')
+        code = native['code']; storage = native['storage']
+        need(code['code_uuid']==launch['code_uuid'] and code['release_id']==launch['release_id'] and
+             code['solver_executable']==envelope['solver_executable'] and
+             code['computer_uuid']==storage['computer_uuid'] and
+             storage['execution_binding_uuid']==launch['native_execution_uuid'] and
+             storage['relative_execution_root']==launch['relative_execution_root'] and
+             storage['storage_identity']==self.qualification['write_domain']['storage_identity'], 'actor_native_binding')
+        submitted = _read_submitted_files_as_owner(policy,launch,budget)
+        need(submitted['files']==launch['files'], 'submitted_digest')
+        budget.reserve(launch['files']['submit_script']['bytes']*8)
+        script = base64.b64decode(submitted['script'],validate=True)
+        need(len(script)==launch['files']['submit_script']['bytes'] and
+             hashlib.sha256(script).hexdigest()==launch['files']['submit_script']['sha256'], 'submitted_digest')
+        _review_native_script(script,launch,envelope['solver_executable'],context['configuration']['client']['bash_executable'],self)
+        self._refresh_caller(action)
+        self._actor = {'calcjob_uuid':calcjob_uuid,'action':action,'launch':actual,
+                       'execution_sha256':hashlib.sha256(raw).hexdigest()}
+        return host
 
     def snapshot(self, launch, dispatch, budget):
         result = _read_submitted_files_as_owner(self.policy, launch, budget)
@@ -871,9 +1162,15 @@ class NativeSources:
 
     def _intent(self, launch, snapshot, dispatch):
         _authenticate_server(self)
+        need(hasattr(self,'_actor') and self._actor['launch']==launch, 'actor_input_binding_unavailable')
+        caller = self._refresh_caller(self._actor['action'])
+        self._submit_admission(launch)
         process = self.process(os.getpid()); unit = self.unit(process['cgroup'].rsplit('/', 1)[-1])
-        return {'argv': self._argv(launch, snapshot, dispatch), 'script_sha256': snapshot['script_sha256'],
-                'owner': {'process': process, 'unit': unit, 'host': self.host()}}
+        packet = {'argv': self._argv(launch,snapshot,dispatch),'script_sha256':snapshot['script_sha256'],
+                  'owner': {'process':process,'unit':unit,'host':self.host(),'caller':caller,'actor':self._actor}}
+        _reserve_private_record(packet,self.budget)
+        need(len(encoded(packet))<=49152, 'private_record_bound')
+        return packet
 
     def native_job(self, job_id):
         need(matches(job_id, JOB), 'job_selector')
@@ -1241,8 +1538,9 @@ def _authenticate_server(sources):
     # systemctl renders RuntimeMaxUSec as a human duration; require the fixed module bound.
     need(unit['RuntimeMaxUSec'] in {'1min 30s', '90s'}, 'server_limits')
     expected = sources.qualification['unit_origins']['server']['executable']
-    need(process['executable'] == expected and process == sources.process(os.getpid()) and
+    need(process['executable'] == expected and _caller_generation(process) == _caller_generation(sources.process(os.getpid())) and
          unit == sources.unit(unit_name), 'server_generation_changed')
+    sources._server_unit = unit_name
 
 
 def handle_connection(connection):
@@ -1250,14 +1548,15 @@ def handle_connection(connection):
     try:
         policy = _load_policy('controller', budget); sources = NativeSources(policy, budget)
         sources.qualify(); _authenticate_server(sources)
-        authenticate_socket_peer(connection, policy, sources)
         document = read_frame(connection, budget, policy['limits']['request_bytes'])
-        owner = OrdinaryAttemptOwner(policy, AttemptStore(policy['private_root']), sources, budget)
         action = validate_request(document)['action']
+        sources._caller = authenticate_socket_peer(connection,policy,sources,action=action)
+        owner = OrdinaryAttemptOwner(policy, AttemptStore(policy['private_root']), sources, budget)
         result = {'submit': owner.submit, 'reconcile': owner.reconcile, 'start': owner.observe_start,
                   'close': owner.qualify_close, 'status': owner.status}[action](document)
     except (Hold, OSError, ValueError, ResourceError, KeyError, engine.CommandFailure) as error:
         reason = error.reason if isinstance(error, Hold) else getattr(error, 'code', 'native_observation_failed')
+        if isinstance(error,engine.CommandFailure): _preclaim_diagnostic(error)
         result = reply({}, 'hold', reason=reason)
     write_frame(connection, result, budget, budget.limits['response_bytes'])
 

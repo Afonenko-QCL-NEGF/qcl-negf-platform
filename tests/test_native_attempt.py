@@ -48,7 +48,7 @@ class Observations:
     def __init__(self, m):
         self.m, self.calls, self.fault = m, [], None
 
-    def preflight(self, launch, budget):
+    def preflight(self, launch, budget, *, calcjob_uuid=None, action=None):
         budget.before()
         if self.fault == 'policy':
             raise self.m.Hold('native_qualification_missing')
@@ -191,14 +191,24 @@ def test_frame_positive_extra_frame_and_bound():
 
 class PeerSources:
     def __init__(self):
-        self.count = 0; self.fault = None
+        self.count = 0; self.fault = None; self.changing_counters = True
+        self.policy = dict(client_uid=3000,daemon_unit='qcl-negf-aiida.service')
+        self.python = '/nix/store/' + 'a'*32 + '-python/bin/python3'
+        self.app = '/nix/store/application'; self.profile = '/nix/var/nix/profiles/qcl-negf-application'
+        self.qualification = {'unit_origins': {self.policy['daemon_unit']: {'executable':self.python}}}
+        self.configuration = dict(profile='qcl-negf',aiida_path='/var/lib/qcl-negf/aiida',
+            application_profile=self.profile,jobs_root='/srv/qcl-negf/jobs',client=dict(
+                entrypoint='/nix/store/client/bin/qcl-negf-native-attempt-client',
+                argv_prefix=[self.python,'-I','-c','fixed generated source'],bash_executable='/nix/store/bash/bin/bash'))
 
     def process(self, pid):
         self.count += 1
-        return dict(pid=pid, start_ticks=55 + (self.fault == 'reuse' and self.count > 1),
+        parent = {456:345,345:234,234:123,123:1}[pid]
+        return dict(pid=pid,ppid=parent,start_ticks={456:40,345:30,234:20,123:10}[pid] + (self.fault == 'reuse' and self.count > 4),
                     uids=[3000] * 4, cgroup=('/system.slice/qcl-negf-api.service' if self.fault == 'api'
                                           else '/system.slice/qcl-negf-aiida.service/worker'),
-                    executable='/nix/store/' + 'a' * 32 + '-python/bin/python3')
+                    executable=self.python, state='S',comm='python3',
+                    observations={'raw_counter':self.count if self.changing_counters else 0})
 
     def unit(self, name):
         return dict(InvocationID='a' * 32, ControlGroup='/system.slice/' + name,
@@ -207,6 +217,17 @@ class PeerSources:
     def application_origin(self, process):
         if self.fault == 'shell':
             raise module().Hold('application_origin')
+
+    def actor_context(self):return {'app':self.app,'configuration':self.configuration}
+    def origin(self,path):return path
+    def profile_view(self,pid,context):return {'fixture_metadata_only':'not native authority'}
+    def command_line(self,pid):
+        tails={345:['worker'],234:['start-circus','1','--foreground'],123:['start','--foreground']}
+        if pid==456:return self.configuration['client']['argv_prefix']+['submit']
+        if self.fault=='shell':return ['/bin/sh','unrelated']
+        return [self.python,self.app+'/bin/verdi','-p','qcl-negf','daemon',*tails[pid]]
+    def selected_environment(self,pid):return {'AIIDA_PATH':self.configuration['aiida_path']+('' if pid==123 else '/.aiida'),
+                                            'QCL_NEGF_NATIVE_JOBS_ROOT':self.configuration['jobs_root']}
 
 
 @pytest.mark.parametrize('fault', [None, 'reuse', 'api', 'shell'])
@@ -218,9 +239,82 @@ def test_real_peer_observation_boundary_distinguishes_same_uid_and_pid_reuse(fau
     policy = dict(client_uid=3000, daemon_unit='qcl-negf-aiida.service')
     if fault:
         with pytest.raises(m.Hold):
-            m.authenticate_socket_peer(Connection(), policy, sources)
+            m.authenticate_socket_peer(Connection(), policy, sources,action='submit')
     else:
-        assert m.authenticate_socket_peer(Connection(), policy, sources)['pid'] == 456
+        assert m.authenticate_socket_peer(Connection(), policy, sources,action='submit')['pid'] == 456
+
+
+@pytest.mark.parametrize('fault',['action','parent','birth','worker_argv','environment','mainpid','loop','dead'])
+def test_actual_causal_chain_rejects_each_unjoined_peer(fault):
+    m=module();sources=PeerSources();sources.changing_counters=False
+    original_process=sources.process;original_command=sources.command_line;original_unit=sources.unit
+    def process(pid):
+        row=original_process(pid)
+        if fault=='parent' and pid==345:row['ppid']=123
+        if fault=='loop' and pid==345:row['ppid']=456
+        if fault=='birth' and pid==123:row['start_ticks']=99
+        if fault=='dead' and pid==345:row['state']='Z'
+        return row
+    sources.process=process
+    sources.command_line=lambda pid: ['/bin/sh','manual'] if fault=='worker_argv' and pid==345 else original_command(pid)
+    if fault=='environment':sources.selected_environment=lambda pid: {'AIIDA_PATH':'/other'}
+    if fault=='mainpid':sources.unit=lambda name:{**original_unit(name),'MainPID':'456'}
+    class Connection:
+        def getsockopt(self,*args):return struct.pack('3i',456,3000,3000)
+    with pytest.raises(m.Hold):
+        m.authenticate_socket_peer(Connection(),sources.policy,sources,action='status' if fault=='action' else 'submit')
+
+
+def stock_aiida_descendant_environment(base,jobs_root):
+    """Execute only two pinned upstream AST functions, without importing AiiDA."""
+    import ast
+    import importlib.metadata
+    import types
+    distribution=importlib.metadata.distribution('aiida-core')
+    assert distribution.version=='2.9.2'
+    class NoProfilePath(type(Path())):
+        def is_dir(self):return False
+    environment=types.SimpleNamespace(environ={'AIIDA_PATH':base,'PATH':'/APP/bin:/empty',
+        'QCL_NEGF_NATIVE_JOBS_ROOT':jobs_root},path=os.path)
+    def isolated(relative,name,namespace):
+        path=distribution.locate_file(relative)
+        tree=ast.parse(path.read_text())
+        node=next(n for n in ast.walk(tree) if isinstance(n,ast.FunctionDef) and n.name==name)
+        node.decorator_list=[]
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[node],type_ignores=[])),str(path),'exec'),namespace)
+        return namespace[name]()
+    directory=isolated('aiida/manage/configuration/settings.py','_get_configuration_directory_from_envvar',
+        {'os':environment,'pathlib':types.SimpleNamespace(Path=NoProfilePath),'sys':sys,
+         'DEFAULT_AIIDA_PATH_VARIABLE':'AIIDA_PATH','DEFAULT_AIIDA_PATH':'/unused','DEFAULT_CONFIG_DIR_NAME':'.aiida'})
+    child=isolated('aiida/engine/daemon/client.py','get_env',
+        {'os':environment,'sys':sys,'get_config':lambda:types.SimpleNamespace(dirpath=str(directory))})
+    assert str(directory)==base+'/.aiida' and child['AIIDA_PATH']==str(directory)
+    return {key:child[key] for key in ('AIIDA_PATH','QCL_NEGF_NATIVE_JOBS_ROOT')}
+
+
+@pytest.mark.parametrize('fault',[None,'main_derived','all_base','leaf_base','worker_base','circus_base','jobs',
+    'changed','changed_main','changed_worker','changed_circus'])
+def test_pinned_stock_aiida_role_environments_and_distinguishing_negatives(fault):
+    m=module();sources=PeerSources();cfg=sources.configuration
+    child=stock_aiida_descendant_environment(cfg['aiida_path'],cfg['jobs_root']);counts={}
+    def environment(pid):
+        counts[pid]=counts.get(pid,0)+1
+        value={**child,'AIIDA_PATH':cfg['aiida_path']} if pid==123 else dict(child)
+        if fault=='main_derived' and pid==123:value=dict(child)
+        if fault=='all_base' or pid=={'leaf_base':456,'worker_base':345,'circus_base':234}.get(fault):
+            value['AIIDA_PATH']=cfg['aiida_path']
+        if fault=='jobs' and pid==345:value['QCL_NEGF_NATIVE_JOBS_ROOT']='/other'
+        if pid=={'changed':456,'changed_main':123,'changed_worker':345,'changed_circus':234}.get(fault) and counts[pid]>1:
+            value['AIIDA_PATH']='/changed/.aiida'
+        return value
+    sources.selected_environment=environment
+    class Connection:
+        def getsockopt(self,*args):return struct.pack('3i',456,3000,3000)
+    if fault:
+        with pytest.raises(m.Hold):m.authenticate_socket_peer(Connection(),sources.policy,sources,action='submit')
+    else:
+        packet=m.authenticate_socket_peer(Connection(),sources.policy,sources,action='submit')
+        assert [entry['environment']['AIIDA_PATH'] for entry in packet['chain']]==[child['AIIDA_PATH']]*3+[cfg['aiida_path']]
 
 
 def test_native_fixed_dispatch_uses_snapshot_and_shared_command_budget(monkeypatch):
@@ -387,6 +481,420 @@ def test_worker_collector_reuses_original_before_and_whole_stop_oracles(tmp_path
 
 
 original_exists = Path.exists
+
+
+def test_actor_preflight_receives_actual_calcjob_and_action_before_claim(tmp_path):
+    m = module()
+    class ActualRequest(Observations):
+        def preflight(self, launch, budget, *, calcjob_uuid=None, action=None):
+            self.observed = (calcjob_uuid, action)
+            return super().preflight(launch, budget)
+    sources = ActualRequest(m); selected, _ = owner(tmp_path, sources)
+    assert selected.submit(request())['state'] == 'bound'
+    assert sources.observed == (request()['calcjob_uuid'], 'submit')
+
+
+def bridge_inputs():
+    """Public actor output fixture, stock scheduler bytes; no ORM/profile load."""
+    from aiida.schedulers.plugins.slurm import SlurmScheduler
+    from aiida.schedulers.datastructures import JobTemplate, JobTemplateCodeInfo
+    from aiida.common.datastructures import CodeRunMode
+    from test_application_release import RetainedReleaseSourcesTests, delivery_manifest
+    m = module(); document = request(); launch = document['launch']
+    graph = RetainedReleaseSourcesTests.RAW
+    value = {**delivery_manifest(False), 'sources': json.loads(graph), 'solver_build': {
+        'source_graph_sha256': hashlib.sha256(graph).hexdigest(), 'julia_manifest_sha256': 'd'*64,
+        'drv_path': '/nix/store/solver.drv', 'output_path': '/nix/store/solver'}}
+    launch['release_id'] = value['release_id']; plan = b' \n{"original":"frozen-plan"}\n'
+    def ref(node, raw): return dict(node_uuid=node, bytes=str(len(raw)), sha256=hashlib.sha256(raw).hexdigest())
+    native = dict(schema='qcl-negf.aiida-native-execution.v1', request_id=launch['request_id'],
+        execution_id=launch['execution_id'], input_plan=ref(launch['input_plan_uuid'], plan),
+        source_graph=ref(launch['source_graph_uuid'], graph), access_receipt_ref='untrusted-locator',
+        code=dict(code_uuid=launch['code_uuid'], computer_uuid=document['calcjob_uuid'],
+            solver_executable=value['solver_executable'], release_id=value['release_id'], build_receipt_ref='locator'),
+        storage=dict(namespace_id='managed', storage_identity='storage',
+            relative_execution_root=launch['relative_execution_root'], computer_uuid=document['calcjob_uuid'],
+            execution_binding_uuid=launch['native_execution_uuid'], retention_policy_id='retain',
+            retention_owner_id='team', hold_ref='locator', access_binding_ref='locator'))
+    raw_native = b' \n' + m.encoded(native) + b'\n'
+    scheduler = SlurmScheduler(); template = JobTemplate()
+    template.shebang = '#!/nix/store/bash/bin/bash'; template.rerunnable = False
+    template.job_name = 'aiida-1'; template.import_sys_environment = True
+    template.sched_output_path = '_scheduler-stdout.txt'; template.sched_error_path = '_scheduler-stderr.txt'
+    template.job_resource = scheduler.create_job_resource(num_machines=1, num_mpiprocs_per_machine=1, num_cores_per_mpiproc=2)
+    template.job_environment = {'JULIA_NUM_THREADS':'2', 'OPENBLAS_NUM_THREADS':'1'}
+    template.prepend_text = ('/run/current-system/sw/bin/qcl-negf-release guard --release-id release-a '
+                            '--solver-executable /nix/store/solver/bin/qcl-negf || exit 78\nunset QCL_NEGF_CAPTURE_SPEC')
+    code = JobTemplateCodeInfo(); code.prepend_cmdline_params = [value['solver_executable']]
+    code.cmdline_params = ['run-plan', 'plan.json', '/srv/qcl-negf/jobs/'+launch['relative_execution_root'],
+                          '--execution-id', launch['execution_id'], '--source-graph', 'source-graph.json']
+    code.use_double_quotes = [False,False]; code.stdout_name = 'solver.stdout'; code.stderr_name = 'solver.stderr'
+    template.codes_info = [code]; template.codes_run_mode = CodeRunMode.SERIAL
+    script = scheduler.get_submit_script(template).encode()
+    files = dict(plan=plan, source_graph=graph, native_execution=raw_native, submit_script=script)
+    launch['files'] = {key:dict(bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest()) for key,raw in files.items()}
+    return document, value, files, native
+
+
+@pytest.fixture
+def actor_bridge(monkeypatch):
+    m = module(); document, value, files, native = bridge_inputs(); launch = document['launch']
+    policy = dict(jobs_root='/srv/qcl-negf/jobs',native_result_prefix='native',release_runtime='/protected/runtime',
+        client_uid=3000, tools=dict(runuser='/nix/store/runuser'), limits={**limits(), 'metadata_bytes':8*1024*1024})
+    sources = m.NativeSources(policy,m.Operation(policy['limits']))
+    host = dict(machine_id='a'*32,boot_id=launch['request_id'],image_id='/nix/store/image')
+    sources.qualification = dict(write_domain={'storage_identity':'storage'})
+    monkeypatch.setattr(sources,'qualify',lambda:host)
+    context = dict(app=value['application_path'],configuration=PeerSources().configuration)
+    monkeypatch.setattr(sources,'_refresh_caller',lambda action: {'application':context},raising=False)
+    def read(path,*args):
+        path = str(path)
+        if path.endswith('source-graph-'+hashlib.sha256(files['source_graph']).hexdigest()+'.json'):return files['source_graph']
+        if '/records/release-' in path:return m.encoded({**value,'code_uuid':launch['code_uuid'],
+            'quantum_runtime_context':m.engine.quantum_context(value)})
+        if path.endswith('/release.json'):return m.encoded({**value,'ready':True,'code_uuid':launch['code_uuid']})
+        raise AssertionError(path)
+    monkeypatch.setattr(m,'protected_read',read)
+    monkeypatch.setattr(m,'_read_submitted_files_as_owner',lambda *args:dict(files=launch['files'],script=base64_script(files['submit_script'])))
+    monkeypatch.setattr(m.engine,'public_binary_origin',lambda budget,path,**kw: {'path':path})
+    monkeypatch.setattr(m.engine,'admission_reader',lambda path: __import__('contextlib').nullcontext())
+    monkeypatch.setattr(sources.budget,'read',lambda path,limit=65536:m.encoded(dict(open=True,release_id=value['release_id'])))
+    calls=[]; actor_launch=copy.deepcopy(launch)
+    state=dict(m=m,document=document,value=value,files=files,native=native,sources=sources,host=host,
+               actor_launch=actor_launch,context=context,calls=calls,gate=True,ready=True,fault=None)
+    def run(argv,**kw):
+        calls.append((argv,kw))
+        if state['fault']=='query':raise m.engine.CommandFailure(dict(failure='timeout',cleanup_confirmed=False,
+            stdout='original actor prefix',stderr='original query failure',child_started=True))
+        raw=m.encoded(actor_launch) if 'launch' in argv else files['native_execution']
+        output=m.engine.CommandOutput(raw.decode());output.output_bytes=len(raw)+(1 if state['fault']=='partial' else 0)
+        return output
+    monkeypatch.setattr(m.engine,'command',run)
+    def read_current(path,*args):
+        if str(path).endswith('/release.json'):return m.encoded({**value,'ready':state['ready'],'code_uuid':launch['code_uuid']})
+        return read(path,*args)
+    monkeypatch.setattr(m,'protected_read',read_current)
+    monkeypatch.setattr(sources.budget,'read',lambda path,limit=65536:m.encoded(dict(open=state['gate'],release_id=value['release_id'])))
+    state['run']=run
+    return state
+
+
+def test_original_actor_launch_raw_bytes_and_stock_script_join_preflight(actor_bridge):
+    state=actor_bridge;sources=state['sources'];document=state['document'];launch=document['launch'];calls=state['calls']
+    assert sources.preflight(launch,sources.budget,calcjob_uuid=document['calcjob_uuid'],action='submit')==state['host']
+    assert [row[0][-4] for row in calls]==['launch','execution']
+    assert all(row[1]['deadline']==sources.budget.deadline for row in calls)
+
+
+@pytest.mark.parametrize('fault',['launch','partial','raw','fullref','code','storage','legacy_attempt','extra_shell',
+    'directive','duplicate_header','scratch','output','thread','unquoted','gate','ready','budget','query'])
+def test_actor_script_reference_and_budget_negatives_precede_claim(actor_bridge,tmp_path,fault):
+    state=actor_bridge;m=state['m'];document=state['document'];launch=document['launch'];files=state['files'];sources=state['sources']
+    if fault=='launch':state['actor_launch']['transport_attempt']+=1
+    if fault in {'partial','query'}:state['fault']=fault
+    if fault=='raw':files['native_execution']+=b' '
+    if fault in {'fullref','code','storage'}:
+        native=state['native']
+        if fault=='fullref':native['input_plan']['node_uuid']=document['calcjob_uuid']
+        if fault=='code':native['code']['solver_executable']='/nix/store/foreign/bin/qcl-negf'
+        if fault=='storage':native['storage']['storage_identity']='foreign'
+        files['native_execution']=m.encoded(native)
+    if fault in {'legacy_attempt','extra_shell','directive','duplicate_header','scratch','output','thread','unquoted'}:
+        script=files['submit_script']
+        if fault=='legacy_attempt':script=script.replace(b"  >",b" '--attempt' '1'  >")
+        if fault=='extra_shell':script+=b'\necho unsafe\n'
+        if fault=='directive':script=script.replace(b'#SBATCH --no-requeue',b'#SBATCH --wrap=unsafe')
+        if fault=='duplicate_header':script=script.replace(b'#SBATCH --nodes=1',b'#SBATCH --nodes=1\n#SBATCH --nodes=1')
+        if fault=='scratch':script=script.replace(b"  >",b" '--scratch-root' '/free/path'  >")
+        if fault=='output':script=script.replace(b'/srv/qcl-negf/jobs/native/',b'/outside/native/')
+        if fault=='thread':script=script.replace(b"JULIA_NUM_THREADS='2'",b"JULIA_NUM_THREADS='3'")
+        if fault=='unquoted':script=script.replace(b"'run-plan'",b'run-plan')
+        files['submit_script']=script
+    if fault in {'fullref','code','storage','legacy_attempt','extra_shell','directive','duplicate_header','scratch','output','thread','unquoted'}:
+        launch['files']={key:dict(bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest()) for key,raw in files.items()}
+        state['actor_launch'].update(copy.deepcopy(launch))
+    if fault=='gate':state['gate']=False
+    if fault=='ready':state['ready']=False
+    if fault=='budget':sources.budget.bytes=sources.budget.limits['metadata_bytes']
+    selected=m.OrdinaryAttemptOwner(sources.policy,m.AttemptStore(tmp_path),sources,sources.budget)
+    result=selected.submit(document)
+    assert result['state']=='hold' and not (tmp_path/'attempts').exists()
+    assert not any('--parsable' in row[0] for row in state['calls'])
+
+
+@pytest.mark.parametrize('action',['reconcile','status','start','close'])
+def test_operational_original_input_reads_remain_possible_with_admission_closed(actor_bridge,action):
+    state=actor_bridge;state['gate']=state['ready']=False;sources=state['sources']
+    assert sources.preflight(state['document']['launch'],sources.budget,
+        calcjob_uuid=state['document']['calcjob_uuid'],action=action)==state['host']
+
+
+def test_actor_query_failure_keeps_bounded_original_before_claim(actor_bridge,tmp_path,capsys):
+    state=actor_bridge;m=state['m'];state['fault']='query';sources=state['sources']
+    selected=m.OrdinaryAttemptOwner(sources.policy,m.AttemptStore(tmp_path),sources,sources.budget)
+    assert selected.submit(state['document'])['state']=='hold'
+    diagnostic=json.loads(capsys.readouterr().err.split('native-attempt preclaim HOLD: ',1)[1])
+    import base64
+    original=json.loads(base64.b64decode(diagnostic['original_prefix_base64']))
+    assert original['stdout']=='original actor prefix' and original['cleanup_confirmed'] is False
+    assert not (tmp_path/'attempts').exists()
+
+
+@pytest.mark.parametrize('large',[False,True])
+def test_actual_ingress_environment_command_failure_keeps_bounded_original(monkeypatch,capsys,large):
+    import base64
+    m=module();budget=m._bootstrap_operation();captured=[];commands=[]
+    policy={'client_uid':3000,'daemon_unit':'qcl-negf-aiida.service',
+        'tools':{'systemctl':'/nix/store/systemctl'},'limits':budget.limits}
+    source=m.NativeSources(policy,budget);source._server_unit='qcl-negf-native-attempt@one.service'
+    monkeypatch.setattr(source,'qualify',lambda:None)
+    original={'failure':'timeout','returncode':None,'stdout':'unique-original-P3-prefix'+('x'*40000 if large else ''),
+        'stderr':'original fixture diagnostic','cleanup_confirmed':False}
+    primary=m.engine.CommandFailure(original)
+    def failed(argv):
+        commands.append(argv)
+        assert argv==['/nix/store/systemctl','show',source._server_unit,'--property=Environment','--value']
+        raise primary
+    monkeypatch.setattr(source,'run',failed)
+    monkeypatch.setattr(m,'_bootstrap_operation',lambda:budget)
+    monkeypatch.setattr(m,'_load_policy',lambda *args:policy)
+    monkeypatch.setattr(m,'_authenticate_server',lambda sources:None)
+    monkeypatch.setattr(m,'NativeSources',lambda policy,budget:source)
+    monkeypatch.setattr(m,'read_frame',lambda *args:request())
+    monkeypatch.setattr(m,'write_frame',lambda connection,result,*args:captured.append(result))
+    def no_owner(*args):raise AssertionError('preowner failure must not construct an AttemptStore')
+    monkeypatch.setattr(m,'AttemptStore',no_owner)
+    monkeypatch.setenv('QCL_NEGF_NATIVE_ACTOR_CONFIG','/nix/store/config/actor.json')
+    class Connection:
+        def getsockopt(self,*args):return struct.pack('3i',456,3000,3000)
+    m.handle_connection(Connection())
+    assert len(commands)==1 and captured==[m.reply({},'hold',reason='native_observation_failed')]
+    assert 'unique-original-P3-prefix' not in json.dumps(captured)
+    stderr=capsys.readouterr().err
+    retained=json.loads(stderr.split('native-attempt preclaim HOLD: ',1)[1])
+    raw=m.encoded(original)
+    assert base64.b64decode(retained['original_prefix_base64'])==raw[:24576]
+    assert retained=={'original_prefix_base64':base64.b64encode(raw[:24576]).decode('ascii'),
+        'original_bytes':len(raw),'original_sha256':hashlib.sha256(raw).hexdigest(),'truncated':len(raw)>24576}
+    assert primary.record is original and original['cleanup_confirmed'] is False and len(stderr)<34000
+
+
+@pytest.mark.parametrize('secondary',[OSError('stderr unavailable'),KeyboardInterrupt('secondary write')])
+def test_preclaim_diagnostic_write_failure_cannot_replace_primary_hold(monkeypatch,secondary):
+    m=module();budget=m._bootstrap_operation();captured=[];calls=[]
+    primary=m.engine.CommandFailure({'failure':'timeout','stdout':'original','cleanup_confirmed':False})
+    def failed(*args,**kwargs):calls.append('original');raise primary
+    monkeypatch.setattr(m,'_bootstrap_operation',lambda:budget)
+    monkeypatch.setattr(m,'_load_policy',failed)
+    monkeypatch.setattr(m,'write_frame',lambda connection,result,*args:captured.append(result))
+    class BrokenStderr:
+        def write(self,*args):raise secondary
+        def flush(self):pass
+    monkeypatch.setattr(m.sys,'stderr',BrokenStderr())
+    m.handle_connection(object())
+    assert calls==['original'] and captured==[m.reply({},'hold',reason='native_observation_failed')]
+    assert primary.record=={'failure':'timeout','stdout':'original','cleanup_confirmed':False}
+
+
+@pytest.mark.parametrize('scenario',['bound','lost_ack','withdraw_before_intent'])
+def test_joined_native_owner_caller_actor_script_and_same_key_reentry(actor_bridge,tmp_path,monkeypatch,scenario):
+    """Production owner/preflight/auth/intent/dispatch/join; OS/CLI facts are fixtures."""
+    state=actor_bridge;m=state['m'];policy=state['sources'].policy
+    policy.update(spool_root='/local/spool',daemon_unit='qcl-negf-aiida.service',server_unit_prefix='qcl-negf-native-attempt@',
+                  slurm=dict(cluster='cluster',config_file='/etc/slurm.conf'))
+    policy['tools'].update(sbatch='/nix/store/sbatch',scontrol='/nix/store/scontrol')
+    dispatches=[];state['lost']=scenario=='lost_ack'
+    root_executable='/nix/store/root-python';server_unit='qcl-negf-native-attempt@fixture.service'
+    peers=PeerSources();current={'peer':456,'action':'submit'}
+    qualification={'write_domain':{'storage_identity':'storage'},'unit_origins':{
+        'server':{'executable':root_executable},policy['daemon_unit']:{'executable':peers.python}}}
+    original_command=m.engine.command
+    def command(argv,**kw):
+        if '--parsable' in argv:
+            dispatch=argv[argv.index('--comment')+1];dispatches.append((dispatch,argv[-1]))
+            if state['lost']:raise m.engine.CommandFailure(dict(failure='timeout',cleanup_confirmed=False,
+                child_started=True,stdout='lost original ACK',stderr=''))
+            text='42;cluster\n'
+        elif policy['tools']['scontrol'] in argv:
+            dispatch,path=dispatches[0]
+            text=('JobId=42 UserId=qcl-negf(3000) SubmitTime=2026-10-30T01:00:00 WorkDir='+state['document']['launch']['remote_workdir']+
+                  ' Comment='+dispatch+' Command='+path+' Restarts=0 NumNodes=1 NumTasks=1')
+        else:return original_command(argv,**kw)
+        result=m.engine.CommandOutput(text);result.output_bytes=len(text);return result
+    monkeypatch.setattr(m.engine,'command',command)
+    monkeypatch.setattr(m,'trusted_root_path',lambda path,**kw:Path(path))
+    class Connection:
+        def getsockopt(self,*args):return struct.pack('3i',current['peer'],3000,3000)
+    def fresh(action,pid):
+        current.update(action=action,peer=pid)
+        source=m.NativeSources(policy,m.Operation(policy['limits']));source.qualification=qualification
+        monkeypatch.setattr(source,'qualify',lambda:state['host']);monkeypatch.setattr(source,'host',lambda:state['host'])
+        monkeypatch.setattr(source,'actor_context',lambda:state['context'])
+        monkeypatch.setattr(source,'profile_view',peers.profile_view);monkeypatch.setattr(source,'origin',lambda path:path)
+        monkeypatch.setattr(source,'selected_environment',peers.selected_environment)
+        def process(which):
+            if which==os.getpid():return dict(pid=which,ppid=1,start_ticks=2,uids=[0]*4,state='S',comm='python',
+                cgroup='/system.slice/'+server_unit,executable=root_executable,observations={'changing':peers.count})
+            row=peers.process(456 if which==pid else which)
+            if which==pid:row.update(pid=pid,start_ticks=50)
+            return row
+        monkeypatch.setattr(source,'process',process)
+        monkeypatch.setattr(source,'command_line',lambda which:peers.configuration['client']['argv_prefix']+[action]
+            if which==pid else peers.command_line(which))
+        monkeypatch.setattr(source,'unit',lambda name:dict(MainPID=str(os.getpid()),ControlGroup='/system.slice/'+server_unit,
+            InvocationID='b'*32,ActiveState='active',MemoryMax='134217728',RuntimeMaxUSec='90s')
+            if name==server_unit else peers.unit(name))
+        monkeypatch.setattr(source,'snapshot',lambda launch,dispatch,budget:dict(script_path='/local/spool/'+dispatch+'.sh',
+            script_sha256=launch['files']['submit_script']['sha256']))
+        monkeypatch.setattr(source,'_check_snapshot',lambda snapshot:None)
+        monkeypatch.setattr(source.budget,'read',lambda path,limit=65536:m.encoded(dict(open=state['gate'],release_id=state['value']['release_id'])))
+        m._authenticate_server(source)
+        source._caller=m.authenticate_socket_peer(Connection(),policy,source,action=action)
+        if scenario=='withdraw_before_intent' and action=='submit' and not (tmp_path/'attempts').exists():
+            refresh=source._refresh_caller;calls=[0]
+            def withdrawing(selected):
+                calls[0]+=1
+                if calls[0]==3:state['gate']=False
+                return refresh(selected)
+            monkeypatch.setattr(source,'_refresh_caller',withdrawing)
+        return m.OrdinaryAttemptOwner(policy,m.AttemptStore(tmp_path),source,source.budget)
+    first=fresh('submit',456).submit(state['document'])
+    directory=tmp_path/'attempts'/state['document']['calcjob_uuid']
+    assert (directory/'claim.json').is_file()
+    if scenario=='withdraw_before_intent':
+        assert first['state']=='hold' and dispatches==[]
+        state['gate']=True
+        again=fresh('reconcile',567).reconcile({**state['document'],'action':'reconcile'})
+        assert again['state']=='hold' and again['reason']=='partial_claim' and dispatches==[]
+    elif scenario=='lost_ack':
+        assert first['reason']=='dispatch_outcome_unknown' and len(dispatches)==1
+        original=(directory/'failure.json').read_bytes();state['lost']=False
+        again=fresh('reconcile',567).reconcile({**state['document'],'action':'reconcile'})
+        assert again['reason']=='dispatch_outcome_unknown' and len(dispatches)==1
+        assert (directory/'failure.json').read_bytes()==original
+    else:
+        assert first['state']=='bound' and len(dispatches)==1
+        state['ready']=state['gate']=False
+        again=fresh('status',567).status({**state['document'],'action':'status'})
+        assert again['state']=='bound' and again['job']==first['job'] and len(dispatches)==1
+        retained=json.loads((directory/'dispatch.json').read_bytes())['native']['owner']
+        assert retained['caller']['pid']==456 and retained['actor']['calcjob_uuid']==state['document']['calcjob_uuid']
+        assert set(json.loads((directory/'claim.json').read_bytes())['context'])=={'machine_id','boot_id','image_id'}
+
+
+@pytest.mark.parametrize('fault',[None,'alias_target','alias_owner','mutable_ancestor'])
+def test_actor_app_selection_reuses_public_nix_origin_and_root_profile(monkeypatch,fault):
+    m=module();from test_application_release import delivery_manifest
+    sources=m.NativeSources({'release_runtime':'/protected/runtime'},m.Operation(limits()))
+    cfg=PeerSources().configuration;value=delivery_manifest(False);app=value['application_path']
+    monkeypatch.setattr(sources,'actor_configuration',lambda:cfg)
+    monkeypatch.setattr(m,'protected_read',lambda *args:m.encoded(value))
+    def info(mode,uid=0):return (1,1,mode,uid,0,0,0)
+    chain=[('/nix',info(m.stat.S_IFDIR|0o755),None),('/nix/store',info(m.stat.S_IFDIR|0o1775),None),
+        ('/nix/var/nix/profiles',info(m.stat.S_IFDIR|(0o777 if fault=='mutable_ancestor' else 0o755)),None),
+        (cfg['application_profile'],info(m.stat.S_IFLNK|0o777,3000 if fault=='alias_owner' else 0),app),
+        ('/nix/store/other' if fault=='alias_target' else app,info(m.stat.S_IFDIR|0o555),None)]
+    monkeypatch.setattr(m.engine,'public_binary_origin',lambda budget,path,**kw:{'path':path,'chain':chain})
+    if fault:
+        with pytest.raises(m.Hold):sources.actor_context()
+    else:assert sources.actor_context()['app']==app
+
+
+def test_exact_s1_bash_hop_and_fixed_client_alias_are_joined():
+    m=module();sources=PeerSources();original_process=sources.process;original_command=sources.command_line
+    def process(pid):
+        if pid==400:return dict(pid=400,ppid=345,start_ticks=35,uids=[3000]*4,state='S',comm='bash',
+            cgroup='/system.slice/qcl-negf-aiida.service/worker',executable='/nix/store/bash/bin/bash',observations={})
+        row=original_process(pid)
+        if pid==456:row['ppid']=400
+        return row
+    sources.process=process
+    sources.command_line=lambda pid:['bash','--noprofile','--norc','-c',
+        '/run/current-system/sw/bin/qcl-negf-native-attempt-client submit'] if pid==400 else original_command(pid)
+    sources.origin=lambda path:sources.configuration['client']['entrypoint'] if path=='/run/current-system/sw/bin/qcl-negf-native-attempt-client' else path
+    class Connection:
+        def getsockopt(self,*args):return struct.pack('3i',456,3000,3000)
+    assert [row['process']['pid'] for row in m.authenticate_socket_peer(Connection(),sources.policy,sources,action='submit')['chain']]==[456,400,345,234,123]
+
+
+def test_existing_journal_encoding_is_prepaid_for_long_original_transport_int():
+    m=module();budget=m.Operation(limits());value={'transport_attempt':10**1000}
+    m._reserve_private_record(value,budget)
+    assert budget.bytes>=len(m.encoded(value))
+    first=budget.bytes;m._reserve_private_record(value,budget)
+    assert budget.bytes==2*first
+
+
+def test_native_off_evaluator_preserves_two_coerced_script_identity_assertion():
+    source=(Path(__file__).parent/'infrastructure/native-attempt.nix').read_text()
+    assert 'assert toString off.systemd.services.qcl-negf-aiida.serviceConfig.ExecStart == toString originalDaemonStart;' in source
+
+
+def test_current_profile_alias_argv_cannot_certify_already_loaded_app():
+    m=module();sources=PeerSources();command=sources.command_line
+    sources.command_line=lambda pid:[part.replace(sources.app+'/bin/verdi',sources.profile+'/bin/verdi')
+                                     for part in command(pid)]
+    class Connection:
+        def getsockopt(self,*args):return struct.pack('3i',456,3000,3000)
+    with pytest.raises(m.Hold,match='application_origin'):
+        m.authenticate_socket_peer(Connection(),sources.policy,sources,action='submit')
+
+
+def test_old_mainpid_immutable_argv_does_not_follow_retargeted_profile():
+    m=module();sources=PeerSources();command=sources.command_line
+    sources.actor_context=lambda:{'app':'/nix/store/new-application','configuration':sources.configuration}
+    sources.command_line=command  # Actual old PID keeps the old immutable APP argv.
+    class Connection:
+        def getsockopt(self,*args):return struct.pack('3i',456,3000,3000)
+    with pytest.raises(m.Hold,match='application_origin'):
+        m.authenticate_socket_peer(Connection(),sources.policy,sources,action='submit')
+
+
+@pytest.mark.parametrize('fault',[None,'unit_selection','extra','jobs_root'])
+def test_fixed_actor_configuration_joins_qualified_unit_and_immutable_source(monkeypatch,fault):
+    m=module();sources=m.NativeSources(dict(jobs_root='/srv/qcl-negf/jobs',tools={'systemctl':'/nix/store/systemctl'}),m.Operation(limits()))
+    sources._server_unit='qcl-negf-native-attempt@one.service'
+    config={'schema':'qcl-negf.native-actor-launch.v1','profile':'qcl-negf',
+        'aiida_path':'/var/lib/qcl-negf/aiida','application_profile':'/nix/var/nix/profiles/qcl-negf-application',
+        'jobs_root':'/srv/qcl-negf/jobs','client':PeerSources().configuration['client']}
+    if fault=='extra':config['verified']=True
+    if fault=='jobs_root':config['jobs_root']='/other'
+    path='/nix/store/config/actor.json';monkeypatch.setenv('QCL_NEGF_NATIVE_ACTOR_CONFIG',path)
+    monkeypatch.setattr(m.engine,'public_binary_origin',lambda budget,path,**kw:{'path':path})
+    monkeypatch.setattr(m.engine,'immutable_public_bytes',lambda *args:m.encoded(config))
+    monkeypatch.setattr(sources,'run',lambda argv:'QCL_NEGF_NATIVE_ACTOR_CONFIG='+('/other' if fault=='unit_selection' else path))
+    if fault:
+        with pytest.raises(m.Hold):sources.actor_configuration()
+    else:assert sources.actor_configuration()==config
+
+
+@pytest.mark.parametrize('fault',[None,'alias','writable','log_alias','config_rw','view_changed'])
+def test_existing_profile_view_actual_fd_reads_no_bootstrap_or_lock_cleanup(tmp_path,monkeypatch,fault):
+    m=module();config=PeerSources().configuration;root=tmp_path/'namespace'
+    folder=root/'var/lib/qcl-negf/aiida/.aiida';(folder/'access/qcl-negf').mkdir(parents=True);(folder/'log').mkdir()
+    (folder/'config.json').write_bytes(b'{"fixture":"not a real profile or credential"}')
+    (folder/'access/qcl-negf/unknown.lock').write_bytes(b'unknown owner; preserve')
+    if fault=='alias':(folder/'config.json').rename(folder/'original');(folder/'config.json').symlink_to('original')
+    if fault=='writable':(folder/'config.json').chmod(0o666)
+    if fault=='log_alias':(folder/'log/aiida-qcl-negf.log').symlink_to('../config.json')
+    sources=m.NativeSources({'client_uid':os.getuid()},m.Operation(limits()));opened=os.open
+    def namespace(path,*args,**kwargs):
+        text=str(path)
+        if text.startswith('/proc/') and text.endswith('/root'):return opened(root,*args,**kwargs)
+        return opened(path,*args,**kwargs)
+    monkeypatch.setattr(m.os,'open',namespace)
+    def mountinfo(path,limit=65536):
+        assert str(path).endswith('/mountinfo')
+        if fault=='view_changed' and '/123/' in str(path):(folder/'config.json').write_bytes(b'changed')
+        return ('1 0 0:1 / /var/lib/qcl-negf/aiida/.aiida/config.json '+
+                ('rw' if fault=='config_rw' else 'ro')+' - ext4 /dev/fixture rw\n').encode()
+    monkeypatch.setattr(sources.budget,'read',mountinfo)
+    if fault:
+        with pytest.raises((m.Hold,OSError)):sources.profile_view(123,{'configuration':config})
+    else:
+        result=sources.profile_view(123,{'configuration':config})
+        assert result['sha256']==hashlib.sha256((folder/'config.json').read_bytes()).hexdigest()
+    assert (folder/'access/qcl-negf/unknown.lock').read_bytes()==b'unknown owner; preserve'
 
 
 @pytest.mark.parametrize('manual', [False, True])

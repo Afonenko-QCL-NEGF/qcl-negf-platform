@@ -30,13 +30,32 @@ let
   };
   socket = on.systemd.sockets.qcl-negf-native-attempt.socketConfig;
   server = on.systemd.services."qcl-negf-native-attempt@".serviceConfig;
+  launch = (import ../../nix/native-attempt.nix { inherit pkgs; }).clientLaunch;
+  profileConfig = "/var/lib/qcl-negf/aiida/.aiida/config.json";
+  profileAccess = "/var/lib/qcl-negf/aiida/.aiida/access/qcl-negf";
+  profileLog = "/var/lib/qcl-negf/aiida/.aiida/log";
+  originalDaemonStart = pkgs.writeShellScript "qcl-negf-aiida-start" ''
+    export PATH=/nix/var/nix/profiles/qcl-negf-application/bin:$PATH
+    exec /nix/var/nix/profiles/qcl-negf-application/bin/verdi -p qcl-negf daemon start --foreground
+  '';
 in
 assert !(off.systemd.sockets ? qcl-negf-native-attempt);
+assert toString off.systemd.services.qcl-negf-aiida.serviceConfig.ExecStart == toString originalDaemonStart;
 assert on.systemd.services.qcl-negf-aiida.serviceConfig.NoNewPrivileges;
 assert on.systemd.services.qcl-negf-api.serviceConfig.NoNewPrivileges;
 assert socket.Accept && socket.SocketMode == "0660" && socket.SocketUser == "root";
 assert server.User == "root" && server.Restart == "no" && server.KillMode == "control-group";
 assert server.MemoryMax == 134217728 && server.RuntimeMaxSec == 90;
+assert !(off.systemd.services.qcl-negf-aiida.environment ? QCL_NEGF_NATIVE_JOBS_ROOT);
+assert on.systemd.services.qcl-negf-aiida.environment.QCL_NEGF_NATIVE_JOBS_ROOT == "/srv/qcl-negf/jobs";
+assert pkgs.lib.hasPrefix "/nix/store/" on.systemd.services."qcl-negf-native-attempt@".environment.QCL_NEGF_NATIVE_ACTOR_CONFIG;
+assert server.StandardError == "journal";
+assert server.ReadWritePaths == [ "/var/lib/qcl-negf-native-attempt" "/var/lib/qcl-negf-native-spool" profileAccess profileLog ];
+assert server.ReadOnlyPaths == [ profileConfig ];
+assert builtins.elem profileConfig on.systemd.services.qcl-negf-aiida.serviceConfig.ReadOnlyPaths;
+assert builtins.elem profileConfig on.systemd.services.qcl-negf-api.serviceConfig.ReadOnlyPaths;
+assert builtins.elemAt launch.argv_prefix 1 == "-I" && builtins.elemAt launch.argv_prefix 2 == "-c";
+assert pkgs.lib.hasInfix "m.client_main()" (builtins.elemAt launch.argv_prefix 3);
 assert builtins.elem "/srv/qcl-negf/jobs/native" on.systemd.services.qcl-negf-aiida.serviceConfig.ReadOnlyPaths;
 assert builtins.elem "/srv/qcl-negf/jobs/native" on.systemd.services.qcl-negf-api.serviceConfig.ReadOnlyPaths;
 assert pkgs.lib.hasInfix "Prolog=" worker.services.slurm.extraConfig;
