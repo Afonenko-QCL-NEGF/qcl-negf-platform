@@ -491,3 +491,121 @@ enrollment. Это процедура, а не выполненный rollback/r
 Без actual artifact location/checksum/build/content/first-boot и target receipts статус
 соответствующей клетки остаётся `not_measured` или `blocked`; этот guide не присваивает ей PASS и не
 заявляет готовность Proxmox/Hyper-V. Их installation/native gates отдельны.
+
+### Native NetworkManager: PORT-first DHCP и ограниченный guard
+
+[Отдельный playbook](../ansible/networkmanager-bridge.yml) создаёт **только private staging
+bundle**. Он не загружает profiles, не активирует connections и не меняет работающую сеть.
+Потребуются существующие Python 3 с GI/libnm и NetworkManager 1.58.x; установка зависимостей в
+playbook не скрыта. На целевом host конкретная версия и поведение Reapply ещё требуют native
+qualification. Эта SOURCE/L реализация не является разрешением установки или boot worker.
+
+В private inventory создайте `qcl_nm_bridge_hosts` и явно задайте `qcl_nm_stage: true`, новый
+`qcl_nm_stage_directory: /var/lib/qcl-negf/nm-bridge-stage/<packet>`, `qcl_nm_bridge_name`, разные
+`qcl_nm_bridge_uuid` и `qcl_nm_port_uuid`, `qcl_nm_permanent_mac`. Например, synthetic имя
+`br-example`, UUID `11111111-1111-4111-8111-111111111111` и `22222222-2222-4222-8222-222222222222`,
+MAC `02:00:00:00:00:01`. Real inventory в Git не хранится. Запуск `--check` проверяет inputs и
+свободный stage; обычный opt-in запуск только записывает bundle. Существующий stage не заменяется.
+HOME, VPN, Docker и другие profiles не являются inputs для записи.
+
+PORT сопоставляется permanent MAC без имени USB interface; `autoconnect=true`, priority100,
+retries1, controller — точный UUID MASTER. У PORT нет IPv4/IPv6 settings. MASTER имеет
+`autoconnect=false`, `autoconnect-ports=0`, IPv4 DHCP с явным client-id `01:<permanent MAC>`, IPv6
+auto, metric600, DHCP timeout30. Поэтому пустой мост не выбирает stale static host IP при reboot, а
+IP/lease изменения обслуживает NM. Scoped `ignore-carrier=no` — дополнительная защита; carrier моста
+с TAP не доказывает наличие физического uplink. Priority/timeout и native boot selection принимаются
+только в отдельных native cases.
+
+Минимальный post-event dispatcher вызывает один bounded guard для `up`, `down`, `reapply`,
+`dhcp4-change`, `dhcp6-change` только на собственном MASTER или physical NIC с указанным permanent
+MAC. Аргументы события — hints; решение всегда использует actual owner/kernel state. Guard не
+активирует HOME/PORT, не down/delete bridge, не трогает VM/TAP и не запускает monitor daemon. Он
+меняет только applied IPv4/IPv6 MASTER и runtime metadata ключ
+`user.data["org.qcl-negf.bridge-guard.operation"]`, сохраняя остальные settings и user keys. Saved
+profiles не переписываются. При HOME либо пропавшем физическом carrier собственный L3 отключается;
+возвращение PORT позволяет restore только доказанной собственной suspension того же saved profile.
+Просто `disabled` не даёт authority. DHCP/up с уже правильным profile — NOOP.
+
+Будущий Root install packet должен под общим lock `/run/lock/qcl-negf-nm-bridge.lock` установить
+ровно следующие owned объекты, сохранив rollback прежнего содержимого/отсутствия каждого:
+
+| Staged source              | Будущий installed path                                           | Owner / mode    |
+| -------------------------- | ---------------------------------------------------------------- | --------------- |
+| `linux_bridge_nm.py`       | `/usr/local/libexec/linux_bridge_nm.py`                          | root:root /0600 |
+| `qcl-negf-nm-bridge-guard` | `/usr/local/libexec/qcl-negf-nm-bridge-guard`                    | root:root /0700 |
+| `bridge.nmconnection`      | `/etc/NetworkManager/system-connections/qcl-bridge.nmconnection` | root:root /0600 |
+| `uplink.nmconnection`      | `/etc/NetworkManager/system-connections/qcl-uplink.nmconnection` | root:root /0600 |
+| `bridge-device.conf`       | `/etc/NetworkManager/conf.d/90-qcl-bridge.conf`                  | root:root /0600 |
+| `dispatcher-guard`         | `/etc/NetworkManager/dispatcher.d/90-qcl-bridge-guard`           | root:root /0700 |
+| private binding            | `/etc/qcl-negf/nm-bridge/binding.json`                           | root:root /0600 |
+
+Непроверенное существующее имя/path не считается owned. Installer должен проверять symlink/owner
+всех parent directories и существующих destinations до любой записи; staging playbook этим installer
+не является. Новые private directories `nm-bridge` имеют0700. Guard runtime:
+`/var/lib/qcl-negf/nm-bridge/state.json` — один WAL, `/run/qcl-negf/nm-bridge/pending.json` —
+coalesced wake nonce, файлы0600. WAL записывается atomic replace с fsync файла и parent **до** RPC.
+Lock installer и guard общий. Не смешивайте profiles из разных packets и не меняйте installer/source
+во время handler. Публикация dispatcher раньше module/binding/profiles запрещена.
+
+Binding — JSON с точными ключами: `schema: "qcl.nm-bridge.v1"`, `bridge_name`, `bridge_uuid`,
+`port_uuid`, canonical lowercase `permanent_mac`, exact `nm_version`, `source_sha256` module и
+`profile_sha256`, `port_profile_sha256`. Последние — `profile_hash(from_variant(settings))` **actual
+saved GetSettings** в принятой версии NM: исключается только `connection.timestamp`. Нельзя считать
+hash текста keyfile эквивалентным native settings hash. Получение и review этих private hashes,
+отсутствие runtime operation token в saved profile и явный rebind при source/profile upgrade входят
+в будущий installation packet. Привязка не строится из старого WAL/версии state. `GetSecrets` не
+используется.
+
+`--status` читает fresh NM/kernel/per-link DNS и marker, не создавая directories, lock, wake или
+receipt и не выполняя repair. Только `worker_ready=true` означает свежий локальный predicate; exit0
+включает также absent/suspended и сам по себе готовность не означает. Этот predicate не сертификат
+полного DNS/Internet, VM, memory admission или научной приёмки. `--reconcile` — Root one-shot с
+actual unique D-Bus destination, nonzero applied-version CAS и флагом `preserve-external-ip=1`; в
+SOURCE/L проверках он допускается только с injected fake adapter и private fixture directories.
+Реальный запуск здесь не выполнен.
+
+WAL связывает operation nonce, boot/bus/NM unique-owner epoch, source/binding/profile/object
+identity, actual physical owner, before version/hash и exact typed payload. Void Reapply reply не
+означает settlement. Потеря reply/cancellation оставляет unresolved marker; accepted state требует
+своего nonce, payload и ровно before-version+1. Собственная suspension не наследуется после epoch,
+profile/source edit или внешнего version jump. Late older CAS ограждается fresh runtime token с
+новой CAS version, а не no-diff Reapply. Не более2 RPC за wake; максимум один unresolved
+predecessor. Перед RPC проверяется actual physical owner, независимо от версии MASTER; после RPC
+проверяются owner, собственный L3, kernel addresses/routes/rules, NM per-link DNS и сохранность
+L2/foreign. Изменившийся attachment PORT между отдельными wakes допускает новое current-state
+решение; изменение L2/foreign во время операции закрывает её результат без попытки исправить чужую
+сеть.
+
+Если post-RPC readback уже обнаружил нарушение protected L2/foreign, guard сохраняет в WAL
+`invariant_failure` с operation/context и hashes ожидаемой/наблюдаемой проекции. Этот факт остаётся
+closed при следующих wakes и RO status; ни новый owner, ни возврат MTU, ни новый dirty nonce не
+заменяют его свежим baseline. Это относится к уже обнаруженному нарушению собственной операции;
+здоровый физический attachment change между отдельными wakes сохраняется. Automatic repair чужой
+сети или общий sticky-error framework не добавляются.
+
+Сброс этого факта — отдельный explicit Root rebind под тем же lock, с сохранением исходного WAL и
+доказательства нарушения. Сначала нужны выясненная причина и принятая текущая L2/foreign projection,
+исключённые unresolved/late CAS, actual saved/applied/profile/source/epoch binding и fresh native
+activation/readback, соответствующий принятому profile. Лишь затем Root создаёт новый private
+baseline без authority старой failed chain. Обычный `--reconcile`/restart/silent удаление marker
+rebind не выполняют; нового автоматического reset command нет. Эта SOURCE/L правка rebind или native
+действия не исполняет.
+
+Own address identity сопоставляется с NM только после usability checks: tentative, dadfailed,
+optimistic, deprecated, expired lifetime либо неподдержанный state/flag закрывают settled.
+Projection сохраняет эти признаки, нормализуя лишь положительные lifetime countdowns; zero lifetime
+не маскируется как обычный отсчёт. Healthy IPv6/DHCP и стандартные безопасные address flags
+сохраняются.
+
+Каждый relevant event до попытки lock публикует новый dirty nonce. Consumer запоминает generation
+**до** readback. Busy owner не стирает notification; pending/unknown закрывает ready. Следующий NM
+event либо отдельный Root one-shot подхватывает marker. Без нового wake фонового исполнения нет.
+Статус не обещает liveness после последнего busy event. Это одноразовый guard, не служба.
+
+Отдельные native gates перед installation/qualification: local console и checkpoint rollback, actual
+typed Reapply/version/token, DHCP stage3 и IPv4/IPv6 DNS removal/restore, ручной HOME, lease/IP
+change, reboot/NM restart, USB replug, physical loss при живом TAP, MTU/VLAN/TAP/foreign invariance,
+crash/unknown/late CAS/busy pickup. Projection консервативна: unsupported native properties,
+extra/unattributed bridge address, policy-route attributes или неизвестная own rule дают closed.
+Маршруты и DNS других links не flush/repair; global resolver byte equality и DNS доступность не
+сертифицируются. Результаты fake/offline tests не заменяют эти cases.

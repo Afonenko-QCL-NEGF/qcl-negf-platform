@@ -1,0 +1,15 @@
+[connection]
+id=qcl-uplink
+uuid={{ qcl_nm_port_uuid }}
+type=ethernet
+autoconnect=true
+autoconnect-priority=100
+autoconnect-retries=1
+controller={{ qcl_nm_bridge_uuid }}
+port-type=bridge
+
+[ethernet]
+mac-address={{ qcl_nm_permanent_mac }}
+cloned-mac-address=permanent
+
+[bridge-port]
