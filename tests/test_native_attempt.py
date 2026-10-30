@@ -1208,8 +1208,293 @@ def test_f1_missing_hook_proof_still_holds_only_the_dependent_managed_attempt(tm
     monkeypatch.setattr(native, '_trust_root', lambda: '/private/fixture-only')
     monkeypatch.setattr(facts, 'trusted_rpc', lambda *args, **kwargs: packet)
     observed.worker = native.worker
-    document = request(phase); document['controls'] = [] if phase == 'close' else None
+    document = request(phase); document['controls'] = [dict(path=name,bytes=0,sha256=hashlib.sha256(b'').hexdigest())
+        for name in ('series_result.json','native-selection.json','_scheduler-stdout.txt','_scheduler-stderr.txt')] if phase == 'close' else None
     result = first.observe_start(document) if phase == 'start' else first.qualify_close(document)
     assert result['state'] == 'hold' and result['reason'] == missing and result['job'] == bound
     assert result['controls'] is None and len(observed.calls) == 1
     assert not (first.store.path(document['calcjob_uuid']) / 'allocation.json').exists()
+
+
+def q1_controls(root,launch):
+    names=('series_result.json','native-selection.json','_scheduler-stdout.txt','_scheduler-stderr.txt')
+    result=root/launch['relative_execution_root'];work=root/Path(launch['remote_workdir']).relative_to('/srv/qcl-negf/jobs')
+    result.mkdir(parents=True);work.mkdir(parents=True)
+    contents=(b'original failed result bytes\n',b'{"version":1,"selected_inputs":[]}',b'',b'original log\x00bytes')
+    claims=[]
+    for index,(name,raw) in enumerate(zip(names,contents)):
+        path=(result if index<2 else work)/name;path.write_bytes(raw);path.chmod(0o640)
+        claims.append(dict(path=name,bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest()))
+    return claims,result,work
+
+
+@pytest.fixture
+def q1_joined(tmp_path,monkeypatch):
+    """Actual owner/preflight/W1/reader/store; OS/RPC facts are SOURCE fixtures."""
+    m=module();real_reader=m._read_submitted_files_as_owner
+    state=actor_bridge.__wrapped__(monkeypatch);source=state['sources'];policy=source.policy
+    journal=tmp_path/'journal';journal.mkdir(mode=0o700)
+    namespace=tmp_path/'namespace';jobs=namespace/'srv/qcl-negf/jobs'
+    controls,result,work=q1_controls(jobs,state['document']['launch'])
+    policy.update(private_root=str(journal),spool_root='/local/spool',daemon_unit='qcl-negf-aiida.service',
+        server_unit_prefix='qcl-negf-native-attempt@',worker_routes={'node-a':{'fixture':'authenticated RPC boundary'}},
+        nfs_source='storage:/jobs',limits={**policy['limits'],'maximum_files':2048})
+    source.budget=m.Operation(policy['limits']);host=state['host'];dispatch=state['document']['calcjob_uuid']
+    store=m.AttemptStore(journal);launch=state['document']['launch']
+    job=dict(job_id='42',cluster='cluster',submit_time='2026-10-30T01:00:00',controller_machine_id=host['machine_id'],
+        controller_boot_id=host['boot_id'],dispatch_id=dispatch,generation='b'*64,node_name='node-a',
+        start_time='2026-10-30T01:00:01',worker_machine_id='c'*32,worker_boot_id=dispatch)
+    for name,value in [('claim.json',dict(launch=launch,dispatch_id=dispatch,context=host)),
+        ('dispatch.json',dict(original='retained source fixture')),('ack.json',dict(job_id='42',cluster='cluster')),
+        ('job.json',job),('allocation.json',job)]:store.put(dispatch,name,value,source.budget)
+    source.qualification=dict(write_domain=dict(storage_identity='storage',native_prefix='native',retention_ref='qualified-site-locator',
+        writer_hosts={'node-a':'c'*32},controller_units=['qcl-negf-aiida.service','qcl-negf-api.service']),
+        worker_bindings={'c'*32:dict(machine_id='c'*32,boot_id=dispatch)},unit_origins={'server':{'executable':'/nix/store/root-python'}})
+    monkeypatch.setattr(source,'host',lambda:host)
+    monkeypatch.setattr(source,'native_job',lambda job_id:dict(fields=dict(SubmitTime=job['submit_time'],Comment=dispatch,NodeList='node-a')))
+    server='qcl-negf-native-attempt@fixture.service'
+    monkeypatch.setattr(source,'process',lambda pid:dict(pid=pid,ppid=1,start_ticks=2,uids=[0]*4,state='S',comm='python',
+        cgroup='/system.slice/'+server,executable='/nix/store/root-python'))
+    def unit(name):return dict(InvocationID='d'*32,ControlGroup='/system.slice/'+name,
+        MainPID=str(os.getpid()) if name==server else ('123' if name==policy['daemon_unit'] else '124'),
+        ActiveState='active',MemoryMax='134217728',RuntimeMaxUSec='90s')
+    monkeypatch.setattr(source,'unit',unit)
+    original_read=source.budget.read
+    def read(path,limit=65536):
+        if str(path).endswith('/mountinfo'):
+            return ('1 0 0:1 / /srv/qcl-negf/jobs/native ro - nfs4 storage:/jobs rw\n').encode()
+        return original_read(path,limit)
+    monkeypatch.setattr(source.budget,'read',read)
+    inventory=dict(schema='qcl.host-resource-guest-facts.v1',identity_before={'boot':'fixture'},identity_after={'boot':'fixture'},
+        slurm_registered=True,jobs={},groups={})
+    packet=dict(version=1,identity=dict(schema='qcl.host-resource-guest-identity.v1',identity=dict(machine_id='c'*32,boot_id=dispatch)),
+        job=dict(fields=dict(SubmitTime=job['submit_time'],Comment=dispatch)),prolog_ref='prolog',epilog_ref='epilog',
+        before={'original_live_before':'RPC fixture'},after={'whole_stop':'RPC fixture'},writer_snapshot=inventory)
+    import host_resource_facts as facts
+    monkeypatch.setattr(facts,'trusted_rpc',lambda *args,**kw:copy.deepcopy(packet))
+    fake_reader=m._read_submitted_files_as_owner;opened=m.os.open;uid=os.getuid();euid=os.geteuid()
+    # This tests the production fork/FD code using only our synthetic child and
+    # own temp files. Real UID3000/NFS qualification remains Root's native gate.
+    def owner_reader(p,launch,budget,*,controls=None):
+        if controls is None:return fake_reader(p,launch,budget)
+        child={'dropped':False}
+        with monkeypatch.context() as patch:
+            patch.setattr(m.os,'geteuid',lambda:uid if child['dropped'] else 0)
+            patch.setattr(m.os,'setgroups',lambda groups:None if groups==[] else pytest.fail('groups'))
+            patch.setattr(m.os,'setgid',lambda value:None)
+            patch.setattr(m.os,'setuid',lambda value:child.update(dropped=True))
+            def open_path(path,*args,**kw):
+                if str(path)=='/':
+                    assert child['dropped'],'root must not open NFS payload/ancestry'
+                    return opened(namespace,*args,**kw)
+                return opened(path,*args,**kw)
+            patch.setattr(m.os,'open',open_path)
+            return real_reader({**p,'client_uid':uid},launch,budget,controls=controls)
+    monkeypatch.setattr(m,'_read_submitted_files_as_owner',owner_reader)
+    state.update(store=store,controls=controls,result=result,work=work,packet=packet,job=job,journal=journal,unit=unit)
+    state['owner']=m.OrdinaryAttemptOwner(policy,store,source,source.budget)
+    return state
+
+
+def test_q1_actual_owner_w1_credential_fd_store_and_lost_close_ack(q1_joined):
+    s=q1_joined;m=s['m'];document={**s['document'],'action':'close','controls':s['controls']}
+    closed=s['owner'].qualify_close(document)
+    assert closed['state']=='closed' and closed['controls']==s['controls'] and closed['job']==s['job']
+    directory=s['store'].path(document['calcjob_uuid']);raw=(directory/'close.json').read_bytes()
+    witness=(directory/'close-observation.json').read_bytes()
+    assert raw==m.encoded(closed) and not raw.endswith(b'\n')
+    retained=json.loads(witness);assert retained['reply_sha256']==hashlib.sha256(raw).hexdigest()
+    assert retained['control_read']['controls']==s['controls'] and len(retained['control_read']['files'])==4
+    assert retained['control_read']['io']['actual_bytes']==sum(row['bytes'] for row in s['controls'])
+    source=copy.copy(s['sources']);source.budget=m.Operation(source.policy['limits'])
+    source.budget.read=s['sources'].budget.read  # immutable fixture OS observations, not budget credit
+    again=m.OrdinaryAttemptOwner(source.policy,s['store'],source,source.budget).qualify_close(document)
+    assert again==closed and (directory/'close.json').read_bytes()==raw and (directory/'close-observation.json').read_bytes()==witness
+    assert not any('--parsable' in call[0] for call in s['calls'])
+
+
+def test_q1_native_tuple_observations_compare_exact_encoded_bytes(q1_joined):
+    s=q1_joined;s['context']['profile_origin']={'chain':[('/nix/profile',(1,2,3,0,0,1,1,1,1),None)]}
+    closed=s['owner'].qualify_close({**s['document'],'action':'close','controls':s['controls']})
+    assert closed['state']=='closed'
+
+
+def test_q1_original_publication_error_and_partial_observation_survive(q1_joined,monkeypatch,capsys):
+    import base64
+    s=q1_joined;m=s['m'];put=s['store'].put;original=OSError('unique original close sync failure')
+    def failed(calcjob,name,value,budget):
+        put(calcjob,name,value,budget)
+        if name=='close-observation.json':raise original
+    monkeypatch.setattr(s['store'],'put',failed)
+    reply=s['owner'].qualify_close({**s['document'],'action':'close','controls':s['controls']})
+    assert reply['state']=='hold' and reply['job']==s['job']
+    path=s['store'].path(s['document']['calcjob_uuid'])
+    assert (path/'close-observation.json').is_file() and not (path/'close.json').exists()
+    diagnostic=json.loads(capsys.readouterr().err.split('native-attempt preclaim HOLD: ',1)[1])
+    assert b'unique original close sync failure' in base64.b64decode(diagnostic['original_prefix_base64'])
+
+
+def test_q1_real_observation_fsync_error_and_repeat_never_repair(q1_joined,monkeypatch,capsys):
+    import base64
+    s=q1_joined;m=s['m'];fsync=m.os.fsync;document={**s['document'],'action':'close','controls':s['controls']}
+    def sync(fd):
+        if os.readlink('/proc/self/fd/'+str(fd)).endswith('/close-observation.json'):
+            raise OSError('unique original observation fsync error')
+        return fsync(fd)
+    monkeypatch.setattr(m.os,'fsync',sync)
+    assert s['owner'].qualify_close(document)['state']=='hold'
+    directory=s['store'].path(document['calcjob_uuid']);original=(directory/'close-observation.json').read_bytes()
+    diagnostic=json.loads(capsys.readouterr().err.split('native-attempt preclaim HOLD: ',1)[1])
+    assert b'unique original observation fsync error' in base64.b64decode(diagnostic['original_prefix_base64'])
+    monkeypatch.setattr(m.os,'fsync',fsync)
+    source=copy.copy(s['sources']);source.budget=m.Operation(source.policy['limits']);source.budget.read=s['sources'].budget.read
+    monkeypatch.setattr(m.os,'fork',lambda:pytest.fail('partial publication must not reread/repair'))
+    result=m.OrdinaryAttemptOwner(source.policy,s['store'],source,source.budget).qualify_close(document)
+    assert result['state']=='hold' and result['reason']=='q1_close_publication_unknown'
+    assert (directory/'close-observation.json').read_bytes()==original and not (directory/'close.json').exists()
+
+
+@pytest.mark.parametrize('fault',['mount_source','mount_switch','mount_root_switch','mount_malformed','writer_after','unit_after','worker_boot'])
+def test_q1_after_read_changes_are_not_a_closed_access_pass(q1_joined,monkeypatch,fault):
+    import host_resource_facts as facts
+    s=q1_joined;m=s['m'];source=s['sources'];reader=m._read_submitted_files_as_owner;read=source.budget.read
+    reached={'read':False};unit=source.unit
+    def read_controls(*args,**kwargs):
+        value=reader(*args,**kwargs)
+        if kwargs.get('controls') is not None:reached['read']=True
+        return value
+    monkeypatch.setattr(m,'_read_submitted_files_as_owner',read_controls)
+    def mount(path,limit=65536):
+        raw=read(path,limit)
+        if str(path).endswith('/mountinfo') and (fault=='mount_source' or fault=='mount_switch' and reached['read']):
+            raw=raw.replace(b'storage:/jobs',b'foreign:/jobs')
+        if str(path).endswith('/mountinfo') and fault=='mount_root_switch' and reached['read']:
+            raw=raw.replace(b' / /srv',b' /foreign /srv')
+        if str(path).endswith('/mountinfo') and fault=='mount_malformed':raw=b'broken - nfs4 storage:/jobs rw\n'
+        return raw
+    monkeypatch.setattr(source.budget,'read',mount)
+    def state(name):
+        value=unit(name)
+        if fault=='unit_after' and reached['read'] and name=='qcl-negf-api.service':value['InvocationID']='e'*32
+        return value
+    monkeypatch.setattr(source,'unit',state)
+    def rpc(*args,**kwargs):
+        packet=copy.deepcopy(s['packet'])
+        if reached['read'] and fault=='writer_after':
+            packet['writer_snapshot']['jobs']['99']=dict(owner_uid=3000,submit_time='unknown',terminal=False)
+        if reached['read'] and fault=='worker_boot':
+            packet['identity']['identity']['boot_id']=s['document']['launch']['request_id']
+            source.qualification['worker_bindings']['c'*32]['boot_id']=packet['identity']['identity']['boot_id']
+        return packet
+    monkeypatch.setattr(facts,'trusted_rpc',rpc)
+    reply=s['owner'].qualify_close({**s['document'],'action':'close','controls':s['controls']})
+    assert reply['state']=='hold' and reply['controls'] is None
+    assert not (s['store'].path(s['document']['calcjob_uuid'])/'close.json').exists()
+
+
+@pytest.mark.parametrize('fault',['bytes','files','deadline'])
+def test_q1_gross_child_debit_refuses_before_fork(monkeypatch,fault):
+    m=module();budget=m.Operation({**limits(),'maximum_files':2048})
+    policy=dict(limits=budget.limits,jobs_root='/srv/qcl-negf/jobs')
+    claims=[dict(path=name,bytes=0,sha256=hashlib.sha256(b'').hexdigest())
+        for name in ('series_result.json','native-selection.json','_scheduler-stdout.txt','_scheduler-stderr.txt')]
+    if fault=='bytes':budget.bytes=budget.limits['metadata_bytes']
+    if fault=='files':budget.files=budget.limits['maximum_files']
+    if fault=='deadline':budget.deadline=0
+    before=(budget.bytes,budget.files,budget.deadline)
+    monkeypatch.setattr(m.os,'geteuid',lambda:0)
+    def forbidden(*args):raise AssertionError('budget refusal must precede pipes/fork/NFS')
+    monkeypatch.setattr(m.os,'pipe2',forbidden);monkeypatch.setattr(m.os,'fork',forbidden)
+    with pytest.raises(m.Hold):m._read_submitted_files_as_owner(policy,request()['launch'],budget,controls=claims)
+    assert budget.bytes>=before[0] and budget.files>=before[1] and budget.deadline==before[2]
+
+
+@pytest.mark.parametrize('fault',['whitespace','observation_only','close_conflict','oversized','qualification'])
+def test_q1_journal_partial_conflict_and_current_access_remain_hold(q1_joined,monkeypatch,fault):
+    s=q1_joined;m=s['m'];document={**s['document'],'action':'close','controls':s['controls']}
+    directory=s['store'].path(document['calcjob_uuid']);put=s['store'].put
+    if fault in ('whitespace','observation_only'):
+        def writing(calcjob,name,value,budget):
+            put(calcjob,name,value,budget)
+            if name=='close-observation.json':
+                if fault=='whitespace':
+                    with (directory/name).open('ab') as stream:stream.write(b' ')
+                else:raise OSError('retained partial publication')
+        monkeypatch.setattr(s['store'],'put',writing)
+    if fault=='oversized':s['context']['bounded_raw_observation']='x'*70000
+    if fault in ('close_conflict','qualification'):
+        assert s['owner'].qualify_close(document)['state']=='closed'
+        original=(directory/'close.json').read_bytes()
+        source=copy.copy(s['sources']);source.budget=m.Operation(source.policy['limits']);source.budget.read=s['sources'].budget.read
+        if fault=='close_conflict':
+            value=json.loads(original);value['job']['submit_time']='foreign'
+            (directory/'close.json').write_bytes(m.encoded(value));original=(directory/'close.json').read_bytes()
+        else:
+            def unavailable():raise m.Hold('native_qualification_missing')
+            monkeypatch.setattr(source,'qualify',unavailable)
+        s['owner']=m.OrdinaryAttemptOwner(source.policy,s['store'],source,source.budget)
+    result=s['owner'].qualify_close(document)
+    assert result['state']=='hold' and result['controls'] is None
+    if fault in ('close_conflict','qualification'):assert (directory/'close.json').read_bytes()==original
+    else:assert not (directory/'close.json').exists()
+
+
+@pytest.mark.parametrize('fault',['hash','symlink','hardlink','writable','missing','order','extra','allocation','before','after','new_writer'])
+def test_q1_close_negatives_never_publish_closed(q1_joined,fault):
+    s=q1_joined;document={**s['document'],'action':'close','controls':copy.deepcopy(s['controls'])}
+    if fault=='hash':document['controls'][0]['sha256']='0'*64
+    if fault=='symlink':
+        path=s['result']/'series_result.json';path.rename(s['result']/'original');path.symlink_to('original')
+    if fault=='hardlink':os.link(s['result']/'series_result.json',s['result']/'alias')
+    if fault=='writable':(s['result']/'series_result.json').chmod(0o666)
+    if fault=='missing':(s['work']/'_scheduler-stderr.txt').unlink()
+    if fault=='order':document['controls'].reverse()
+    if fault=='extra':document['controls'].append(dict(path='native-close.json',bytes=0,sha256='0'*64))
+    if fault=='allocation':(s['store'].path(document['calcjob_uuid'])/'allocation.json').unlink()
+    if fault in ('before','after'):s['packet'][fault]=None
+    if fault=='new_writer':s['packet']['writer_snapshot']['jobs']['99']=dict(owner_uid=3000,submit_time='foreign',terminal=False)
+    reply=s['owner'].qualify_close(document)
+    assert reply['state'] in ('hold','rejected') and reply['controls'] is None
+    assert not (s['store'].path(document['calcjob_uuid'])/'close.json').exists()
+
+
+@pytest.mark.parametrize('fault',['named_file','shrink','ancestor','directory_mode','file_owner'])
+def test_q1_same_open_file_and_ancestor_replacements_hold(q1_joined,monkeypatch,fault):
+    s=q1_joined;m=s['m'];read=m.read_fd;target=s['result']/'series_result.json'
+    inode=target.stat().st_ino;fstat=m.os.fstat
+    def reading(fd,limit,budget):
+        value=read(fd,limit,budget)
+        if fstat(fd).st_ino==inode:
+            if fault=='named_file':
+                target.unlink();target.write_bytes(value[0]);target.chmod(0o640)
+            if fault=='shrink':target.write_bytes(b'')
+            if fault=='ancestor':
+                ancestor=s['result'].parent;ancestor.rename(ancestor.with_name('retained-original'))
+                ancestor.mkdir();s['result'].mkdir()
+            if fault=='directory_mode':s['result'].chmod(0o777)
+        return value
+    monkeypatch.setattr(m,'read_fd',reading)
+    if fault=='file_owner':
+        def info(fd):
+            result=fstat(fd)
+            if result.st_ino==inode:
+                fields=list(result);fields[4]=os.getuid()+1;return os.stat_result(fields)
+            return result
+        monkeypatch.setattr(m.os,'fstat',info)
+    result=s['owner'].qualify_close({**s['document'],'action':'close','controls':s['controls']})
+    assert result['state']=='hold' and result['controls'] is None
+    assert not (s['store'].path(s['document']['calcjob_uuid'])/'close.json').exists()
+
+
+@pytest.mark.parametrize('fault',['boolean','negative','over_cap','relative_alias','absolute','row_extra'])
+def test_q1_fixed_four_claim_domains_are_not_caller_authority(q1_joined,fault):
+    s=q1_joined;controls=copy.deepcopy(s['controls']);row=controls[0]
+    if fault=='boolean':row['bytes']=True
+    if fault=='negative':row['bytes']=-1
+    if fault=='over_cap':row['bytes']=33554433
+    if fault=='relative_alias':row['path']='./series_result.json'
+    if fault=='absolute':row['path']='/series_result.json'
+    if fault=='row_extra':row['verified']=True
+    result=s['owner'].qualify_close({**s['document'],'action':'close','controls':controls})
+    assert result['state'] in ('hold','rejected') and result['controls'] is None
+    assert not (s['store'].path(s['document']['calcjob_uuid'])/'close.json').exists()

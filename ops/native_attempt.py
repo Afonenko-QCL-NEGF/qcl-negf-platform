@@ -30,6 +30,7 @@ POLICY = Path('/etc/qcl-negf/native-attempt/policy.json')
 SOCKET = '/run/qcl-negf/native-attempt.sock'
 FILES = {'plan': 'plan.json', 'source_graph': 'source-graph.json',
          'native_execution': 'native-execution.json', 'submit_script': '_aiidasubmit.sh'}
+CLOSE_FILES = ('series_result.json', 'native-selection.json', '_scheduler-stdout.txt', '_scheduler-stderr.txt')
 ID = r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}'
 SHA = r'[0-9a-f]{64}'
 JOB = r'[1-9][0-9]{0,9}'
@@ -234,7 +235,20 @@ def validate_reply(document):
             for control in document['controls']:
                 exact(control, {'path', 'bytes', 'sha256'}); path_value(control['path'], absolute=False)
                 need(type(control['bytes']) is int and control['bytes'] >= 0 and matches(control['sha256'], SHA), 'reply_shape')
+            _close_controls(document['controls'])
+            need(document['receipt_ref'] == document['calcjob_uuid'] + '/close.json', 'reply_binding')
     return document
+
+
+def _close_controls(controls):
+    need(type(controls) is list and len(controls) == 4, 'q1_controls_unavailable')
+    result = []
+    for name, cap, row in zip(CLOSE_FILES, (33554432, 262144, 65536, 65536), controls):
+        exact(row, {'path','bytes','sha256'})
+        need(row['path'] == name and type(row['bytes']) is int and 0 <= row['bytes'] <= cap and
+             matches(row['sha256'], SHA), 'q1_controls_unavailable')
+        result.append(dict(row))
+    return result
 
 
 def signature(info):
@@ -424,6 +438,48 @@ def _preclaim_diagnostic(error, retained=None):
         pass
 
 
+def _read_close_payload(store, calcjob_uuid, name, budget):
+    """Only the two fixed close records, with exact original payload readback."""
+    need(name in ('close.json','close-observation.json'), 'journal_namespace')
+    with store.directory(store.path(calcjob_uuid)) as parent:
+        try:
+            budget.file()
+            fd = os.open(name, os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC, dir_fd=parent)
+        except FileNotFoundError:
+            return None
+        try:
+            raw, info = read_fd(fd,65536,budget)
+            need(info.st_uid == os.geteuid() and not info.st_mode&0o077, 'journal_namespace')
+            budget.reserve(len(raw)*8)
+            value = strict_json(raw.decode());need(type(value) is dict and encoded(value)==raw, 'q1_close_conflict')
+            if name=='close.json':
+                validate_reply(value)
+                need(value['state']=='closed' and value['calcjob_uuid']==calcjob_uuid, 'q1_close_conflict')
+            budget.before(); os.fsync(fd); budget.before(); os.fsync(parent)
+            need(signature(info)==signature(os.fstat(fd))==signature(os.stat(name,dir_fd=parent,follow_symlinks=False)),
+                 'q1_close_conflict')
+            return value,raw
+        finally:
+            os.close(fd)
+
+
+def _read_close_record(store, calcjob_uuid, budget):
+    return _read_close_payload(store,calcjob_uuid,'close.json',budget)
+
+
+def _close_mount_line(raw, prefix, source):
+    rows = []
+    for line in raw.splitlines():
+        left,separator,right = line.partition(' - ');fields=left.split();tail=right.split()
+        need(separator and len(fields)>=6 and len(tail)>=3, 'writer_domain_not_closed')
+        if fields[4]==prefix:rows.append((line,fields,tail))
+    need(len(rows)==1, 'writer_domain_not_closed')
+    line,fields,tail = rows[0]
+    need('ro' in fields[5].split(',') and tail[0] in ('nfs','nfs4') and tail[1]==source,
+         'writer_domain_not_closed')
+    return line
+
+
 class OrdinaryAttemptOwner:
     def __init__(self, policy, store, sources, budget):
         self.policy, self.store, self.sources, self.budget = policy, store, sources, budget
@@ -436,6 +492,7 @@ class OrdinaryAttemptOwner:
             return reply({}, 'rejected', reason='shape')
         calcjob = document['calcjob_uuid']; launch = document['launch']
         try:
+            controls = _close_controls(document['controls']) if action=='close' else None
             context = self.sources.preflight(launch, self.budget, calcjob_uuid=calcjob, action=action)
             with self.store.locked(calcjob, self.budget):
                 claim = self.store.read(calcjob, 'claim.json', self.budget)
@@ -496,9 +553,8 @@ class OrdinaryAttemptOwner:
                         job = attached
                         return reply(document, 'started', job=job, receipt=receipt)
                     need(observed['after'] is not None, 'native_stop_not_observed')
-                    self.sources.close_writers(job, launch, observed, self.budget)
-                    # Exact durable Q1 transfer-close controls and actor loading belong to their owners.
-                    raise Hold('q1_controls_unavailable')
+                    need(allocation is not None and observed['before'] is not None, 'native_start_not_observed')
+                    return self._close(document,job,context,observed,controls)
                 return reply(document, 'bound', job=job, receipt=receipt)
         except (Hold, ResourceError, OSError, ValueError, KeyError, engine.CommandFailure) as error:
             reason = error.reason if isinstance(error, Hold) else getattr(error, 'code', 'native_observation_failed')
@@ -515,6 +571,12 @@ class OrdinaryAttemptOwner:
                         raise error
                 else:
                     _preclaim_diagnostic(error,retained)
+            elif action=='close':
+                try:
+                    _preclaim_diagnostic(engine.CommandFailure(dict(failure='close_observation_failed',phase='close',
+                        original_type=type(error).__name__,message=str(error)[:4096])))
+                except BaseException:
+                    pass  # A diagnostic failure cannot replace the original HOLD.
             # Read-only retained identity remains useful after current policy or
             # native observation failed. It is explicitly not current authority.
             if job is None:
@@ -529,6 +591,51 @@ class OrdinaryAttemptOwner:
                     pass
             return reply(document, 'hold' if claimed or not isinstance(error, Hold) or reason != 'shape' else 'rejected',
                          job=job, reason=reason, receipt=receipt)
+
+    def _close(self, document, job, context, observed, controls):
+        launch = document['launch']; calcjob = document['calcjob_uuid']; budget = self.budget
+        need(isinstance(self.sources,NativeSources), 'q1_controls_unavailable')
+        previous = _read_close_record(self.store,calcjob,budget)
+        retained = _read_close_payload(self.store,calcjob,'close-observation.json',budget)
+        need((previous is None)==(retained is None), 'q1_close_publication_unknown')
+        need(observed['identity']['identity']['machine_id']==job['worker_machine_id'] and
+             observed['identity']['identity']['boot_id']==job['worker_boot_id'], 'worker_generation_changed')
+        before = self.sources.close_writers(job,launch,observed,budget)
+        readback = _read_submitted_files_as_owner(self.policy,launch,budget,controls=controls)
+        need(readback['controls']==controls, 'q1_control_changed')
+        need(self.sources.qualify()==context, 'controller_generation_changed')
+        _authenticate_server(self.sources)
+        caller = self.sources._refresh_caller('close')
+        latest = self.sources.worker(job,calcjob,'close',budget)
+        need(latest['before'] is not None and latest['after'] is not None, 'native_stop_not_observed')
+        need(latest['identity']['identity']==observed['identity']['identity'], 'worker_generation_changed')
+        after = self.sources.close_writers(job,launch,latest,budget)
+        for key in ('storage_identity','native_prefix','retention_ref'):
+            need(before[key]==after[key], 'writer_domain_not_closed')
+        need([(r['unit'],r['state']) for r in before['controller_units']]==
+             [(r['unit'],r['state']) for r in after['controller_units']], 'writer_domain_not_closed')
+        prefix = self.policy['jobs_root']+'/'+self.policy['native_result_prefix']
+        need([_close_mount_line(r['mountinfo'],prefix,self.policy['nfs_source']) for r in before['controller_units']]==
+             [_close_mount_line(r['mountinfo'],prefix,self.policy['nfs_source']) for r in after['controller_units']],
+             'writer_domain_not_closed')
+        need([(r['node'],r['reply']['identity']['identity']) for r in before['workers']]==
+             [(r['node'],r['reply']['identity']['identity']) for r in after['workers']], 'worker_generation_changed')
+        candidate = validate_reply(reply(document,'closed',job=job,controls=controls,receipt=calcjob+'/close.json'))
+        _reserve_private_record(candidate,budget)
+        raw = encoded(candidate); digest = hashlib.sha256(raw).hexdigest()
+        if previous is not None:
+            need(previous[0]==candidate and retained[0].get('reply_sha256')==digest, 'q1_close_conflict')
+            return previous[0]
+        witness = dict(reply_sha256=digest,job=job,launch=launch,worker_close=observed,
+                       w1_before=before,control_read=readback,w1_after=after,caller=caller)
+        _reserve_private_record(witness,budget); need(len(encoded(witness))<=65536, 'journal_bound')
+        self.store.put(calcjob,'close-observation.json',witness,budget)
+        witness_readback = _read_close_payload(self.store,calcjob,'close-observation.json',budget)
+        need(witness_readback is not None and witness_readback[1]==encoded(witness), 'q1_close_conflict')
+        self.store.put(calcjob,'close.json',candidate,budget)
+        stored = _read_close_record(self.store,calcjob,budget)
+        need(stored is not None and stored[1]==raw, 'q1_close_conflict')
+        return stored[0]
 
     def submit(self, request):
         return self._run(request, 'submit')
@@ -747,9 +854,11 @@ def write_frame(connection, document, budget, limit):
     connection.sendall(struct.pack('!I', len(raw)) + raw)
 
 
-def _owner_read(policy, launch, budget):
+def _owner_read(policy, launch, budget, *, controls=None):
     """Runs ONLY after dropping credentials in production; no root NFS access."""
     need(os.getuid() == os.geteuid() == policy['client_uid'], 'owner_read_credentials')
+    if controls is not None:
+        return _owner_close_read(policy,launch,budget,controls)
     work = path_value(launch['remote_workdir'], absolute=True)
     need(within(work, policy['jobs_root']) and work != policy['jobs_root'], 'upload_namespace')
     # Walk every component using directory FDs. Symlinks, including parent aliases, fail.
@@ -787,24 +896,81 @@ def _owner_read(policy, launch, budget):
             os.close(directory)
 
 
-def _read_submitted_files_as_owner(policy, launch, budget):
+def _owner_close_read(policy, launch, budget, controls):
+    need(os.getuid()==os.geteuid()==policy['client_uid'], 'owner_read_credentials')
+    controls = _close_controls(controls); rows = []; roots = []; actual = []
+    initial_bytes, initial_files = budget.actual_bytes, budget.files
+    result = path_value(policy['jobs_root']+'/'+launch['relative_execution_root'],absolute=True)
+    work = path_value(launch['remote_workdir'],absolute=True)
+    need(within(result,policy['jobs_root']+'/'+policy['native_result_prefix']) and
+         within(work,policy['jobs_root']) and not within(work,result) and not within(result,work), 'output_namespace')
+    for role,path,selected in (('result',result,controls[:2]),('workdir',work,controls[2:])):
+        parent = os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW); walked = []
+        try:
+            for name in Path(path).parts[1:]:
+                budget.file(); child = os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
+                info = os.fstat(child)
+                if info.st_uid not in (0,policy['client_uid']) or info.st_mode&0o022:
+                    os.close(child);raise Hold('q1_directory_identity')
+                walked.append((os.dup(parent),name,info));os.close(parent);parent=child
+            directory = os.fstat(parent)
+            for claim in selected:
+                fd = os.open(claim['path'],os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC,dir_fd=parent)
+                try:
+                    raw,info = read_fd(fd,claim['bytes'],budget)
+                    need(info.st_uid==policy['client_uid'] and not info.st_mode&0o022 and
+                         signature(info)==signature(os.stat(claim['path'],dir_fd=parent,follow_symlinks=False)), 'q1_file_identity')
+                    observed = dict(path=claim['path'],bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest())
+                    need(observed==claim, 'q1_control_changed');actual.append(observed)
+                    rows.append(dict(path=claim['path'],root=role,signature=signature(info)))
+                    del raw
+                finally:os.close(fd)
+            need(signature(directory)==signature(os.fstat(parent)), 'q1_directory_changed')
+            for ancestor,name,info in walked:
+                need(signature(info)==signature(os.stat(name,dir_fd=ancestor,follow_symlinks=False)), 'q1_directory_changed')
+            roots.append(dict(role=role,path=path,directory=signature(directory),
+                ancestors=[dict(name=name,signature=signature(info)) for _,name,info in walked]))
+        finally:
+            os.close(parent)
+            for ancestor,_,_ in walked:os.close(ancestor)
+    return dict(controls=actual,roots=roots,files=rows,
+                io=dict(actual_bytes=budget.actual_bytes-initial_bytes,file_operations=budget.files-initial_files))
+
+
+def _read_submitted_files_as_owner(policy, launch, budget, *, controls=None):
     import selectors
     need(os.geteuid() == 0, 'root_required')
     # Reserve the complete bounded child envelope before forking. Charges never reset.
-    cap = min(policy['limits']['response_bytes'], 131072)
-    budget.reserve(cap * 3); budget.file()
+    cap = min(policy['limits']['response_bytes'], 131072 if controls is None else 65536)
+    if controls is not None:
+        controls = _close_controls(controls)
+        paths = (path_value(policy['jobs_root']+'/'+launch['relative_execution_root'],absolute=True),
+                 path_value(launch['remote_workdir'],absolute=True))
+        depth = sum(len(Path(path).parts)-1 for path in paths)
+        budget.reserve(8*(sum(row['bytes'] for row in controls)+4)+16*65536+4096*(depth+4)+8*len(encoded(controls)))
+        for _ in range(8*depth+64):budget.file()
+    else:
+        budget.reserve(cap * 3); budget.file()
     read_end, write_end = os.pipe2(os.O_CLOEXEC)
     pid = os.fork()
     if pid == 0:
+        initial_actual = budget.actual_bytes
         try:
             os.close(read_end); os.setgroups([]); os.setgid(policy['client_uid']); os.setuid(policy['client_uid'])
-            raw = encoded(_owner_read(policy, launch, budget))
+            raw = encoded(_owner_read(policy, launch, budget,controls=controls)) if controls is not None else encoded(_owner_read(policy, launch, budget))
             need(len(raw) <= cap, 'owner_read_bound')
             offset = 0
             while offset < len(raw):
                 budget.before(); count = os.write(write_end, raw[offset:]); need(count > 0, 'owner_read_short_write'); offset += count
             os._exit(0)
-        except BaseException:
+        except BaseException as error:
+            if controls is not None:
+                try:
+                    raw = encoded(dict(failure=type(error).__name__,message=str(error)[:4096],
+                                       reason=error.reason if isinstance(error,Hold) else 'owner_read_failed',
+                                       actual_bytes=budget.actual_bytes-initial_actual))
+                    budget.before();os.write(write_end,raw)
+                except BaseException:pass
             os._exit(1)
     os.close(write_end); selector = selectors.DefaultSelector(); raw = bytearray(); reaped = False
     try:
@@ -817,12 +983,27 @@ def _read_submitted_files_as_owner(policy, launch, budget):
             if not chunk:
                 break
             raw.extend(chunk); need(len(raw) <= cap, 'owner_read_bound')
+            if controls is not None:budget.actual_bytes += len(chunk)
         while True:
             budget.before(); waited, status = os.waitpid(pid, os.WNOHANG)
             if waited:
-                reaped = True; need(os.waitstatus_to_exitcode(status) == 0, 'owner_read_failed'); break
+                reaped = True
+                if controls is not None and os.waitstatus_to_exitcode(status)!=0:
+                    failure = strict_json(raw.decode()) if raw else dict(failure='unknown child outcome')
+                    if 'actual_bytes' in failure:
+                        count=failure['actual_bytes']
+                        need(type(count) is int and 0<=count<=sum(row['bytes'] for row in controls)+4, 'owner_read_bound')
+                        budget.actual_bytes+=count
+                    primary = engine.CommandFailure(failure);_preclaim_diagnostic(primary)
+                    raise Hold('owner_read_failed') from primary
+                need(os.waitstatus_to_exitcode(status) == 0, 'owner_read_failed'); break
             time.sleep(.005)
-        return strict_json(raw.decode())
+        result = strict_json(raw.decode())
+        if controls is not None:
+            count = result['io']['actual_bytes']
+            need(type(count) is int and 0<=count<=sum(row['bytes'] for row in controls), 'owner_read_bound')
+            budget.actual_bytes += count
+        return result
     finally:
         selector.close(); os.close(read_end)
         if not reaped:
@@ -1230,16 +1411,17 @@ class NativeSources:
              'writer_domain_not_closed')
         prefix = self.policy['jobs_root'] + '/' + domain['native_prefix']
         # Actual per-service mount namespaces, not the root helper's mount view.
+        units = []
         for name in domain['controller_units']:
             need(name in {'qcl-negf-aiida.service', 'qcl-negf-api.service'}, 'writer_domain_not_closed')
             unit = self.unit(name); pid = int(unit['MainPID'])
             need(unit['ActiveState'] == 'active' and pid > 0, 'writer_domain_not_closed')
             raw = budget.read('/proc/' + str(pid) + '/mountinfo', 65536).decode()
-            need(any(line.split(' - ')[0].split()[4] == prefix and
-                     'ro' in line.split(' - ')[0].split()[5].split(',') for line in raw.splitlines()),
-                 'writer_domain_not_closed')
+            _close_mount_line(raw,prefix,self.policy['nfs_source'])
+            need(unit == self.unit(name), 'writer_domain_not_closed')
+            units.append(dict(unit=name,state=unit,mountinfo=raw))
         need(set(domain['controller_units']) == {'qcl-negf-aiida.service', 'qcl-negf-api.service'}, 'writer_domain_not_closed')
-        inventories = []
+        inventories = []; workers = []
         for node, route in self.policy['worker_routes'].items():
             packet = trusted_rpc(route, 'attempt-facts', dict(version=1, calcjob_uuid=self._calcjob,
                                  dispatch_id=job['dispatch_id'], job_id=job['job_id'],
@@ -1251,8 +1433,11 @@ class NativeSources:
             need(expected is not None and all(identity[k] == expected[k] for k in expected), 'writer_domain_not_closed')
             need(identity['machine_id'] == domain['writer_hosts'][node], 'writer_domain_not_closed')
             inventories.append(packet['writer_snapshot'])
+            workers.append(dict(node=node,reply=packet))
         known = self.managed_writers()
         enforce_writer_closure(launch['relative_execution_root'], inventories, known, job['generation'])
+        return dict(storage_identity=domain['storage_identity'],native_prefix=domain['native_prefix'],
+                    retention_ref=domain['retention_ref'],controller_units=units,workers=workers,managed=known)
 
     def _trust_root(self):
         root = Path(self.policy['private_root']) / 'trust-snapshots'
