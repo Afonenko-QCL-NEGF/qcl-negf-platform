@@ -17,7 +17,7 @@ import time
 
 from host_resource_operations import (NativeCleanupEvidence, ResourceError, RuntimeBinding,
     UNKNOWN, HostResourceController, integer, policy_digest, require, strict_json, text)
-from host_resource_backends import (MAX_OUTPUT_BYTES, fingerprint,
+from host_resource_backends import (MAX_OUTPUT_BYTES, fingerprint, pve_memory_mib,
     read_root_json, trusted_root_path)
 
 PROTOCOLS={'pve-local-put-balloon-v1','libvirt-local-setmem-v1'}
@@ -327,7 +327,7 @@ class NativeCleanupSources:
             config=strict_json(backend._run(['get',backend._path(vm)+'/config','--current','1']))
             require(type(config) is dict,'readback','native current config required')
             integer(config.get('balloon'),'PVE enabled balloon',1)
-            integer(config.get('memory'),'PVE native maximum',1)
+            pve_memory_mib(config.get('memory'))
             hotplug=config.get('hotplug','1')
             require(type(hotplug) is str and set(hotplug.split(','))<={'0','1','network','disk','cpu','memory','usb'},'qualification','cloudinit/unknown hotplug path excluded')
             require(config.get('digest')==before.revision and config.get('balloon',0)>0 and type(config.get('shares')) is int and config['shares']==0,'identity_mismatch','PVE revision/manual balloon changed')
