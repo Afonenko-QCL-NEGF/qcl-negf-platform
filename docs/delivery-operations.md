@@ -164,6 +164,25 @@ primary completed как failed-known. Если auxiliary publication не по�
 
 ## Reboot и ручная сверка
 
+Проверка controller-role читает публичный `/etc/qcl-negf/release-config.json` как штатный NixOS
+источник: цепочка через `/etc/static` допустима только до обычного root-owned файла в `/nix/store`
+без write bits. Корень, каталоги и symlink принадлежат root; каталоги не допускают group/world
+write, кроме фиксированного `/nix/store` с точным штатным sticky-режимом `01775` для build group.
+Снятие sticky, world-write или тот же режим у другого каталога недопустимы. Существующий
+public-origin reader ограничивает обход и объём; JSON ограничен 16 KiB, metadata
+deadline — существующие 360 секунд управляющей команды. После чтения байтов повторно сверяются
+цепочка и identity/owner/mode корня. Только затем проверяются `role=controller` и наличие
+установленных helpers. Изменяемые request/journal/enrollment файлы по-прежнему читаются строгим
+symlink-free reader; этот случай конфигурации не разрешает произвольные mutable targets.
+
+Native switch может установить новую OS generation и одновременно завершиться с ошибкой службы:
+первичный такой отказ boot reconcile был `OSError(40)` на NixOS symlink конфигурации при чтении
+через mutable reader. Это не подтверждает delivery, readiness или существование старого запроса.
+Сначала сохраните исходный failure/receipt и read-only установите фактические OS/service/runtime,
+request/attempt и admission identities. После потери ответа результат остаётся неизвестным до
+сверки; не повторяйте switch, delivery или открытие admission вслепую. Исправление source и
+локальные fixtures требуют отдельного native readback на целевом узле.
+
 Boot reconcile unit выполняется до новых delivery instances; failed-unit reconciliation использует
 отдельную oneshot. Они классифицируют stale queued/running и malformed/missing binding как
 `reconciliation_required/outcome_unknown`, сохраняют оригиналы и никогда не вызывают delivery ещё
