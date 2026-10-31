@@ -23,11 +23,19 @@ Private foreign agreement задаёт для каждой строки явны
 reservation и до live admission; наблюдённый native maximum обязан помещаться в согласованном bound.
 Root-protected происхождение не заменяет эту проверку.
 
-В source **нет** adapter/producer, который доказывает завершение server-side dynamic mutator/task/
-lock и всех его descendants. `NativeFactsProvider.cleanup()` возвращает None; production factory
-отказывает dynamic policy с `native_mutation_protocol` до mutation. Existing P20-A typed dynamic
-adapters/fixtures сохраняются для owning qualification work, но installed production динамика этим
-PR не готова. Native unit inactive, CLI exit, matching memory не создают cleanup proof.
+Для `qualified_dynamic` production factory `open_service()` подключает
+`NativeMutationProofs` и `QualifiedMutationBackend` из [P20-C](host-resource-native-cleanup.md).
+`NativeFactsProvider.cleanup()` передаёт проверку этому owner; без него возвращает None. C
+производит witness только для квалифицированного успешного синхронного native вызова с exact
+source/peer binding, завершением owned command и свежими absence/lock checks. Нужны защищённые
+per-VM profiles и отдельная установленная N-проверка. Наличие этого source не означает готовности
+конкретной установки. Native unit inactive, CLI exit или matching memory не создают cleanup proof.
+
+При потерянном server reply C сохраняет UNKNOWN и полный charge, без replay. Отдельный
+[P20-D retirement](host-resource-recovery.md) реализован только для local libvirt; он не
+устанавливает исход старого resize и требует собственной qualification. Для PVE этот recovery
+source остаётся недоступным. Healthy C, lost-reply recovery и workload/output completion — разные
+gates.
 
 Owning P04/P07/staging producer durable output publication также **не реализован**. Guest reader
 возвращает неизвестное output closure; production finish сохраняет commitment/charge. Он требует
@@ -103,8 +111,10 @@ cleanup semantics. Второй process supervisor не добавлен.
 Каждая mutating resource invocation запускается native systemd oneshot unit. Native service пишет
 полный grant/UNKNOWN cleanup barrier до actual resize; v3 row может хранить exact native
 unit/InvocationID/cgroup/host boot/mutation context через prepare_mutation. Production fixed lane не
-вызывает resize. Динамический proof adapter/source отсутствует, поэтому optional context не выдаётся
-за готовую dynamic integration. Disconnect/timeout не снимает charge и не replay-ит intent.
+вызывает resize. C использует этот context для exact dispatch и terminal witness успешного квалифицированного
+синхронного вызова. Optional context сам по себе не удостоверяет dynamic completion или readiness.
+Disconnect/timeout не снимает charge и не replay-ит intent; границы C и отдельного libvirt D
+описаны выше.
 Оригинальные native errors/records при journal/log I/O остаются primary в owner engine.
 
 Защищённые пути фиксированы: `/etc/qcl-negf/host-resources/service.json`, runtime
@@ -194,8 +204,9 @@ attachment/service start. Private tool paths указывают на exact prote
 profile/symlink. Existing command engine и P12 store reader co-located read-only; их owning files не
 менялись.
 
-Требуют source follow-up: dynamic task/lock cleanup producer, P04/P07 output publication producer,
-complete Nix daemon/build join, owning P07/P22/P12/P31 callsites. Отдельно требуют deployment/N:
+Требуют source follow-up: PVE lost-reply recovery, P04/P07 output publication producer,
+complete Nix daemon/build join и owning P07/P22/P12/P31 callsites. Healthy C и отдельный local-libvirt
+D уже имеют source, но не заменяют эти границы. Отдельно требуют deployment/N:
 реальная установка/runtime credentials/enrollment/capacity agreement, installed PVE/libvirt/Slurm/
 systemd/Python protocols, actual fixed allocation/image/proc/cgroup/readbacks, hook ordering,
 pressure и foreign boundary. Source eval/fixtures не заменяют ни один из этих gates.
