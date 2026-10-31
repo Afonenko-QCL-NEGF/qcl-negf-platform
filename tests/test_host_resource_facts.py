@@ -292,3 +292,55 @@ def test_native_facts_cold_and_live_share_same_foreign_capacity_boundary(tmp_pat
             if route=='cold':provider.cold_facts()
             else:provider.request_facts(None,owner_state=store.load())
     assert store.state_path.read_bytes()==before and not b.calls
+
+
+def _pve_inventory_source(memory, *, lxc_only=False):
+    from host_resource_facts import LocalSources
+    class Backend:
+        node = 'synthetic-node'
+        def _run(self, args):
+            if args == ['get', '/nodes/synthetic-node/qemu']:
+                return json.dumps([] if lxc_only else [{'vmid': 101}])
+            if args == ['get', '/nodes/synthetic-node/lxc']:
+                return json.dumps([{'vmid': 102}])
+            if args[-2:] == ['--current', '1']:
+                return json.dumps({'memory': memory, 'digest': 'raw-digest', 'smbios1': 'uuid=owned'})
+            return json.dumps({'status': 'stopped'})
+    return LocalSources({'backend_config': {'backend': 'proxmox'}}, None), Backend()
+
+
+@pytest.mark.parametrize('memory', ['4096', 4096])
+def test_pve_cold_inventory_converts_qemu_and_lxc_mib_preserving_raw_fingerprint(memory, monkeypatch):
+    import host_resource_backends as m
+    fingerprint = m.pve_config_fingerprint
+    seen = []
+    def capture(raw):
+        seen.append(dict(raw))
+        return fingerprint(raw)
+    monkeypatch.setattr(m, 'pve_config_fingerprint', capture)
+    sources, backend = _pve_inventory_source(memory)
+    rows = sources.inventory(backend)
+    raw = {'memory': memory, 'digest': 'raw-digest', 'smbios1': 'uuid=owned'}
+    expected = fingerprint(raw)
+    assert [r['kind'] for r in rows] == ['qemu', 'lxc']
+    assert all(r['maximum_bytes'] == 4096 * 1024**2 and r['config_fingerprint'] == expected for r in rows)
+    assert all(not r['running'] and r['process_id'] is None for r in rows)
+    assert seen == [raw, raw] and all(type(row['memory']) is type(memory) for row in seen)
+
+
+@pytest.mark.parametrize('memory', [True, False, 1.0, None, -1, '-1', '0', 0,
+    '', '01', '+1', ' 1', '1 ', '1.0', '1MiB', '١', pytest.param('9' * 5000, id='oversize'),
+    str(((2**63-1)//(1024**2))+1), ((2**63-1)//(1024**2))+1])
+def test_pve_cold_inventory_rejects_invalid_memory_before_byte_arithmetic(memory):
+    from host_resource_operations import ResourceError
+    sources, backend = _pve_inventory_source(memory)
+    with pytest.raises(ResourceError):
+        sources.inventory(backend)
+
+
+@pytest.mark.parametrize('memory', ['01', True, str(2**43)])
+def test_pve_lxc_only_inventory_rejects_invalid_memory(memory):
+    from host_resource_operations import ResourceError
+    sources, backend = _pve_inventory_source(memory, lxc_only=True)
+    with pytest.raises(ResourceError):
+        sources.inventory(backend)

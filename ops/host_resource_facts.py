@@ -16,7 +16,7 @@ import application_release as command_engine
 from host_resource_operations import (BackendQualification, CompletionEvidence, GuestEvidence,
     HostEvidence, ResourceError, RuntimeBinding, integer, policy_digest,
     require, strict_json, text)
-from host_resource_backends import (collect_native_runtime, fingerprint, read_root_json,
+from host_resource_backends import (collect_native_runtime, fingerprint, pve_memory_mib, read_root_json,
     trusted_root_path, MAX_OUTPUT_BYTES)
 from host_resource_startup import ColdHostEvidence, ColdVMRecord
 
@@ -211,8 +211,9 @@ class LocalSources:
                     if kind=='qemu':
                         uuid=re.findall(r'(?:^|,)uuid=([^,]+)(?:,|$)',cfg.get('smbios1',''))
                         require(len(uuid)==1,'incomplete_inventory','every QEMU requires actual UUID')
-                        native=uuid[0];maximum=cfg['memory']*1024**2
-                    else:native='lxc:'+str(vmid);maximum=cfg['memory']*1024**2
+                        native=uuid[0]
+                    else:native='lxc:'+str(vmid)
+                    maximum=pve_memory_mib(cfg.get('memory'))*1024**2
                     status=strict_json(backend._run(['get',f'{root}/{kind}/{vmid}/status/current']))
                     from host_resource_backends import pve_config_fingerprint
                     stable=pve_config_fingerprint(cfg)
