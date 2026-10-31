@@ -240,6 +240,28 @@ def test_actual_pve_preflight_closed_packet_protocol(change):
         with pytest.raises(n.ResourceError):source.preflight({'protocol_id':'pve-local-put-balloon-v1'},backend,'vm-a',SimpleNamespace(revision='revision'))
 
 
+def test_actual_pve_preflight_accepts_canonical_memory_string():
+    import host_resource_native_cleanup as n
+    from types import SimpleNamespace
+    packets=[json.dumps([dict(key='memory',value='8192')]),
+             json.dumps(dict(digest='revision',memory='8192',balloon=512,shares=0))]
+    backend=SimpleNamespace(_run=lambda args:packets.pop(0),_path=lambda vm:'/nodes/synthetic/qemu/101')
+    source=n.NativeCleanupSources.__new__(n.NativeCleanupSources)
+    source.preflight({'protocol_id':'pve-local-put-balloon-v1'},backend,'vm-a',SimpleNamespace(revision='revision'))
+
+
+@pytest.mark.parametrize('memory',[True,0,'01',' 8192','١',str(((2**63-1)//(1024**2))+1)])
+def test_actual_pve_preflight_rejects_invalid_memory_scalar(memory):
+    import host_resource_native_cleanup as n
+    from types import SimpleNamespace
+    packets=[json.dumps([dict(key='memory',value='8192')]),
+             json.dumps(dict(digest='revision',memory=memory,balloon=512,shares=0))]
+    backend=SimpleNamespace(_run=lambda args:packets.pop(0),_path=lambda vm:'/nodes/synthetic/qemu/101')
+    source=n.NativeCleanupSources.__new__(n.NativeCleanupSources)
+    with pytest.raises(n.ResourceError):
+        source.preflight({'protocol_id':'pve-local-put-balloon-v1'},backend,'vm-a',SimpleNamespace(revision='revision'))
+
+
 @pytest.mark.parametrize('change',['source-path','copied-source','missing-vm','wrong-binding','profile-boot','extra-profile-field'])
 def test_profile_facts_not_private_true_flag(tmp_path,change):
     n,m,c,b,store,e,p,s,r,profiles=fixture(tmp_path)
