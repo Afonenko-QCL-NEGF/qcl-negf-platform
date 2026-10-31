@@ -66,11 +66,14 @@ baseline без чужой или неизвестной работы.
 Писатель private probes обязан аутентифицировать актуальные host/guest факты. P20-B реализует
 `NativeFactsProvider`, отдельный privileged ingress, demand-only client, cold/offline API и
 read-only projection; source installation opt-in и отдельно от реальной установки. Поддержанный
-production путь — одновременно оплаченные fixed maxima всех owned VM. Dynamic task/lock cleanup
-producer и owning staging completion producer **отсутствуют в source**: это отдельные follow-up, не
-просто `not_measured` имеющегося адаптера. P07/P22/P12 launch/start wiring здесь не меняется и не
-READY. Точные DTO, источники, роли, ограничения и отдельные N gates описаны в
-[руководстве интеграции](host-resource-integration.md). Одно наличие protected JSON не является
+fixed путь — одновременно оплаченные полные maxima. Для `qualified_dynamic` production factory
+подключает [C cleanup producer](host-resource-native-cleanup.md), который квалифицирует только
+успешный синхронный native вызов. Он требует per-VM source/peer profiles и отдельной N-проверки;
+восстановление после потерянного ответа не следует из healthy witness. Отдельный
+[D retirement](host-resource-recovery.md) ограничен local libvirt; PVE lost-reply recovery и owning
+staging completion producer остаются source follow-up. P07/P22/P12 launch/start wiring этим
+описанием не объявляется READY. Точные DTO, источники, роли, ограничения и отдельные N gates
+описаны в [руководстве интеграции](host-resource-integration.md). Одно наличие protected JSON не является
 измерением.
 
 ## Состояния и неатомарные переходы
@@ -160,11 +163,14 @@ readback переходит к GUEST_ADMIT; shrink с полным readback и �
 остаётся primary при journal/log I/O error; `.native_journal_error`/`.native_log_error` отмечают
 secondary errors. Ни readback, ни потерянный failure reason не снимают barrier после reload.
 
-Успешный backend resize гарантирует cleanup всех собственных native command groups через shared P11
-engine; confirmed command failure record позволяет сохранить cleanup confirmed отдельно от
-неизвестного memory outcome. Поэтому timeout с подтверждённым cleanup после durable записи такого
-результата допускает обычное read-only recovery. Если confirmation не успело сохраниться или cleanup
-неизвестен, нужен **отдельный свежий административный** `NativeCleanupEvidence`: `request_id`,
+Shared P11 engine подтверждает cleanup собственных native command groups. Для typed backend без
+`requires_native_cleanup_proof` confirmed failure record после durable записи может сохранить этот
+cleanup отдельно от неизвестного memory outcome и допустить read-only recovery. Production C
+(`QualifiedMutationBackend`) требует terminal witness и свежую exact source/peer/absence/lock
+проверку: одного `native_record.cleanup_confirmed=True` недостаточно. Timeout или потерянный
+server reply сохраняют UNKNOWN, полный charge и запрет replay; они не получают cleanup proof из
+локального command record. Если подходящего proof нет, нужен **отдельный свежий административный**
+`NativeCleanupEvidence`: `request_id`,
 latest `mutation_id`, `host_id`, `owner_id`, `host_boot_id`, `policy_sha256`, точный
 `RuntimeBinding`, `observed_at`, `native_mutators_absent=True` и `evidence_ref`. Timestamp не раньше
 intent и в обычном окне fresh evidence. Старый grow proof не подходит для нового shrink intent.
@@ -172,16 +178,18 @@ Proof не создаётся из memory target, request-id или желаем
 обязан фактически установить отсутствие native mutator и всех исполняющихся owned descendants для
 данного intent; typed class/true-флаг/строка ref сами не дают privilege или native proof.
 
-Source `RootNativeBoundary` читает proof только из `cleanups` защищённого probe bundle, не из job
+Базовый `RootNativeBoundary` читает proof только из `cleanups` защищённого probe bundle, не из job
 payload/пути caller. При принятом proof `reconcile` проверяет полный актуальный host/runtime/
 workload snapshot и actual memory readback. Только matching target разрешает GUEST_ADMIT либо
 RELEASE со свежим guest completion; при другом allocation остаётся UNKNOWN с полным charge. Cleanup
 proof может сохраниться отдельно от memory outcome; backend mutation/retry не выполняется. Receipt в
 последующих фазах не потребляет уже ненужный proof повторно. Этот путь снимает только cleanup block:
-reboot/policy/config/identity block требует отдельной административной сверки. Production writer
-этого dynamic cleanup proof отсутствует и в текущем P20-B: отдельный protocol/source follow-up;
-privileged transport source реализован отдельно от установки/N; synthetic injected evidence в
-fixtures не является заменой.
+reboot/policy/config/identity block требует отдельной административной сверки. В production
+`open_service()` подключает C owner, а `NativeFactsProvider.cleanup()` получает exact
+`NativeCleanupEvidence` из проверенного native witness. Правила успешного synchronous return,
+source/peer binding и UNKNOWN после lost reply описаны в [P20-C](host-resource-native-cleanup.md).
+Его source и privileged transport не заменяют installation/N; synthetic injected evidence в
+fixtures также не является native proof.
 
 Несовпадение host boot, guest boot/machine/image/backend, config fingerprint или policy блокирует
 допуск и сохраняет все grants ambiguous. TTL не снимает активное/неизвестное выделение. После reboot
