@@ -1425,21 +1425,21 @@ def q1_joined(tmp_path,monkeypatch):
 
 
 def q1t_document(state, raw=b'{"original":"technical index bytes"}\n'):
-    document={**state['document'],'version':2,'action':'close','controls':copy.deepcopy(state['controls'])}
+    document={**state['document'],'version':3,'action':'close','controls':copy.deepcopy(state['controls'])}
     if raw is None:
         document['technical_control']={'status':'absent','path':'performance-source.json','reason':'not_published'}
     else:
-        path=state['work']/'performance-source.json';path.write_bytes(raw);path.chmod(0o640)
+        path=state['result']/'performance-source.json';path.write_bytes(raw);path.chmod(0o640)
         document['technical_control']={'status':'present','path':'performance-source.json',
             'bytes':str(len(raw)),'sha256':hashlib.sha256(raw).hexdigest()}
     return document
 
 
 @pytest.mark.parametrize('raw',[None,b'',b'{"original":"technical index bytes"}\n'])
-def test_q1t_v2_closes_only_observed_present_whole_bytes_or_actual_absence(q1_joined,raw):
+def test_q1t_v3_closes_only_observed_present_whole_bytes_or_actual_absence(q1_joined,raw):
     s=q1_joined;m=s['m'];document=q1t_document(s,raw)
     closed=s['owner'].qualify_close(document)
-    assert closed['state']=='closed' and closed['version']==2
+    assert closed['state']=='closed' and closed['version']==3
     assert set(closed)=={'version','state','calcjob_uuid','receipt_ref','job','controls','technical_control','reason'}
     assert closed['technical_control']==document['technical_control'] and closed['controls']==s['controls']
     assert m.validate_reply(closed)==closed
@@ -1448,11 +1448,11 @@ def test_q1t_v2_closes_only_observed_present_whole_bytes_or_actual_absence(q1_jo
     assert witness['control_read']['technical_control']==document['technical_control']
     assert witness['control_read']['io']['actual_bytes']==sum(c['bytes'] for c in s['controls'])+(0 if raw is None else len(raw))
     assert witness['reply_sha256']==hashlib.sha256(receipt).hexdigest()
-    assert [r['root'] for r in witness['control_read']['files'] if r['path']=='performance-source.json']==([] if raw is None else ['workdir'])
+    assert [r['root'] for r in witness['control_read']['files'] if r['path']=='performance-source.json']==([] if raw is None else ['result'])
 
 
 @pytest.mark.parametrize('mutate',[
-    lambda r:r.update(version=3),
+    lambda r:r.update(version=2),
     lambda r:r.update(version=True),
     lambda r:r.update(action='status',controls=None),
     lambda r:r['technical_control'].update(path='../performance-source.json'),
@@ -1467,7 +1467,7 @@ def test_q1t_v2_closes_only_observed_present_whole_bytes_or_actual_absence(q1_jo
 ])
 def test_q1t_bad_wire_is_rejected_before_preflight_lock_or_durable_effects(tmp_path,monkeypatch,mutate):
     m=module();first,_=owner(tmp_path)
-    document=request('close');document.update(version=2,
+    document=request('close');document.update(version=3,
         controls=[dict(path=name,bytes=0,sha256='0'*64) for name in
             ('series_result.json','native-selection.json','_scheduler-stdout.txt','_scheduler-stderr.txt')],
         technical_control=dict(status='present',path='performance-source.json',bytes='1',sha256='0'*64))
@@ -1478,12 +1478,12 @@ def test_q1t_bad_wire_is_rejected_before_preflight_lock_or_durable_effects(tmp_p
 
 
 @pytest.mark.parametrize('valid',[True,False])
-def test_q1t_socket_failure_preserves_v2_shape_only_after_valid_request(monkeypatch,valid):
-    m=module();document=request('close');document.update(version=2,
+def test_q1t_socket_failure_preserves_v3_shape_only_after_valid_request(monkeypatch,valid):
+    m=module();document=request('close');document.update(version=3,
         controls=[dict(path=name,bytes=0,sha256='0'*64) for name in
             ('series_result.json','native-selection.json','_scheduler-stdout.txt','_scheduler-stderr.txt')],
         technical_control=dict(status='absent',path='performance-source.json',reason='not_published'))
-    if not valid:document['version']=3
+    if not valid:document['version']=2
     sources=type('SocketSources',(),{'qualify':lambda self:None})()
     monkeypatch.setattr(m,'_load_policy',lambda *a:{'limits':limits()})
     monkeypatch.setattr(m,'NativeSources',lambda *a:sources)
@@ -1493,7 +1493,7 @@ def test_q1t_socket_failure_preserves_v2_shape_only_after_valid_request(monkeypa
     monkeypatch.setattr(m,'authenticate_socket_peer',peer)
     captured=[];monkeypatch.setattr(m,'write_frame',lambda connection,result,*a:captured.append(result))
     m.handle_connection(object());result=captured[0]
-    assert result['version']==(2 if valid else 1)
+    assert result['version']==(3 if valid else 1)
     assert result['state']==('hold' if valid else 'rejected')
     if valid:assert result['technical_control'] is None and result['controls'] is None
 
@@ -1515,16 +1515,16 @@ def test_q1t_server_classifies_only_integer_v1_as_legacy_before_authentication(m
         'job':None,'controls':None,'reason':'shape'}
 
 
-@pytest.mark.parametrize('version',[1,2])
+@pytest.mark.parametrize('version',[1,3])
 @pytest.mark.parametrize('fault',['namespace','connect','response_frame'])
-def test_q1t_client_main_transport_errors_preserve_only_validated_v2_context(monkeypatch,capsys,version,fault):
+def test_q1t_client_main_transport_errors_preserve_only_validated_v3_context(monkeypatch,capsys,version,fault):
     import io
     from contextlib import contextmanager
     m=module();document=request('close')
     document['controls']=[dict(path=name,bytes=0,sha256='0'*64) for name in
         ('series_result.json','native-selection.json','_scheduler-stdout.txt','_scheduler-stderr.txt')]
-    if version==2:
-        document.update(version=2,technical_control=dict(status='absent',path='performance-source.json',reason='not_published'))
+    if version==3:
+        document.update(version=3,technical_control=dict(status='absent',path='performance-source.json',reason='not_published'))
     raw=m.encoded(document);stdin=io.BytesIO(raw);calls=[]
     monkeypatch.setattr(m.sys,'argv',['client','close'])
     monkeypatch.setattr(m.sys,'stdin',type('Input',(),{'buffer':stdin})())
@@ -1550,10 +1550,10 @@ def test_q1t_client_main_transport_errors_preserve_only_validated_v2_context(mon
     monkeypatch.setattr(m,'read_frame',failed_frame)
     assert m.client_main()==75
     output=capsys.readouterr().out;result=json.loads(output)
-    expected={'version':version,'state':'hold','calcjob_uuid':document['calcjob_uuid'] if version==2 else None,
+    expected={'version':version,'state':'hold','calcjob_uuid':document['calcjob_uuid'] if version==3 else None,
         'receipt_ref':None,'job':None,'controls':None,
         'reason':'frame_bound' if fault=='response_frame' else 'transport_outcome_unknown'}
-    if version==2:expected['technical_control']=None
+    if version==3:expected['technical_control']=None
     assert result==expected and output.encode()==m.encoded(expected)+b'\n'
     assert stdin.tell()==len(raw) and calls==({'namespace':['namespace'],'connect':['connect'],
         'response_frame':['connect','response_frame']}[fault])
@@ -1561,7 +1561,7 @@ def test_q1t_client_main_transport_errors_preserve_only_validated_v2_context(mon
 
 @pytest.mark.parametrize('raw',[b'{',b'\xff',b'{"version":2,"version":2}',
     b'{"version":true}',b'{"version":1.0}',b'{"version":2.0}',b'{"version":3}'])
-def test_q1t_client_main_early_invalid_parse_never_gains_v2_context_or_transport(monkeypatch,capsys,raw):
+def test_q1t_client_main_early_invalid_parse_never_gains_v3_context_or_transport(monkeypatch,capsys,raw):
     import io
     m=module();monkeypatch.setattr(m.sys,'argv',['client','close'])
     monkeypatch.setattr(m.sys,'stdin',type('Input',(),{'buffer':io.BytesIO(raw)})())
@@ -1574,7 +1574,7 @@ def test_q1t_client_main_early_invalid_parse_never_gains_v2_context_or_transport
 
 @pytest.mark.parametrize('fault',['hash','missing','unexpected_present','symlink','hardlink','writable','oversize','owner','ancestor'])
 def test_q1t_technical_foreign_or_changed_file_never_publishes_receipt(q1_joined,monkeypatch,fault):
-    s=q1_joined;m=s['m'];document=q1t_document(s);path=s['work']/'performance-source.json'
+    s=q1_joined;m=s['m'];document=q1t_document(s);path=s['result']/'performance-source.json'
     if fault=='hash':document['technical_control']['sha256']='0'*64
     if fault=='missing':path.unlink()
     if fault=='unexpected_present':document['technical_control']={'status':'absent','path':'performance-source.json','reason':'not_published'}
@@ -1594,18 +1594,18 @@ def test_q1t_technical_foreign_or_changed_file_never_publishes_receipt(q1_joined
         def reading(fd,limit,budget):
             result=read(fd,limit,budget)
             if fstat(fd).st_ino==inode:
-                s['work'].rename(s['work'].with_name('retained'));s['work'].mkdir()
+                s['result'].rename(s['result'].with_name('retained'));s['result'].mkdir()
             return result
         monkeypatch.setattr(m,'read_fd',reading)
     result=s['owner'].qualify_close(document)
-    assert result['version']==2 and result['state']=='hold' and result['technical_control'] is None
+    assert result['version']==3 and result['state']=='hold' and result['technical_control'] is None
     assert result['controls'] is None and not (s['store'].path(document['calcjob_uuid'])/'close.json').exists()
 
 
 @pytest.mark.parametrize('fault',['replace','tamper','absent_published','late_writer'])
 def test_q1t_late_file_or_writer_change_cannot_certify_technical_context(q1_joined,monkeypatch,fault):
     s=q1_joined;m=s['m'];document=q1t_document(s,None if fault=='absent_published' else b'original')
-    path=s['work']/'performance-source.json';read=m.read_fd;opened=m.os.open
+    path=s['result']/'performance-source.json';read=m.read_fd;opened=m.os.open
     if fault=='absent_published':
         def open_path(name,*args,**kw):
             if name=='performance-source.json':
@@ -1635,7 +1635,7 @@ def test_q1t_late_file_or_writer_change_cannot_certify_technical_context(q1_join
     assert not (s['store'].path(document['calcjob_uuid'])/'close.json').exists()
 
 
-@pytest.mark.parametrize('first_version,second_version,changed',[(2,2,False),(2,2,True),(1,2,False),(2,1,False)])
+@pytest.mark.parametrize('first_version,second_version,changed',[(3,3,False),(3,3,True),(1,3,False),(3,1,False)])
 def test_q1t_retry_preserves_exact_receipts_and_never_relabels_v1(q1_joined,first_version,second_version,changed):
     s=q1_joined;m=s['m'];document=q1t_document(s)
     if first_version==1:document.pop('technical_control');document['version']=1
@@ -1668,7 +1668,7 @@ def test_q1t_partial_publication_is_not_repaired_or_overwritten(q1_joined,monkey
     s=q1_joined;m=s['m'];document=q1t_document(s);put=s['store'].put
     def failed(calcjob,name,value,budget):
         put(calcjob,name,value,budget)
-        if name=='close-observation.json':raise OSError('original v2 publication uncertainty')
+        if name=='close-observation.json':raise OSError('original v3 publication uncertainty')
     monkeypatch.setattr(s['store'],'put',failed)
     result=s['owner'].qualify_close(document)
     assert result['state']=='hold' and result['technical_control'] is None
@@ -1680,13 +1680,15 @@ def test_q1t_partial_publication_is_not_repaired_or_overwritten(q1_joined,monkey
     assert (directory/'close-observation.json').read_bytes()==original and not (directory/'close.json').exists()
 
 
-@pytest.mark.parametrize('reply_version',[1,2])
-def test_q1t_fixed_client_requires_exact_v2_reply_without_v1_fallback(q1_joined,monkeypatch,capsys,reply_version):
+@pytest.mark.parametrize('reply_version',[1,2,3])
+def test_q1t_fixed_client_requires_exact_v3_reply_without_v1_fallback(q1_joined,monkeypatch,capsys,reply_version):
     import io
     from contextlib import contextmanager
     s=q1_joined;m=s['m'];document=q1t_document(s)
     result=s['owner'].qualify_close(document);assert result['state']=='closed'
-    if reply_version==1:result.pop('technical_control');result['version']=1
+    if reply_version!=3:
+        if reply_version==1:result.pop('technical_control')
+        result['version']=reply_version
     @contextmanager
     def directory(*args,**kwargs):yield 999
     class Connection:
@@ -1704,8 +1706,8 @@ def test_q1t_fixed_client_requires_exact_v2_reply_without_v1_fallback(q1_joined,
     monkeypatch.setattr(m.sys,'stdin',type('Input',(),{'buffer':io.BytesIO(m.encoded(document))})())
     monkeypatch.setattr(m,'write_frame',lambda connection,value,*args:None)
     monkeypatch.setattr(m,'read_frame',lambda *args:result)
-    if reply_version==1:
-        with pytest.raises(m.Hold,match='reply_version'):m._client_operation()
+    if reply_version!=3:
+        with pytest.raises(m.Hold,match='reply_shape' if reply_version==2 else 'reply_version'):m._client_operation()
         assert capsys.readouterr().out==''
     else:
         assert m._client_operation()==0
@@ -2073,3 +2075,240 @@ def test_launch12_invalid_claims_refuse_before_actor(monkeypatch,tmp_path,fault)
     selected=m.OrdinaryAttemptOwner(policy,m.AttemptStore(tmp_path),sources,budget)
     assert selected.submit(document)['state']=='rejected'
     assert budget.calls==0 and not (tmp_path/'attempts').exists()
+
+
+@pytest.mark.parametrize('raw',[None,b'original result technical bytes'])
+def test_q1t_v3_result_is_only_technical_domain_even_with_workdir_decoy(q1_joined,raw):
+    s=q1_joined;document=q1t_document(s,raw)
+    (s['work']/'performance-source.json').write_bytes(b'foreign workdir decoy')
+    result=s['owner'].qualify_close(document)
+    assert result['state']=='closed' and result['version']==3
+    assert result['technical_control']==document['technical_control']
+    witness=json.loads((s['store'].path(document['calcjob_uuid'])/'close-observation.json').read_bytes())
+    assert all(row['root']=='result' for row in witness['control_read']['files'] if row['path']=='performance-source.json')
+
+
+@pytest.mark.parametrize('version',[1,2,3])
+def test_q1t_historical_v2_close_is_immutable_and_never_migrated(q1_joined,monkeypatch,version):
+    s=q1_joined;m=s['m'];document=q1t_document(s)
+    old=dict(version=2,state='closed',calcjob_uuid=document['calcjob_uuid'],receipt_ref=document['calcjob_uuid']+'/close.json',
+        job=s['job'],controls=s['controls'],technical_control=document['technical_control'],reason=None)
+    witness=dict(reply_sha256=hashlib.sha256(m.encoded(old)).hexdigest(),
+        control_read=dict(technical_control=document['technical_control'],roots=[dict(role='workdir',path=document['launch']['remote_workdir'])]))
+    for name,value in [('close-observation.json',witness),('close.json',old)]:
+        s['store'].put(document['calcjob_uuid'],name,value,s['sources'].budget)
+    directory=s['store'].path(document['calcjob_uuid'])
+    before={name:(directory/name).read_bytes() for name in ('close.json','close-observation.json')}
+    document['version']=version
+    if version==1:document.pop('technical_control')
+    reader=m._read_submitted_files_as_owner
+    def no_close_read(*args,**kwargs):
+        if kwargs.get('controls') is not None:pytest.fail('version conflict must precede close payload read')
+        return reader(*args,**kwargs)
+    monkeypatch.setattr(m,'_read_submitted_files_as_owner',no_close_read)
+    result=s['owner'].qualify_close(document)
+    assert result['state']==('rejected' if version==2 else 'hold')
+    if version!=2:assert result['reason']=='q1_close_conflict'
+    assert {name:(directory/name).read_bytes() for name in before}==before
+
+
+@pytest.mark.parametrize('mutate',[
+    lambda d:d.update(root='native_execution'),lambda d:d.update(path='performance-source.json'),
+    lambda d:d['technical_control'].update(root='result'),lambda d:d['technical_control'].update(provider='native_execution'),
+])
+def test_q1t_v3_has_no_caller_root_path_or_provider_selector(q1_joined,monkeypatch,mutate):
+    s=q1_joined;document=q1t_document(s,None);mutate(document)
+    monkeypatch.setattr(s['sources'],'preflight',lambda *a,**kw:pytest.fail('selector reached preflight'))
+    assert s['owner'].qualify_close(document)['state']=='rejected'
+
+
+@pytest.mark.parametrize('native',[True,False])
+def test_native_capture_fixed_export_only_for_exact_native_argv(actor_bridge,tmp_path,native):
+    s=actor_bridge;m=s['m'];script=native_origin_bridge_script(s) if native else s['files']['submit_script']
+    script=script.replace(b'unset QCL_NEGF_CAPTURE_SPEC',
+        b'export QCL_NEGF_CAPTURE_SPEC=capture-spec.json QCL_NEGF_NATIVE_CAPTURE_INPUT=native-execution.json')
+    replace_bridge_script(s,script)
+    if native:
+        assert s['sources'].preflight(s['document']['launch'],s['sources'].budget,
+            calcjob_uuid=s['document']['calcjob_uuid'],action='submit')==s['host']
+    else:
+        selected=m.OrdinaryAttemptOwner(s['sources'].policy,m.AttemptStore(tmp_path),s['sources'],s['sources'].budget)
+        assert selected.submit(s['document'])['state']=='hold'
+        assert not (tmp_path/'attempts').exists()
+
+
+@pytest.mark.parametrize('change',[
+    b'export QCL_NEGF_NATIVE_CAPTURE_INPUT=native-execution.json QCL_NEGF_CAPTURE_SPEC=capture-spec.json',
+    b'export QCL_NEGF_CAPTURE_SPEC=capture-spec.json',
+    b'export QCL_NEGF_CAPTURE_SPEC=./capture-spec.json QCL_NEGF_NATIVE_CAPTURE_INPUT=native-execution.json',
+    b'export QCL_NEGF_CAPTURE_SPEC=capture-spec.json QCL_NEGF_NATIVE_CAPTURE_INPUT=./native-execution.json',
+    b'export QCL_NEGF_CAPTURE_SPEC="capture-spec.json" QCL_NEGF_NATIVE_CAPTURE_INPUT=native-execution.json',
+    b'export QCL_NEGF_CAPTURE_SPEC=capture-spec.json QCL_NEGF_NATIVE_CAPTURE_INPUT=native-execution.json OTHER=1',
+    b'export QCL_NEGF_CAPTURE_SPEC=capture-spec.json QCL_NEGF_NATIVE_CAPTURE_INPUT=native-execution.json; printf x',
+    b'export QCL_NEGF_CAPTURE_SPEC=capture-spec.json\nexport QCL_NEGF_NATIVE_CAPTURE_INPUT=native-execution.json',
+])
+def test_native_capture_export_rejects_grammar_variants_before_effects(actor_bridge,tmp_path,change):
+    s=actor_bridge;m=s['m'];script=native_origin_bridge_script(s).replace(b'unset QCL_NEGF_CAPTURE_SPEC',change)
+    replace_bridge_script(s,script)
+    selected=m.OrdinaryAttemptOwner(s['sources'].policy,m.AttemptStore(tmp_path),s['sources'],s['sources'].budget)
+    assert selected.submit(s['document'])['state']=='hold'
+    assert not (tmp_path/'attempts').exists() and not any('--parsable' in row[0] for row in s['calls'])
+
+
+@pytest.mark.parametrize('fault',['root_path','root_role','technical_role'])
+def test_q1t_v3_retained_root_mismatch_is_not_reused_or_repaired(q1_joined,fault):
+    s=q1_joined;m=s['m'];document=q1t_document(s)
+    assert s['owner'].qualify_close(document)['state']=='closed'
+    directory=s['store'].path(document['calcjob_uuid']);path=directory/'close-observation.json'
+    witness=json.loads(path.read_bytes())
+    if fault=='root_path':witness['control_read']['roots'][0]['path']=document['launch']['remote_workdir']
+    if fault=='root_role':witness['control_read']['roots'][0]['role']='workdir'
+    if fault=='technical_role':
+        next(row for row in witness['control_read']['files'] if row['path']=='performance-source.json')['root']='workdir'
+    path.write_bytes(m.encoded(witness))
+    before={name:(directory/name).read_bytes() for name in ('close.json','close-observation.json')}
+    source=copy.copy(s['sources']);source.budget=m.Operation(source.policy['limits']);source.budget.read=s['sources'].budget.read
+    result=m.OrdinaryAttemptOwner(source.policy,s['store'],source,source.budget).qualify_close(document)
+    assert result['state']=='hold' and result['reason']=='q1_close_conflict'
+    assert {name:(directory/name).read_bytes() for name in before}==before
+
+
+def test_q1t_v3_reduced_leaf_fits_existing_eight_mib_close_budget(q1_joined):
+    s=q1_joined;m=s['m'];raw=b'r'*65536;document=q1t_document(s,raw)
+    budget=s['sources'].budget
+    assert budget.limits['metadata_bytes']==8*1024*1024
+    result=s['owner'].qualify_close(document)
+    assert result['state']=='closed' and result['technical_control']==document['technical_control']
+    assert budget.bytes<=8*1024*1024 and budget.actual_bytes>=len(raw)
+
+
+@pytest.mark.parametrize('delta',[-1,0])
+def test_q1t_v3_prepaid_leaf_boundary_before_pipe_fork_or_read(monkeypatch,delta):
+    m=module();controls=[dict(path=name,bytes=0,sha256='0'*64) for name in m.CLOSE_FILES]
+    technical=dict(status='present',path='performance-source.json',bytes='65536',sha256='0'*64)
+    launch=request()['launch'];jobs='/srv/qcl-negf/jobs'
+    depth=sum(len(Path(path).parts)-1 for path in (jobs+'/'+launch['relative_execution_root'],launch['remote_workdir']))
+    total=8*4+16*65536+4096*(depth+4)+8*len(m.encoded(controls))+8*(65536+1)+8*len(m.encoded(technical))+65536
+    budget=m.Operation({**limits(),'metadata_bytes':total+delta,'maximum_files':2048})
+    policy=dict(limits=budget.limits,jobs_root=jobs);reached=[]
+    monkeypatch.setattr(m.os,'geteuid',lambda:0)
+    class Prepaid(Exception):pass
+    def pipe(*args):reached.append('pipe');raise Prepaid()
+    monkeypatch.setattr(m.os,'pipe2',pipe)
+    monkeypatch.setattr(m.os,'fork',lambda:pytest.fail('no fork before synthetic pipe'))
+    with pytest.raises(m.Hold if delta<0 else Prepaid):
+        m._read_submitted_files_as_owner(policy,launch,budget,controls=controls,technical_control=technical)
+    assert reached==([] if delta<0 else ['pipe']) and budget.bytes==total and budget.actual_bytes==0
+
+
+def test_q1t_v3_cancelled_technical_read_never_publishes_close(q1_joined,monkeypatch,capsys):
+    s=q1_joined;m=s['m'];document=q1t_document(s);target=(s['result']/'performance-source.json').stat().st_ino
+    read=m.read_fd
+    def cancelled(fd,limit,budget):
+        if os.fstat(fd).st_ino==target:raise OSError('synthetic cancelled technical read')
+        return read(fd,limit,budget)
+    monkeypatch.setattr(m,'read_fd',cancelled)
+    result=s['owner'].qualify_close(document)
+    assert result['state']=='hold' and result['technical_control'] is None
+    diagnostics=capsys.readouterr().err.splitlines()
+    import base64
+    retained=[json.loads(line.split(': ',1)[1]) for line in diagnostics]
+    assert any(b'synthetic cancelled technical read' in base64.b64decode(row['original_prefix_base64']) for row in retained)
+    directory=s['store'].path(document['calcjob_uuid'])
+    assert not (directory/'close.json').exists() and not (directory/'close-observation.json').exists()
+
+
+def test_q1t_v3_root_replacement_between_retries_is_hold_even_with_same_bytes(q1_joined):
+    s=q1_joined;m=s['m'];document=q1t_document(s)
+    assert s['owner'].qualify_close(document)['state']=='closed'
+    directory=s['store'].path(document['calcjob_uuid'])
+    before={name:(directory/name).read_bytes() for name in ('close.json','close-observation.json')}
+    s['result'].rename(s['result'].with_name('original-result'))
+    s['result'].mkdir(mode=0o755)
+    for path in s['result'].with_name('original-result').iterdir():
+        target=s['result']/path.name;target.write_bytes(path.read_bytes());target.chmod(0o640)
+    source=copy.copy(s['sources']);source.budget=m.Operation(source.policy['limits']);source.budget.read=s['sources'].budget.read
+    result=m.OrdinaryAttemptOwner(source.policy,s['store'],source,source.budget).qualify_close(document)
+    assert result['state']=='hold' and result['reason']=='q1_close_conflict'
+    assert {name:(directory/name).read_bytes() for name in before}==before
+
+
+def test_q1t_v3_retry_timestamps_do_not_change_original_domain_identity(q1_joined):
+    s=q1_joined;m=s['m'];document=q1t_document(s)
+    first=s['owner'].qualify_close(document);assert first['state']=='closed'
+    for root in (s['result'],s['work']):
+        info=root.stat();os.utime(root,ns=(info.st_atime_ns,info.st_mtime_ns+1000000))
+    source=copy.copy(s['sources']);source.budget=m.Operation(source.policy['limits']);source.budget.read=s['sources'].budget.read
+    result=m.OrdinaryAttemptOwner(source.policy,s['store'],source,source.budget).qualify_close(document)
+    assert result==first
+
+
+@pytest.mark.parametrize('fault',['read_null','roots_null','root_null','directory_null','files_null','file_null'])
+def test_q1t_v3_malformed_retained_domain_is_hold_with_immutable_records(q1_joined,fault):
+    s=q1_joined;m=s['m'];document=q1t_document(s)
+    assert s['owner'].qualify_close(document)['state']=='closed'
+    directory=s['store'].path(document['calcjob_uuid']);path=directory/'close-observation.json'
+    witness=json.loads(path.read_bytes());prior=witness['control_read']
+    if fault=='read_null':witness['control_read']=None
+    if fault=='roots_null':prior['roots']=None
+    if fault=='root_null':prior['roots'][0]=None
+    if fault=='directory_null':prior['roots'][0]['directory']=None
+    if fault=='files_null':prior['files']=None
+    if fault=='file_null':prior['files'][0]=None
+    path.write_bytes(m.encoded(witness))
+    before={name:(directory/name).read_bytes() for name in ('close.json','close-observation.json')}
+    source=copy.copy(s['sources']);source.budget=m.Operation(source.policy['limits']);source.budget.read=s['sources'].budget.read
+    result=m.OrdinaryAttemptOwner(source.policy,s['store'],source,source.budget).qualify_close(document)
+    assert result['state']=='hold' and result['reason']=='q1_close_conflict'
+    assert {name:(directory/name).read_bytes() for name in before}==before
+
+
+@pytest.mark.parametrize('version',[1,3])
+@pytest.mark.parametrize('state',['hold',[],{},None,False,1,1.0])
+def test_q1t_external_client_typed_state_refusal_preserves_exact_wire(monkeypatch,capsys,version,state):
+    import io
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    m=module();document=request('close')
+    document['controls']=[dict(path=name,bytes=0,sha256='0'*64) for name in m.CLOSE_FILES]
+    response=dict(version=version,state=state,calcjob_uuid=document['calcjob_uuid'],receipt_ref=None,
+        job=None,controls=None,reason='synthetic_hold')
+    if version==3:
+        document.update(version=3,technical_control=dict(status='absent',path=m.TECHNICAL_FILE,reason='not_published'))
+        response['technical_control']=None
+    raw_response=m.encoded(response);connections=[]
+    class Connection:
+        def __init__(self):
+            self.raw=struct.pack('!I',len(raw_response))+raw_response;self.sent=bytearray();connections.append(self)
+        def recv(self,size):
+            chunk=self.raw[:size];self.raw=self.raw[size:];return chunk
+        def sendall(self,data):self.sent.extend(data)
+        def __enter__(self):return self
+        def __exit__(self,*args):pass
+        def settimeout(self,*args):pass
+        def connect(self,path):assert path==m.SOCKET
+        def shutdown(self,*args):pass
+        def getsockopt(self,*args):return struct.pack('3i',1,0,0)
+    @contextmanager
+    def directory(*args,**kwargs):yield 999
+    info=SimpleNamespace(st_dev=1,st_ino=2,st_uid=0,st_gid=3000,st_mode=m.stat.S_IFSOCK|0o660,
+        st_nlink=1,st_size=0,st_mtime_ns=1,st_ctime_ns=1)
+    original_stat=m.os.stat
+    monkeypatch.setattr(m.os,'stat',lambda path,*a,**kw:info if path==Path(m.SOCKET).name else original_stat(path,*a,**kw))
+    monkeypatch.setattr(m,'protected_directory',directory)
+    monkeypatch.setattr(m.socket,'socket',lambda *a,**kw:Connection())
+    monkeypatch.setattr(m.sys,'argv',['client','close'])
+    monkeypatch.setattr(m.sys,'stdin',SimpleNamespace(buffer=io.BytesIO(m.encoded(document))))
+    assert m.client_main()==75
+    output=capsys.readouterr().out
+    if state=='hold':expected=response
+    else:
+        context=dict(version=3,action='close',calcjob_uuid=document['calcjob_uuid']) if version==3 else {}
+        expected=m.reply(context,'hold',reason='reply_shape')
+    assert output.encode()==m.encoded(expected)+b'\n'
+    assert set(json.loads(output))==set(expected) and expected['version']==version
+    assert expected['job'] is expected['controls'] is expected['receipt_ref'] is None
+    if version==3:assert expected['technical_control'] is None and expected['calcjob_uuid']==document['calcjob_uuid']
+    raw_request=m.encoded(document)
+    assert connections[0].sent==struct.pack('!I',len(raw_request))+raw_request
+    assert connections[0].raw==b''

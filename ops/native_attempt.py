@@ -163,12 +163,12 @@ class Operation:
 
 
 def validate_request(document):
-    need(type(document) is dict and type(document.get('version')) is int and document['version'] in (1,2))
+    need(type(document) is dict and type(document.get('version')) is int and document['version'] in (1,3))
     version = document['version']
     keys = {'version', 'action', 'calcjob_uuid', 'launch', 'controls'}
-    exact(document, keys | ({'technical_control'} if version == 2 else set()))
+    exact(document, keys | ({'technical_control'} if version == 3 else set()))
     need(document['action'] in {'submit', 'reconcile', 'start', 'close', 'status'})
-    if version == 2:
+    if version == 3:
         need(document['action'] == 'close')
         _close_controls(document['controls'])
         _technical_control(document['technical_control'])
@@ -200,10 +200,10 @@ def validate_request(document):
 
 
 def reply(document, state, *, job=None, reason=None, receipt=None, controls=None, technical_control=None):
-    version = 2 if type(document.get('version')) is int and document['version'] == 2 and document.get('action') == 'close' else 1
+    version = 3 if type(document.get('version')) is int and document['version'] == 3 and document.get('action') == 'close' else 1
     result = dict(version=version, state=state, calcjob_uuid=document.get('calcjob_uuid'), receipt_ref=receipt,
                   job=job, controls=controls, reason=reason)
-    if version == 2:
+    if version == 3:
         result['technical_control'] = technical_control
     return result
 
@@ -225,14 +225,15 @@ def validate_job(job):
     return job
 
 
-def validate_reply(document):
-    need(type(document) is dict and type(document.get('version')) is int and document['version'] in (1,2), 'reply_shape')
+def validate_reply(document, *, historical=False):
+    need(type(document) is dict and type(document.get('version')) is int and document['version'] in ((1,2,3) if historical else (1,3)), 'reply_shape')
     version = document['version']
     keys = {'version', 'state', 'calcjob_uuid', 'receipt_ref', 'job', 'controls', 'reason'}
-    exact(document, keys | ({'technical_control'} if version == 2 else set()))
-    need(document['state'] in ({'closed','hold','rejected'} if version == 2 else
+    exact(document, keys | ({'technical_control'} if version in (2,3) else set()))
+    need(type(document['state']) is str, 'reply_shape')
+    need(document['state'] in ({'closed','hold','rejected'} if version in (2,3) else
                               {'bound','started','closed','hold','rejected'}), 'reply_shape')
-    if version == 2:
+    if version in (2,3):
         if document['state'] == 'closed':
             _technical_control(document['technical_control'])
         else:
@@ -486,7 +487,7 @@ def _read_close_payload(store, calcjob_uuid, name, budget):
             budget.reserve(len(raw)*8)
             value = strict_json(raw.decode());need(type(value) is dict and encoded(value)==raw, 'q1_close_conflict')
             if name=='close.json':
-                validate_reply(value)
+                validate_reply(value,historical=True)
                 need(value['state']=='closed' and value['calcjob_uuid']==calcjob_uuid, 'q1_close_conflict')
             budget.before(); os.fsync(fd); budget.before(); os.fsync(parent)
             need(signature(info)==signature(os.fstat(fd))==signature(os.stat(name,dir_fd=parent,follow_symlinks=False)),
@@ -639,8 +640,21 @@ class OrdinaryAttemptOwner:
         options = {} if document['version'] == 1 else {'technical_control':technical}
         readback = _read_submitted_files_as_owner(self.policy,launch,budget,controls=controls,**options)
         need(readback['controls']==controls, 'q1_control_changed')
-        if document['version'] == 2:
+        if document['version'] == 3:
             need(readback['technical_control']==technical, 'q1_technical_changed')
+            if previous is not None:
+                prior = retained[0]['control_read']
+                # Persisted v3 authority is the original named domain/inode,
+                # not its mutable timestamps or the caller's matching hash.
+                need(type(prior) is dict and type(prior.get('roots')) is list and
+                     type(prior.get('files')) is list, 'q1_close_conflict')
+                need(len(prior['roots'])==len(readback['roots']) and
+                     len(prior['files'])==len(readback['files']), 'q1_close_conflict')
+                for old,new in zip(prior['roots'],readback['roots']):
+                    need(type(old) is dict and old.get('role')==new['role'] and old.get('path')==new['path'] and
+                         type(old.get('directory')) is list and old['directory'][:2]==new['directory'][:2], 'q1_close_conflict')
+                for old,new in zip(prior['files'],readback['files']):
+                    need(type(old) is dict and old.get('path')==new['path'] and old.get('root')==new['root'], 'q1_close_conflict')
         need(self.sources.qualify()==context, 'controller_generation_changed')
         _authenticate_server(self.sources)
         caller = self.sources._refresh_caller('close')
@@ -804,7 +818,9 @@ def _review_native_script(raw, launch, solver, bash, sources, *, calcjob_uuid):
     need(set(lines[1:3])==expected_exports, 'native_script_environment')
     guard = ('/run/current-system/sw/bin/qcl-negf-release guard --release-id '+shlex.quote(launch['release_id'])+
              ' --solver-executable '+shlex.quote(solver)+' || exit 78')
-    need(lines[4]==guard and lines[5]=='unset QCL_NEGF_CAPTURE_SPEC', 'native_script_guard')
+    capture_export = ('export QCL_NEGF_CAPTURE_SPEC=capture-spec.json '
+                      'QCL_NEGF_NATIVE_CAPTURE_INPUT=native-execution.json')
+    need(lines[4]==guard and lines[5] in ('unset QCL_NEGF_CAPTURE_SPEC',capture_export), 'native_script_guard')
     argv = [solver,'run-plan','plan.json',sources.policy['jobs_root']+'/'+launch['relative_execution_root'],
             '--execution-id',launch['execution_id'],'--source-graph','source-graph.json']
     # Stock Scheduler single-quotes every code argument. A free shell token or
@@ -816,7 +832,7 @@ def _review_native_script(raw, launch, solver, bash, sources, *, calcjob_uuid):
     if '--scratch-root' in lines[6]: raise Hold('native_scratch_binding_unavailable')
     # The legacy seven-argument class stays unmapped; neither branch is itself
     # proof of invocation birth or of a qualified native producer.
-    need(lines[6] in expected, 'native_script_argv')
+    need(lines[6] in (expected[1:] if lines[5]==capture_export else expected), 'native_script_argv')
 
 
 def _reserve_private_record(value, budget, depth=0):
@@ -976,7 +992,7 @@ def _owner_close_read(policy, launch, budget, controls, *, technical_control=Non
                     rows.append(dict(path=claim['path'],root=role,signature=signature(info)))
                     del raw
                 finally:os.close(fd)
-            if role == 'workdir' and technical is not None:
+            if role == 'result' and technical is not None:
                 try:
                     budget.file()
                     fd = os.open(TECHNICAL_FILE,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|os.O_CLOEXEC,dir_fd=parent)
@@ -1833,9 +1849,9 @@ def handle_connection(connection):
     except (Hold, OSError, ValueError, ResourceError, KeyError, engine.CommandFailure) as error:
         reason = error.reason if isinstance(error, Hold) else getattr(error, 'code', 'native_observation_failed')
         if isinstance(error,engine.CommandFailure): _preclaim_diagnostic(error)
-        # Keep the v1 pre-owner Reply7 byte semantics; only validated v2 carries
+        # Keep the v1 pre-owner Reply7 byte semantics; only validated v3 carries
         # the close request context into a noncompleted Reply8.
-        context = document if validated and document['version'] == 2 else {}
+        context = document if validated and document['version'] == 3 else {}
         result = reply(context, 'rejected' if request_invalid else 'hold', reason=reason)
     write_frame(connection, result, budget, budget.limits['response_bytes'])
 
@@ -1853,9 +1869,9 @@ def _client_operation(context=None):
     raw = sys.stdin.buffer.read(65537); need(0 < len(raw) <= 65536, 'frame_bound')
     document = validate_request(strict_json(raw.decode('utf-8')))
     need(document['action'] == sys.argv[1], 'client_action')
-    # Local failure retains only validated v2 identity, never server observations.
-    if context is not None and document['version'] == 2:
-        context.update(version=2, action='close', calcjob_uuid=document['calcjob_uuid'])
+    # Local failure retains only validated v3 identity, never server observations.
+    if context is not None and document['version'] == 3:
+        context.update(version=3, action='close', calcjob_uuid=document['calcjob_uuid'])
     with protected_directory(Path(SOCKET).parent, budget=budget) as parent:
         first = os.stat(Path(SOCKET).name, dir_fd=parent, follow_symlinks=False)
         need(stat.S_ISSOCK(first.st_mode) and first.st_uid == 0 and first.st_gid == 3000 and

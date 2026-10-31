@@ -100,7 +100,9 @@ followed, in order, by `--native-execution native-execution.json
 --native-calcjob-uuid UUID`. The latter has exactly eleven arguments; UUID must
 equal the actual authenticated request CalcJob UUID passed by
 `NativeSources.preflight`, independently of Launch file/hash assertions. Both
-classes retain the release guard and `unset QCL_NEGF_CAPTURE_SPEC`. Path aliases,
+classes retain the release guard. The native class also admits the one exact
+fixed capture export documented below; the ordinary class requires
+`unset QCL_NEGF_CAPTURE_SPEC`. Path aliases,
 alternate quoting, reordered/duplicate/missing flags, substitutions and extra
 shell remain refused. The original seven-argument class stays unmapped and
 receives no creator attribution. Accepting the new literal establishes only its
@@ -241,10 +243,10 @@ record into a fresh access pass. AiiDA getter lifetime, original creator joins,
 retained/cross-root sources, scientific acceptance and optional capture remain
 separate owning gates.
 
-## Q1T: optional technical metadata, версия 2
+## Q1T: optional technical metadata, версия 3
 
-Версия 2 расширяет только существующий parser `close`. Запрос имеет ровно поля
-`version,action,calcjob_uuid,launch,controls,technical_control`, где `version=2`,
+Версия 3 расширяет только существующий parser `close`. Запрос имеет ровно поля
+`version,action,calcjob_uuid,launch,controls,technical_control`, где `version=3`,
 `action="close"`, а `launch` сохраняет исходную форму. Успешный ответ имеет ровно
 `version,state,calcjob_uuid,receipt_ref,job,controls,technical_control,reason`.
 Четыре scientific controls, их порядок, integer lengths и потолки остаются прежними.
@@ -262,13 +264,16 @@ separate owning gates.
 допускаются. Это длина целого исходного файла, а hash относится к тем же полным
 байтам. Пустой существующий файл имеет `present` с `bytes="0"`; отсутствие не
 означает нулевую нагрузку или нулевые метрики. `absent` подтверждается только
-реальным отсутствием фиксированного leaf в исходном workdir после W1. Оно не
+реальным отсутствием фиксированного leaf в исходном result root после W1. Оно не
 препятствует закрытию и последующему scientific/control retrieval по прежним
 четырём controls.
 
 Ожидания caller не являются доказательством. Credential-drop child читает
-`performance-source.json` только из отдельного исходного `remote_workdir`, рядом
-с scheduler logs. Путь нельзя выбрать клиентом или перенести в result root.
+`performance-source.json` только из исходного result root
+`jobs_root/relative_execution_root`, под прежним result W1 и RO mapping. Scheduler
+logs остаются в отдельном исходном `remote_workdir`; его одноимённый technical
+leaf не читается даже при отсутствии leaf в result. Клиент не задаёт selector,
+provider, root или альтернативный путь.
 Применяются тот же `O_NOFOLLOW`, regular/single-link/owner/permissions контроль,
 удержанные directory FDs, полная длина/hash, named-inode и ancestor readback.
 Leaf и его родители должны оставаться стабильными; неизвестные writers,
@@ -283,17 +288,22 @@ hash само по себе их не устанавливает. Отсутст
 обязательные scientific files и не скрывает ошибку их чтения.
 
 Невалидная или неподдерживаемая версия запроса отвергается до durable effects.
-Валидный v2 close получает exact8 reply; при `hold/rejected` оба поля `controls`
+Валидный v3 close получает exact8 reply; при `hold/rejected` оба поля `controls`
 и `technical_control` равны `null`. Здесь `null` означает «не подтверждено», а
 не наблюдённое отсутствие. Fixed client требует совпадения версии reply с
-версией запроса и не принимает v1 как v2. Encoding без LF и единственный
+версией запроса и не принимает v1/v2 как v3. Encoding без LF и единственный
 transport LF сохраняются.
 
 Прежние v1 requests и scientific close receipts сохраняют исходную семантику.
-Старый `close.json` никогда не переименовывается и не становится technical
+Исторический v2 workdir close не поддерживается для новых requests; его
+receipt читается только для обнаружения immutable конфликта. Старый `close.json`
+и witness никогда не мигрируются, не переименовываются и не становятся result
 authority: запрос иной версии к уже закрытому attempt даёт HOLD с сохранением
-обоих исходных records. Повтор того же v2 close заново проверяет W1 и полный
-technical file либо отсутствие, затем возвращает неизменённый receipt. Поздняя
+обоих исходных records. Для v3 повтор также сверяет исходные role/path и
+`st_dev/st_ino` каждого root, а также root каждого fixed leaf с сохранённым
+witness. Root/candidate/version mismatch даёт HOLD без ремонта. Изменяемые
+операционные timestamps не заменяют domain identity. Повтор того же v3 close
+заново проверяет W1 и полный technical file либо отсутствие, затем возвращает неизменённый receipt. Поздняя
 публикация после сохранённого `absent`, смена bytes или partial publication не
 перезаписывает прежнее свидетельство. Порядок exclusive observation → receipt,
 fsync/readback, потолки records 64 KiB, сохранение первичной ошибки и отказ от
@@ -310,8 +320,25 @@ SOURCE/L проверка: подготовленный Python environment, ко
 `PYTHONDONTWRITEBYTECODE=1`. Fixtures выполняют owner/store/credential-drop
 fork/FD путь только на собственных temporary files с подставленными OS/RPC
 наблюдениями; реального backend close, DB/ORM, NFS или services здесь нет.
-AiiDA exact-v2 consumer/retrieval, installed/native qualification, R5 и все
+AiiDA exact-v3 consumer/retrieval, installed/native qualification, R5 и все
 научные gates остаются отдельными проверками Root.
+
+## Native capture script grammar
+
+Stock seven-line body допускает прежнюю строку `unset QCL_NEGF_CAPTURE_SPEC`
+для ordinary/native argv. Единственная новая альтернатива — ровно строка:
+
+```sh
+export QCL_NEGF_CAPTURE_SPEC=capture-spec.json QCL_NEGF_NATIVE_CAPTURE_INPUT=native-execution.json
+```
+
+Она допускается только с canonical native argv и genuine authenticated CalcJob
+UUID в `--native-calcjob-uuid`, с прежними literal single quotes и порядком
+аргументов. Legacy ordinary argv с этим export отвергается. Перестановка,
+альтернативные paths/quoting, extra environment assignments/commands и native
+scratch остаются запрещёнными. Guard, shebang, SBATCH, threading и mandatory
+original inputs сохраняют прежние проверки. Приёмка grammar не создаёт spec и
+не доказывает CREATE, root birth, producer lifetime или scientific acceptance.
 
 ## Accounting and qualification
 
