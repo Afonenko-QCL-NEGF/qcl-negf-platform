@@ -328,3 +328,211 @@ class DeliveryRequestTests(RequestFixture):
             admitted=first.result(timeout=4)
         self.assertEqual(requests.submit_update(self.request,runtime=self.runtime,run=self.native),admitted)
         self.assertEqual(len(self.calls),1)
+
+
+class NativeControllerConfigTests(unittest.TestCase):
+    """Real public-source IO in a virtual NixOS tree; ownership is fixture-only."""
+    CONFIG = '/etc/qcl-negf/release-config.json'
+    STATIC = '/etc/static/qcl-negf/release-config.json'
+    STORE = '/nix/store/config-release.json'
+
+    def setUp(self):
+        self.requests = importlib.import_module('delivery_requests')
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        for name in ('etc/qcl-negf', 'etc/static/qcl-negf', 'nix/store'):
+            (self.root/name).mkdir(parents=True, exist_ok=True)
+        self.write_config({'role': 'controller'})
+        self.local(self.STATIC).symlink_to(self.STORE)
+        self.local(self.CONFIG).symlink_to(self.STATIC)
+        self.foreign = set()
+        original_scan, original_open, original_fstat = engine.UpdateScan, os.open, os.fstat
+        self.original_fstat = original_fstat
+        self.original_open = original_open
+        self.original_trusted = release_trust.trusted_stat
+        fixture = self
+
+        def root_stat(info, foreign=False):
+            # Preserve nanosecond times and all real type/mode/inode properties.
+            class RootStat:
+                st_uid = 12345 if foreign else 0
+                def __getattr__(self, name):
+                    return getattr(info, name)
+            if info.st_uid != os.geteuid():
+                raise ValueError('Foreign fixture filesystem owner')
+            return RootStat()
+
+        class FixtureScan(original_scan):
+            def stat(self, path, *, follow_symlinks=False):
+                result = super().stat(fixture.local(path), follow_symlinks=follow_symlinks)
+                return root_stat(result, str(path) in fixture.foreign)
+            def link(self, path):
+                return super().link(fixture.local(path))
+
+        def open_public(path, *args, **kwargs):
+            if str(path) == '/' or str(path).startswith(('/etc/', '/nix/')):
+                path = self.local(path)
+            return original_open(path, *args, **kwargs)
+
+        self.public_open = open_public
+        self.public_fstat = lambda fd: root_stat(original_fstat(fd))
+        for hook in (patch.object(engine, 'UpdateScan', FixtureScan),
+                     patch.object(os, 'open', open_public),
+                     patch.object(os, 'fstat', lambda fd: root_stat(original_fstat(fd)))):
+            hook.start()
+            self.addCleanup(hook.stop)
+
+    def local(self, path):
+        return self.root/str(path).lstrip('/')
+
+    def write_config(self, settings):
+        target = self.local(self.STORE)
+        if target.exists():
+            target.chmod(0o644)
+        target.write_text(json.dumps(settings))
+        target.chmod(0o444)
+
+    def test_native_etc_static_store_chain_admits_controller(self):
+        self.assertIsNone(self.requests.require_controller())
+
+    def test_native_sticky_group_writable_store_admits_controller(self):
+        self.local('/nix/store').chmod(0o1775)
+        self.assertIsNone(self.requests.require_controller())
+
+    def test_store_exception_rejects_nonsticky_foreign_or_world_writable(self):
+        store = self.local('/nix/store')
+        for mode in (0o775, 0o1777):
+            store.chmod(mode)
+            with self.subTest(mode=oct(mode)), self.assertRaises(ValueError):
+                self.requests.require_controller()
+        store.chmod(0o1775)
+        self.foreign.add('/nix/store')
+        with self.assertRaises(ValueError):
+            self.requests.require_controller()
+
+    def test_store_exception_does_not_cover_other_sticky_ancestors(self):
+        self.local('/etc/static/qcl-negf').chmod(0o1775)
+        with self.assertRaises(ValueError):
+            self.requests.require_controller()
+
+    def test_native_static_directory_symlink_admits_controller(self):
+        static = self.local('/etc/static')
+        (static/'qcl-negf/release-config.json').unlink()
+        (static/'qcl-negf').rmdir()
+        static.rmdir()
+        generation = self.local('/nix/store/etc-generation')
+        (generation/'qcl-negf').mkdir(parents=True)
+        (generation/'qcl-negf/release-config.json').symlink_to(self.STORE)
+        static.symlink_to('/nix/store/etc-generation', target_is_directory=True)
+        self.assertIsNone(self.requests.require_controller())
+
+    def test_mutable_protected_reader_still_rejects_public_symlink(self):
+        with self.assertRaises(OSError) as caught:
+            release_trust.read_protected_file(self.CONFIG, 16384)
+        self.assertEqual(caught.exception.errno, 40)
+
+    def test_worker_role_is_rejected(self):
+        self.write_config({'role': 'worker'})
+        with self.assertRaisesRegex(ValueError, 'controller role'):
+            self.requests.require_controller()
+
+    def test_writable_or_foreign_store_file_is_rejected(self):
+        self.local(self.STORE).chmod(0o644)
+        with self.assertRaises(ValueError):
+            self.requests.require_controller()
+        self.local(self.STORE).chmod(0o444)
+        self.foreign.add(self.STORE)
+        with self.assertRaises(ValueError):
+            self.requests.require_controller()
+
+    def test_foreign_symlink_or_writable_ancestor_is_rejected(self):
+        self.foreign.add(self.STATIC)
+        with self.assertRaises(ValueError):
+            self.requests.require_controller()
+        self.foreign.clear()
+        self.local('/etc/static/qcl-negf').chmod(0o777)
+        with self.assertRaises(ValueError):
+            self.requests.require_controller()
+
+    def test_foreign_or_writable_root_is_rejected(self):
+        self.foreign.add('/')
+        with self.assertRaises(ValueError):
+            self.requests.require_controller()
+        self.foreign.clear()
+        self.root.chmod(0o777)
+        with self.assertRaises(ValueError):
+            self.requests.require_controller()
+
+    def test_escaping_mutable_target_is_rejected(self):
+        mutable = self.local('/etc/mutable.json')
+        mutable.write_text('{"role":"controller"}')
+        self.local(self.STATIC).unlink()
+        self.local(self.STATIC).symlink_to('/etc/mutable.json')
+        with self.assertRaises(ValueError):
+            self.requests.require_controller()
+
+    def test_symlink_cycle_is_bounded(self):
+        self.local(self.STATIC).unlink()
+        self.local(self.STATIC).symlink_to(self.CONFIG)
+        with self.assertRaisesRegex(ValueError, 'symlink bound'):
+            self.requests.require_controller()
+
+    def test_swapped_selection_during_read_is_rejected(self):
+        other = '/nix/store/config-other.json'
+        self.local(other).write_text('{"role":"controller"}')
+        self.local(other).chmod(0o444)
+        read = engine.immutable_public_bytes
+        def swap_after_read(*args, **kwargs):
+            value = read(*args, **kwargs)
+            self.local(self.STATIC).unlink()
+            self.local(self.STATIC).symlink_to(other)
+            return value
+        with patch.object(engine, 'immutable_public_bytes', swap_after_read):
+            with self.assertRaisesRegex(ValueError, 'namespace changed'):
+                self.requests.require_controller()
+
+    def test_wrong_terminal_type_is_rejected_before_open(self):
+        target = self.local(self.STORE)
+        target.unlink()
+        target.mkdir()
+        with self.assertRaises(ValueError):
+            self.requests.require_controller()
+        target.rmdir()
+        os.mkfifo(target)
+        with self.assertRaises(ValueError):
+            self.requests.require_controller()
+
+    def test_oversize_config_is_rejected(self):
+        self.write_config({'role':'controller', 'padding':'x'*16384})
+        with self.assertRaises(ValueError):
+            self.requests.require_controller()
+
+    def test_missing_installed_helper_still_rejects_controller(self):
+        with patch.object(self.requests, '__file__', str(self.root/'delivery_requests.py')):
+            with self.assertRaisesRegex(ValueError, 'Uninstalled controller'):
+                self.requests.require_controller()
+
+    def test_empty_boot_reconcile_has_no_side_effect(self):
+        service = importlib.import_module('delivery_service')
+        runtime = self.root/'runtime'
+        runtime.mkdir(mode=0o700)
+        gate = runtime/'admission.json'
+        gate.write_text('{"open":false}')
+        before = (gate.read_bytes(), gate.stat().st_mtime_ns)
+        def forbidden(*args, **kwargs):
+            raise AssertionError('Empty boot must not invoke native commands or delivery')
+        check = self.requests.require_controller
+        def controller_check():
+            with patch.object(os, 'fstat', self.public_fstat), \
+                 patch.object(os, 'open', self.public_open), \
+                 patch.object(release_trust, 'trusted_stat', self.original_trusted):
+                check()
+        with patch.object(service, 'require_controller', controller_check), \
+             patch.object(os, 'open', self.original_open), \
+             patch.object(os, 'fstat', self.original_fstat), \
+             patch.object(engine, 'deliver_cli', forbidden), \
+             fixture_trust(self.root):
+            self.assertEqual(service.reconcile_update_requests(runtime=runtime, run=forbidden), ())
+        self.assertEqual(list(runtime.iterdir()), [gate])
+        self.assertEqual((gate.read_bytes(), gate.stat().st_mtime_ns), before)

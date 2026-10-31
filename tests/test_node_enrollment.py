@@ -673,8 +673,25 @@ class EnrollmentTests(unittest.TestCase):
 
     def test_complete_public_request_on_worker_refuses_before_request_store_or_service(self):
         import delivery_requests
-        calls,snapshots,unresolved=[],[],[]
+        calls,snapshots,unresolved,refusals=[],[],[],[]
         submit=delivery_requests.submit_update
+        # This CLI boundary consumes an already-proven immutable public source.
+        # Config filesystem/origin faults are exercised by NativeControllerConfigTests.
+        worker_config=b'{"role":"worker"}'
+        config_path='/nix/store/fixture-release-config.json'
+        origin={'path':config_path,'chain':[(config_path,
+            (1,3,stat.S_IFREG|0o444,0,len(worker_config),1,1),None)]}
+        root_info=SimpleNamespace(st_dev=1,st_ino=2,st_mode=stat.S_IFDIR|0o755,st_uid=0)
+        def config_origin(budget,path,*,executable):
+            self.assertEqual(path,'/etc/qcl-negf/release-config.json')
+            self.assertFalse(executable)
+            return copy.deepcopy(origin)
+        def config_bytes(budget,path,limit):
+            self.assertEqual((path,limit),(config_path,16384))
+            return worker_config
+        def config_root(budget,path,**kwargs):
+            self.assertEqual(path,'/')
+            return root_info
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);runtime=root/'not-created'
             source,selected=root/'manifest.json',root/'pool.json'
@@ -683,10 +700,16 @@ class EnrollmentTests(unittest.TestCase):
                 '--enrollment','/protected/registry.json','--runtime',str(runtime),
                 '--request-id','d3986590-cf69-4ca8-af7c-c3e065241ad2','--procedure','maintenance']
             def dispatch(value,**kwargs):
-                return submit(value,run=lambda *a,**k:calls.append(a),**kwargs)
+                try:
+                    return submit(value,run=lambda *a,**k:calls.append(a),**kwargs)
+                except ValueError as error:
+                    refusals.append(str(error))
+                    raise
             with patch.object(sys,'argv',args),patch.object(ops,'RUNTIME',runtime), \
                  patch.object(ops,'read_protected_file',return_value=json.dumps(registry()).encode()), \
-                 patch.object(delivery_requests.trust,'read_protected_file',return_value=b'{"role":"worker"}'), \
+                 patch.object(delivery_requests.engine,'public_binary_origin',config_origin), \
+                 patch.object(delivery_requests.engine,'immutable_public_bytes',config_bytes), \
+                 patch.object(delivery_requests.engine.UpdateScan,'stat',config_root), \
                  patch.object(delivery_requests,'submit_update',dispatch), \
                  patch.object(ops,'observe_node_identity',lambda **_:WORKER), \
                  patch.object(ops,'freeze_ssh_trust',lambda *a,**k:snapshots.append(True)), \
@@ -700,6 +723,7 @@ class EnrollmentTests(unittest.TestCase):
                     'request_id':'d3986590-cf69-4ca8-af7c-c3e065241ad2','error_class':'ValueError'})
             self.assertFalse(runtime.exists())
             self.assertEqual(calls+snapshots+unresolved,[])
+            self.assertEqual(refusals,['Delivery service belongs to protected controller role'])
 
     def test_bound_release_check_before_after_boot_is_required(self):
         from test_application_release import Commands

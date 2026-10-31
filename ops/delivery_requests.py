@@ -49,7 +49,28 @@ def digest(value):
 
 
 def require_controller():
-    settings = engine.unique_json(trust.read_protected_file('/etc/qcl-negf/release-config.json', 16384), 16384)
+    # NixOS publishes this public config through /etc/static into the store.
+    # Mutable request/journal files retain the strict symlink-free trust reader.
+    path = '/etc/qcl-negf/release-config.json'
+    budget = engine.UpdateScan(time.monotonic()+360.0)
+    root = budget.stat('/')
+    trust.trusted_stat(root, directory=True)
+    origin = engine.public_binary_origin(budget, path, executable=False)
+    for selected, signature, target in origin['chain']:
+        # Native Nix store permits its build group under the sticky bit; this
+        # fixed directory exception never applies to the immutable final file.
+        store = (selected == '/nix/store' and stat.S_ISDIR(signature[2]) and
+                 stat.S_IMODE(signature[2]) == 0o1775)
+        if signature[3] != 0 or (target is None and signature[2] & 0o022 and not store):
+            raise ValueError('Unprotected public controller config namespace')
+    data = engine.immutable_public_bytes(budget, origin['path'], 16384)
+    later = engine.public_binary_origin(budget, path, executable=False)
+    after = budget.stat('/')
+    if (later != origin or
+            (root.st_dev, root.st_ino, root.st_mode, root.st_uid) !=
+            (after.st_dev, after.st_ino, after.st_mode, after.st_uid)):
+        raise ValueError('Public controller config namespace changed')
+    settings = engine.unique_json(data, 16384)
     if settings.get('role') != 'controller':
         raise ValueError('Delivery service belongs to protected controller role')
     for helper in ('delivery_service.py', 'aiida_update_check.py'):
