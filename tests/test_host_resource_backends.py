@@ -382,3 +382,61 @@ def test_root_boundary_reconcile_uses_only_protected_cleanup_record_not_client_p
     assert boundary.invoke('reconcile', request_id='request-1').phase == 'GUEST_ADMIT'
     assert boundary.invoke('reconcile', request_id='request-1').phase == 'GUEST_ADMIT'
     assert b.calls == [('vm-a', 512)]
+
+
+@pytest.mark.parametrize('dynamic', [False, True])
+@pytest.mark.parametrize('memory', ['4096', 4096])
+def test_pve_memory_scalar_readback_keeps_raw_fingerprint_and_digest(dynamic, memory, monkeypatch):
+    m = api()
+    config = {**pve_config(), 'memory': memory, 'balloon': 512 if dynamic else 0}
+    raw_before = dict(config)
+    fingerprint = m.pve_config_fingerprint
+    seen = []
+    def capture(raw):
+        seen.append(dict(raw))
+        return fingerprint(raw)
+    monkeypatch.setattr(m, 'pve_config_fingerprint', capture)
+    backend = m.ProxmoxMemoryBackend(Commands(pve_row(config)), '/usr/bin/pvesh', 'synthetic-node',
+        {'vm-a': m.ProxmoxVM(101, '11111111-1111-4111-8111-111111111111')}, dynamic=dynamic)
+    row = backend.readback('vm-a')
+    expected = (512 if dynamic else 4096) * 1024**2
+    assert row.configured_bytes == row.assigned_bytes == expected
+    assert row.revision == 'digest-1'
+    assert row.config_fingerprint == fingerprint(raw_before)
+    assert config == raw_before and seen == [raw_before]
+    assert type(seen[0]['memory']) is type(memory)
+
+
+@pytest.mark.parametrize('memory', [True, False, 1.0, None, -1, '-1', '0', 0,
+    '', '01', '+1', ' 1', '1 ', '1.0', '1MiB', '١', pytest.param('9' * 5000, id='oversize'),
+    str(((2**63-1)//(1024**2))+1), ((2**63-1)//(1024**2))+1])
+def test_pve_memory_invalid_scalar_and_byte_overflow_refused(memory):
+    m = api()
+    config = {**pve_config(), 'memory': memory}
+    backend = m.ProxmoxMemoryBackend(Commands(pve_row(config)), '/usr/bin/pvesh', 'synthetic-node',
+        {'vm-a': m.ProxmoxVM(101, '11111111-1111-4111-8111-111111111111')}, dynamic=True)
+    with pytest.raises(m.ResourceError):
+        backend.readback('vm-a')
+
+
+@pytest.mark.parametrize('as_string', [False, True])
+def test_pve_memory_maximum_representable_bytes(as_string):
+    m = api()
+    maximum = (2**63 - 1) // 1024**2
+    value = str(maximum) if as_string else maximum
+    assert m.pve_memory_mib(value) * 1024**2 == maximum * 1024**2 < 2**63
+
+
+@pytest.mark.parametrize('memory', ['2048', '4096', '8192', '36864'])
+def test_pve_observed_memory_values_decode_exactly(memory):
+    assert api().pve_memory_mib(memory) * 1024**2 == int(memory) * 1024**2
+
+
+@pytest.mark.parametrize('balloon', [True, '512', 1.0, -1, None])
+def test_pve_memory_string_does_not_relax_balloon_validation(balloon):
+    m = api()
+    config = {**pve_config(), 'memory': '4096', 'balloon': balloon}
+    backend = m.ProxmoxMemoryBackend(Commands(pve_row(config)), '/usr/bin/pvesh', 'synthetic-node',
+        {'vm-a': m.ProxmoxVM(101, '11111111-1111-4111-8111-111111111111')}, dynamic=True)
+    with pytest.raises(m.ResourceError):
+        backend.readback('vm-a')

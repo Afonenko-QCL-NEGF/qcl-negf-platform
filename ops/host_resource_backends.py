@@ -122,6 +122,18 @@ def pve_config_fingerprint(config):
     return fingerprint(stable)
 
 
+def pve_memory_mib(value):
+    """Decode the PVE memory scalar without altering its original config."""
+    maximum = (2**63 - 1) // (1024**2)
+    if type(value) is str:
+        require(len(value) <= len(str(maximum)) and re.fullmatch(r"[1-9][0-9]*", value) is not None,
+                "shape", "canonical PVE memory MiB required")
+        value = int(value)
+    require(type(value) is int and 0 < value <= maximum,
+            "shape", "PVE memory MiB outside byte range")
+    return value
+
+
 @dataclass(frozen=True)
 class ProxmoxVM:
     vmid: int
@@ -162,9 +174,9 @@ class ProxmoxMemoryBackend:
         config = strict_json(self._run(["get", path + "/config", "--current", "1"]))
         status = strict_json(self._run(["get", path + "/status/current"]))
         require(type(config) is dict and type(status) is dict, "readback", "PVE object expected")
-        for key in ("memory", "balloon"):
-            integer(config.get(key), "PVE " + key)
-        require(config["memory"] > 0 and config["balloon"] <= config["memory"],
+        memory = pve_memory_mib(config.get("memory"))
+        integer(config.get("balloon"), "PVE balloon")
+        require(config["balloon"] <= memory,
                 "readback", "unsupported PVE memory format/range")
         if self.dynamic:
             require(config["balloon"] > 0 and type(config.get("shares")) is int and
@@ -173,7 +185,7 @@ class ProxmoxMemoryBackend:
         require(actual_uuid == [self.vms[vm_id].native_id], "ownership", "enrolled PVE UUID changed")
         integer(status.get("pid"), "PVE pid", 1)
         text(config.get("digest"), "PVE digest")
-        configured = (config["balloon"] or config["memory"]) * self.quantum_bytes
+        configured = (config["balloon"] or memory) * self.quantum_bytes
         # Balloon is logical assignment in bytes. mem/RSS/maxmem cannot replace it.
         assigned = status.get("balloon") if config["balloon"] else status.get("maxmem")
         integer(assigned, "PVE actual balloon/fixed allocation", 1)
