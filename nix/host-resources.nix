@@ -27,7 +27,10 @@ let
   '';
   entry = name: expression: pkgs.writeShellApplication {
     inherit name;
-    runtimeInputs = [ pkgs.python314 pkgs.openssh pkgs.sudo pkgs.systemd ];
+    # NixOS puts the privileged sudo entry here; the store binary has no setuid.
+    # Missing wrappers must fail closed, without store or caller-PATH fallback.
+    runtimeInputs = [ "/run/wrappers" pkgs.python314 pkgs.openssh pkgs.systemd ];
+    inheritPath = false;
     text = ''
       exec python3 -I -c ${pkgs.lib.escapeShellArg "import sys; sys.path.insert(0, '${source}/ops'); ${expression}"} "$@"
     '';
