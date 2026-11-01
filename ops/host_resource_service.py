@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import re
 import shlex
+import signal
+import subprocess
 import sys
 import time
 import uuid
@@ -124,6 +126,8 @@ class NativeResourceService:
                 try:state=c.store.load();row=self._active_row(state,ref) or row
                 except (OSError,ResourceError):pass
             return operation_view(ref,state=state,row=row,failure=error.code)
+        finally:
+            if isinstance(self.provider,NativeFactsProvider):self.provider._end_invocation()
     def request_native(self,demand):return self._invoke('request',demand)
     def reconcile_native(self,ref):return self._invoke('reconcile',ref)
     def finish_native(self,ref):return self._invoke('finish',ref)
@@ -251,6 +255,12 @@ def route_public(config,action,document,caller):
 def root_main(role,argv=None):
     argv=list(sys.argv[1:] if argv is None else argv)
     require(os.geteuid()==0,'root_required','root helper only')
+    if role=='facts' and len(argv)==2 and argv[0]=='scheduler-facts':
+        # This factory owns config/caller/source admission under one Operation;
+        # the ordinary generic setup must not perform an unaccounted pre-read.
+        require(argv==sys.argv[1:],'caller','actual scheduler facts argv required')
+        from native_attempt import capture_scheduler_output_facts
+        return capture_scheduler_output_facts()
     config=validate_service_config(read_root_json(CONFIG))
     if role=='worker' and len(argv)==2 and argv[0]=='retirement':
         from host_resource_recovery import NativeRecoveryRequest
@@ -291,9 +301,101 @@ def root_main(role,argv=None):
         require(document=={} and action in {'guest-facts','guest-identity','scheduler-facts'},'action','facts route is read-only')
         if action=='guest-identity':return capture_guest_identity(config,LocalSources(config,None))
         sources=LocalSources(config,NativeCommandRunner(config['tools'],slurm_conf=config['slurm_conf']))
-        if action=='scheduler-facts':return dict(schema='qcl.host-resource-scheduler-facts.v1',jobs=capture_scheduler(config,sources))
         return capture_guest_facts(config,sources)
     raise ResourceError('action','privileged role unavailable')
+
+
+def _scheduler_facts_ingress(sources,config):
+    """Observe the live installed facts/forced-SSH chain, never its history.
+
+    The fixed Python SSH entry remains the sudo parent. Direct administrative
+    calls may use private readers but cannot acquire production output authority.
+    """
+    import native_attempt as native
+    require(os.getuid()==os.geteuid()==0 and config['role']=='controller','caller','controller root facts ingress required')
+    require(len(sys.argv)==3 and sys.argv[0]=='-c' and sys.argv[1]=='scheduler-facts' and
+        decode_token(sys.argv[2])=={},'caller','fixed scheduler facts invocation required')
+    budget=sources.budget
+    module=engine.public_binary_origin(budget,__file__,executable=False)['path']
+    require(module.endswith('/ops/host_resource_service.py'),'caller','immutable installed facts module required')
+    ops=str(Path(module).parent)
+    require(engine.public_binary_origin(budget,native.__file__,executable=False)['path']==ops+'/native_attempt.py',
+        'caller','installed native reader source differs')
+    python=engine.public_binary_origin(budget,sys.executable)['path']
+    def python_word(word):
+        # The packaged shell uses literal "exec python3". Its argv[0] may
+        # therefore be that basename; the actual kernel executable above must
+        # still be this immutable interpreter, independently of PATH/argv text.
+        return word=='python3' or (type(word) is str and word.startswith('/nix/store/') and
+            engine.public_binary_origin(budget,word)['path']==python)
+    prefix="import sys; sys.path.insert(0, '"+ops+"'); import host_resource_service as m; "
+    own=sources.process(os.getpid());own_argv=sources.command_line(own['pid'])
+    require(own['uids']==[0]*4 and own['ppid']==os.getppid() and own['executable']==python and
+        len(own_argv)==6 and python_word(own_argv[0]) and
+        own_argv[1:]==['-I','-c',prefix+"sys.exit(m.main('facts'))",'scheduler-facts',sys.argv[2]],
+        'caller','actual fixed root facts process required')
+    for executable in config['sudo_executables']:engine.public_binary_origin(budget,executable)
+    caller=authenticate_sudo_caller(os.environ,parent_pid=own['ppid'],process=sources.process,
+        sudo_executables=tuple(config['sudo_executables']),allowed_uid=config['facts_uid'])
+    argv=sources.command_line(caller['pid'])
+    require(caller['executable']==python and len(argv)==4 and
+        python_word(argv[0]) and
+        argv[1:]==['-I','-c',prefix+"m.ssh_main('facts')"],
+        'caller','actual retained forced-SSH Python caller required')
+    chain=[];pid=own['ppid']
+    for _ in range(8):
+        if pid==caller['pid']:break
+        row=sources.process(pid);args=sources.command_line(pid)
+        require(row['executable'] in config['sudo_executables'] and len(args)==5 and
+            args[1:]==['-n','/run/current-system/sw/bin/qcl-negf-resource-facts','scheduler-facts',sys.argv[2]],
+            'caller','actual fixed sudo facts argv required')
+        chain.append((native._caller_generation(row),args));pid=row['ppid']
+    require(pid==caller['pid'] and chain,'caller','complete fixed sudo chain required')
+    helpers=[]
+    for path in ('/run/current-system/sw/bin/qcl-negf-resource-facts',
+                 '/run/current-system/sw/bin/qcl-negf-resource-ssh-facts'):
+        helpers.append(engine.public_binary_origin(budget,path)['path'])
+    require(native._caller_generation(own)==native._caller_generation(sources.process(own['pid'])) and
+        native._caller_generation(caller)==native._caller_generation(sources.process(caller['pid'])),
+        'caller','facts ingress birth changed')
+    return dict(process=native._caller_generation(own),argv=own_argv,caller=native._caller_generation(caller),
+        caller_argv=argv,chain=chain,module=module,python=python,helpers=helpers)
+
+
+def _wait_ssh_helper(argv,*,timeout_seconds=120,cleanup_seconds=2):
+    """Retain the fixed ingress parent; own only this local sudo session.
+
+    Streams remain inherited, without a buffering/re-encoding wire adapter.
+    A retained direct-child identity, rather than a reusable numeric PID,
+    authorizes cleanup before reap, as in the existing command boundary.
+    """
+    engine.duration(timeout_seconds,'SSH helper timeout');engine.duration(cleanup_seconds,'SSH cleanup reserve')
+    require(timeout_seconds>cleanup_seconds,'trust','SSH timeout must contain cleanup reserve')
+    end=time.monotonic()+timeout_seconds;process=None;primary=None;status=None
+    try:
+        require(signal.getsignal(signal.SIGCHLD)==signal.SIG_DFL,'caller','original SSH child ownership required')
+        process=subprocess.Popen(argv,shell=False,start_new_session=True)
+        while True:
+            owned,status=engine._command_child_status(process)
+            require(owned,'caller','SSH helper ownership lost before reap')
+            if status is not None:break
+            require(time.monotonic()<end-cleanup_seconds,'transport_timeout','SSH helper timeout')
+            time.sleep(min(.02,max(0,end-cleanup_seconds-time.monotonic())))
+    except BaseException as error:
+        primary=error;raise
+    finally:
+        if process is not None:
+            try:
+                owned,_=engine._command_child_status(process)
+                require(owned,'caller','SSH helper ownership lost during cleanup')
+                try:os.killpg(process.pid,signal.SIGKILL)
+                except ProcessLookupError:pass
+                process.wait(timeout=max(.001,end-time.monotonic()))
+                require(engine.group_cleanup_confirmed(process.pid,end),'cleanup','SSH helper cleanup unconfirmed')
+            except BaseException as cleanup:
+                if primary is None:raise
+                primary.add_note('SSH helper cleanup also raised '+type(cleanup).__name__)
+    return status
 
 
 def ssh_main(role,*,helper_prefix='/run/current-system/sw/bin'):
@@ -305,7 +407,10 @@ def ssh_main(role,*,helper_prefix='/run/current-system/sw/bin'):
     action,token=parts[2:];decode_token(token)
     require(action in (ACTIONS if role!='facts' else {'guest-facts','guest-identity','scheduler-facts','attempt-facts'}),'action','fixed resource action required')
     executable=helper_prefix+'/qcl-negf-resource-'+('client-root' if role=='client' else role)
-    os.execvp('sudo',['sudo','-n',executable,action,token])
+    # The root facts reader must observe this actual fixed Python caller, not
+    # infer its historical argv from sshd after an exec of sudo.
+    status=_wait_ssh_helper(['sudo','-n',executable,action,token])
+    raise SystemExit(status if status>=0 else 128-status)
 
 
 def main(role):

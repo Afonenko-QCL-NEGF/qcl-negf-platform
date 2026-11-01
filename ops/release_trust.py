@@ -21,21 +21,33 @@ def trusted_stat(info, *, directory):
 @contextmanager
 def protected_directory(path, *, budget=None):
     parts = [] if str(path) == "/" else protected_parts(path)
-    if budget:budget.before()
-    descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    descriptor = None
+    primary = None
     try:
+        if budget:budget.before()
+        descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         if budget:budget.before()
         trusted_stat(os.fstat(descriptor), directory=True)
         for part in parts:
             if budget:budget.before()
             following = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
-            os.close(descriptor)
+            previous = descriptor
+            # Own the new FD before the previous close can fail. The previous
+            # numeric FD is never retried after an uncertain close outcome.
             descriptor = following
+            os.close(previous)
             if budget:budget.before()
             trusted_stat(os.fstat(descriptor), directory=True)
         yield descriptor
+    except BaseException as error:
+        primary = error
+        raise
     finally:
-        os.close(descriptor)
+        if descriptor is not None:
+            try:os.close(descriptor)
+            except BaseException as cleanup:
+                if primary is None:raise
+                primary.add_note('protected directory close also raised '+type(cleanup).__name__[:128])
 
 
 def read_protected_file(path, limit=65536, *, budget=None):
@@ -45,6 +57,7 @@ def read_protected_file(path, limit=65536, *, budget=None):
     with protected_directory("/" + "/".join(parts[:-1]),budget=budget) as parent:
         if budget:budget.before()
         descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        primary = None
         try:
             if budget:budget.before()
             trusted_stat(os.fstat(descriptor), directory=False)
@@ -59,5 +72,11 @@ def read_protected_file(path, limit=65536, *, budget=None):
                     return bytes(chunks)
                 chunks.extend(chunk)
             raise ValueError("Protected metadata exceeds bound")
+        except BaseException as error:
+            primary = error
+            raise
         finally:
-            os.close(descriptor)
+            try:os.close(descriptor)
+            except BaseException as cleanup:
+                if primary is None:raise
+                primary.add_note('protected file close also raised '+type(cleanup).__name__[:128])

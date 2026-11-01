@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import time
+import uuid
 import xml.etree.ElementTree as ET
 
 import application_release as command_engine
@@ -22,6 +23,7 @@ from host_resource_startup import ColdHostEvidence, ColdVMRecord
 
 TERMINAL={'CANCELLED','COMPLETED','FAILED','TIMEOUT','OUT_OF_MEMORY','NODE_FAIL','PREEMPTED','BOOT_FAIL','DEADLINE'}
 JOB_ID=re.compile(r'[1-9][0-9]{0,18}\Z')
+SERVICE_CONFIG=Path('/etc/qcl-negf/host-resources/service.json')
 
 
 def meminfo(raw):
@@ -56,10 +58,13 @@ def parse_slurm_jobs(raw,*,cluster):
             require(re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}',fields[name]),
                     'native_generation','allocated job generation unavailable/evicted')
         state=fields['JobState']
+        exit_code=fields.get('ExitCode')
+        require(exit_code is None or re.fullmatch(r'[0-9]+:[0-9]+',exit_code) is not None,'unsupported','literal native exit status required')
         generation=fingerprint([cluster,job,fields['UserId'],fields['SubmitTime'],fields['StartTime'],fields['Restarts']])
         result[job]=dict(native_id=job,kind='slurm_allocation',generation=generation,
             owner_uid=int(owner[1]),node=fields['NodeList'],state=state,terminal=state in TERMINAL,
-            limit_bytes=int(limit[1])*scale[limit[2]],submit_time=fields['SubmitTime'],start_time=fields['StartTime'])
+            limit_bytes=int(limit[1])*scale[limit[2]],submit_time=fields['SubmitTime'],start_time=fields['StartTime'],
+            cluster=cluster,raw_user_id=fields['UserId'],exit_code=exit_code)
     return result
 
 
@@ -67,6 +72,96 @@ def workload_identity(native):
     # Native generation is observed, never accepted from a client.
     generation=fingerprint([native.get('generation'),native.get('submit_time'),native.get('start_time')])
     return 'slurm:'+generation if native.get('kind','slurm_allocation')=='slurm_allocation' else 'build:'+generation
+
+
+def _output_native_tuple(native):
+    keys=('cluster','raw_user_id','owner_uid','node','submit_time','start_time','limit_bytes')
+    require(type(native) is dict and all(k in native for k in (*keys,'native_id','generation','exit_code','state','terminal')),
+        'cleanup','complete literal native tuple required')
+    value={k:native[k] for k in keys};value.update(job_id=native['native_id'],restarts=0)
+    generation=fingerprint([value[k] for k in ('cluster','job_id','raw_user_id','submit_time','start_time')]+['0'])
+    require(generation==native['generation'] and native['state']=='COMPLETED' and native['terminal'] is True and
+        native['exit_code']=='0:0' and type(native['owner_uid']) is int and native['owner_uid']==3000,
+        'cleanup','exact successful original native allocation required')
+    return value
+
+
+def _scheduler_output_observations(packet):
+    """Finite detached metadata projection from the existing authenticated RPC.
+
+    The RPC reader has already bounded/decoded its original JSON and rejected
+    duplicate keys. These fields convey no authority before the later guest,
+    original tuple and protected owner joins.
+    """
+    require(type(packet) is dict and {'schema','jobs'}<=packet.keys() and
+        set(packet)<={'schema','jobs','outputs'} and packet['schema']=='qcl.host-resource-scheduler-facts.v1'
+        and type(packet['jobs']) is dict,'shape','closed scheduler facts packet required')
+    outputs=packet.get('outputs',{})
+    require(type(outputs) is dict and len(outputs)<=8,'output_bound','finite output map required')
+    def fields(value,names):
+        require(type(value) is dict and set(value)==set(names),'shape','closed output fields required')
+    def string(value,maximum):
+        require(type(value) is str and 0<len(value)<=maximum and '\x00' not in value and
+            len(value.encode())<=maximum,'shape','bounded output string required')
+    def sha(value):
+        require(type(value) is str and re.fullmatch(r'[0-9a-f]{64}',value),'shape','output SHA required')
+    def identity(value):
+        fields(value,('machine_id','boot_id','kernel','dmi_uuid'))
+        require(type(value['machine_id']) is str and re.fullmatch(r'[0-9a-f]{32}',value['machine_id']),
+            'shape','machine identity required')
+        for name in ('boot_id','dmi_uuid'):
+            string(value[name],36)
+            try:valid=str(uuid.UUID(value[name]))==value[name] and uuid.UUID(value[name]).int!=0
+            except ValueError:valid=False
+            require(valid,'shape','canonical output identity required')
+        string(value['kernel'],256)
+    retained=[];total=0
+    for generation,value in outputs.items():
+        sha(generation)
+        fields(value,('generation','durable','scope','observed_at','controller_identity',
+            'worker_identity','owner','attempt','native_tuple','publication'))
+        require(value['generation']==generation and type(value['durable']) is bool and
+            value['scope'] in ('controls','completed_final') and
+            (value['scope']!='controls' or value['durable'] is False),'shape','output scope/generation differs')
+        integer(value['observed_at'],'output observed_at')
+        identity(value['controller_identity']);identity(value['worker_identity'])
+        owner=value['owner'];fields(owner,('policy_sha256','qualification_sha256','source_graph_sha256',
+            'unit_generation_sha256','storage_identity','retention_ref'))
+        for key in ('policy_sha256','qualification_sha256','source_graph_sha256','unit_generation_sha256'):sha(owner[key])
+        for key in ('storage_identity','retention_ref'):string(owner[key],256)
+        attempt=value['attempt'];fields(attempt,('calcjob_uuid','dispatch_id','generation'));sha(attempt['generation'])
+        for key in ('calcjob_uuid','dispatch_id'):
+            string(attempt[key],36)
+            try:valid=str(uuid.UUID(attempt[key]))==attempt[key] and uuid.UUID(attempt[key]).int!=0
+            except ValueError:valid=False
+            require(valid,'shape','canonical attempt identity required')
+        native=value['native_tuple'];fields(native,('cluster','job_id','raw_user_id','owner_uid','node',
+            'submit_time','start_time','restarts','limit_bytes'))
+        for key in ('cluster','node'):
+            string(native[key],128)
+            require(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*',native[key]),'shape','simple native name required')
+        require(type(native['job_id']) is str and JOB_ID.fullmatch(native['job_id']) and
+            type(native['owner_uid']) is int and native['owner_uid']==3000 and
+            type(native['restarts']) is int and native['restarts']==0,'native_generation','simple original allocation required')
+        string(native['raw_user_id'],128)
+        require(re.fullmatch(r'[^()\s]+\(3000\)',native['raw_user_id']),'native_generation','literal native owner required')
+        integer(native['limit_bytes'],'native output allocation',1)
+        for key in ('submit_time','start_time'):
+            require(type(native[key]) is str and re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}',native[key]),
+                'native_generation','original allocation times required')
+        require(generation==fingerprint([native[k] for k in
+            ('cluster','job_id','raw_user_id','submit_time','start_time')]+[str(native['restarts'])]),
+            'native_generation','resource generation differs from original native tuple')
+        publication=value['publication'];fields(publication,('close_sha256','close_observation_sha256','result_sha256','selection_sha256'))
+        for digest in publication.values():sha(digest)
+        raw=json.dumps(value,sort_keys=True,separators=(',',':'),allow_nan=False).encode()
+        require(len(raw)<=8192,'output_bound','output observation bound')
+        total+=len(raw);require(total<=65536,'output_bound','aggregate output observation bound')
+        retained.append((generation,raw))
+    require(len(json.dumps(packet,sort_keys=True,separators=(',',':'),allow_nan=False).encode())<=MAX_OUTPUT_BYTES,
+        'output_bound','whole scheduler packet bound')
+    # All entry/aggregate admissions precede detached output materialization.
+    return {generation:json.loads(raw) for generation,raw in retained}
 
 
 def authenticate_sudo_caller(environment,*,parent_pid,process,sudo_executables,allowed_uid):
@@ -163,6 +258,8 @@ class LocalSources:
     """Real readers; tests inject an explicit synthetic source, never a production flag."""
     def __init__(self,config,runner):self.config,self.runner=config,runner
     def read(self,path,limit=65536):
+        source=getattr(self,'_output_sources',None)
+        if source is not None:return source.budget.read(path,limit).decode()
         with open(path,'rb') as stream:data=stream.read(limit+1)
         require(len(data)<=limit,'output_bound','native metadata exceeds bound')
         return data.decode()
@@ -171,15 +268,18 @@ class LocalSources:
             machine_id=self.read('/etc/machine-id').strip(),kernel=self.read('/proc/sys/kernel/osrelease').strip(),
             dmi_uuid=self.read('/sys/class/dmi/id/product_uuid').strip().lower(),**meminfo(self.read('/proc/meminfo')))
     def process(self,pid):
-        budget=command_engine.UpdateScan(time.monotonic()+10)
+        source=getattr(self,'_output_sources',None)
+        budget=source.budget if source is not None else command_engine.UpdateScan(time.monotonic()+10)
         row=command_engine.process_record(budget,Path('/proc')/str(pid))
         raw=budget.read(Path('/proc')/str(pid)/'stat').decode();fields=raw[raw.rfind(')')+2:].split()
         row['ppid']=int(fields[1])
         require(int(fields[19])==row['start_ticks'],'caller','PID birth changed')
         return {k:row[k] for k in ('pid','ppid','uids','start_ticks','cgroup','executable')}
     def processes(self):
-        budget=command_engine.UpdateScan(time.monotonic()+10);rows=[]
+        source=getattr(self,'_output_sources',None)
+        budget=source.budget if source is not None else command_engine.UpdateScan(time.monotonic()+10);rows=[]
         for path in budget.entries('/proc','pid'):
+            if source is not None:require(len(rows)<budget.limits['maximum_pids'],'output_bound','bounded native process inventory required')
             try:
                 classification=command_engine.process_classification(budget,path)
                 if command_engine.process_state_class(classification)=='nonexecuting':
@@ -191,7 +291,13 @@ class LocalSources:
                 rows.append(command_engine.process_record(budget,path))
             except FileNotFoundError:raise ResourceError('incomplete_probe','process disappeared during complete scan')
         return rows
-    def run(self,argv):return self.runner.run(argv,timeout_seconds=30)
+    def run(self,argv):
+        source=getattr(self,'_output_sources',None)
+        if source is None:return self.runner.run(argv,timeout_seconds=30)
+        require(type(argv) in (list,tuple) and argv and argv[0] in self.runner.tools and
+            argv[0] in source.policy['tools'].values(),'argv','same enrolled native tools required')
+        require(source.origin(argv[0])==argv[0],'qualification','native tool origin changed')
+        return source.run(argv)
     def guest_identity(self,vm_id):
         return trusted_rpc(self.config['guests'][vm_id],'guest-identity',{},run=command_engine.command)
     def guest(self,vm_id):
@@ -248,7 +354,18 @@ def trusted_rpc(route,action,payload,*,run,trust_snapshot_root=None,existing_bud
     require(action in {'guest-facts','guest-identity','scheduler-facts','attempt-facts','request','status','reconcile','finish','launch-gate'},'action','fixed resource RPC action required')
     require(set(route)=={'target','known_hosts','identity_file','helper','role'},'trust','enrolled RPC route required')
     require(re.fullmatch(r'[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+',route['target']), 'trust','fixed SSH target required')
-    if existing_budget is not None:existing_budget.before()
+    if existing_budget is not None:
+        from native_attempt import _reserve_private_record
+        existing_budget.before()
+        # Four encodings' conservative bounds cover prospective ASCII JSON,
+        # UTF8 bytes, base64 bytes/string and quoted/resident argv. The existing
+        # encoder forecast is >=2*JSON's worst escaped length. No request
+        # materialization or trust-snapshot effect precedes this admission.
+        for _ in range(4):_reserve_private_record(payload,existing_budget)
+        existing_budget.reserve(32768)
+        for value in route.values():
+            require(type(value) is str and len(value)<=4096,'trust','bounded enrolled route required')
+            existing_budget.reserve(16*len(value)+256)
     key=trusted_root_path(route['identity_file']);known=trusted_root_path(route['known_hosts'])
     require(not key.stat().st_mode&0o077,'trust','private runtime key permissions')
     if existing_budget is not None:existing_budget.before()
@@ -263,18 +380,18 @@ def trusted_rpc(route,action,payload,*,run,trust_snapshot_root=None,existing_bud
     else:
         # G retains the actual nofollow/root ancestry check and immutable write.
         snapshot=command_engine.freeze_ssh_trust(raw,snapshot_root=trust_snapshot_root)
-    if existing_budget is not None:
-        existing_budget.before()
-        # Reserve before JSON/base64 allocation, not after materializing payload.
-        existing_budget.reserve(4*MAX_OUTPUT_BYTES)
     token=base64.urlsafe_b64encode(json.dumps(payload,separators=(',',':')).encode()).decode()
     require(len(token)<=MAX_OUTPUT_BYTES,'output_bound','RPC input bound')
-    if existing_budget is not None:
-        existing_budget.before();existing_budget.reserve(3*MAX_OUTPUT_BYTES)
     result=command_engine.ssh(route['target'],[route['helper'],route['role'],action,token],
         run=lambda argv:run([argv[0],'-oIdentitiesOnly=yes','-oIdentityAgent=none','-i',str(key),*argv[1:]],
             timeout_seconds=120,output_bytes=MAX_OUTPUT_BYTES),trust_snapshot=snapshot)
-    if existing_budget is not None:existing_budget.before()
+    if existing_budget is not None:
+        # The caller's Operation.command already prepaid four response caps
+        # before transport, including retained raw buffers. Only the additional
+        # prospective JSON decoder graph/workspace is admitted here, from the
+        # actual bounded raw string, before strict_json can allocate that graph.
+        # This operational forecast is not a Python RSS measurement.
+        existing_budget.before();existing_budget.reserve(64*len(result)+4096)
     packet=strict_json(result);require(type(packet) is dict,'shape','bounded RPC object required')
     return packet
 
@@ -284,6 +401,8 @@ class NativeFactsProvider:
         self.policy,self.config,self.backend,self.runner,self.clock=policy,config,backend,runner,clock
         self.sources=sources or LocalSources(config,runner)
         self.last=None;self.native={}
+        self._output_epoch=self._joined_epoch=self._pending_epoch=None
+        self._pending_outputs={};self._joined_outputs={};self._pending_jobs={};self._output_config=None
     def _host_inventory(self,*,retiring_vm_id=None):
         before=self.sources.host();enrolled=self.config['enrollment'];agreement=read_root_json(self.config['agreement'])
         require(before['machine_id']==self.config['host_identity']['machine_id'] and
@@ -317,16 +436,25 @@ class NativeFactsProvider:
                 by_id[self.config['enrollment'][vm.vm_id]['native_id']]['config_fingerprint'],by_id[self.config['enrollment'][vm.vm_id]['native_id']]['maximum_bytes'],
                 by_id[self.config['enrollment'][vm.vm_id]['native_id']]['maximum_bytes'],'running' if by_id[self.config['enrollment'][vm.vm_id]['native_id']]['running'] else 'stopped') for vm in self.policy.vms))
     def resolve(self,ref):
-        require(ref.kind=='slurm_allocation','unsupported','systemd/Nix per-build daemon join is not qualified; use paid full-VM administrative reservation')
-        require(JOB_ID.fullmatch(ref.native_id),'shape','native allocation ID required')
-        # Native scheduler generation must still exist. Never synthesize from job ID.
-        route=self.config['scheduler_route'];packet=trusted_rpc(route,'scheduler-facts',{},run=command_engine.command)
-        require(packet['schema']=='qcl.host-resource-scheduler-facts.v1','shape','authenticated scheduler facts required')
-        jobs=packet['jobs'];require(ref.native_id in jobs,'native_generation','native allocation missing/evicted')
-        native=jobs[ref.native_id];require(native['owner_uid']==self.config['client_uid'],'ownership','native owner differs')
-        vm=self.config['nodes'].get(native['node']);require(vm in self.config['enrollment'],'ownership','node not enrolled on this host')
-        identity='slurm:'+native['generation'];self.native[identity]=native
-        return native,vm,identity,'native-'+hashlib.sha256(identity.encode()).hexdigest()
+        self._end_invocation();self._output_epoch=object()
+        try:
+            require(ref.kind=='slurm_allocation','unsupported','systemd/Nix per-build daemon join is not qualified; use paid full-VM administrative reservation')
+            require(JOB_ID.fullmatch(ref.native_id),'shape','native allocation ID required')
+            # Native scheduler generation must still exist. Never synthesize from job ID.
+            self._output_config=self._current_output_config()
+            route=self.config['scheduler_route'];packet=trusted_rpc(route,'scheduler-facts',{},run=command_engine.command)
+            outputs=_scheduler_output_observations(packet)
+            jobs=packet['jobs'];require(ref.native_id in jobs,'native_generation','native allocation missing/evicted')
+            native=jobs[ref.native_id];require(native['owner_uid']==self.config['client_uid'],'ownership','native owner differs')
+            vm=self.config['nodes'].get(native['node']);require(vm in self.config['enrollment'],'ownership','node not enrolled on this host')
+            identity='slurm:'+native['generation'];self.native[identity]=native
+            self._pending_outputs=outputs
+            self._pending_epoch=self._output_epoch
+            self._pending_jobs={value['native_tuple']['job_id']:_output_native_tuple(jobs[value['native_tuple']['job_id']])
+                for value in outputs.values()}
+            return native,vm,identity,'native-'+hashlib.sha256(identity.encode()).hexdigest()
+        except BaseException:
+            self._end_invocation();raise
     def binding_facts(self,native_vm_id,*,owner_state):
         host,rows,_=self._host_inventory();bindings=[];qualifications=[]
         protected=read_root_json(self.config['qualification'])
@@ -349,8 +477,78 @@ class NativeFactsProvider:
             True,True,host['MemAvailable']>=self.policy.reserves.safety_bytes,fingerprint([host,rows]),tuple(bindings),tuple(qualifications),
             {vm.vm_id:() for vm in self.policy.vms})
     def request_facts(self,demand,*,owner_state):
-        return self._capture(demand,owner_state=owner_state)
+        self.last=None
+        try:return self._capture(demand,owner_state=owner_state)
+        except BaseException:
+            self._end_invocation();raise
+    def _end_invocation(self):
+        self._output_epoch=self._joined_epoch=self._pending_epoch=None
+        self._pending_outputs={};self._joined_outputs={};self._pending_jobs={};self._output_config=None;self.last=None
+
+    def _current_output_config(self):
+        from native_attempt import _output_identity,_output_runner,_completed_final_binding,_output_sha,Hold
+        current=read_root_json(SERVICE_CONFIG)
+        require(current.get('schema')=='qcl.host-resource-service.v1' and current.get('role')=='native_host' and
+            current.get('client_uid')==self.config['client_uid'] and type(current.get('facts')) is dict,
+            'qualification','current protected native-host facts configuration required')
+        facts=current['facts'];keys=('scheduler_route','guests','nodes','enrollment','output_owner')
+        require(all(facts.get(key)==self.config.get(key) for key in keys),'qualification','facts binding/routes changed')
+        expected=facts.get('output_owner')
+        if 'output_owner' in facts:
+            try:
+                require(type(expected) is dict and set(expected)=={'owner','controller_identity','runner','worker_generations'},
+                    'qualification','closed output owner expectation required')
+                _output_identity(expected['controller_identity']);_output_runner(expected['runner'])
+                owner=expected['owner'];require(type(owner) is dict and set(owner)=={'policy_sha256','qualification_sha256',
+                    'source_graph_sha256','unit_generation_sha256','storage_identity','retention_ref'},'qualification','exact owner6 required')
+                for key in ('policy_sha256','qualification_sha256','source_graph_sha256','unit_generation_sha256'):_output_sha(owner[key])
+                for key in ('storage_identity','retention_ref'):
+                    require(type(owner[key]) is str and 0<len(owner[key].encode())<=256 and '\x00' not in owner[key],
+                        'qualification','bounded owner locator required')
+                require(owner['source_graph_sha256']==expected['runner']['source_graph_sha256'],'qualification','owner/Runner source differs')
+                _completed_final_binding(dict(runner=expected['runner'],unit_generation_sha256=owner['unit_generation_sha256'],
+                    worker_generations=expected['worker_generations']),facts['nodes'])
+            except Hold as error:raise ResourceError('qualification','invalid protected output owner') from error
+        raw=json.dumps({key:facts.get(key) for key in keys},sort_keys=True,separators=(',',':'),allow_nan=False).encode()
+        require(len(raw)<=MAX_OUTPUT_BYTES,'output_bound','bounded protected output expectation required')
+        return raw
+
+    def _join_scheduler_outputs(self,guests,*,observed_now):
+        from native_attempt import _output_worker,_output_runner,Hold
+        try:
+            if self._output_epoch is None:
+                require(not self._pending_outputs,'cleanup','no output outside invocation');return
+            require(self._pending_epoch is self._output_epoch,'cleanup','stale output invocation')
+            require(self._current_output_config()==self._output_config,'qualification','output owner drift')
+            expected=json.loads(self._output_config)['output_owner']
+            if expected is None:
+                self._joined_outputs={};self._joined_epoch=self._output_epoch;return
+            timeout=self.policy.timeouts.request_seconds
+            for generation,output in self._pending_outputs.items():
+                native=output['native_tuple'];node=native['node'];vm=self.config['nodes'].get(node)
+                require(vm in guests,'cleanup','output guest not enrolled');guest=guests[vm]
+                require(output['scope']=='completed_final' and output['durable'] is True and output['owner']==expected['owner'] and
+                    output['controller_identity']==expected['controller_identity'],'cleanup','qualified output scope/owner differs')
+                require(guest['identity_before']==guest['identity_after'],'identity_mismatch','guest identity drift')
+                identity={key:guest['identity_before'][key] for key in ('machine_id','boot_id','kernel','dmi_uuid')}
+                require(identity==output['worker_identity'],'identity_mismatch','output/guest identity differs')
+                require(type(guest.get('output_generation')) is dict and set(guest['output_generation'])=={'worker','runner'},
+                    'cleanup','fresh guest output owner tuple missing')
+                actual=guest['output_generation'];_output_worker(actual['worker']);_output_runner(actual['runner'])
+                require(actual['worker']==expected['worker_generations'].get(node) and actual['worker']['identity']==identity and
+                    actual['runner']==expected['runner'],'cleanup','fresh worker/source generation differs')
+                require(self._pending_jobs.get(native['job_id'])==native and native==_output_native_tuple(guest['jobs'][native['job_id']]) and
+                    generation==guest['jobs'][native['job_id']]['generation'],'native_generation','scheduler/guest/original tuple differs')
+                require(type(guest['observed_at']) is int and 0<=observed_now-output['observed_at']<=timeout and
+                    0<=observed_now-guest['observed_at']<=timeout and output['observed_at']<=guest['observed_at']<=observed_now,
+                    'stale_evidence','fresh ordered output and guest observations required')
+            self._joined_outputs=dict(self._pending_outputs);self._joined_epoch=self._output_epoch
+        except Hold as error:
+            self._end_invocation();raise ResourceError('cleanup','malformed output generation') from error
+        except BaseException:
+            self._end_invocation();raise
     def recovery_snapshot(self,retiring_vm_id,*,owner_state):
+        self._end_invocation()
         require(retiring_vm_id in owner_state['bindings'],'ownership','retiring resident required')
         evidence=self._capture(None,owner_state=owner_state,retiring_vm_id=retiring_vm_id)
         return evidence,{vm.vm_id:self.backend.readback(vm.vm_id) for vm in self.policy.vms if vm.vm_id!=retiring_vm_id}
@@ -396,6 +594,7 @@ class NativeFactsProvider:
         evidence=HostEvidence(self.policy.host_id,self.policy.owner_id,host['boot_id'],policy_digest(self.policy),int(self.clock()),
             host['MemTotal'],self.policy.reserves.foreign_max_bytes,self.policy.capacity_evidence_ref,self.policy.owned_pool.agreement_ref,
             True,True,host['MemAvailable']>=self.policy.reserves.safety_bytes,fingerprint([host,rows,guests]),tuple(bindings),tuple(qualifications),live)
+        self._join_scheduler_outputs(guests,observed_now=self.clock())
         self.last=(evidence,guests)
         proofs=getattr(self,'native_proofs',None)
         if proofs is not None:proofs.validate_state(owner_state,evidence=evidence)
@@ -429,14 +628,20 @@ class NativeFactsProvider:
             g['memory']['MemTotal'],g['memory']['MemAvailable'],self.config['enrollment'][req['vm_id']]['os_reserve_bytes'],
             group['memory_max_bytes'],g['slurm_memory_bytes'],True,tuple(self.last[0].live_workloads[req['vm_id']]))
     def completion(self,request_id,*,owner_state):
-        row,g,native=self._row_guest(request_id,owner_state);req=row['request'];group=g['groups'][native['native_id']]
-        require(native['terminal'] and not group['populated'] and not group['processes'],
-                'cleanup','actual terminal and whole native subtree absence required; gate/COMPLETING insufficient')
-        output=g['outputs'].get(native['generation'])
-        require(output is not None and output['generation']==native['generation'] and output['durable'] is True,
-                'cleanup','root-observed closed/fsynced output provenance missing')
-        return CompletionEvidence(req['vm_id'],g['identity_before']['boot_id'],req['workload_id'],g['observed_at'],0,True,True,
-            g['memory']['MemTotal'],g['memory']['MemAvailable'],tuple(self.last[0].live_workloads[req['vm_id']]))
+        try:
+            if self.last is not None:self._join_scheduler_outputs(self.last[1],observed_now=self.clock())
+            row,g,native=self._row_guest(request_id,owner_state);req=row['request'];group=g['groups'][native['native_id']]
+            require(native['terminal'] and not group['populated'] and not group['processes'],
+                    'cleanup','actual terminal and whole native subtree absence required; gate/COMPLETING insufficient')
+            output=getattr(self,'_joined_outputs',{}).get(native['generation'])
+            require(getattr(self,'_output_epoch',None) is not None and
+                    getattr(self,'_joined_epoch',None) is self._output_epoch and output is not None and
+                    output['generation']==native['generation'] and output['scope']=='completed_final' and output['durable'] is True,
+                    'cleanup','root-observed closed/fsynced output provenance missing')
+            return CompletionEvidence(req['vm_id'],g['identity_before']['boot_id'],req['workload_id'],g['observed_at'],0,True,True,
+                g['memory']['MemTotal'],g['memory']['MemAvailable'],tuple(self.last[0].live_workloads[req['vm_id']]))
+        except BaseException:
+            self._end_invocation();raise
     def cleanup(self,request_id,*,owner_state):
         proofs=getattr(self,'native_proofs',None)
         if proofs is None:return None
@@ -492,6 +697,10 @@ def capture_guest_identity(config,sources):
 
 def capture_guest_facts(config,sources,*,clock=time.time):
     """Installed root-only guest reader; machine-local protected config only."""
+    from native_attempt import _worker_output_sources,_worker_output_generation
+    output_sources=_worker_output_sources()
+    sources._output_sources=output_sources
+    output_before=_worker_output_generation(output_sources)
     before=sources.host();processes=sources.processes();alljobs=capture_scheduler(config,sources)
     jobs={key:value for key,value in alljobs.items() if value['node']==config['node']}
     require(all(j['owner_uid']==config['client_uid'] for j in jobs.values()),'ownership','foreign job on enrolled dedicated guest')
@@ -521,6 +730,13 @@ def capture_guest_facts(config,sources,*,clock=time.time):
         main['uids']==[0]*4 and main['cgroup']==unit['ControlGroup'] and
         main['executable']==config['slurmd_executable'] and len(states)==1 and
         states[0].split('+')[0] in {'IDLE','ALLOCATED','MIXED'} and 'NOT_RESPONDING' not in states[0])
-    return dict(schema='qcl.host-resource-guest-facts.v1',protocol=config['guest_protocol'],observed_at=int(clock()),
+    output_after=_worker_output_generation(output_sources)
+    require(output_before==output_after,'qualification','worker output generation changed during guest snapshot')
+    packet=dict(schema='qcl.host-resource-guest-facts.v1',protocol=config['guest_protocol'],observed_at=int(clock()),
         identity_before=identity,identity_after=identity,jobs=jobs,groups=groups,outputs=outputs,
         memory={key:before[key] for key in ('MemTotal','MemAvailable')},slurm_memory_bytes=int(real[0])*1024**2,slurm_registered=registered)
+    if output_after is not None:
+        require(output_after['worker']['node']==config['node'] and output_after['worker']['identity']==
+            {key:identity[key] for key in ('machine_id','boot_id','kernel','dmi_uuid')},'qualification','local worker identity differs')
+        packet['output_generation']=output_after
+    return packet

@@ -20,6 +20,613 @@ def module():
     return native_attempt
 
 
+@pytest.mark.parametrize('kind',[None,MemoryError,KeyboardInterrupt,RuntimeError])
+@pytest.mark.parametrize('outer_close',[False,True])
+def test_revision2_original_leaf_cleanup_preserves_primary_identity(tmp_path,monkeypatch,kind,outer_close):
+    m=module();root=tmp_path/'private';root.mkdir(mode=0o700);store=m.AttemptStore(root)
+    budget=m.Operation(limits());calc='11111111-1111-4111-8111-111111111111'
+    with store.locked(calc,budget):store.put(calc,'claim.json',{'original':'metadata'},budget)
+    primary=None if kind is None else kind('original decoder failure');secondary=OSError('leaf close failure')
+    close=os.close;opened=os.open;target={'leaf':None,'entered':False};closed=[]
+    def opening(path,*args,**kwargs):
+        fd=opened(path,*args,**kwargs)
+        if path=='claim.json':target['leaf']=fd;target['entered']=True
+        return fd
+    def closing(fd):
+        is_leaf=fd==target['leaf'];is_outer=outer_close and target['entered'] and m.stat.S_ISDIR(os.fstat(fd).st_mode)
+        close(fd);closed.append(fd)
+        with pytest.raises(OSError):os.fstat(fd)
+        if is_leaf:target['leaf']=None;raise secondary
+        if is_outer:raise OSError('secondary original directory close')
+    if primary is not None:monkeypatch.setattr(m,'strict_json',lambda raw:(_ for _ in ()).throw(primary))
+    monkeypatch.setattr(m.os,'open',opening);monkeypatch.setattr(m.os,'close',closing)
+    with pytest.raises(kind or OSError) as caught:store.read(calc,'claim.json',budget)
+    assert caught.value is (primary or secondary) and target['leaf'] is None and len(closed)>=2
+    assert all(len(note)<=256 for note in getattr(caught.value,'__notes__',[]))
+
+
+@pytest.mark.parametrize('kind',[None,MemoryError,KeyboardInterrupt,RuntimeError])
+@pytest.mark.parametrize('outer_close',[False,True])
+def test_revision2_protected_leaf_and_actual_outer_cleanup_preserve_primary(monkeypatch,kind,outer_close):
+    """Actual local root-owned proc metadata FDs/trust; no native-site claim."""
+    m=module();primary=None if kind is None else kind('original source read failure')
+    secondary=OSError('leaf close failure');close=os.close;target={'leaf':None,'entered':False};closed=[]
+    def reading(fd,limit,budget):
+        target.update(leaf=fd,entered=True)
+        if primary is not None:raise primary
+        return b'controlled read seam',os.fstat(fd)
+    def closing(fd):
+        is_leaf=fd==target['leaf'];is_outer=outer_close and target['entered'] and m.stat.S_ISDIR(os.fstat(fd).st_mode)
+        close(fd)
+        with pytest.raises(OSError):os.fstat(fd)
+        if is_leaf:target['leaf']=None;closed.append('leaf');raise secondary
+        if is_outer:closed.append('outer');raise OSError('secondary protected-directory close')
+    monkeypatch.setattr(m,'read_fd',reading);monkeypatch.setattr(m.os,'close',closing)
+    with pytest.raises(kind or OSError) as caught:m.protected_read('/proc/sys/kernel/osrelease',m.Operation(limits()))
+    assert caught.value is (primary or secondary) and closed==(['leaf','outer'] if outer_close else ['leaf'])
+    assert all(len(note)<=256 for note in getattr(caught.value,'__notes__',[]))
+
+
+def p20_runner():
+    """Explicit synthetic immutable-source metadata, never installed proof."""
+    m=module();root='/nix/store/synthetic-p20-solver'
+    relative=dict(launcher='bin/qcl-negf',julia_launcher='bin/.qcl-negf-julia',project='share/qcl-negf/julia/Project.toml',
+        manifest='share/qcl-negf/julia/Manifest.toml',runner_entry='share/qcl-negf/components/QCLNEGFRunner.jl/scripts/scientific_workflow.jl',
+        runner_module='share/qcl-negf/components/QCLNEGFRunner.jl/src/QCLNEGFRunner.jl',cli='share/qcl-negf/components/QCLNEGFRunner.jl/src/cli.jl',
+        native_lane='share/qcl-negf/components/QCLNEGFRunner.jl/src/composition/scratch_execution.jl',
+        execution='share/qcl-negf/components/QCLNEGFRunner.jl/src/composition/scientific_execution.jl',
+        publication='share/qcl-negf/components/QCLNEGFRunner.jl/src/infrastructure/persistence/point_artifacts.jl')
+    paths={key:root+'/'+value for key,value in relative.items()}
+    paths.update(capture_entry='/nix/store/synthetic-p20-capture/bin/qcl-negf-results',
+        capture_cli='/nix/store/synthetic-p20-capture/lib/python/site-packages/qcl_negf_results/cli.py',
+        capture_runtime='/nix/store/synthetic-p20-capture/lib/python/site-packages/qcl_negf_results/capture.py')
+    files={key:dict(path=path,bytes=3,sha256=hashlib.sha256(b'abc').hexdigest()) for key,path in paths.items()}
+    return dict(solver_executable=paths['launcher'],runner_revision='a'*40,source_graph_sha256='b'*64,
+        julia_manifest_sha256=files['manifest']['sha256'],capture_executable=paths['capture_entry'],files=files)
+
+
+def p20_unit(name='slurmd.service'):
+    worker=name=='slurmd.service';uid=0 if worker else 3000
+    return dict(name=name,state=dict(InvocationID='1'*32,ControlGroup='/system.slice/'+name,MainPID='123',ActiveState='active',
+        FragmentPath='/nix/store/synthetic-units/'+name,MemoryMax='134217728',RuntimeMaxUSec='90s'),
+        main=dict(pid=123,start_ticks=99,uids=[uid]*4,cgroup='/system.slice/'+name,executable='/nix/store/synthetic-python/bin/python'),
+        mount_namespace=dict(device=4,inode=8),mount_line='1 0 0:1 / /srv/qcl-negf/jobs/native '+('rw' if worker else 'ro')+' - nfs4 storage:/jobs rw,hard')
+
+
+def p20_worker(node='node-a'):
+    return dict(node=node,identity=dict(machine_id='c'*32,boot_id='11111111-1111-4111-8111-111111111111',
+        kernel='synthetic-kernel',dmi_uuid='22222222-2222-4222-8222-222222222222'),unit=p20_unit())
+
+
+def p20_metadata_profile():
+    """Only typed metadata-profile operands; not a full scientific/native proof.
+
+    No declared manifest/HDF references below stand for existing payloads. The
+    installed-source and genuine producer/creator gates remain separate.
+    """
+    m=module();launch=copy.deepcopy(request()['launch']);launch['transport_attempt']=2
+    calcjob=request()['calcjob_uuid'];runner=p20_runner()
+    boot=p20_worker()['identity']['boot_id'];root='/srv/qcl-negf/jobs/'+launch['relative_execution_root']
+    digest=lambda raw:hashlib.sha256(raw).hexdigest()
+    plan=dict(schema='qcl-negf-scientific-plan-v2',fingerprint=digest(b'plan-profile'),scientific_fingerprint=digest(b'science-profile'),
+        points=[dict(id='point-a',execution_id=launch['execution_id'],effective_inputs=dict(model_sha256=digest(b'model-profile')))])
+    graph=dict(format='qcl-negf.git-graph.v1',revision='d'*40,components=[dict(path='components/QCLNEGFRunner.jl',revision=runner['runner_revision'],url='fixture')])
+    runner['source_graph_sha256']=digest(m.encoded(graph))
+    native=dict(schema='qcl-negf.aiida-native-execution.v1',request_id=launch['request_id'],execution_id=launch['execution_id'],
+        input_plan=dict(node_uuid=launch['input_plan_uuid'],bytes=str(len(m.encoded(plan))),sha256=digest(m.encoded(plan))),
+        source_graph=dict(node_uuid=launch['source_graph_uuid'],bytes=str(len(m.encoded(graph))),sha256=digest(m.encoded(graph))),
+        code=dict(code_uuid=launch['code_uuid'],computer_uuid=launch['code_uuid'],solver_executable=runner['solver_executable'],release_id=launch['release_id'],build_receipt_ref='fixture'),
+        storage=dict(namespace_id='fixture',storage_identity='fixture-storage',relative_execution_root=launch['relative_execution_root'],
+            computer_uuid=launch['code_uuid'],execution_binding_uuid=launch['native_execution_uuid'],retention_policy_id='fixture',retention_owner_id='fixture',hold_ref='fixture',access_binding_ref='fixture'),access_receipt_ref='fixture')
+    def ref(path,schema,media='application/json'):
+        return dict(path=path,bytes='1',sha256=digest(path.encode()),schema=schema,media_type=media)
+    epoch='c1-'+calcjob.replace('-','')+'-'+launch['native_execution_uuid'].replace('-','')+'-1'
+    identity=dict(run_id='scientific-profile',execution_id=launch['execution_id'],point_id='point-a',attempt='1',branch_id='branch',
+        model_sha256=plan['points'][0]['effective_inputs']['model_sha256'],plan_sha256=digest(m.encoded(plan)))
+    state=dict(identity=identity,state_id=epoch+'-state-1',state_sequence='1',manifest=ref('executions/point-a/'+epoch+'-manifest.json','qcl-negf.result-manifest.v1'))
+    source=dict(schema='qcl-negf.native-point-source.v1',kind='final',artifact_root='.',relation='current_point_attempt',selected_state=state,
+        diagnostics=ref('diagnostics.h5','qcl-negf-physics-analysis-v5','application/x-hdf5'),
+        observations=ref('observations.h5','qcl-negf-physics-analysis-v5','application/x-hdf5'),reason=None)
+    result=dict(schema='qcl-negf-series-result-v4',contract_set='qcl-negf.results.v2',status='completed',plan_fingerprint=plan['fingerprint'],
+        plan_scientific_fingerprint=plan['scientific_fingerprint'],expected_point_count=1,available_point_count=1,attempt_history=[],
+        executions=[dict(id=launch['execution_id'],point_ids=['point-a'])],points=[dict(id='point-a',execution_id=launch['execution_id'],attempt=1,status='completed',data=dict(native_source=source))])
+    planref=ref('retained-plan.json',plan['schema']);planref.update(bytes=str(len(m.encoded(plan))),sha256=digest(m.encoded(plan)))
+    selection=dict(version=1,selected_inputs=[dict(artifact_root='.',selected_state=copy.deepcopy(state),plan=planref,model=ref('model.json','qcl-negf-resolved-configuration-v3'))])
+    spec=dict(schema='qcl-negf.capture-spec.v3',capture_token='a'*32,selection=dict(calcjob_uuid=calcjob,execution_id=launch['execution_id'],
+        attempt=launch['transport_attempt'],plan_fingerprint=plan['fingerprint']),plan=dict(path='plan.json',bytes=len(m.encoded(plan)),sha256=digest(m.encoded(plan))),
+        allocation_id='calcjob-process:'+calcjob+':'+str(launch['transport_attempt']),allocated_logical_cpus=None,scratch_root=None,
+        credits=dict(performance_bytes=32*1024**2,scalar_bytes=64*1024**2,io_bytes=128*1024**2,reserve_bytes=4096),native_performance=dict(run_uuid=launch['run_uuid']))
+    locator=dict(schema='qcl-negf.capture-source.v3',capture_token=spec['capture_token'],execution_id=launch['execution_id'],plan_fingerprint=plan['fingerprint'],
+        mode='direct',actual_root=root,epoch=0,root_birth=dict(boot_id=boot,mount_namespace_device='4',mount_namespace_inode='8',producer_pid='123',
+            producer_start_ticks='99',device='11',inode='12'))
+    documents={'plan.json':plan,'source-graph.json':graph,'native-execution.json':native,'capture-spec.json':spec,'capture-source.json':locator,
+        'series_result.json':result,'native-selection.json':selection}
+    raws={key:m.encoded(value) for key,value in documents.items()}
+    for role,name in m.FILES.items():
+        raw=raws.get(name,b'fixed script fixture')
+        launch['files'][role]=dict(bytes=len(raw),sha256=digest(raw))
+    return launch,dict(calcjob_uuid=calcjob,runner=runner,worker_boot_id=boot,output_root=root),raws
+
+
+def p20_original_records():
+    """Typed root-local journal operands; not live original creator evidence."""
+    m=module();document=request();launch=document['launch'];calc=document['calcjob_uuid'];dispatch='88888888-8888-4888-8888-888888888888'
+    context=dict(machine_id='d'*32,boot_id='99999999-9999-4999-8999-999999999999',image_id='/nix/store/controller')
+    policy=dict(spool_root='/local/spool',tools=dict(runuser='/nix/store/runuser',sbatch='/nix/store/sbatch'))
+    snapshot=dict(script_path='/local/spool/'+dispatch+'.sh',script_sha256=launch['files']['submit_script']['sha256'])
+    fields=dict(JobId='42',UserId='qcl-negf(3000)',JobState='COMPLETED',ExitCode='0:0',NumNodes='1',NumTasks='1',NodeList='node-a',
+        SubmitTime='2026-10-30T01:00:00',StartTime='2026-10-30T01:00:01',Restarts='0',MinMemoryNode='256',
+        Command=snapshot['script_path'],Comment=dispatch,WorkDir=launch['remote_workdir'])
+    generation=hashlib.sha256(m.encoded(dict(controller=context,job_id='42',submit_time=fields['SubmitTime'],dispatch_id=dispatch,
+        command=fields['Command'],workdir=fields['WorkDir']))).hexdigest()
+    job=dict(job_id='42',cluster='cluster',submit_time=fields['SubmitTime'],controller_machine_id=context['machine_id'],
+        controller_boot_id=context['boot_id'],dispatch_id=dispatch,generation=generation,node_name='node-a',start_time=fields['StartTime'],
+        worker_machine_id='c'*32,worker_boot_id='11111111-1111-4111-8111-111111111111')
+    source=m.NativeSources(policy,m._bootstrap_operation())
+    actor=dict(calcjob_uuid=calc,action='submit',launch=copy.deepcopy(launch),execution_sha256=launch['files']['native_execution']['sha256'])
+    process=dict(pid=50,ppid=1,start_ticks=10,uids=[0]*4,state='S',comm='python',
+        cgroup='/system.slice/qcl-negf-native-attempt@original.service',executable='/nix/store/python')
+    caller=dict(application=dict(configuration=dict(client=dict(bash_executable='/nix/store/bash'))),unit={'original':'fixture'},profile={'original':'fixture'},chain=[{'original':'fixture'}])
+    owner=dict(process=process,host=context,unit=dict(MainPID='50',ControlGroup=process['cgroup'],InvocationID='a'*32,ActiveState='active'),caller=caller,actor=actor)
+    records={'claim.json':dict(launch=launch,dispatch_id=dispatch,context=context),
+        'dispatch.json':dict(dispatch_id=dispatch,snapshot=snapshot,context=context,native=dict(argv=source._argv(launch,snapshot,dispatch),script_sha256=snapshot['script_sha256'],owner=owner)),
+        'ack.json':dict(job_id='42',cluster='cluster'),'job.json':job,'allocation.json':copy.deepcopy(job)}
+    native=__import__('host_resource_facts').parse_slurm_jobs(' '.join(k+'='+v for k,v in fields.items()),cluster='cluster')['42']
+    return source,calc,records,native,fields
+
+
+@pytest.mark.parametrize('fault',[None,'dispatch','ack','context','native_generation','resource_generation','command','workdir','actor','owner','allocation','partial'])
+def test_completed_original_journal_join_keeps_generation_domains_distinct(fault):
+    m=module();source,calc,records,native,fields=p20_original_records()
+    if fault=='dispatch':records['dispatch.json']['dispatch_id']=calc
+    if fault=='ack':records['ack.json']['job_id']='43'
+    if fault=='context':records['dispatch.json']['context']={'other':'controller'}
+    if fault=='native_generation':records['allocation.json']['generation']='e'*64
+    if fault=='resource_generation':records['allocation.json']['generation']=native['generation']
+    if fault=='command':fields['Command']='/other/script.sh'
+    if fault=='workdir':fields['WorkDir']='/other/workdir'
+    if fault=='actor':records['dispatch.json']['native']['owner']['actor']['calcjob_uuid']=records['claim.json']['dispatch_id']
+    if fault=='owner':records['dispatch.json']['native']['owner']['process']['uids']=[3000]*4
+    if fault=='allocation':records['allocation.json']['worker_boot_id']='77777777-7777-4777-8777-777777777777'
+    if fault=='partial':records['ack.json']=None
+    q=dict(worker_bindings={'c'*32:dict(machine_id='c'*32,boot_id='11111111-1111-4111-8111-111111111111')},
+        unit_origins={'server':dict(executable='/nix/store/python')},write_domain=dict(writer_hosts={'node-a':'c'*32}))
+    source.qualification=q
+    if fault is None:
+        value=m._output_original_records(source,calc,records,native,fields,records['claim.json']['context'])
+        assert value['job']['generation']!=native['generation'] and value['launch']==records['claim.json']['launch']
+        assert 'durable' not in value
+    else:
+        with pytest.raises(m.Hold):m._output_original_records(source,calc,records,native,fields,records['claim.json']['context'])
+
+
+@pytest.mark.parametrize('fault',[None,'current_release','code','graph','runner','manifest','script','legacy'])
+def test_completed_release_source_is_current_and_original_not_hash_only(actor_bridge,monkeypatch,fault):
+    s=actor_bridge;m=s['m'];source=s['sources'];launch=s['document']['launch'];runner=p20_runner()
+    value=s['value'];runner.update(solver_executable=value['solver_executable'],source_graph_sha256=launch['files']['source_graph']['sha256'],
+        julia_manifest_sha256=value['solver_build']['julia_manifest_sha256'],runner_revision=next(row['revision'] for row in value['sources']['components'] if row['path']=='components/QCLNEGFRunner.jl'))
+    snapshot=dict(script_path='/local/spool/original.sh',script_sha256=launch['files']['submit_script']['sha256'])
+    source.policy['spool_root']='/local/spool';raw=s['files']['submit_script']
+    # This original stock scheduler fixture uses legacy unset/native-free argv.
+    # Upgrade only this synthetic script to the approved fixed capture subset.
+    raw=raw.replace(b'unset QCL_NEGF_CAPTURE_SPEC',b'export QCL_NEGF_CAPTURE_SPEC=capture-spec.json QCL_NEGF_NATIVE_CAPTURE_INPUT=native-execution.json')
+    raw=raw.replace(b"  > 'solver.stdout'",(" '--native-execution' 'native-execution.json' '--native-calcjob-uuid' '"+s['document']['calcjob_uuid']+"'  > 'solver.stdout'").encode())
+    launch['files']['submit_script']=dict(bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest());snapshot['script_sha256']=launch['files']['submit_script']['sha256']
+    original=m.protected_read
+    def reading(path,budget,limit=65536):
+        if str(path)==snapshot['script_path']:return raw
+        data=original(path,budget,limit)
+        if fault=='current_release' and str(path).endswith('/release.json'):
+            doc=json.loads(data);doc['release_id']='other-release';return m.encoded(doc)
+        if fault=='code' and '/records/release-' in str(path):
+            doc=json.loads(data);doc['code_uuid']=s['document']['calcjob_uuid'];return m.encoded(doc)
+        return data
+    monkeypatch.setattr(m,'protected_read',reading)
+    if fault=='graph':runner['source_graph_sha256']='e'*64
+    if fault=='runner':runner['runner_revision']='e'*40
+    if fault=='manifest':runner['julia_manifest_sha256']='e'*64
+    if fault=='script':snapshot['script_sha256']='e'*64
+    if fault=='legacy':raw=raw.replace(b'export QCL_NEGF_CAPTURE_SPEC=capture-spec.json QCL_NEGF_NATIVE_CAPTURE_INPUT=native-execution.json',b'unset QCL_NEGF_CAPTURE_SPEC')
+    caller=dict(application=dict(configuration=dict(client=dict(bash_executable='/nix/store/bash/bin/bash'))))
+    joined=dict(launch=launch,snapshot=snapshot,caller=caller)
+    if fault is None:assert m._output_release_source(source,s['document']['calcjob_uuid'],joined,runner) is None
+    else:
+        with pytest.raises((m.Hold,ValueError)):m._output_release_source(source,s['document']['calcjob_uuid'],joined,runner)
+
+
+@pytest.mark.parametrize('state',['missing_policy','missing_qualification','old_qualification','malformed_policy','bad_ingress'])
+def test_noarg_scheduler_factory_preserves_complete_jobs_without_optional_authority(monkeypatch,state):
+    """Explicit factory I/O seams; no root/native authority is supplied by jobs."""
+    m=module();import host_resource_service as service,host_resource_facts as facts
+    jobs={str(i):dict(state='RUNNING',unchanged=i) for i in range(10)};events=[]
+    config=dict(schema='qcl.host-resource-service.v1',role='controller',client_uid=3000,
+        facts_uid=3002,sudo_executables=['/nix/store/sudo'],tools=['/nix/store/scontrol'],
+        slurm_conf='/protected/slurm.conf',scontrol='/nix/store/scontrol',cluster='cluster')
+    monkeypatch.setattr(m.os,'getuid',lambda:0);monkeypatch.setattr(m.os,'geteuid',lambda:0)
+    monkeypatch.setattr(m,'protected_read',lambda path,budget,limit=65536:m.encoded(config))
+    def ingress(*a):
+        events.append('ingress')
+        if state=='bad_ingress':raise m.Hold('facts_entry_unavailable')
+        return {'actual':'explicit SOURCE fixture'}
+    monkeypatch.setattr(service,'_scheduler_facts_ingress',ingress)
+    def policy(role,budget):
+        events.append('policy')
+        if state=='malformed_policy':raise m.Hold('shape')
+        if state=='missing_policy':raise m.Hold('native_policy_missing')
+        return dict(facts_service_config=str(service.CONFIG),worker_routes={'node-a':{}},
+            tools=dict(scontrol=config['scontrol']),slurm=dict(config_file=config['slurm_conf'],cluster='cluster'),
+            qualification_file='/protected/native-q',limits=budget.limits)
+    monkeypatch.setattr(m,'_load_policy',policy)
+    def q(self):
+        if state=='missing_qualification':raise m.Hold('native_qualification_missing')
+        self.qualification={};return {}
+    monkeypatch.setattr(m.NativeSources,'qualify',q)
+    monkeypatch.setattr(facts,'NativeCommandRunner',lambda *a,**kw:object(),raising=False)
+    monkeypatch.setattr(service,'NativeCommandRunner',lambda *a,**kw:object())
+    monkeypatch.setattr(facts,'capture_scheduler',lambda config,sources:events.append(('scheduler',sources)) or jobs)
+    monkeypatch.setattr(m,'_scheduler_output_entries',lambda *a:pytest.fail('old/absent binding attempted close'),raising=False)
+    if state in ('malformed_policy','bad_ingress'):
+        with pytest.raises(m.Hold):m.capture_scheduler_output_facts()
+    else:
+        packet=m.capture_scheduler_output_facts()
+        assert packet==dict(schema='qcl.host-resource-scheduler-facts.v1',jobs=jobs,outputs={})
+        assert packet['jobs'] is jobs and len([x for x in events if isinstance(x,tuple)])==1
+    assert events[0]=='ingress'
+
+
+@pytest.mark.parametrize('fault',[None,'no_close','legacy','technical','partial_pair','partial_original','forged_generation',
+    'duplicate','nine','cancel','late_source','raw_corruption'])
+def test_scheduler_output_selection_is_finite_atomic_and_uses_original_owner(tmp_path,monkeypatch,fault):
+    """Composition L: real private store/read/lock and original join; mocked OS,
+    installed-source and held-reader operands remain explicit synthetic seams.
+    Actual held-FD/close adversaries are exercised separately below.
+    """
+    import contextlib,uuid
+    import host_resource_facts as facts
+    m=module();source,calc,records,native,fields=p20_original_records();budget=source.budget
+    source.policy.update(private_root=str(tmp_path),jobs_root='/srv/qcl-negf/jobs',native_result_prefix='native',
+        slurm=dict(cluster='cluster'),limits=budget.limits,_policy_sha256='e'*64)
+    store=m.AttemptStore(tmp_path);worker=p20_worker();runner=p20_runner()
+    controller=dict(identity=dict(machine_id=records['claim.json']['context']['machine_id'],boot_id=records['claim.json']['context']['boot_id'],
+        kernel='synthetic-kernel',dmi_uuid='33333333-3333-4333-8333-333333333333'),units=[p20_unit('qcl-negf-aiida.service'),p20_unit('qcl-negf-api.service')])
+    generation=dict(controller=controller,workers=[worker]);gsha=hashlib.sha256(m.encoded(generation)).hexdigest()
+    source.qualification=dict(completed_final=dict(runner=runner,unit_generation_sha256=gsha,worker_generations={'node-a':worker}),
+        unit_origins={'server':dict(executable='/nix/store/python')},worker_bindings={'c'*32:{key:worker['identity'][key] for key in ('machine_id','boot_id')}},
+        write_domain=dict(writer_hosts={'node-a':'c'*32},storage_identity='storage',retention_ref='retained'))
+    source._qualification_sha256='f'*64
+    jobs={};allrecords={};fields_by_job={};closed_by_calc={};witnesses={}
+    count=9 if fault=='nine' else 2 if fault=='duplicate' else 1
+    for i in range(count):
+        current=copy.deepcopy(records);cid=str(uuid.UUID(int=i+1));jobid='42' if fault=='duplicate' else str(42+i)
+        for name in ('ack.json','job.json','allocation.json'):current[name]['job_id']=jobid
+        current['dispatch.json']['native']['owner']['actor']['calcjob_uuid']=cid
+        f={**fields,'JobId':jobid};raw=' '.join(k+'='+v for k,v in f.items());jobs[jobid]=facts.parse_slurm_jobs(raw,cluster='cluster')[jobid]
+        for name in ('job.json','allocation.json'):
+            current[name]['generation']=hashlib.sha256(m.encoded(dict(controller=current['claim.json']['context'],job_id=jobid,
+                submit_time=f['SubmitTime'],dispatch_id=current['claim.json']['dispatch_id'],command=f['Command'],workdir=f['WorkDir']))).hexdigest()
+        if fault=='forged_generation':current['allocation.json']['generation']=jobs[jobid]['generation']
+        controls=[dict(path=name,bytes=2,sha256=hashlib.sha256(b'{}').hexdigest()) for name in m.CLOSE_FILES]
+        document=dict(version=3,action='close',calcjob_uuid=cid,launch=current['claim.json']['launch'],controls=controls,
+            technical_control=dict(status='absent',path=m.TECHNICAL_FILE,reason='not_published'))
+        closed=m.reply(document,'closed',job=current['allocation.json'],controls=controls,technical_control=document['technical_control'],receipt=cid+'/close.json')
+        if fault=='legacy':closed.pop('technical_control');closed['version']=1
+        if fault=='technical':closed['technical_control']=dict(status='present',path=m.TECHNICAL_FILE,bytes='2',sha256=controls[0]['sha256'])
+        observed=dict(job=dict(raw=raw,fields=f),prolog_ref='original-prolog',epilog_ref='original-epilog',before=None,after=None)
+        witness=dict(job=current['allocation.json'],launch=current['claim.json']['launch'],worker_close={**observed,'before':{'processes':[]},'after':{'original':'stop'}})
+        with store.locked(cid,budget):
+            for name,value in current.items():
+                if fault=='partial_original' and name=='ack.json':continue
+                store.put(cid,name,value,budget)
+            if fault!='no_close':store.put(cid,'close.json',closed,budget)
+            if fault not in ('no_close','partial_pair'):store.put(cid,'close-observation.json',witness,budget)
+        allrecords[cid]=current;fields_by_job[jobid]=observed;closed_by_calc[cid]=closed;witnesses[cid]=witness
+    calls=[];guards=[];source_calls=[];primary=KeyboardInterrupt('actual original cancel')
+    monkeypatch.setattr(source,'native_job',lambda job:copy.deepcopy(fields_by_job[job]['job']))
+    monkeypatch.setattr(source,'worker',lambda job,calc,phase,budget:copy.deepcopy(fields_by_job[job['job_id']]))
+    monkeypatch.setattr(m,'protected_read',lambda path,budget,limit=65536:m.encoded(dict(calcjob_uuid=next(iter(allrecords)),domain=records['claim.json']['launch']['relative_execution_root'])))
+    def release(*args):
+        source_calls.append(True)
+        if fault=='late_source' and len(source_calls)>1:raise m.Hold('release_binding_changed')
+    monkeypatch.setattr(m,'_output_release_source',release)
+    def close(owner,document,job,context,observed,controls,**kwargs):
+        calls.append(document['calcjob_uuid']);assert kwargs['facts_guard'] is guard and kwargs['facts_inputs']['runner']==runner
+        if fault=='cancel':raise primary
+        cid=document['calcjob_uuid'];closed=closed_by_calc[cid];witness=witnesses[cid]
+        return dict(original_close=(closed,m.encoded(closed)),original_observation=(witness,m.encoded(witness)),
+            current_worker=observed,w1_before={'output_generation':generation},w1_after={'output_generation':generation},
+            control_read={'binding':{'root_birth':dict(producer_pid='123',producer_start_ticks='99')}})
+    monkeypatch.setattr(m.OrdinaryAttemptOwner,'_close',close)
+    def guard():guards.append(True)
+    if fault=='raw_corruption':fields_by_job['42']['job']['raw']+=' JobId=42'
+    selected=lambda:m._scheduler_output_entries(source,store,jobs,records['claim.json']['context'],runner,guard)
+    if fault in ('partial_pair','partial_original','forged_generation','duplicate','nine','cancel','late_source','raw_corruption'):
+        with pytest.raises(KeyboardInterrupt if fault=='cancel' else m.Hold) as caught:selected()
+        if fault=='cancel':assert caught.value is primary
+        if fault in ('partial_pair','partial_original','duplicate','nine','forged_generation','raw_corruption'):assert calls==[]
+    else:
+        values=selected()
+        if fault in ('no_close','legacy','technical'):assert values=={} and calls==[]
+        else:
+            assert len(calls)==len(values)==1;value=values[native['generation']]
+            assert value['scope']=='completed_final' and value['attempt']['generation']!=value['generation']
+            assert facts._scheduler_output_observations(dict(schema='qcl.host-resource-scheduler-facts.v1',jobs=jobs,outputs=values))==values
+
+
+@pytest.mark.parametrize('fault',[None,'missing','populated','process','tuple','identity','nonzero'])
+def test_completed_current_worker_requires_actual_empty_original_allocation(fault):
+    m=module();source,calc,records,native,fields=p20_original_records();job=records['allocation.json']
+    identity=dict(machine_id=job['worker_machine_id'],boot_id=job['worker_boot_id'])
+    raw=' '.join(k+'='+v for k,v in fields.items())
+    observed=dict(job=dict(raw=raw,fields=fields),prolog_ref='original-prolog',epilog_ref='original-epilog',
+        identity={'identity':identity},writer_snapshot=dict(schema='qcl.host-resource-guest-facts.v1',identity_before=identity,
+            identity_after=dict(identity),jobs={'42':native},groups={'42':dict(populated=False,processes=[])}))
+    if fault=='missing':observed['writer_snapshot']['jobs']={}
+    if fault=='populated':observed['writer_snapshot']['groups']['42']['populated']=True
+    if fault=='process':observed['writer_snapshot']['groups']['42']['processes']=[{'pid':123}]
+    if fault=='tuple':native['start_time']='2026-10-30T02:00:00'
+    if fault=='identity':observed['writer_snapshot']['identity_after']['boot_id']='77777777-7777-4777-8777-777777777777'
+    if fault=='nonzero':observed['job']['fields']['ExitCode']='1:0'
+    if fault is None:assert m._completed_worker_status(observed,job)==native
+    else:
+        with pytest.raises((m.Hold,m.ResourceError)):m._completed_worker_status(observed,job)
+
+
+@pytest.mark.parametrize('fault',[None,'token','boot','root_inode','producer_zero','mode','epoch','calcjob','transport','run','plan_path','plan_digest',
+    'graph_revision','native_code','native_uuid','history','history_type','count_bool','actual_root','absent','checkpoint','retained','old_epoch','point_attempt','model','extra_selection','missing_point','failed','traversal'])
+def test_completed_metadata_profile_never_substitutes_locator_for_creator(monkeypatch,fault):
+    m=module();launch,inputs,raws=p20_metadata_profile();docs={key:json.loads(raw) for key,raw in raws.items()}
+    spec=docs['capture-spec.json'];locator=docs['capture-source.json'];result=docs['series_result.json'];selected=docs['native-selection.json']
+    if fault=='token':locator['capture_token']='b'*32
+    if fault=='boot':locator['root_birth']['boot_id']='99999999-9999-4999-8999-999999999999'
+    if fault=='root_inode':locator['root_birth']['inode']='13'
+    if fault=='producer_zero':locator['root_birth']['producer_pid']='0'
+    if fault=='mode':locator['mode']='staged'
+    if fault=='epoch':locator['epoch']=1
+    if fault=='calcjob':spec['selection']['calcjob_uuid']=launch['request_id']
+    if fault=='transport':spec['selection']['attempt']+=1
+    if fault=='run':spec['native_performance']['run_uuid']=launch['request_id']
+    if fault=='plan_path':spec['plan']['path']='other-plan.json'
+    if fault=='plan_digest':spec['plan']['sha256']='f'*64
+    if fault=='graph_revision':docs['source-graph.json']['components'][0]['revision']='e'*40
+    if fault=='native_code':docs['native-execution.json']['code']['solver_executable']='/nix/store/other/bin/qcl-negf'
+    if fault=='native_uuid':docs['native-execution.json']['storage']['execution_binding_uuid']=launch['request_id']
+    if fault=='history':result['attempt_history']=[copy.deepcopy(result['points'][0])]
+    if fault=='history_type':result['attempt_history']={}
+    if fault=='count_bool':result['expected_point_count']=result['available_point_count']=True
+    if fault=='actual_root':locator['actual_root']='/foreign/alias/'+launch['relative_execution_root']
+    source=result['points'][0]['data']['native_source']
+    if fault=='absent':source['kind']='absent'
+    if fault=='checkpoint':source['kind']='checkpoint'
+    if fault=='retained':source['relation']='retained_source'
+    if fault=='old_epoch':source['selected_state']['state_id']='epoch-1-state-1'
+    if fault=='point_attempt':result['points'][0]['attempt']=2
+    if fault=='model':source['selected_state']['identity']['model_sha256']='e'*64
+    if fault=='extra_selection':selected['selected_inputs'].append(copy.deepcopy(selected['selected_inputs'][0]))
+    if fault=='missing_point':result['points']=[]
+    if fault=='failed':result['status']='failed'
+    if fault=='traversal':source['artifact_root']='../foreign'
+    raws={key:m.encoded(value) for key,value in docs.items()}
+    if fault is None:
+        proof=m._completed_metadata(launch,inputs,raws,(11,12))
+        assert proof['selected_points']==1 and proof['root_birth']==locator['root_birth']
+        assert 'creator_verified' not in proof and 'durable' not in proof
+    else:
+        with pytest.raises(m.Hold):m._completed_metadata(launch,inputs,raws,(11,12))
+
+
+@pytest.mark.parametrize('fault',[None,'extra','missing','path','roles','alias','manifest','size','total','revision','capture_path'])
+def test_completed_final_runner_closed_fixed_roles_and_bounds(fault):
+    m=module();runner=p20_runner()
+    if fault=='extra':runner['certificate']=True
+    if fault=='missing':del runner['runner_revision']
+    if fault=='path':runner['files']['execution']['path']='/tmp/unchecked.jl'
+    if fault=='roles':runner['files']['other']=runner['files'].pop('native_lane')
+    if fault=='alias':runner['files']['capture_cli']['path']=runner['files']['capture_runtime']['path']
+    if fault=='manifest':runner['julia_manifest_sha256']='e'*64
+    if fault=='size':runner['files']['launcher']['bytes']=1048577
+    if fault=='total':
+        for row in runner['files'].values():row['bytes']=200000
+    if fault=='revision':runner['runner_revision']='dirty-main'
+    if fault=='capture_path':runner['files']['capture_cli']['path']='/nix/store/foreign/cli.py'
+    if fault is None:assert m._output_runner(runner)==runner
+    else:
+        with pytest.raises(m.Hold):m._output_runner(runner)
+
+
+@pytest.mark.parametrize('fault',[None,'extra','bool_pid','birth','uid','invocation','state','namespace','line','bytes'])
+def test_completed_final_worker_unit_projection_is_closed_and_finite(fault):
+    m=module();worker=p20_worker()
+    if fault=='extra':worker['unit']['main']['raw_proc']=b'not admitted'
+    if fault=='bool_pid':worker['unit']['main']['pid']=True
+    if fault=='birth':worker['unit']['main']['start_ticks']=0
+    if fault=='uid':worker['unit']['main']['uids']=[3000]*4
+    if fault=='invocation':worker['unit']['state']['InvocationID']='0'*32
+    if fault=='state':worker['unit']['state']['ActiveState']='inactive'
+    if fault=='namespace':worker['unit']['mount_namespace']['inode']=0
+    if fault=='line':worker['unit']['mount_line']+='\n'
+    if fault=='bytes':worker['unit']['mount_line']='x'*8193
+    if fault is None:assert m._output_worker(worker)==worker
+    else:
+        with pytest.raises(m.Hold):m._output_worker(worker)
+
+
+@pytest.mark.parametrize('fault',[None,'capture_selector','capture_selector_wrong','absent','null','extra','worker_omitted','corrupt','origin_drift','alias','read_failure','cancel'])
+def test_completed_runner_qualifies_all_exact_sources_before_return(monkeypatch,fault):
+    m=module();runner=p20_runner();binding=dict(runner=runner,unit_generation_sha256='d'*64,worker_generations={'node-a':p20_worker()})
+    if fault=='null':binding=None
+    if fault=='extra':binding['pending']=True
+    if fault=='worker_omitted':binding['worker_generations']={}
+    source=m.NativeSources(dict(worker_routes={'node-a':{}}),m.Operation({**limits(),'maximum_files':2048}))
+    if fault in ('capture_selector','capture_selector_wrong'):runner['capture_executable']='/nix/store/synthetic-selector/bin/qcl-negf-results'
+    source.qualification={} if fault=='absent' else {'completed_final':binding}
+    calls=[];seen={};paths=list(runner['files'].values());index={row['path']:i+1 for i,row in enumerate(paths)}
+    def origin(budget,path,**kwargs):
+        if path==runner['capture_executable'] and path not in index:
+            actual=runner['files']['capture_entry']['path']
+            return dict(path='/nix/store/wrong/bin/qcl-negf-results' if fault=='capture_selector_wrong' else actual,
+                chain=[(path,(4,999,m.stat.S_IFLNK|0o777,0,3,1,1),actual),
+                       (actual,(4,index[actual],m.stat.S_IFREG|0o555,0,3,1,1),None)])
+        seen[path]=seen.get(path,0)+1;inode=index[path]
+        if fault=='alias' and path==runner['files']['capture_cli']['path']:inode=index[runner['files']['capture_entry']['path']]
+        if fault=='origin_drift' and seen[path]>1:inode+=100
+        return dict(path=path,chain=[(path,(4,inode,m.stat.S_IFREG|0o444,0,3,1,1),None)])
+    primary=KeyboardInterrupt('actual source cancellation')
+    def read(budget,path,limit):
+        assert limit==3 and budget is source.budget and budget.bytes>=4
+        calls.append(path)
+        if fault=='read_failure':raise OSError('actual source read failure')
+        if fault=='cancel':raise primary
+        return b'abd' if fault=='corrupt' else b'abc'
+    monkeypatch.setattr(m.engine,'public_binary_origin',origin);monkeypatch.setattr(m.engine,'immutable_public_bytes',read)
+    if fault in (None,'capture_selector'):assert source.completed_final_runner()==runner and len(calls)==13
+    else:
+        with pytest.raises(KeyboardInterrupt if fault=='cancel' else OSError if fault=='read_failure' else m.Hold) as caught:
+            source.completed_final_runner()
+        if fault=='cancel':assert caught.value is primary
+        if fault in ('absent','null','extra','worker_omitted'):assert calls==[] and seen=={}
+
+
+@pytest.mark.parametrize('fault',[None,'unit_drift','birth_drift','namespace_drift','mount_rw','mount_hard','mount_alias','executable'])
+def test_unit_generation_reads_actual_process_and_mount_namespace_before_after(monkeypatch,fault):
+    from types import SimpleNamespace
+    m=module();expected=p20_unit('qcl-negf-aiida.service');budget=m.Operation({**limits(),'maximum_files':2048})
+    source=m.NativeSources(dict(client_uid=3000,jobs_root='/srv/qcl-negf/jobs',native_result_prefix='native',nfs_source='storage:/jobs'),budget)
+    source.qualification={'unit_origins':{expected['name']:dict(executable=expected['main']['executable'])}}
+    calls={'unit':0,'main':0,'ns':0};reads=[]
+    def unit(name):
+        assert name==expected['name'];calls['unit']+=1;value=copy.deepcopy(expected['state'])
+        if fault=='unit_drift' and calls['unit']>1:value['InvocationID']='2'*32
+        return value
+    def process(pid):
+        assert pid==123;calls['main']+=1;value={**expected['main'],'state':'S'}
+        if fault=='birth_drift' and calls['main']>1:value['start_ticks']+=1
+        if fault=='executable':value['executable']='/tmp/python'
+        return value
+    def namespace(path,**kwargs):
+        assert str(path)=='/proc/123/ns/mnt' and kwargs=={'follow_symlinks':True};calls['ns']+=1
+        return SimpleNamespace(st_dev=4,st_ino=9 if fault=='namespace_drift' and calls['ns']>1 else 8)
+    def read(path,limit=65536):
+        reads.append(str(path));assert str(path)=='/proc/123/mountinfo';raw=expected['mount_line']
+        if fault=='mount_rw':raw=raw.replace('native ro','native rw')
+        if fault=='mount_hard':raw=raw.replace(',hard','')
+        if fault=='mount_alias':raw+='\n'+raw
+        return (raw+'\n').encode()
+    monkeypatch.setattr(source,'unit',unit);monkeypatch.setattr(source,'process',process)
+    monkeypatch.setattr(source,'origin',lambda path:path)
+    monkeypatch.setattr(budget,'stat',namespace);monkeypatch.setattr(budget,'read',read)
+    if fault is None:
+        assert source.output_unit_generation(expected['name'],readonly=True)==expected
+        assert calls=={'unit':2,'main':2,'ns':2} and reads==['/proc/123/mountinfo']
+    else:
+        with pytest.raises(m.Hold):source.output_unit_generation(expected['name'],readonly=True)
+
+
+@pytest.mark.parametrize('fault',[None,'absent','null','unit','identity','runner','qualification_drift'])
+def test_worker_output_tuple_is_current_local_expected_branch_on_same_operation(monkeypatch,fault):
+    m=module();worker=p20_worker();runner=p20_runner();budget=m.Operation({**limits(),'maximum_files':2048})
+    binding=dict(runner=runner,unit_generation_sha256='d'*64,worker_generations={'node-a':worker})
+    source=m.NativeSources(dict(worker_routes={'node-a':{}}),budget)
+    source.qualification={} if fault=='absent' else dict(completed_final=None if fault=='null' else binding,
+        write_domain=dict(writer_hosts={'node-a':worker['identity']['machine_id']}))
+    host={key:worker['identity'][key] for key in ('machine_id','boot_id')};host['image_id']='/nix/store/synthetic-image'
+    calls=[]
+    def qualify():
+        calls.append('qualify');source._qualification_sha256=('c' if fault=='qualification_drift' and len(calls)>1 else 'a')*64
+        return host
+    def actual_runner():
+        value=copy.deepcopy(runner)
+        if fault=='runner':value['runner_revision']='c'*40
+        return value
+    def unit(name,*,readonly):
+        assert name=='slurmd.service' and readonly is False;value=copy.deepcopy(worker['unit'])
+        if fault=='unit':value['main']['start_ticks']+=1
+        return value
+    def read(path,limit=65536):
+        if str(path)=='/proc/sys/kernel/osrelease':return b'synthetic-kernel\n'
+        assert str(path)=='/sys/class/dmi/id/product_uuid'
+        return ((('9' if fault=='identity' else '2')*8)+'-2222-4222-8222-222222222222\n').encode()
+    monkeypatch.setattr(source,'qualify',qualify);monkeypatch.setattr(source,'host',lambda:host)
+    monkeypatch.setattr(source,'completed_final_runner',actual_runner);monkeypatch.setattr(source,'output_unit_generation',unit)
+    monkeypatch.setattr(budget,'read',read)
+    if fault=='absent':assert m._worker_output_generation(source) is None and calls==[]
+    elif fault is None:
+        value=m._worker_output_generation(source);assert value==dict(worker=worker,runner=runner) and source.budget is budget
+    else:
+        with pytest.raises(m.Hold):m._worker_output_generation(source)
+
+
+@pytest.mark.parametrize('fault',[None,'missing_controller','controller_rw','worker_omitted','worker_only_hash','worker_source','worker_birth','controller_kernel','duplicate_worker'])
+def test_full_generation_joins_two_controller_ro_units_and_all_enrolled_workers(monkeypatch,fault):
+    m=module();worker=p20_worker();runner=p20_runner();identity={**worker['identity'],'machine_id':'a'*32,
+        'boot_id':'88888888-8888-4888-8888-888888888888'}
+    units=[dict(unit=name,output_unit=p20_unit(name)) for name in ('qcl-negf-aiida.service','qcl-negf-api.service')]
+    workers=[dict(node='node-a',reply=dict(writer_snapshot=dict(output_generation=dict(worker=copy.deepcopy(worker),runner=copy.deepcopy(runner)))))]
+    expected=dict(controller=dict(identity=identity,units=[row['output_unit'] for row in units]),workers=[worker])
+    binding=dict(runner=runner,unit_generation_sha256=hashlib.sha256(m.encoded(expected)).hexdigest(),worker_generations={'node-a':worker})
+    source=m.NativeSources(dict(worker_routes={'node-a':{}},jobs_root='/srv/qcl-negf/jobs',native_result_prefix='native',nfs_source='storage:/jobs'),m.Operation({**limits(),'maximum_files':2048}))
+    source.qualification=dict(completed_final=binding,write_domain=dict(writer_hosts={'node-a':worker['identity']['machine_id']}))
+    actual_identity=dict(identity)
+    if fault=='missing_controller':units.pop()
+    if fault=='controller_rw':units[0]['output_unit']['mount_line']=units[0]['output_unit']['mount_line'].replace('native ro','native rw')
+    if fault=='worker_omitted':workers=[]
+    if fault=='worker_only_hash':binding['unit_generation_sha256']=hashlib.sha256(m.encoded(worker)).hexdigest()
+    if fault=='worker_source':workers[0]['reply']['writer_snapshot']['output_generation']['runner']['runner_revision']='b'*40
+    if fault=='worker_birth':workers[0]['reply']['writer_snapshot']['output_generation']['worker']['unit']['main']['start_ticks']+=1
+    if fault=='controller_kernel':actual_identity['kernel']='different-kernel'
+    if fault=='duplicate_worker':workers.append(copy.deepcopy(workers[0]))
+    monkeypatch.setattr(m,'_output_host',lambda actual:actual_identity)
+    if fault is None:assert m._full_output_generation(source,units,workers)==expected
+    else:
+        with pytest.raises(m.Hold):m._full_output_generation(source,units,workers)
+
+
+@pytest.mark.parametrize('state',['missing_directory','missing_file','existing','busy','symlink'])
+def test_facts_attempt_lock_existing_only_never_creates_or_adopts(tmp_path,monkeypatch,state):
+    """Real nofollow/flock in an explicit own unprivileged fixture namespace."""
+    from contextlib import contextmanager
+    m=module();store=m.AttemptStore(tmp_path);calcjob='11111111-1111-4111-8111-111111111111'
+    @contextmanager
+    def directory(path,create=False):
+        if create:Path(path).mkdir(mode=0o700,exist_ok=True)
+        fd=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        try:yield fd
+        finally:os.close(fd)
+    monkeypatch.setattr(store,'directory',directory)
+    locks=tmp_path/'locks'
+    if state!='missing_directory':locks.mkdir(mode=0o700)
+    if state in ('existing','busy'):(locks/calcjob).write_bytes(b'');(locks/calcjob).chmod(0o600)
+    if state=='symlink':
+        (tmp_path/'foreign').write_bytes(b'preserve');(locks/calcjob).symlink_to(tmp_path/'foreign')
+    before=sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob('*'));budget=m.Operation(limits())
+    if state=='existing':
+        with store.locked(calcjob,budget,existing_only=True):pass
+    elif state=='busy':
+        fd=os.open(locks/calcjob,os.O_RDWR);m.fcntl.flock(fd,m.fcntl.LOCK_EX|m.fcntl.LOCK_NB)
+        try:
+            with pytest.raises(m.Hold,match='attempt_busy'):
+                with store.locked(calcjob,budget,existing_only=True):pytest.fail('busy lock admitted')
+        finally:os.close(fd)
+    else:
+        with pytest.raises(OSError):
+            with store.locked(calcjob,budget,existing_only=True):pytest.fail('unknown namespace admitted')
+    assert sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob('*'))==before
+
+
+@pytest.mark.parametrize('kind',['invariant','fatal','cancel'])
+def test_existing_journal_directory_cleanup_preserves_its_primary(tmp_path,monkeypatch,kind):
+    m=module();root=tmp_path/'owned-journal';root.mkdir(mode=0o700);store=m.AttemptStore(root)
+    primary={'invariant':RuntimeError('original invariant'),
+        'fatal':MemoryError('original allocation'),'cancel':KeyboardInterrupt('original cancellation')}[kind]
+    close=m.os.close;closed=[]
+    def closing(fd):close(fd);closed.append(fd);raise OSError('secondary held directory close failure')
+    monkeypatch.setattr(m.os,'close',closing)
+    with pytest.raises(type(primary)) as caught:
+        with store.directory(root):raise primary
+    assert caught.value is primary and closed and any('close' in note for note in primary.__notes__)
+    for fd in closed:
+        with pytest.raises(OSError):os.fstat(fd)
+
+
 def request(action='submit'):
     claim = {'bytes': 3, 'sha256': hashlib.sha256(b'abc').hexdigest()}
     return {'version': 1, 'action': action, 'calcjob_uuid': '11111111-1111-4111-8111-111111111111',
@@ -1150,7 +1757,8 @@ def test_attempt_facts_uses_existing_flat_guest_config_not_a_new_nested_policy(m
         assert actual is config or actual == config
         return {'schema': 'qcl.host-resource-guest-identity.v1', 'identity': host}
     monkeypatch.setattr(facts, 'capture_guest_identity', identity)
-    monkeypatch.setattr(m, '_capture_writer_snapshot', lambda actual, *args: {'flat_config': actual == config})
+    monkeypatch.setattr(m, '_capture_writer_snapshot', lambda actual, *args,**kwargs: {'flat_config': actual == config and
+        isinstance(kwargs['output_sources'],m.NativeSources)})
     result = m.read_attempt_facts(document)
     assert result['writer_snapshot']['flat_config'] is True and result['prolog_ref'] is None
 
@@ -1354,6 +1962,49 @@ def q1_controls(root,launch):
     return claims,result,work
 
 
+@pytest.mark.parametrize('fault',[None,'replacement','content','missing_log','fsync'])
+def test_held_output_files_sync_and_survive_actual_post_w1_boundary(tmp_path,monkeypatch,fault):
+    """Actual FDs/files, explicit own UID namespace; not native UID3000 proof."""
+    m=module();namespace=tmp_path/'namespace';jobs=namespace/'srv/qcl-negf/jobs';launch=request()['launch']
+    controls,result,work=q1_controls(jobs,launch)
+    for name in ('solver.stdout','solver.stderr'):(work/name).write_bytes(b'synthetic logger bytes')
+    if fault=='missing_log':(work/'solver.stderr').unlink()
+    policy=dict(client_uid=os.getuid(),jobs_root='/srv/qcl-negf/jobs',native_result_prefix='native')
+    opened=m.os.open;synced=[];handles={};boundary=[];sync=m.os.fsync
+    names={row['path'] for row in controls}|{'solver.stdout','solver.stderr'}
+    def opening(path,*args,**kwargs):
+        fd=opened(namespace if str(path)=='/' else path,*args,**kwargs)
+        if str(path) in names:handles[str(path)]=fd
+        return fd
+    def fsync(fd):
+        sync(fd);synced.append(fd)
+        if fault=='fsync' and fd==handles.get('series_result.json'):raise OSError('original fsync failure')
+    monkeypatch.setattr(m.os,'open',opening);monkeypatch.setattr(m.os,'fsync',fsync)
+    monkeypatch.setattr(m.os,'scandir',lambda *a,**k:pytest.fail('finite close must not enumerate trees'))
+    def post_w1(metadata):
+        boundary.append(True)
+        assert set(handles)==names and all(fd in synced for fd in handles.values())
+        assert all(m.stat.S_ISREG(os.fstat(fd).st_mode) for fd in handles.values())
+        assert metadata['controls']==controls
+        if fault=='replacement':
+            (result/'series_result.json').rename(result/'retained-original')
+            (result/'series_result.json').write_bytes(b'original failed result bytes\n')
+        elif fault=='content':(result/'series_result.json').write_bytes(b'changed')
+    budget=m.Operation({**limits(),'maximum_files':2048})
+    def call():return m._owner_close_read(policy,launch,budget,controls,
+        technical_control=dict(status='absent',path=m.TECHNICAL_FILE,reason='not_published'),
+        durable=True,solver_logs=True,barrier=post_w1)
+    if fault is None:
+        observed=call();assert observed['controls']==controls and boundary==[True]
+        assert {r['path'] for r in observed['logs']}=={'solver.stdout','solver.stderr'}
+        assert observed['io']['actual_bytes']==2*(sum(r['bytes'] for r in controls)+2*len(b'synthetic logger bytes'))
+    else:
+        with pytest.raises((m.Hold,OSError)):call()
+        assert boundary==([] if fault in ('missing_log','fsync') else [True])
+    for fd in handles.values():
+        with pytest.raises(OSError):os.fstat(fd)
+
+
 @pytest.fixture
 def q1_joined(tmp_path,monkeypatch):
     """Actual owner/preflight/W1/reader/store; OS/RPC facts are SOURCE fixtures."""
@@ -1401,15 +2052,20 @@ def q1_joined(tmp_path,monkeypatch):
     fake_reader=m._read_submitted_files_as_owner;uid=os.getuid();euid=os.geteuid()
     # This tests the production fork/FD code using only our synthetic child and
     # own temp files. Real UID3000/NFS qualification remains Root's native gate.
-    def owner_reader(p,launch,budget,*,controls=None,technical_control=None):
+    def owner_reader(p,launch,budget,*,controls=None,technical_control=None,barrier=None,solver_logs=False,native_inputs=None):
         if controls is None:return fake_reader(p,launch,budget)
-        opened=m.os.open
-        child={'dropped':False}
+        opened=m.os.open;fork=m.os.fork
+        child={'dropped':False,'parent_after_fork':False}
         with monkeypatch.context() as patch:
-            patch.setattr(m.os,'geteuid',lambda:uid if child['dropped'] else 0)
+            patch.setattr(m.os,'geteuid',lambda:uid if child['dropped'] or child['parent_after_fork'] else 0)
             patch.setattr(m.os,'setgroups',lambda groups:None if groups==[] else pytest.fail('groups'))
             patch.setattr(m.os,'setgid',lambda value:None)
             patch.setattr(m.os,'setuid',lambda value:child.update(dropped=True))
+            def forking():
+                pid=fork()
+                if pid>0:child['parent_after_fork']=True
+                return pid
+            patch.setattr(m.os,'fork',forking)
             def open_path(path,*args,**kw):
                 if str(path)=='/':
                     assert child['dropped'],'root must not open NFS payload/ancestry'
@@ -1417,11 +2073,238 @@ def q1_joined(tmp_path,monkeypatch):
                 return opened(path,*args,**kw)
             patch.setattr(m.os,'open',open_path)
             options={} if technical_control is None else {'technical_control':technical_control}
+            if barrier is not None:options['barrier']=barrier
+            if solver_logs:options['solver_logs']=True
+            if native_inputs is not None:options['native_inputs']=native_inputs
             return real_reader({**p,'client_uid':uid},launch,budget,controls=controls,**options)
     monkeypatch.setattr(m,'_read_submitted_files_as_owner',owner_reader)
     state.update(store=store,controls=controls,result=result,work=work,packet=packet,job=job,journal=journal,unit=unit)
     state['owner']=m.OrdinaryAttemptOwner(policy,store,source,source.budget)
     return state
+
+
+@pytest.mark.parametrize('fault',[None,'replacement','cancel','late_close'])
+def test_actual_private_child_holds_fds_through_parent_w1_and_closes_before_return(q1_joined,monkeypatch,fault):
+    s=q1_joined;m=s['m'];parent=os.getpid();boundary=[]
+    for name in ('solver.stdout','solver.stderr'):(s['work']/name).write_bytes(b'logger')
+    document=q1t_document(s,None);inode=(s['result']/'series_result.json').stat().st_ino
+    close=m.os.close;primary=KeyboardInterrupt('parent post-W1 cancelled')
+    if fault=='late_close':
+        def closing(fd):
+            target=False
+            if os.getpid()!=parent:
+                try:target=os.fstat(fd).st_ino==inode
+                except OSError:pass
+            close(fd)
+            if target:raise OSError('original held-file close failure')
+        monkeypatch.setattr(m.os,'close',closing)
+    def post_w1(value):
+        assert os.getpid()==parent
+        boundary.append(True);assert value['controls']==s['controls']
+        if fault=='replacement':
+            (s['result']/'series_result.json').rename(s['result']/'held-original')
+            (s['result']/'series_result.json').write_bytes(b'original failed result bytes\n')
+        if fault=='cancel':raise primary
+    def read():return m._read_submitted_files_as_owner(s['sources'].policy,document['launch'],s['sources'].budget,
+        controls=document['controls'],technical_control=document['technical_control'],solver_logs=True,barrier=post_w1)
+    if fault is None:
+        value=read();assert value['controls']==s['controls']
+        assert value['io']['actual_bytes']==2*(sum(c['bytes'] for c in s['controls'])+2*len(b'logger'))
+    elif fault=='cancel':
+        with pytest.raises(KeyboardInterrupt) as caught:read()
+        assert caught.value is primary
+    else:
+        with pytest.raises(m.Hold):read()
+    assert boundary==[True]
+    assert not (s['store'].path(document['calcjob_uuid'])/'close.json').exists()
+
+
+@pytest.mark.parametrize('case',['exact','bytes_short','files_short','expired','child_overrun','failed_unconsumed'])
+def test_held_child_spends_only_parent_prepaid_credit_before_first_effect(q1_joined,monkeypatch,case):
+    s=q1_joined;m=s['m'];document=q1t_document(s,None);policy=s['sources'].policy
+    for name in ('solver.stdout','solver.stderr'):(s['work']/name).write_bytes(b'logger')
+    read_bytes,file_ops,envelope,_=m._held_read_forecast(policy,document['launch'],document['controls'],
+        document['technical_control'],True,65536)
+    full_bytes=read_bytes+envelope
+    budget=m.Operation({**policy['limits'],'metadata_bytes':full_bytes-(case=='bytes_short'),
+        'maximum_files':file_ops-(case=='files_short')})
+    if case=='expired':budget.deadline=m.time.monotonic()-1
+    pipe=m.os.pipe2;fork=m.os.fork;effects=[];boundaries=[]
+    def pipe2(*args):effects.append('pipe');return pipe(*args)
+    def forking():effects.append('fork');return fork()
+    monkeypatch.setattr(m.os,'pipe2',pipe2);monkeypatch.setattr(m.os,'fork',forking)
+    if case=='child_overrun':
+        def overrun(*args,**kwargs):m._owner_read_reserve(budget,read_bytes+1)
+        monkeypatch.setattr(m,'_owner_close_read',overrun)
+    if case=='failed_unconsumed':(s['work']/'solver.stderr').unlink()
+    def call():return m._read_submitted_files_as_owner(policy,document['launch'],budget,
+        controls=document['controls'],technical_control=document['technical_control'],solver_logs=True,
+        barrier=lambda value:boundaries.append(value))
+    if case=='exact':
+        result=call();assert boundaries and result['io']['actual_bytes']>0
+        assert result['io']['file_operations']<file_ops and result['io']['actual_bytes']<read_bytes
+    else:
+        with pytest.raises(m.Hold):call()
+        assert boundaries==[]
+    if case in ('bytes_short','files_short','expired'):assert effects==[]
+    else:assert effects==['pipe','pipe','fork']
+    # Failed/unused child slices remain charged to the same parent operation.
+    assert budget.bytes==(0 if case=='expired' else full_bytes)
+    assert budget.files==(0 if case in ('expired','bytes_short') else file_ops)
+    assert not hasattr(budget,'_owner_read_credit')
+
+
+def test_parent_cancellation_retains_already_reported_actual_child_read_bytes(q1_joined,monkeypatch):
+    s=q1_joined;m=s['m'];document=q1t_document(s,None);budget=s['sources'].budget
+    for name in ('solver.stdout','solver.stderr'):(s['work']/name).write_bytes(b'logger')
+    parent=os.getpid();read=m.os.read;transport=[];reported=[];primary=KeyboardInterrupt('original parent cancellation')
+    def reading(fd,size):
+        raw=read(fd,size)
+        if os.getpid()==parent and m.stat.S_ISFIFO(os.fstat(fd).st_mode):transport.append(len(raw))
+        return raw
+    def boundary(value):reported.append(value['io']['actual_bytes']);raise primary
+    monkeypatch.setattr(m.os,'read',reading);initial=budget.actual_bytes
+    with pytest.raises(KeyboardInterrupt) as caught:
+        m._read_submitted_files_as_owner(s['sources'].policy,document['launch'],budget,controls=document['controls'],
+            technical_control=document['technical_control'],solver_logs=True,barrier=boundary)
+    assert caught.value is primary and reported[0]>0
+    assert budget.actual_bytes-initial==sum(transport)+reported[0]
+
+
+def test_prepaid_owner_read_uses_held_file_size_before_read_not_unknown_leaf_ceiling(tmp_path,monkeypatch):
+    m=module();path=tmp_path/'tiny-original';path.write_bytes(b'abc');budget=m.Operation(limits())
+    budget.reserve(16)
+    for _ in range(4):budget.file()
+    budget._owner_read_credit=[16,4];read=m.os.read;sizes=[]
+    def reading(fd,size):sizes.append(size);return read(fd,size)
+    monkeypatch.setattr(m.os,'read',reading)
+    fd=os.open(path,os.O_RDONLY)
+    try:raw,_=m.read_fd(fd,65536,budget)
+    finally:os.close(fd)
+    assert raw==b'abc' and budget.actual_bytes==3 and budget.bytes==16
+    assert sizes==[4,1] and budget._owner_read_credit==[11,3]
+
+
+@pytest.mark.parametrize('fault',[None,'token','root','source','late','cancel'])
+def test_actual_owned_held_metadata_inputs_share_w1_and_never_return_partial(q1_joined,monkeypatch,fault):
+    s=q1_joined;m=s['m'];launch,inputs,raws=p20_metadata_profile();locator=json.loads(raws['capture-source.json'])
+    info=s['result'].stat();locator['root_birth'].update(device=str(info.st_dev),inode=str(info.st_ino))
+    if fault=='token':locator['capture_token']='b'*32
+    if fault=='root':locator['actual_root']='/foreign/'+launch['relative_execution_root']
+    raws['capture-source.json']=m.encoded(locator)
+    for name in ('series_result.json','native-selection.json'):(s['result']/name).write_bytes(raws[name])
+    for name in ('plan.json','source-graph.json','native-execution.json','capture-spec.json','capture-source.json'):
+        (s['work']/name).write_bytes(raws[name])
+    (s['work']/'_aiidasubmit.sh').write_bytes(b'fixed script fixture')
+    for name in ('solver.stdout','solver.stderr'):(s['work']/name).write_bytes(b'closed log')
+    if fault=='source':(s['work']/'source-graph.json').write_bytes(b'changed original')
+    controls=[]
+    for index,name in enumerate(m.CLOSE_FILES):
+        raw=((s['result'] if index<2 else s['work'])/name).read_bytes()
+        controls.append(dict(path=name,bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest()))
+    boundary=[];primary=KeyboardInterrupt('actual metadata W1 cancellation')
+    def guard(value):
+        boundary.append(True)
+        assert value['binding']['selected_points']==1 and value['binding']['root_birth']['inode']==str(info.st_ino)
+        if fault=='late':(s['work']/'capture-source.json').write_bytes(b'late writer')
+        if fault=='cancel':raise primary
+    def call():return m._read_submitted_files_as_owner(s['sources'].policy,launch,s['sources'].budget,controls=controls,
+        technical_control=dict(status='absent',path=m.TECHNICAL_FILE,reason='not_published'),solver_logs=True,barrier=guard,native_inputs=inputs)
+    if fault is None:
+        value=call();assert value['binding']['selected_points']==1 and boundary==[True]
+        assert set(row['path'] for row in value['files'])==set(m.CLOSE_FILES)|set(m.FILES.values())|{'capture-spec.json','capture-source.json','solver.stdout','solver.stderr'}
+    else:
+        with pytest.raises(KeyboardInterrupt if fault=='cancel' else m.Hold) as caught:call()
+        if fault=='cancel':assert caught.value is primary
+        assert boundary==([] if fault in ('token','root','source') else [True])
+
+
+@pytest.mark.parametrize('kind',['memory','invariant','assertion','cancel','exit'])
+@pytest.mark.parametrize('secondary_close',[False,True])
+def test_delivered_native_child_fatal_class_survives_owned_cleanup(q1_joined,monkeypatch,kind,secondary_close):
+    """Process identity cannot cross fork/JSON; delivered primary type/cause can."""
+    s=q1_joined;m=s['m'];parent=os.getpid();close=m.os.close;failed={'metadata':False,'cleanup':False}
+    cls={'memory':MemoryError,'invariant':RuntimeError,'assertion':AssertionError,'cancel':KeyboardInterrupt,'exit':SystemExit}[kind]
+    primary=cls('original native metadata '+kind)
+    def metadata(*args):failed['metadata']=True;raise primary
+    def closing(fd):
+        target=False
+        if os.getpid()!=parent and failed['metadata'] and secondary_close and not failed['cleanup']:
+            try:target=m.stat.S_ISREG(os.fstat(fd).st_mode)
+            except OSError:pass
+        close(fd)
+        if target:failed['cleanup']=True;raise OSError('secondary held FD close')
+    monkeypatch.setattr(m,'_completed_metadata',metadata);monkeypatch.setattr(m.os,'close',closing)
+    with pytest.raises(cls,match='original native metadata') as caught:
+        test_actual_owned_held_metadata_inputs_share_w1_and_never_return_partial(s,monkeypatch,None)
+    assert type(caught.value) is cls and caught.value.__cause__.record['failure']==cls.__name__
+
+
+@pytest.mark.parametrize('fault',[None,'guard','late_metadata','cancel'])
+def test_original_closed_bytes_requalify_through_actual_private_child_metadata(q1_joined,monkeypatch,fault):
+    """Genuine Q1 close/read/fork/reclose code on declared synthetic metadata.
+    OS/source authority is explicitly fixture-only, not native creator proof.
+    """
+    s=q1_joined;m=s['m'];source=s['sources'];launch,inputs,raws=p20_metadata_profile()
+    native=json.loads(raws['native-execution.json']);native['storage']['storage_identity']='storage'
+    raws['native-execution.json']=m.encoded(native)
+    launch['files']['native_execution']=dict(bytes=len(raws['native-execution.json']),sha256=hashlib.sha256(raws['native-execution.json']).hexdigest())
+    locator=json.loads(raws['capture-source.json']);root=s['result'].stat()
+    locator['root_birth'].update(device=str(root.st_dev),inode=str(root.st_ino));raws['capture-source.json']=m.encoded(locator)
+    for name,raw in raws.items():((s['result'] if name in m.CLOSE_FILES[:2] else s['work'])/name).write_bytes(raw)
+    (s['work']/'_aiidasubmit.sh').write_bytes(b'fixed script fixture')
+    for name in ('solver.stdout','solver.stderr'):(s['work']/name).write_bytes(b'closed logger')
+    controls=[]
+    for i,name in enumerate(m.CLOSE_FILES):
+        raw=((s['result'] if i<2 else s['work'])/name).read_bytes()
+        controls.append(dict(path=name,bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest()))
+    document=dict(version=3,action='close',calcjob_uuid=inputs['calcjob_uuid'],launch=launch,controls=controls,
+        technical_control=dict(status='absent',path=m.TECHNICAL_FILE,reason='not_published'))
+    observed=source.worker(s['job'],document['calcjob_uuid'],'close',source.budget)
+    original=s['owner']._close(document,s['job'],s['host'],observed,controls)
+    assert original['state']=='closed'
+    journal=s['store'].path(document['calcjob_uuid']);before={p.name:p.read_bytes() for p in journal.iterdir()}
+    worker=p20_worker();controller=dict(identity=dict(machine_id=s['host']['machine_id'],boot_id=s['host']['boot_id'],
+        kernel='synthetic-kernel',dmi_uuid='33333333-3333-4333-8333-333333333333'),units=[p20_unit('qcl-negf-aiida.service'),p20_unit('qcl-negf-api.service')])
+    full=dict(controller=controller,workers=[worker]);gsha=hashlib.sha256(m.encoded(full)).hexdigest()
+    source.qualification['completed_final']=dict(runner=inputs['runner'],unit_generation_sha256=gsha,worker_generations={'node-a':worker})
+    raw=('JobId=42 UserId=qcl-negf(3000) JobState=COMPLETED ExitCode=0:0 NumNodes=1 NumTasks=1 '
+        'NodeList=node-a SubmitTime=2026-10-30T01:00:00 StartTime=2026-10-30T01:00:01 Restarts=0 MinMemoryNode=512M Comment='+s['job']['dispatch_id'])
+    native_job=__import__('host_resource_facts').parse_slurm_jobs(raw,cluster='cluster')['42']
+    packet=copy.deepcopy(s['packet']);packet.update(before=None,after=None,job=dict(raw=raw,fields=dict(m.re.findall(r'(?<!\S)(\w+)=([^\s]+)',raw))))
+    identity=packet['identity']['identity'];packet['writer_snapshot'].update(identity_before=identity,identity_after=identity,
+        jobs={'42':native_job},groups={'42':dict(populated=False,processes=[])})
+    old_writers=source.close_writers
+    def writers(*args):
+        # Real close reuses existing W1 validation; its native unit/RPC readers
+        # are separately covered and represented here by fresh explicit rows.
+        with monkeypatch.context() as patch:
+            q=source.qualification;patch.setattr(source,'qualification',{k:v for k,v in q.items() if k!='completed_final'})
+            value=old_writers(*args)
+        value['output_generation']=full;return value
+    monkeypatch.setattr(source,'close_writers',writers);monkeypatch.setattr(source,'worker',lambda *a:copy.deepcopy(packet))
+    source.budget=m.Operation(source.policy['limits']);s['owner'].budget=source.budget
+    actual_read=source.budget.read
+    monkeypatch.setattr(source.budget,'read',lambda path,limit=65536:b'1 0 0:1 / /srv/qcl-negf/jobs/native ro - nfs4 storage:/jobs rw\n'
+        if str(path).endswith('/mountinfo') else actual_read(path,limit))
+    calls=[];primary=KeyboardInterrupt('original metadata cancellation')
+    def guard():
+        calls.append(True)
+        if len(calls)>1:
+            if fault=='guard':raise m.Hold('facts_entry_changed')
+            if fault=='late_metadata':(s['work']/'capture-source.json').write_bytes(b'late writer')
+            if fault=='cancel':raise primary
+    monkeypatch.setattr(s['store'],'put',lambda *a:pytest.fail('facts wrote journal'))
+    def call():return s['owner']._close(document,s['job'],s['host'],packet,controls,facts_guard=guard,facts_inputs=inputs)
+    if fault is None:
+        proof=call();assert proof['original_close'][1]==before['close.json']
+        assert proof['original_observation'][1]==before['close-observation.json']
+        assert proof['control_read']['binding']['storage_identity']=='storage'
+        assert proof['control_read']['binding']['selected_points']==1
+    else:
+        with pytest.raises(KeyboardInterrupt if fault=='cancel' else m.Hold) as caught:call()
+        if fault=='cancel':assert caught.value is primary
+    assert {p.name:p.read_bytes() for p in journal.iterdir()}==before
 
 
 def q1t_document(state, raw=b'{"original":"technical index bytes"}\n'):
@@ -1433,6 +2316,60 @@ def q1t_document(state, raw=b'{"original":"technical index bytes"}\n'):
         document['technical_control']={'status':'present','path':'performance-source.json',
             'bytes':str(len(raw)),'sha256':hashlib.sha256(raw).hexdigest()}
     return document
+
+
+@pytest.mark.parametrize('fault',[None,'controller_unit','storage','worker_identity','nonzero','running','cancel','entry_drift','epilog'])
+def test_existing_close_can_be_requalified_with_status_only_w1_and_no_put(q1_joined,monkeypatch,fault):
+    """Private Source/L owner seam, never production facts caller authority."""
+    s=q1_joined;m=s['m'];document=q1t_document(s,None)
+    original=s['owner'].qualify_close(document);assert original['state']=='closed'
+    directory=s['store'].path(document['calcjob_uuid'])
+    original_bytes={p.name:p.read_bytes() for p in directory.iterdir() if p.is_file()}
+    for name in ('solver.stdout','solver.stderr'):(s['work']/name).write_bytes(b'closed logger')
+    raw=('JobId=42 UserId=qcl-negf(3000) JobState=COMPLETED ExitCode=0:0 NumNodes=1 NumTasks=1 '
+         'NodeList=node-a SubmitTime=2026-10-30T01:00:00 StartTime=2026-10-30T01:00:01 Restarts=0 '
+         'MinMemoryNode=512M ArrayJobId=0 HetJobId=0 Comment='+s['job']['dispatch_id'])
+    s['packet'].update(before=None,after=None)
+    s['packet']['job']={'raw':raw,'fields':dict(m.re.findall(r'(?<!\S)(\w+)=([^\s]+)',raw))}
+    s['packet']['job']['fields']['Comment']=s['job']['dispatch_id']
+    if fault=='nonzero':s['packet']['job']['fields']['ExitCode']='1:0'
+    if fault=='running':s['packet']['job']['fields']['JobState']='RUNNING'
+    if fault=='epilog':s['packet']['epilog_ref']=None
+    source=s['sources'];source.budget=m.Operation(source.policy['limits']);s['owner'].budget=source.budget
+    actual_read=source.budget.read
+    monkeypatch.setattr(source.budget,'read',lambda path,limit=65536:
+        b'1 0 0:1 / /srv/qcl-negf/jobs/native ro - nfs4 storage:/jobs rw\n'
+        if str(path).endswith('/mountinfo') else actual_read(path,limit))
+    phases=[];worker=source.worker;writers=source.close_writers;captures=[];guards=[]
+    def status(job,calcjob,phase,budget):
+        phases.append(phase);assert phase=='status'
+        return worker(job,calcjob,phase,budget)
+    def closed_writers(*args):
+        row=writers(*args);captures.append(True)
+        if len(captures)>1:
+            if fault=='controller_unit':row['controller_units'][0]['state']['InvocationID']='e'*32
+            if fault=='storage':row['storage_identity']='other-storage'
+            if fault=='worker_identity':row['workers'][0]['reply']['identity']['identity']['boot_id']='22222222-2222-4222-8222-222222222222'
+        return row
+    def guard():
+        guards.append(True)
+        if len(guards)>1:
+            if fault=='cancel':raise KeyboardInterrupt('actual facts cancellation')
+            if fault=='entry_drift':raise m.Hold('facts_entry_changed')
+    monkeypatch.setattr(source,'worker',status);monkeypatch.setattr(source,'close_writers',closed_writers)
+    monkeypatch.setattr(source,'_refresh_caller',lambda *a:pytest.fail('facts must not impersonate daemon caller'))
+    monkeypatch.setattr(m,'_authenticate_server',lambda *a:pytest.fail('facts must not impersonate server unit'))
+    monkeypatch.setattr(s['store'],'put',lambda *a:pytest.fail('facts must never write close/worker records'))
+    def read():return s['owner']._close(document,s['job'],s['host'],copy.deepcopy(s['packet']),s['controls'],facts_guard=guard)
+    if fault is None:
+        value=read();assert value['control_read']['controls']==s['controls'] and len(value['control_read']['logs'])==2
+        assert value['original_close'][1]==original_bytes['close.json']
+        assert value['original_observation'][1]==original_bytes['close-observation.json']
+        assert value['current_worker']['before'] is value['current_worker']['after'] is None
+        assert len(guards)>=3 and captures==[True,True] and phases==['status']
+    else:
+        with pytest.raises(KeyboardInterrupt if fault=='cancel' else m.Hold):read()
+    assert {p.name:p.read_bytes() for p in directory.iterdir() if p.is_file()}==original_bytes
 
 
 @pytest.mark.parametrize('raw',[None,b'',b'{"original":"technical index bytes"}\n'])
@@ -1449,6 +2386,27 @@ def test_q1t_v3_closes_only_observed_present_whole_bytes_or_actual_absence(q1_jo
     assert witness['control_read']['io']['actual_bytes']==sum(c['bytes'] for c in s['controls'])+(0 if raw is None else len(raw))
     assert witness['reply_sha256']==hashlib.sha256(receipt).hexdigest()
     assert [r['root'] for r in witness['control_read']['files'] if r['path']=='performance-source.json']==([] if raw is None else ['result'])
+
+
+@pytest.mark.parametrize('kind',['invariant','fatal','cancel'])
+def test_close_record_read_preserves_primary_when_its_fd_close_also_fails(q1_joined,monkeypatch,kind):
+    s=q1_joined;m=s['m'];document=q1t_document(s,None)
+    assert s['owner'].qualify_close(document)['state']=='closed'
+    primary={'invariant':RuntimeError('original invariant'),
+        'fatal':MemoryError('original allocation'),'cancel':KeyboardInterrupt('original cancellation')}[kind]
+    read=m.read_fd;close=m.os.close;target=set()
+    def reading(fd,limit,budget):
+        if os.readlink('/proc/self/fd/'+str(fd)).endswith('/close.json'):
+            target.add(fd);raise primary
+        return read(fd,limit,budget)
+    def closing(fd):
+        close(fd)
+        if fd in target:target.remove(fd);raise OSError('secondary original-record close failure')
+    monkeypatch.setattr(m,'read_fd',reading);monkeypatch.setattr(m.os,'close',closing)
+    with pytest.raises(type(primary)) as caught:
+        m._read_close_record(s['store'],document['calcjob_uuid'],m.Operation(s['sources'].policy['limits']))
+    assert caught.value is primary and any('close' in note for note in primary.__notes__)
+    assert not target
 
 
 @pytest.mark.parametrize('mutate',[
@@ -1605,14 +2563,14 @@ def test_q1t_technical_foreign_or_changed_file_never_publishes_receipt(q1_joined
 @pytest.mark.parametrize('fault',['replace','tamper','absent_published','late_writer'])
 def test_q1t_late_file_or_writer_change_cannot_certify_technical_context(q1_joined,monkeypatch,fault):
     s=q1_joined;m=s['m'];document=q1t_document(s,None if fault=='absent_published' else b'original')
-    path=s['result']/'performance-source.json';read=m.read_fd;opened=m.os.open
+    path=s['result']/'performance-source.json';read=m.read_fd;stat=m.os.stat
     if fault=='absent_published':
-        def open_path(name,*args,**kw):
+        def stat_path(name,*args,**kw):
             if name=='performance-source.json':
                 path.write_bytes(b'late');path.chmod(0o640)
                 raise FileNotFoundError('leaf was absent before late publish')
-            return opened(name,*args,**kw)
-        monkeypatch.setattr(m.os,'open',open_path)
+            return stat(name,*args,**kw)
+        monkeypatch.setattr(m.os,'stat',stat_path)
     elif fault in ('replace','tamper'):
         inode=path.stat().st_ino
         def reading(fd,limit,budget):

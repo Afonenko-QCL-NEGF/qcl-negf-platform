@@ -37,13 +37,109 @@ per-VM profiles и отдельная установленная N-провер�
 source остаётся недоступным. Healthy C, lost-reply recovery и workload/output completion — разные
 gates.
 
-Owning P04/P07/staging producer durable output publication также **не реализован**. Guest reader
-возвращает неизвестное output closure; production finish сохраняет commitment/charge. Он требует
-native terminal, отсутствие всего job subtree и отдельный root-observed output publication факт.
-COMPLETING, gate/client, желаемый finish и пустой один PID не являются completion. Научные файлы и
-массивы reader не сканирует, не fsync-ит и не принимает. Exact existing `CompletionEvidence` —
-owning typed boundary; будущий writer должен связать native generation, output publication,
-closure/descendants и свежую guest boot identity. Формат scientific staging здесь не угадывается.
+Для output completion реализован ограниченный source-путь `completed_final`, описанный ниже.
+Он требует отдельно опубликованного и установленного strong Runner publisher, actual qualification
+его исходников/вызова/creator association и свежих original Q1/worker/guest joins. Пока такой
+qualification нет, production finish сохраняет полный commitment/charge. COMPLETING, CLI exit,
+желаемый finish и отсутствие одного PID не создают completion. Scientific acceptance остаётся у
+scientific owner; existing `CompletionEvidence` и public API не меняются.
+
+## Ограниченный completed-final output факт
+
+Initial supported subset — успешный original native run: literal `COMPLETED` и `ExitCode=0:0`,
+все selected points имеют current produced native closed final, пустой attempt history и direct
+capture-source v3 epoch0. Failure/cancel/nonzero, legacy/unknown source, technical-present,
+checkpoint-only/restore/import/reopened producer и неполные original records сохраняют HOLD/full
+charge. Отсутствие output entry не означает отрицательного научного результата.
+
+Existing controller `facts/scheduler-facts` вызывает private factory без caller operands.
+Factory проверяет actual root process, immutable module/interpreter и точные `python -I -c`
+expressions установленного facts и forced-SSH entry. Forced-SSH Python остаётся живым родителем
+того же sudo argv; root наблюдает actual UID/PPID/birth/cgroup/executable/argv до и после операции.
+Его stdout/stderr и exit status передаются без перекодирования, local child lifetime ограничен.
+Same-UID shell, direct administrative import или переданные PID/flags эту цепь не заменяют.
+Local child fixtures не квалифицируют реальные setuid sudo/PTY/session/signal forwarding:
+deployment требует отдельной проверки actual privileged ancestry и cleanup. Timeout/kill не
+удостоверяют remote completion. Root administrative qualification использует private read seams.
+
+Optional root native qualification field имеет точную форму:
+
+```text
+completed_final = {runner, unit_generation_sha256, worker_generations}
+```
+
+`runner` содержит solver/capture executables, опубликованный Runner revision, source-graph и Julia
+manifest SHA, и ровно 13 immutable file roles: launcher, julia_launcher, project, manifest,
+runner_entry, runner_module, cli, native_lane, execution, publication, capture_entry, capture_cli,
+capture_runtime. Первые десять paths выводятся из solver output; capture entry проверяется через
+actual immutable origin выбранного executable. Один файл ≤1MiB, сумма ≤2MiB, aliases между roles
+отвергаются. Exact bytes/hash/origin/length проверяются existing reader; 13 совпавших SHA не
+заменяют qualification whole published build, loaded modules, fixed callpath и native creator.
+Root заполняет поле только после actual publication/build/install/native qualification. Placeholder
+hash, self-reported locator PID/start ticks и один exit status не являются такой qualification.
+
+Unit SHA — SHA256 canonical JSON exact projection:
+
+```text
+{controller:{identity:I4,units:[U(aiida),U(api)]},workers:[W(node) for sorted(all enrolled nodes)]}
+I4 = {machine_id,boot_id,kernel,dmi_uuid}
+W = {node,identity:I4,unit:U(slurmd)}
+U = {name,state,main,mount_namespace,mount_line}
+```
+
+Canonical encoder — existing `encoded` (sorted keys, compact separators, ASCII JSON, no NaN).
+U хранит actual InvocationID/MainPID/cgroup/unit fragment, executable/UIDs/start ticks, namespace
+device/inode и выбранную raw NFS mountinfo line. Controller units имеют exact readonly native
+prefix; каждый enrolled worker — longest covering writable/hard mount того же NFS source.
+Unit/main/ns/mount/main/unit повторяются; restart, namespace/mount/source drift либо пропущенный
+worker закрывают gate. Старые unit samples из close-observation остаются историческим provenance.
+Свежие samples строятся заново, включая все writer routes, до и после held-FD barrier.
+
+На native host fixed protected service config может содержать `facts.output_owner`:
+`{owner,controller_identity,runner,worker_generations}`. `owner` — ровно policy SHA native attempt,
+raw controller qualification SHA, source-graph SHA, full unit SHA, storage_identity, retention_ref.
+Это другой policy/hash domain, чем PVE/resource policy. Config/routes/role/client UID читаются
+повторно при resolve/join/completion. Старое отсутствие optional field сохраняет basic facts/Q1;
+durable completion при этом недоступен. Present malformed binding отказывает, без fallback.
+
+Factory сохраняет полный jobs snapshot. Bounded existing journal inventory выбирает ровно один
+исходный attempt на successful current native tuple; более восьми eligible entries отвергают весь
+пакет до первого output barrier. Original claim/dispatch/ACK/job/allocation/domain, fixed script
+snapshot, release/Code/graph mappings и paired raw close/close-observation связываются под existing
+per-attempt lock. Только capture-enabled fixed native script domain допускается. Произвольный
+sbatch, legacy unset/capture fallback и source switch не принимаются. Native-attempt generation
+сохраняет preimage whole controller context/job/submit/dispatch/command/workdir; resource generation
+сохраняет cluster/job/raw UserId/submit/start/restarts. Эти SHA не подменяют друг друга.
+
+Existing Q1 `_close` выполняет facts requalification без `put`, нового after-record, repair или
+submit. Original close worker before/after неизменны. Fresh worker `phase=status` проверяет actual
+original tuple/prolog/epilog, terminal status и пустые whole job cgroup/processes. UID3000 child
+держит FD четырёх controls, solver.stdout/stderr, original plan/graph/native-execution/script и
+capture-spec/source v3 через fresh W1 barrier; checks/fsync/close относятся только к этим named
+files и их owned ancestors. Root не читает NFS payload. Capture metadata ≤16KiB/file; original plan
+≤1MiB, graph≤64KiB, native-execution≤16KiB. Все selected rows и nested passports проверяются по
+тем же original bytes. Arrays/history/checkpoint payloads не обходятся, не копируются и повторно
+не fsync-ятся; их produced closed lifetime гарантирует отдельно qualified strong publisher.
+Поздний inode/FD close/fsync/guard/budget failure не даёт факта. Timestamp ставится после successful
+child close/EOF/reap и final guards.
+
+Guest/worker packet может additive содержать `output_generation={worker,runner}` от того же
+fresh local reader до и после capture. Provider связывает этот tuple с protected owner/full unit
+SHA, scheduler и guest allocation/boot/source, empty job group и возрастами output≤guest≤now.
+Pending/joined map действует только внутри текущей resource invocation под `store.operation()`;
+каждый error/cancel/final exit удаляет его. Старый `guest.outputs`, retained cache и свежий
+observed_at без original joins не создают `CompletionEvidence`.
+
+Всё использует один nonrefundable Operation/deadline; native policy может только ужесточать
+bootstrap limits. Private child получает только два уже parent-debited byte/file остатка;
+forecast оплачивается до pipe/fork, превышение отказывает, неиспользованный credit не возвращается.
+Actual consumed I/O учитывается отдельно от prepaid upper bound. Inherited RPC заранее оплачивает
+prospective JSON/UTF8/base64/argv; existing command credit покрывает bounded raw transport buffers,
+а дополнительный decoder workspace оплачивается по actual bounded raw length до parse. Большой
+actual packet может исчерпать budget и дать HOLD. Credits и representation caps не являются RSS
+измерением, workload/campaign quota или обещанием принять любой valid большой набор. Parent fatal/
+cancel остаётся primary при cleanup; delivered fatal child frame сохраняет class/cause, а не
+невозможную cross-process object identity. Нет frame после crash/kill — unknown/HOLD.
 
 Nix daemon/per-build scope join отсутствует: `systemd_build` input распознаётся, production request
 возвращает unsupported. Shared parent MemoryMax нельзя поделить на новые job IDs или считать
@@ -204,8 +300,10 @@ attachment/service start. Private tool paths указывают на exact prote
 profile/symlink. Existing command engine и P12 store reader co-located read-only; их owning files не
 менялись.
 
-Требуют source follow-up: PVE lost-reply recovery, P04/P07 output publication producer,
-complete Nix daemon/build join и owning P07/P22/P12/P31 callsites. Healthy C и отдельный local-libvirt
+Требуют source follow-up: PVE lost-reply recovery, failed/cancelled/nonzero и другие unsupported
+output completion subsets, complete Nix daemon/build join и owning P07/P22/P12/P31 callsites.
+Successful completed-final source зависит от owning strong Runner publication и отдельной actual
+source/creator/ingress/unit/storage qualification. Healthy C и отдельный local-libvirt
 D уже имеют source, но не заменяют эти границы. Отдельно требуют deployment/N:
 реальная установка/runtime credentials/enrollment/capacity agreement, installed PVE/libvirt/Slurm/
 systemd/Python protocols, actual fixed allocation/image/proc/cgroup/readbacks, hook ordering,
@@ -216,4 +314,5 @@ pressure и foreign boundary. Source eval/fixtures не заменяют ни о
 | Host grant предшествует guest fit | service low-memory fixture, P19 owner API             | Consumer launch wiring отдельно        | сохранить              |
 | Cold maximum оплачивается до boot | stopped inventory/offline permit fixtures             | Actual hook/N capacity ещё не измерены | дополнительно измерить |
 | Status не пишет и не refresh-ит   | no-writer/no-mtime/schema/cursor fixtures             | P31 transport не установлен            | сохранить              |
-| Dynamic/outputs/build готовы      | Отсутствующие owning proof producers перечислены явно | Source follow-up, не только N          | изменить               |
+| completed_final source ограничен | Original Q1/held-FD/G/guest fixtures и строгие joins | Actual strong publisher/creator/ingress ещё требуют N | дополнительно измерить |
+| Все output/build outcomes готовы | Unsupported subsets перечислены явно | Failed/cancelled/build producer отсутствуют | изменить |

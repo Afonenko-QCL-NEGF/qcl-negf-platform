@@ -36,7 +36,32 @@ def test_installed_package_isolated_imports_shared_p11_engine_and_fixed_roles(tm
     package=(root/'nix/host-resources.nix').read_text()
     for name in files:assert '../ops/'+name+'.py' in package
     assert 'python3 -I' in package and 'resource-client-root' in package
-    assert 'subprocess.Popen' not in (root/'ops/host_resource_service.py').read_text()
+    # The fixed forced-SSH Python entry must remain the live sudo parent.
+    # Only its finite wait leaf may spawn a child; client/routing/root APIs do
+    # not acquire another arbitrary launcher or supervisor.
+    import ast
+    tree=ast.parse((root/'ops/host_resource_service.py').read_text())
+    functions={node.name:node for node in tree.body if isinstance(node,ast.FunctionDef)}
+    leaf=functions['_wait_ssh_helper'];ssh=functions['ssh_main']
+    calls=[node for node in ast.walk(tree) if isinstance(node,ast.Call)]
+    spawns=[node for node in calls if (isinstance(node.func,ast.Attribute) and node.func.attr in
+        {'Popen','popen','execvp','execve','spawnv','spawnve'}) or
+        (isinstance(node.func,ast.Name) and node.func.id=='Popen')]
+    assert len(spawns)==1 and spawns[0] in set(ast.walk(leaf))
+    spawn=spawns[0]
+    assert ast.unparse(spawn.func)=='subprocess.Popen' and [ast.unparse(arg) for arg in spawn.args]==['argv']
+    assert {kw.arg:ast.literal_eval(kw.value) for kw in spawn.keywords}=={'shell':False,'start_new_session':True}
+    parents={child:node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    current=spawn
+    while current is not leaf:
+        current=parents[current]
+        assert not isinstance(current,(ast.For,ast.AsyncFor,ast.While,ast.comprehension))
+    waits=[node for node in calls if isinstance(node.func,ast.Name) and node.func.id=='_wait_ssh_helper']
+    assert len(waits)==1 and waits[0] in set(ast.walk(ssh)) and not waits[0].keywords
+    assert len(waits[0].args)==1 and isinstance(waits[0].args[0],ast.List)
+    fixed=waits[0].args[0].elts
+    assert [ast.literal_eval(arg) for arg in fixed[:2]]==['sudo','-n']
+    assert [ast.unparse(arg) for arg in fixed[2:]]==['executable','action','token']
 
 
 def test_status_route_never_resolves_scheduler_or_refreshes_native_facts(monkeypatch):
