@@ -30,6 +30,7 @@ in {
       users = [ cfg.factsUser ];
       commands = [ { command = command "facts"; options = [ "NOPASSWD" ]; } ];
     };
+    services.openssh.settings.PermitUserEnvironment = false;
     services.openssh.extraConfig = lib.concatStringsSep "\n" (map (role:
       let user = if role == "authority" then cfg.authorityUser else cfg.factsUser;
           keys = if role == "authority" then cfg.authorityKeysFile else cfg.factsKeysFile;
@@ -44,7 +45,6 @@ in {
           X11Forwarding no
           PermitTTY no
           PermitTunnel no
-          PermitUserEnvironment no
         Match all
       '') [ "authority" "facts" ]);
     # No daemon, autostart, qualification, slurmd resume, or launch wiring. These
