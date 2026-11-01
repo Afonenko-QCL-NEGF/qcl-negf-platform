@@ -64,6 +64,49 @@ def test_installed_package_isolated_imports_shared_p11_engine_and_fixed_roles(tm
     assert [ast.unparse(arg) for arg in fixed[2:]]==['executable','action','token']
 
 
+def test_generated_entries_select_only_nixos_privileged_sudo(tmp_path):
+    """Catch store/ambient sudo selection without executing Python or sudo.
+
+    The source-package build is an explicit prepared-environment opt-in. This
+    resolution check does not qualify setuid, authentication or SSH at runtime.
+    """
+    import json,os,subprocess
+    if os.environ.get('QCL_TEST_HOST_RESOURCE_ENTRY_BUILD')!='1':
+        pytest.skip('Set QCL_TEST_HOST_RESOURCE_ENTRY_BUILD=1 for the source-package build')
+    nixpkgs=os.environ.get('QCL_TEST_NIXPKGS','')
+    assert Path(nixpkgs).is_absolute() and (Path(nixpkgs)/'nixos/lib/eval-config.nix').is_file(), \
+        'QCL_TEST_NIXPKGS must be the prepared locked Nixpkgs source; no implicit fetch'
+    fixture=Path(__file__).parent/'infrastructure/host-resources.nix'
+    expression=(f'import (builtins.toPath {json.dumps(str(fixture),ensure_ascii=False)}) '
+        f'{{ nixpkgs = builtins.toPath {json.dumps(nixpkgs)}; entryResolutionPackage = true; }}')
+    build=subprocess.run(['nix','--extra-experimental-features','nix-command','build',
+        '--offline','--impure','--no-link','--print-out-paths','--expr',expression],
+        capture_output=True,text=True,timeout=120)
+    assert build.returncode==0,build.stderr
+    package=Path(build.stdout.strip())
+    poison=tmp_path/'bin';poison.mkdir()
+    ambient_sudo=poison/'sudo'
+    ambient_sudo.write_text('#!/bin/sh\nexit 99\n');ambient_sudo.chmod(0o755)
+    entries=sorted((package/'bin').iterdir())
+    assert len(entries)==12
+    for entry in entries:
+        interpreter=entry.read_text().splitlines()[0].removeprefix('#!')
+        # Intercept only the final exec: the built application's real shell
+        # prologue sets PATH, then command -v observes its child lookup rules.
+        probe=subprocess.run([interpreter,'--noprofile','--norc','-c',
+            'exec() { printf "%s\\n" "$PATH"; command -v sudo || return 127; }; source "$1"',
+            'entry-resolution',str(entry)],env={'PATH':str(poison)+':/usr/bin'},
+            capture_output=True,text=True,timeout=5)
+        available=os.access('/run/wrappers/bin/sudo',os.X_OK)
+        assert probe.returncode==(0 if available else 127),(entry.name,probe.stderr)
+        lines=probe.stdout.splitlines();paths=lines[0].split(':')
+        assert paths[0]=='/run/wrappers/bin',(entry.name,lines)
+        assert str(poison) not in paths and '/usr/bin' not in paths,(entry.name,lines)
+        assert all(path.startswith('/nix/store/') for path in paths[1:]),(entry.name,lines)
+        expected=['/run/wrappers/bin/sudo'] if available else []
+        assert lines[1:]==expected,(entry.name,lines)
+
+
 def test_status_route_never_resolves_scheduler_or_refreshes_native_facts(monkeypatch):
     import host_resource_service as s
     import host_resource_client as c

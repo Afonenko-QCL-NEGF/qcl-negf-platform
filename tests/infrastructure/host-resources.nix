@@ -1,5 +1,6 @@
-# Source evaluation only: no build, installation, unit start or native backend.
-{ nixpkgs }:
+# Source evaluation by default; entryResolutionPackage exposes only the source package
+# for the separately opted-in generated-entry build, never an OS or native backend.
+{ nixpkgs, entryResolutionPackage ? false }:
 let
   pkgs = import nixpkgs { system = "x86_64-linux"; };
   eval = enabled: extra: import (nixpkgs + "/nixos/lib/eval-config.nix") {
@@ -43,4 +44,4 @@ assert pkgs.lib.hasInfix "host_resource_storage.py" package.passthru.source.buil
 assert pkgs.lib.hasInfix "worker_distribution.py" package.passthru.source.buildCommand;
 assert pkgs.lib.hasInfix "image_stage.py" package.passthru.source.buildCommand;
 assert !(pkgs.lib.hasInfix "native-exec" (builtins.toJSON roles.security.sudo.extraRules));
-true
+if entryResolutionPackage then package else true
