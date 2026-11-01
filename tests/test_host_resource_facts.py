@@ -442,6 +442,87 @@ def test_scheduler_generation_joins_actual_cluster_and_controller_not_config_lab
     with pytest.raises(Exception):f.capture_scheduler(config,source)
 
 
+def scheduler_response_fixture(monkeypatch,jobs,*,version='slurm 25.11.8',controller='controller-a(primary)'):
+    """Exact command boundary; synthetic identities, no live scheduler calls."""
+    import host_resource_facts as f
+    monkeypatch.setattr(f,'trusted_root_path',lambda path,**kw:Path(path))
+    config={'slurm_conf':'/protected/slurm.conf','scontrol':'/protected/scontrol',
+        'slurm_version':'slurm 25.11.8','cluster':'synthetic-cluster','slurmctld_hosts':['controller-a(primary)']}
+    class Source:
+        def __init__(self):self.calls=[]
+        def run(self,argv):
+            self.calls.append(argv)
+            if argv==['/protected/scontrol','--version']:return version+'\n'
+            if argv==['/protected/scontrol','show','config']:
+                return 'ClusterName = synthetic-cluster\nSlurmctldHost[0] = '+controller+'\n'
+            assert argv==['/protected/scontrol','--oneliner','show','jobs']
+            if isinstance(jobs,Exception):raise jobs
+            return jobs
+    return config,Source()
+
+
+def test_scheduler_accepts_qualified_stock_empty_jobs_response(monkeypatch):
+    import host_resource_facts as f
+    # Exact stdout observed from stock scontrol 25.11.8, exit 0, C locale.
+    config,source=scheduler_response_fixture(monkeypatch,'No jobs in the system\n')
+    assert f.capture_scheduler(config,source)=={}
+    assert source.calls==[['/protected/scontrol','--version'],['/protected/scontrol','show','config'],
+        ['/protected/scontrol','--oneliner','show','jobs']]
+
+
+@pytest.mark.parametrize('raw',[
+    'No jobs in the system','No jobs in the system\r\n',' No jobs in the system\n',
+    '\nNo jobs in the system\n','No jobs in the system\n\n',
+    'No jobs in the system\nunknown scheduler response\n','Unknown scheduler response\n',
+])
+def test_scheduler_rejects_unqualified_empty_response_spelling_and_extra_text(monkeypatch,raw):
+    import host_resource_facts as f
+    config,source=scheduler_response_fixture(monkeypatch,raw)
+    with pytest.raises(f.ResourceError,match='incomplete scontrol job protocol'):
+        f.capture_scheduler(config,source)
+
+
+@pytest.mark.parametrize('layout',['allocated','pending','allocated-and-pending','banner-before','banner-after','banner-and-pending'])
+def test_scheduler_empty_response_never_hides_allocated_or_mixed_records(monkeypatch,layout):
+    import host_resource_facts as f
+    packet=json.loads((Path(__file__).parent/'fixtures/host-resources/synthetic-native-packets.json').read_text())
+    allocated=packet['slurm_oneline'].rstrip('\n')+'\n'
+    pending='JobId=43 UserId=qcl-negf(3000) JobState=PENDING NumNodes=1 NumTasks=1 NodeList=(null) SubmitTime=2026-10-28T10:00:00 StartTime=Unknown Restarts=0 MinMemoryNode=512M\n'
+    raw={'allocated':allocated,'pending':pending,'allocated-and-pending':allocated+pending,
+        'banner-before':'No jobs in the system\n'+allocated,'banner-after':allocated+'No jobs in the system\n',
+        'banner-and-pending':'No jobs in the system\n'+pending}[layout]
+    config,source=scheduler_response_fixture(monkeypatch,raw)
+    if layout.startswith('banner'):
+        with pytest.raises(f.ResourceError,match='incomplete scontrol job protocol'):f.capture_scheduler(config,source)
+    else:
+        jobs=f.capture_scheduler(config,source)
+        if layout=='pending':assert jobs=={}
+        else:assert set(jobs)=={'42'} and jobs['42']['owner_uid']==3000 and jobs['42']['limit_bytes']==512*1024**2
+
+
+@pytest.mark.parametrize('fault',['version-mismatch','unqualified-version','controller'])
+def test_scheduler_empty_response_still_requires_qualified_version_and_controller(monkeypatch,fault):
+    import host_resource_facts as f
+    config,source=scheduler_response_fixture(monkeypatch,'No jobs in the system\n',
+        version='slurm 25.11.9' if fault!='controller' else 'slurm 25.11.8',
+        controller='other-controller(primary)' if fault=='controller' else 'controller-a(primary)')
+    if fault=='unqualified-version':config['slurm_version']='slurm 25.11.9'
+    expected={'version-mismatch':'qualification','unqualified-version':'unsupported','controller':'identity_mismatch'}[fault]
+    with pytest.raises(f.ResourceError,match=expected):f.capture_scheduler(config,source)
+    assert len(source.calls)==(3 if fault=='unqualified-version' else 2 if fault=='controller' else 1)
+
+
+def test_scheduler_command_failure_is_not_empty_and_pure_job_parser_stays_strict(monkeypatch):
+    import host_resource_facts as f
+    # Native sources raise on nonzero; a failed command has no successful stdout.
+    failure=f.ResourceError('native_command','scontrol exit 1: No jobs in the system')
+    config,source=scheduler_response_fixture(monkeypatch,failure)
+    with pytest.raises(f.ResourceError) as observed:f.capture_scheduler(config,source)
+    assert observed.value is failure
+    with pytest.raises(f.ResourceError,match='incomplete scontrol job protocol'):
+        f.parse_slurm_jobs('No jobs in the system\n',cluster='synthetic-cluster')
+
+
 def test_native_trust_rejects_traversal_before_any_filesystem_observation(monkeypatch):
     import host_resource_backends as b
     calls=[]
