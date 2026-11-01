@@ -601,3 +601,28 @@ def test_pve_lxc_only_inventory_rejects_invalid_memory(memory):
     sources, backend = _pve_inventory_source(memory, lxc_only=True)
     with pytest.raises(ResourceError):
         sources.inventory(backend)
+
+
+@pytest.mark.parametrize('fault',[None,'ordinary_worker','unknown_expected','null_expected','empty_expected'])
+def test_publication_host_join_keeps_protected_engineering_scope(monkeypatch,fault):
+    import host_resource_facts as f
+    provider,packet,guests,service=output_join_fixture(monkeypatch)
+    expected=provider.config['output_owner']['runner'];expected['engineering_fixture']='native-publication-v1'
+    service['facts']['output_owner']['runner']['engineering_fixture']=({'unknown_expected':'unknown','null_expected':None,'empty_expected':''}.get(fault,'native-publication-v1'))
+    guests['vm-a']['output_generation']['runner']['engineering_fixture']='native-publication-v1'
+    if fault=='ordinary_worker':del guests['vm-a']['output_generation']['runner']['engineering_fixture']
+    from types import SimpleNamespace
+    if fault in ('unknown_expected','null_expected','empty_expected'):
+        # Snapshot and protected config agree on the malformed value; shape must still refuse.
+        expected['engineering_fixture']=service['facts']['output_owner']['runner']['engineering_fixture']
+    if fault in ('unknown_expected','null_expected','empty_expected'):
+        with pytest.raises(f.ResourceError):provider.resolve(SimpleNamespace(kind='slurm_allocation',native_id='42'))
+        assert provider._pending_outputs==provider._joined_outputs=={}
+        return
+    provider.resolve(SimpleNamespace(kind='slurm_allocation',native_id='42'))
+    if fault=='ordinary_worker':
+        with pytest.raises(f.ResourceError):provider._join_scheduler_outputs(guests,observed_now=100)
+        assert provider._output_epoch is None and provider._joined_outputs=={}
+    else:
+        provider._join_scheduler_outputs(guests,observed_now=100)
+        assert provider._joined_outputs==provider._pending_outputs

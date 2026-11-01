@@ -498,6 +498,8 @@ class NativeFactsProvider:
             try:
                 require(type(expected) is dict and set(expected)=={'owner','controller_identity','runner','worker_generations'},
                     'qualification','closed output owner expectation required')
+                # Validate the same whole R (including its optional finite fixture
+                # scope) as controller and worker; never project that scope away.
                 _output_identity(expected['controller_identity']);_output_runner(expected['runner'])
                 owner=expected['owner'];require(type(owner) is dict and set(owner)=={'policy_sha256','qualification_sha256',
                     'source_graph_sha256','unit_generation_sha256','storage_identity','retention_ref'},'qualification','exact owner6 required')

@@ -153,7 +153,10 @@ def _runner_paths(root):
 
 
 def _output_runner(value):
-    exact(value,{'solver_executable','runner_revision','source_graph_sha256','julia_manifest_sha256','capture_executable','files'})
+    keys={'solver_executable','runner_revision','source_graph_sha256','julia_manifest_sha256','capture_executable','files'}
+    need(type(value) is dict and set(value) in (keys,keys|{'engineering_fixture'}),'output_binding')
+    if 'engineering_fixture' in value:
+        need(value['engineering_fixture']=='native-publication-v1','output_binding')
     solver=_output_store_path(value['solver_executable']);capture=_output_store_path(value['capture_executable'])
     need(matches(value['runner_revision'],r'[0-9a-f]{40}') and value['runner_revision']!='0'*40,'output_binding')
     _output_sha(value['source_graph_sha256']);_output_sha(value['julia_manifest_sha256'])
@@ -197,7 +200,100 @@ def _output_ref(value,*,schema=None,media='application/json'):
     need(value['media_type']==media and (schema is None or value['schema']==schema),'output_metadata');return value
 
 
-def _completed_metadata(launch,inputs,raws,root_inode):
+
+def _native_publication_fixture_mode(plan,*,execution_id,budget):
+    """Full original input selector, never a producer/source qualification.
+
+    Stream the owners' existing canonical-bytes-v1 preimage into SHA256. No
+    whole-plan copy or second JSON decode is needed. Only the top fingerprint,
+    worker_capacity and the three existing absolute YAML locator prefixes vary.
+    """
+    need(type(plan) is dict,'engineering_fixture_profile')
+    if plan.get('root_definition_id')!='native-publication-fixture-v1':return None
+    need(execution_id=='execution-1' and budget is not None,'engineering_fixture_profile')
+    # One bounded recursion stack, at most16384 key references for sorting,
+    # bounded UTF-8 chunks and the at-most4096-byte normalized locator leaves.
+    _owner_read_reserve(budget,655360)
+    count=0
+    def bounded(value,depth=0):
+        nonlocal count
+        count+=1;need(depth<=64 and count<=16384,'engineering_fixture_bound')
+        if type(value) is dict:
+            for key,item in value.items():
+                need(type(key) is str,'engineering_fixture_profile');bounded(key,depth+1);bounded(item,depth+1)
+        elif type(value) is list:
+            for item in value:bounded(item,depth+1)
+        else:need(value is None or type(value) in (str,int,bool,float),'engineering_fixture_profile')
+    bounded(plan)
+    names={'reference-2019-70k.yaml','analytical-diagnostic.yaml','native-publication-fixture.yaml'}
+    def locator(value):
+        need(type(value) is str and len(value.encode('utf-8'))<=4096,'engineering_fixture_profile')
+        path,separator,fragment=value.partition('#')
+        if path.startswith('/'):
+            name=os.path.basename(path);need(name in names,'engineering_fixture_profile')
+            return 'fixture-source:'+name+separator+fragment
+        return value
+    # Require actual history shapes before the canonical walk; no key, fragment,
+    # rule origin or ordered history entry is removed by this normalization.
+    try:
+        for execution in plan['executions']:
+            histories=[execution['provenance']['sources']]+[
+                section['input_assigning_histories'] for section in execution['resolved_snapshot']['sections'].values()]
+            for history in histories:
+                need(type(history) is dict,'engineering_fixture_profile')
+                for values in history.values():
+                    need(type(values) is list,'engineering_fixture_profile')
+                    for value in values:locator(value)
+            need(type(execution['resource_estimate']) is dict,'engineering_fixture_profile')
+    except (KeyError,TypeError,AttributeError) as error:raise Hold('engineering_fixture_profile') from error
+    digest=hashlib.sha256()
+    def canonical(value,path=()):
+        if value is None:digest.update(b'n;');return
+        if type(value) is bool:digest.update(b'b1;' if value else b'b0;');return
+        if type(value) in (str,int,float):
+            if type(value) is str:
+                if ((len(path)==6 and path[0]=='executions' and path[2:4]==('provenance','sources')) or
+                    (len(path)==8 and path[0]=='executions' and path[2:4]==('resolved_snapshot','sections') and
+                     path[5]=='input_assigning_histories')):value=locator(value)
+                length=sum(len(char.encode('utf-8')) for char in value)
+                digest.update(b's'+str(length).encode()+b':')
+                for offset in range(0,len(value),256):digest.update(value[offset:offset+256].encode('utf-8'))
+            else:
+                if type(value) is int:tag,payload=b'i',str(value).encode('ascii')
+                else:
+                    need(math.isfinite(value),'engineering_fixture_profile');tag,payload=b'f',struct.pack('>d',value).hex().encode('ascii')
+                digest.update(tag+str(len(payload)).encode()+b':'+payload)
+            return
+        if type(value) is list:
+            digest.update(b'a'+str(len(value)).encode()+b'[')
+            for index,item in enumerate(value):canonical(item,path+(index,))
+            digest.update(b']');return
+        need(type(value) is dict,'engineering_fixture_profile')
+        keys=sorted(key for key in value if not (path==() and key=='fingerprint') and not
+            (len(path)==3 and path[0]=='executions' and path[2]=='resource_estimate' and key=='worker_capacity'))
+        digest.update(b'm'+str(len(keys)).encode()+b'{')
+        for key in keys:canonical(key);canonical(value[key],path+(key,))
+        digest.update(b'}')
+    canonical(plan)
+    need(digest.hexdigest()=='376aedbbfa31311f40bdffdb988242613629d128c0a97e8cdd2d6b14b8c42e47',
+         'engineering_fixture_profile')
+    return 'native-publication-v1'
+
+
+def _submitted_plan_mode(raw,launch,budget):
+    # Prospective decode/object accounting, including whitespace-heavy originals.
+    # Counting punctuation/quotes inside strings can only overcharge this bound.
+    first=0;last=len(raw)
+    while first<last and raw[first] in b' \t\r\n':first+=1
+    while last>first and raw[last-1] in b' \t\r\n':last-=1
+    tokens=sum(raw.count(token) for token in (b'"',b'[',b'{',b':',b','))
+    budget.reserve(4*(len(raw)+1)+8*(last-first)+128*tokens)
+    try:plan=strict_json(raw.decode('utf-8'))
+    except (ResourceError,ValueError,UnicodeError,RecursionError) as error:raise Hold('engineering_fixture_profile') from error
+    return _native_publication_fixture_mode(plan,execution_id=launch['execution_id'],budget=budget)
+
+
+def _completed_metadata(launch,inputs,raws,root_inode,*,budget=None):
     """Finite metadata subset under the qualified actual producer callpath.
 
     The held owner reader prepays parsing before this call. This is no standalone
@@ -217,6 +313,8 @@ def _completed_metadata(launch,inputs,raws,root_inode):
     except (ResourceError,ValueError,UnicodeError) as error:raise Hold('output_metadata') from error
     need(all(type(value) is dict for value in docs.values()),'output_metadata')
     plan=docs['plan.json'];graph=docs['source-graph.json'];native=docs['native-execution.json']
+    mode=_native_publication_fixture_mode(plan,execution_id=launch['execution_id'],budget=budget)
+    need(mode==runner.get('engineering_fixture'),'engineering_fixture_binding')
     plan_sha=launch['files']['plan']['sha256'];fingerprint=plan.get('fingerprint');_output_sha(fingerprint)
     need(plan.get('schema')=='qcl-negf-scientific-plan-v2','output_scope_unsupported')
     exact(graph,{'format','revision','components'});need(graph['format']=='qcl-negf.git-graph.v1' and
@@ -267,7 +365,8 @@ def _completed_metadata(launch,inputs,raws,root_inode):
     result=docs['series_result.json'];selected=exact(docs['native-selection.json'],{'version','selected_inputs'})
     need(type(selected['version']) is int and selected['version']==1 and type(selected['selected_inputs']) is list and
         result.get('schema')=='qcl-negf-series-result-v4' and result.get('contract_set')=='qcl-negf.results.v2' and
-        result.get('status') in ('completed','completed_with_warnings') and result.get('plan_fingerprint')==fingerprint and
+        result.get('status') in (('failed',) if mode is not None else ('completed','completed_with_warnings')) and
+        (mode is None or result.get('selected_execution_id')==launch['execution_id']) and result.get('plan_fingerprint')==fingerprint and
         result.get('plan_scientific_fingerprint')==plan.get('scientific_fingerprint') and
         type(result.get('attempt_history',[])) is list and not result.get('attempt_history',[]),'output_scope_unsupported')
     need(type(plan.get('points')) is list and 0<len(plan['points'])<=256,'output_metadata')
@@ -282,8 +381,19 @@ def _completed_metadata(launch,inputs,raws,root_inode):
     observed=set();used=set()
     for point in points:
         point_id=point['id'];need(point_id in known and point_id not in observed and point['execution_id']==launch['execution_id'] and
-            type(point['attempt']) is int and 0<point['attempt']<2**64 and point['status'] in ('completed','completed_with_warnings'),'output_metadata')
+            type(point['attempt']) is int and 0<point['attempt']<2**64 and
+            point['status'] in (('failed',) if mode is not None else ('completed','completed_with_warnings')),'output_metadata')
         observed.add(point_id);data=point['data'];need(data.get('checkpoint_source_attempt') is None,'output_scope_unsupported')
+        if mode is not None:
+            # Honest constructor-only failure is confined to this qualified lane.
+            # No scientific pass is inferred from the physical output closure.
+            need(point.get('quality')=='invalid' and point.get('converged') is False and
+                type(point.get('observables')) is dict and point['observables'].get('scientific_accepted') is False and
+                point.get('warnings')==[dict(code='SYNTHETIC_NATIVE_PUBLICATION_FIXTURE',scope='execution',
+                    message='synthetic; not_scientific; constructor-only; no SCBA/Poisson')] and
+                'optical_attachment' in data and data['optical_attachment'] is None and
+                data.get('phase_source')==dict(status='disabled',session_id=None,current_path=None,reason='synthetic_fixture'),
+                'engineering_fixture_declaration')
         source=exact(data['native_source'],{'schema','kind','artifact_root','relation','selected_state','diagnostics','observations','reason'})
         need(source['schema']=='qcl-negf.native-point-source.v1' and source['kind']=='final' and source['relation']=='current_point_attempt' and
             source['reason'] is None,'output_scope_unsupported');_output_relative(source['artifact_root'],root=True)
@@ -895,7 +1005,10 @@ def _output_release_source(sources,calcjob,joined,runner):
     need(len(raw)==size and hashlib.sha256(raw).hexdigest()==snapshot['script_sha256'],'snapshot_changed')
     bash=joined['caller']['application']['configuration']['client']['bash_executable']
     _output_store_path(bash)
-    _review_native_script(raw,launch,runner['solver_executable'],bash,sources,calcjob_uuid=calcjob)
+    # Protected expectation only at this early snapshot check. The held original
+    # plan must independently match the full profile before any output is returned.
+    _review_native_script(raw,launch,runner['solver_executable'],bash,sources,calcjob_uuid=calcjob,
+                          engineering_fixture=runner.get('engineering_fixture'))
     need(b'export QCL_NEGF_CAPTURE_SPEC=capture-spec.json QCL_NEGF_NATIVE_CAPTURE_INPUT=native-execution.json' in raw,
         'output_scope_unsupported')
 
@@ -1143,7 +1256,7 @@ class OrdinaryAttemptOwner:
 
 def _bootstrap_operation():
     return Operation(dict(request_bytes=65536, response_bytes=262144, script_bytes=65536,
-                          metadata_bytes=8 * 1024 * 1024, memory_bytes=134217728,
+                          metadata_bytes=16 * 1024 * 1024, memory_bytes=134217728,
                           operation_seconds=90, command_seconds=15, cleanup_seconds=2,
                           maximum_pids=256, maximum_calls=64, maximum_files=2048))
 
@@ -1445,9 +1558,16 @@ def _caller_role(sources, row, argv, role, action, context):
              sources.origin(argv[0]) == row['executable'], 'application_origin')
 
 
-def _review_native_script(raw, launch, solver, bash, sources, *, calcjob_uuid):
+def _review_native_script(raw, launch, solver, bash, sources, *, calcjob_uuid,engineering_fixture=None):
     """One stock script subset; never execute or interpret arbitrary shell."""
     canonical_uuid(calcjob_uuid)
+    need(engineering_fixture in (None,'native-publication-v1'),'engineering_fixture_binding')
+    binding=(sources.qualification or {}).get('completed_final')
+    expected=None
+    if 'completed_final' in (sources.qualification or {}):
+        need(type(binding) is dict and 'runner' in binding,'output_binding')
+        expected=_output_runner(binding['runner']).get('engineering_fixture')
+    need(engineering_fixture==expected,'engineering_fixture_binding')
     lines = [line for line in raw.decode('utf-8').splitlines() if line]
     need(lines and lines[0].startswith('#!'), 'native_script')
     interpreter = lines.pop(0)[2:]
@@ -1479,7 +1599,8 @@ def _review_native_script(raw, launch, solver, bash, sources, *, calcjob_uuid):
     capture_export = ('export QCL_NEGF_CAPTURE_SPEC=capture-spec.json '
                       'QCL_NEGF_NATIVE_CAPTURE_INPUT=native-execution.json')
     need(lines[4]==guard and lines[5] in ('unset QCL_NEGF_CAPTURE_SPEC',capture_export), 'native_script_guard')
-    argv = [solver,'run-plan','plan.json',sources.policy['jobs_root']+'/'+launch['relative_execution_root'],
+    command='run-plan' if engineering_fixture is None else 'native-publication-fixture'
+    argv = [solver,command,'plan.json',sources.policy['jobs_root']+'/'+launch['relative_execution_root'],
             '--execution-id',launch['execution_id'],'--source-graph','source-graph.json']
     # Stock Scheduler single-quotes every code argument. A free shell token or
     # extra flag never becomes authority by merely producing the same shlex words.
@@ -1490,7 +1611,9 @@ def _review_native_script(raw, launch, solver, bash, sources, *, calcjob_uuid):
     if '--scratch-root' in lines[6]: raise Hold('native_scratch_binding_unavailable')
     # The legacy seven-argument class stays unmapped; neither branch is itself
     # proof of invocation birth or of a qualified native producer.
-    need(lines[6] in (expected[1:] if lines[5]==capture_export else expected), 'native_script_argv')
+    if engineering_fixture is not None:
+        need(lines[5]==capture_export and lines[6]==expected[1],'native_script_argv')
+    else:need(lines[6] in (expected[1:] if lines[5]==capture_export else expected), 'native_script_argv')
 
 
 def _reserve_private_record(value, budget, depth=0):
@@ -1593,7 +1716,7 @@ def _owner_read(policy, launch, budget, *, controls=None, technical_control=None
             budget.file(); next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
             walked.append((os.dup(parent), part, os.fstat(next_fd)))
             os.close(parent); parent = next_fd
-        original = os.fstat(parent); result = {}; script = None
+        original = os.fstat(parent); result = {}; script = None; mode=None
         for role, name in FILES.items():
             claim = launch['files'][role]
             limit = _original_input_limit(role, policy)
@@ -1606,6 +1729,7 @@ def _owner_read(policy, launch, budget, *, controls=None, technical_control=None
                 observed = {'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}
                 need(observed == claim, 'submitted_digest')
                 result[role] = observed
+                if role == 'plan':mode=_submitted_plan_mode(raw,launch,budget)
                 if role == 'submit_script':
                     script = base64.b64encode(raw).decode('ascii')
             finally:
@@ -1613,7 +1737,7 @@ def _owner_read(policy, launch, budget, *, controls=None, technical_control=None
         need(signature(original) == signature(os.fstat(parent)), 'submitted_directory_changed')
         for directory, name, info in walked:
             need(signature(info) == signature(os.stat(name, dir_fd=directory, follow_symlinks=False)), 'submitted_directory_changed')
-        return {'files': result, 'script': script}
+        return {'files': result, 'script': script,'engineering_fixture':mode}
     finally:
         os.close(parent)
         for directory, _, _ in walked:
@@ -1716,7 +1840,7 @@ def _owner_close_read(policy, launch, budget, controls, *, technical_control=Non
                 ancestors=[dict(name=name,signature=signature(info)) for name,info in walked]))
         if native_inputs is not None:
             _owner_read_reserve(budget,8*sum(len(raw) for raw in captured.values())+4096)
-            binding=_completed_metadata(launch,native_inputs,captured,roots[0]['directory'][:2]);captured.clear()
+            binding=_completed_metadata(launch,native_inputs,captured,roots[0]['directory'][:2],budget=budget);captured.clear()
         if durable:
             synced=set()
             # Only the finite opened publication ancestors inside the owned jobs
@@ -1771,6 +1895,7 @@ def _held_read_forecast(policy,launch,controls,technical,solver_logs,cap,native_
         sizes.extend((16384,16384))
         workspace=8*(sum(row['bytes'] for row in controls[:2])+sum(launch['files'][role]['bytes'] for role in
             ('plan','source_graph','native_execution'))+2*16384)+4096
+        if native_inputs['runner'].get('engineering_fixture') is not None:workspace+=655360
     # Two finite reads per named file, including each read_fd EOF request.
     # Unexpected repeated short reads exhaust this slice before another read.
     # Held-mode read_fd uses the admitted fstat size, not the loose leaf ceiling.
@@ -1939,7 +2064,129 @@ def _read_submitted_files_as_owner(policy, launch, budget, *, controls=None, tec
             budget.reserve(8*(technical_bytes+1)+8*len(encoded(technical))+65536)
         for _ in range(8*depth+64+(8 if technical is not None else 0)):budget.file()
     else:
-        budget.reserve(cap * 3); budget.file()
+        # The original reader discovers the exact JSON workspace only after its
+        # owned raw read. Each further debit is paid by THIS parent Operation
+        # before the child may consume it; no fork-local charge is refundable.
+        need(cap*3<=budget.limits['metadata_bytes']-budget.bytes,'operation_bound')
+        budget.reserve(cap * 3)
+        need(budget.files<budget.limits['maximum_files'],'operation_file_bound');budget.file()
+        limits=policy['limits']
+        actual_bound=sum(_original_input_limit(role,policy)+1 for role in FILES)
+        message_limit=limits['maximum_files']+2*sum(
+            (_original_input_limit(role,policy)+4095)//4096+2 for role in FILES)+16
+        read_end=write_end=ack_read=ack_write=None;selector=None;pid=None;reaped=False;primary=None
+        try:
+            read_end,write_end=os.pipe2(os.O_CLOEXEC)
+            ack_read,ack_write=os.pipe2(os.O_CLOEXEC)
+            pid=os.fork()
+            if pid==0:
+                initial_actual=budget.actual_bytes;waiter=None
+                try:
+                    os.close(read_end);os.close(ack_write)
+                    os.setgroups([]);os.setgid(policy['client_uid']);os.setuid(policy['client_uid'])
+                    waiter=selectors.DefaultSelector();waiter.register(ack_read,selectors.EVENT_READ)
+                    def send(kind,value):
+                        raw=encoded(dict(kind=kind,value=value,actual_bytes=budget.actual_bytes-initial_actual))
+                        need(len(raw)<=cap,'owner_read_bound');raw=struct.pack('!I',len(raw))+raw;offset=0
+                        while offset<len(raw):
+                            budget.before();count=os.write(write_end,raw[offset:])
+                            need(count>0,'owner_read_short_write');offset+=count
+                    reserve=budget.reserve;file=budget.file
+                    def paid(kind,value):
+                        send(kind,value)
+                        while not waiter.select(min(.1,max(.001,budget.deadline-time.monotonic()))):budget.before()
+                        budget.before();need(os.read(ack_read,2)==b'1','owner_read_release')
+                        # Retain the inherited local limit/deadline as well. The
+                        # parent has already retained the same debit on failure.
+                        if kind=='reserve':reserve(value)
+                        else:file()
+                    budget.reserve=lambda size:paid('reserve',size)
+                    budget.file=lambda:paid('file',None)
+                    result=_owner_read(policy,launch,budget)
+                    send('result',result)
+                    waiter.close();waiter=None
+                    os.close(ack_read);os.close(write_end);os._exit(0)
+                except BaseException as error:
+                    try:send('failure',dict(failure=type(error).__name__,message=str(error)[:4096],
+                        reason=error.reason if isinstance(error,Hold) else 'owner_read_failed'))
+                    except BaseException:pass
+                    os._exit(1)
+            os.close(write_end);write_end=None;os.close(ack_read);ack_read=None
+            selector=selectors.DefaultSelector();selector.register(read_end,selectors.EVENT_READ)
+            def receive(size):
+                raw=bytearray()
+                while len(raw)<size:
+                    budget.before()
+                    if not selector.select(min(.1,max(.001,budget.deadline-time.monotonic()))):continue
+                    chunk=os.read(read_end,size-len(raw));need(chunk,'owner_read_failed')
+                    raw.extend(chunk);budget.actual_bytes+=len(chunk)
+                return bytes(raw)
+            reported=0;result=failure=None
+            for _ in range(message_limit):
+                size=struct.unpack('!I',receive(4))[0];need(0<size<=cap,'owner_read_bound')
+                frame=exact(strict_json(receive(size).decode()),{'kind','value','actual_bytes'})
+                count=frame['actual_bytes'];need(type(count) is int and reported<=count<=actual_bound,'owner_read_bound')
+                budget.actual_bytes+=count-reported;reported=count
+                kind=frame['kind'];value=frame['value']
+                if kind=='reserve':
+                    need(type(value) is int and 0<=value<=limits['metadata_bytes'],'owner_read_bound')
+                    need(value<=budget.limits['metadata_bytes']-budget.bytes,'operation_bound')
+                    budget.reserve(value)
+                elif kind=='file':
+                    need(value is None,'owner_read_bound')
+                    need(budget.files<budget.limits['maximum_files'],'operation_file_bound');budget.file()
+                elif kind=='result':
+                    result=exact(value,{'files','script','engineering_fixture'});break
+                elif kind=='failure':
+                    failure=exact(value,{'failure','message','reason'})
+                    need(all(type(v) is str and len(v)<=4096 for v in failure.values()),'owner_read_bound');break
+                else:raise Hold('owner_read_bound')
+                budget.before();need(os.write(ack_write,b'1')==1,'owner_read_release')
+            else:raise Hold('owner_read_bound')
+            os.close(ack_write);ack_write=None
+            while True:
+                budget.before()
+                if selector.select(min(.1,max(.001,budget.deadline-time.monotonic()))):
+                    need(os.read(read_end,1)==b'','owner_read_extra');break
+            while True:
+                budget.before();waited,status=os.waitpid(pid,os.WNOHANG)
+                if waited:reaped=True;break
+                time.sleep(.005)
+            if os.waitstatus_to_exitcode(status)!=0 or failure is not None:
+                primary_frame=engine.CommandFailure(failure or dict(failure='unknown child outcome'))
+                _preclaim_diagnostic(primary_frame)
+                fatal={'MemoryError':MemoryError,'KeyboardInterrupt':KeyboardInterrupt,
+                    'AssertionError':AssertionError,'RuntimeError':RuntimeError,'SystemExit':SystemExit}
+                cls=None if failure is None else fatal.get(failure['failure'])
+                if cls is not None:raise cls(failure['message']) from primary_frame
+                raise Hold('owner_read_failed') from primary_frame
+            need(result is not None,'owner_read_failed');return result
+        except BaseException as error:
+            primary=error;raise
+        finally:
+            cleanup=None
+            for fd in (read_end,write_end,ack_read,ack_write):
+                if fd is None:continue
+                try:os.close(fd)
+                except BaseException as error:
+                    if cleanup is None:cleanup=error
+                    else:cleanup.add_note('original reader cleanup also raised '+type(error).__name__)
+            if selector is not None:
+                try:selector.close()
+                except BaseException as error:
+                    if cleanup is None:cleanup=error
+            if pid is not None and pid>0 and not reaped:
+                try:os.kill(pid,9)
+                except ProcessLookupError:pass
+                except BaseException as error:
+                    if cleanup is None:cleanup=error
+                try:os.waitpid(pid,os.WNOHANG)
+                except ChildProcessError:pass
+                except BaseException as error:
+                    if cleanup is None:cleanup=error
+            if cleanup is not None:
+                if primary is not None:primary.add_note('original reader cleanup also raised '+type(cleanup).__name__)
+                else:raise cleanup
     read_end, write_end = os.pipe2(os.O_CLOEXEC)
     pid = os.fork()
     if pid == 0:
@@ -2341,7 +2588,7 @@ class NativeSources:
         need(len(script)==launch['files']['submit_script']['bytes'] and
              hashlib.sha256(script).hexdigest()==launch['files']['submit_script']['sha256'], 'submitted_digest')
         _review_native_script(script,launch,envelope['solver_executable'],context['configuration']['client']['bash_executable'],self,
-                              calcjob_uuid=calcjob_uuid)
+                              calcjob_uuid=calcjob_uuid,engineering_fixture=submitted.get('engineering_fixture'))
         self._refresh_caller(action)
         self._actor = {'calcjob_uuid':calcjob_uuid,'action':action,'launch':actual,
                        'execution_sha256':hashlib.sha256(raw).hexdigest()}

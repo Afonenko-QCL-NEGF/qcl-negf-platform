@@ -46,7 +46,7 @@ scientific owner; existing `CompletionEvidence` и public API не меняют�
 
 ## Ограниченный completed-final output факт
 
-Initial supported subset — успешный original native run: literal `COMPLETED` и `ExitCode=0:0`,
+Initial supported subset — физически завершённый original native run: literal `COMPLETED` и `ExitCode=0:0`,
 все selected points имеют current produced native closed final, пустой attempt history и direct
 capture-source v3 epoch0. Failure/cancel/nonzero, legacy/unknown source, technical-present,
 checkpoint-only/restore/import/reopened producer и неполные original records сохраняют HOLD/full
@@ -75,8 +75,68 @@ capture_runtime. Первые десять paths выводятся из solver 
 actual immutable origin выбранного executable. Один файл ≤1MiB, сумма ≤2MiB, aliases между roles
 отвергаются. Exact bytes/hash/origin/length проверяются existing reader; 13 совпавших SHA не
 заменяют qualification whole published build, loaded modules, fixed callpath и native creator.
-Root заполняет поле только после actual publication/build/install/native qualification. Placeholder
-hash, self-reported locator PID/start ticks и один exit status не являются такой qualification.
+Root связывает поле с actual publication/build/install, loaded-source/creator qualification и
+соответствующими native evidence. Для первого engineering acceptance допускается отдельно
+source-qualified engineering admission при честном native status `NOT_PASSED`; оно не является
+положительной native qualification. Placeholder hash, self-reported locator PID/start ticks и один
+exit status не являются такой qualification.
+
+Внутри existing `runner` разрешён один optional scalar
+`engineering_fixture="native-publication-v1"`. Отсутствие допускает прежний `run-plan` scope;
+точное значение допускает только fixed `native-publication-fixture` с теми же eleven native argv
+words и включённым capture export. Null/empty/unknown отвергаются. Engineering R не квалифицирует
+ordinary run-plan, ordinary R не квалифицирует fixture. Whole R сохраняется и строго сравнивается
+между protected host expectation и fresh worker tuple; собственных новых public inputs, actions,
+RPC/DTO/schema, stores или journal fields нет.
+
+Original submitted-file reader под dropped UID читает исходный `plan.json`, проверяет raw
+bytes/SHA и возвращает только finite derived mode. Decode/object workspace оплачивается до JSON
+materialization из той же Operation. Reserved `root_definition_id=native-publication-fixture-v1`
+требует полного profile-v3 (canonical SHA256
+`376aedbbfa31311f40bdffdb988242613629d128c0a97e8cdd2d6b14b8c42e47`). Из preimage исключаются
+только top-level fingerprint и execution resource_estimate.worker_capacity; только absolute
+provenance locators трёх исходных YAML получают переносимый prefix. Filenames, fragments, порядок
+histories, rule origins, configuration/model/scientific fingerprints и все остальные keys/values
+сохраняются. Bounded streaming canonical hash не создаёт второй целый план. Это selector,
+сам по себе не creator/source proof.
+
+Preflight связывает derived original mode, protected R и literal original submit-script. В S3
+ранний root-owned script snapshot проверяется относительно protected R; затем existing held-FD
+reader независимо повторяет полный original plan/profile/R join. Только после этого, successful
+W1/held-FD recheck/close и остальных original source/generation gates возможен output. Поздняя
+подмена plan/script, несовпадение mode или malformed original закрывают весь packet без partial
+completion. Общий debit сохраняется без refund/reset; deadline и остальные guards остаются прежними.
+
+Original reader при `controls=None` сохраняет невозвратный debit через настоящую fork boundary:
+перед child reserve/file выполняется bounded private debit frame, parent списывает его в исходной
+Operation и только затем разрешает child действие. Child дополнительно сохраняет собственные
+inherited cap/deadline checks. Private frame count, byte lengths и monotonic actual-byte samples
+ограничены existing original-role/operation bounds; mode не становится public field/journal.
+Parent принимает metadata только после checked EOF/child reap. Ошибка, cancellation, timeout или
+неопределённый cleanup не возвращают уже оплаченный credit, а дальнейшая работа использует тот же
+ledger. Это отдельный original-input arm; existing held-FD forecast/slices/W1 path не меняется.
+
+Uniform operational bootstrap ceiling metadata_bytes —16MiB для всех routes. Это предел
+невозвратного metadata accounting, отдельно от actual resident memory, VM/unit MemoryMax и научных
+параметров. После исправления fork ledger measured Source/L preflight на full131473-byte original
+со shared parent payments требует около9.27 млн байт (8.84MiB): два original actor query, protected reads,
+original child decode/canonical/frame и script decode. Поэтому private8MiB честно отказывает до
+неоплаченного canonical действия; private16MiB допускается только через обычный only-tightening
+`_load_policy`. Policy выше uniform ceiling отвергается; остальные memory/time/packet/role caps
+не менялись. Родительский счётчик не зависит от fixture mode и не обнуляется между стадиями.
+Private native policy ещё не установлена/не квалифицирована этим source change. Финальная
+достаточность MemoryMax, callee/process RSS и реальной installed qualification требует Root N;
+metadata prepay и local fixture peak не являются таким доказательством.
+
+Только этот engineering scope допускает constructor result `failed` и point `failed/invalid`,
+`converged=false`, `observables.scientific_accepted=false`, exact synthetic execution warning
+`SYNTHETIC_NATIVE_PUBLICATION_FIXTURE` с message
+`synthetic; not_scientific; constructor-only; no SCBA/Poisson`, disabled synthetic phase и absent
+optical attachment. Selected execution обязан совпадать с original launch. Это физическая
+публикация намеренно не принятого scientific carrier. Ordinary failed/nonzero/cancel и
+technical-present остаются HOLD. Standard parser сохраняет scientific failure; stationary
+`native5_final_writer_unavailable` gate не снимается. Source/L fixtures не доказывают actual
+installed source, engineering native acceptance, resource release или scientific acceptance.
 
 Unit SHA — SHA256 canonical JSON exact projection:
 
