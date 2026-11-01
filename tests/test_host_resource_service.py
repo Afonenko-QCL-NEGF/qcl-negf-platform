@@ -68,6 +68,120 @@ def limits_for_rpc():
                 maximum_pids=256, maximum_calls=64, maximum_files=128)
 
 
+@pytest.mark.parametrize('status',[0,7])
+def test_forced_ssh_keeps_actual_python_parent_and_exact_streams(monkeypatch,capfd,status):
+    """Real owned local child; the substituted argv is explicitly not sudo/N."""
+    import host_resource_service as s
+    import subprocess,json,os
+    original=subprocess.Popen;seen=[]
+    def child(argv,**kwargs):
+        seen.append(argv)
+        script=('import os,sys,json; print(json.dumps(dict(parent=os.getppid(),argv=sys.argv[1:]))); '
+                'print("preserved stderr",file=sys.stderr);sys.exit('+str(status)+')')
+        return original([sys.executable,'-c',script,*argv],**kwargs)
+    monkeypatch.setattr(subprocess,'Popen',child)
+    monkeypatch.setattr(s.os,'execvp',lambda *a:pytest.fail('fixed Python ingress parent disappeared'))
+    monkeypatch.setenv('SSH_ORIGINAL_COMMAND','/fixed/qcl-negf-resource-rpc facts scheduler-facts e30=')
+    with pytest.raises(SystemExit) as caught:s.ssh_main('facts',helper_prefix='/fixed')
+    assert caught.value.code==status
+    stdout,stderr=capfd.readouterr();packet=json.loads(stdout)
+    assert packet['parent']==os.getpid()
+    assert packet['argv']==seen[0]==['sudo','-n','/fixed/qcl-negf-resource-facts','scheduler-facts','e30=']
+    assert stderr=='preserved stderr\n'
+
+
+def test_forced_ssh_owned_timeout_is_bounded_and_reaped(monkeypatch):
+    import host_resource_service as s
+    import subprocess,os,time
+    original=subprocess.Popen;children=[]
+    def child(argv,**kwargs):
+        process=original([sys.executable,'-c','import time;time.sleep(30)'],**kwargs)
+        children.append(process);return process
+    monkeypatch.setattr(subprocess,'Popen',child)
+    started=time.monotonic()
+    with pytest.raises(s.ResourceError,match='timeout'):
+        s._wait_ssh_helper(['sudo','-n','fixed'],timeout_seconds=.3,cleanup_seconds=.15)
+    assert time.monotonic()-started<2 and len(children)==1
+    with pytest.raises(ChildProcessError):os.waitpid(children[0].pid,os.WNOHANG)
+
+
+def test_forced_ssh_cancellation_keeps_primary_and_reaps_owned_child(monkeypatch):
+    import host_resource_service as s
+    import subprocess,os
+    original=subprocess.Popen;children=[];primary=KeyboardInterrupt('original cancellation')
+    def child(argv,**kwargs):
+        process=original([sys.executable,'-c','import time;time.sleep(30)'],**kwargs)
+        children.append(process);return process
+    monkeypatch.setattr(subprocess,'Popen',child)
+    original_status=s.engine._command_child_status;calls=[]
+    def interrupted(process):
+        calls.append(1)
+        if len(calls)==1:raise primary
+        return original_status(process)
+    monkeypatch.setattr(s.engine,'_command_child_status',interrupted)
+    with pytest.raises(KeyboardInterrupt) as caught:s._wait_ssh_helper(['sudo','-n','fixed'])
+    assert caught.value is primary
+    with pytest.raises(ChildProcessError):os.waitpid(children[0].pid,os.WNOHANG)
+
+
+@pytest.fixture
+def fixed_facts_ingress(monkeypatch):
+    """Explicit SOURCE/L process/origin operands, not installed root authority."""
+    import host_resource_service as s
+    import native_attempt as n
+    root='/nix/store/platform-source/ops';python='/nix/store/python/bin/python3'
+    monkeypatch.setattr(s,'__file__',root+'/host_resource_service.py')
+    monkeypatch.setattr(n,'__file__',root+'/native_attempt.py')
+    monkeypatch.setattr(s.os,'getuid',lambda:0);monkeypatch.setattr(s.os,'geteuid',lambda:0)
+    monkeypatch.setattr(s.os,'getpid',lambda:100);monkeypatch.setattr(s.os,'getppid',lambda:90)
+    monkeypatch.setattr(s.sys,'executable',python);monkeypatch.setattr(s.sys,'argv',['-c','scheduler-facts','e30='])
+    monkeypatch.setenv('SUDO_UID','3002')
+    config=dict(role='controller',facts_uid=3002,sudo_executables=['/nix/store/sudo/bin/sudo'])
+    rows={100:dict(pid=100,ppid=90,uids=[0]*4,start_ticks=30,cgroup='/ssh.session',executable=python),
+        90:dict(pid=90,ppid=80,uids=[0]*4,start_ticks=20,cgroup='/ssh.session',executable=config['sudo_executables'][0]),
+        80:dict(pid=80,ppid=70,uids=[3002]*4,start_ticks=10,cgroup='/ssh.session',executable=python)}
+    for row in rows.values():row.update(state='S',comm='explicit fixture process')
+    prefix="import sys; sys.path.insert(0, '"+root+"'); import host_resource_service as m; "
+    argv={100:[python,'-I','-c',prefix+"sys.exit(m.main('facts'))",'scheduler-facts','e30='],
+        90:['sudo','-n','/run/current-system/sw/bin/qcl-negf-resource-facts','scheduler-facts','e30='],
+        80:[python,'-I','-c',prefix+"m.ssh_main('facts')"]}
+    sources=n.NativeSources({},n._bootstrap_operation())
+    monkeypatch.setattr(sources,'process',lambda pid:dict(rows[pid]))
+    monkeypatch.setattr(sources,'command_line',lambda pid:list(argv[pid]))
+    monkeypatch.setattr(s.engine,'public_binary_origin',lambda budget,path,**kw:dict(path=str(path),chain=[]))
+    return s,sources,config,rows,argv
+
+
+@pytest.mark.parametrize('fault',['none','literal_python_entry','same_uid_shell','root_shell','wrong_module','different_interpreter','sudo_argv','missing_sudo'])
+def test_scheduler_ingress_requires_actual_retained_fixed_chain(fixed_facts_ingress,monkeypatch,fault):
+    s,sources,config,rows,argv=fixed_facts_ingress
+    if fault=='same_uid_shell':argv[80]=['/bin/sh','-c','pretend facts']
+    if fault=='root_shell':argv[100]=[s.sys.executable,'-c','import host_resource_service']
+    if fault=='wrong_module':argv[80][3]=argv[80][3].replace('platform-source','other-source')
+    if fault=='different_interpreter':rows[80]['executable']='/nix/store/other/bin/python3'
+    if fault=='sudo_argv':argv[90][2]='/different/root-helper'
+    if fault=='missing_sudo':monkeypatch.delenv('SUDO_UID')
+    if fault=='literal_python_entry':argv[100][0]=argv[80][0]='python3'
+    if fault in ('none','literal_python_entry'):
+        first=s._scheduler_facts_ingress(sources,config)
+        assert first==s._scheduler_facts_ingress(sources,config)
+    else:
+        with pytest.raises((s.ResourceError,__import__('native_attempt').Hold)):
+            s._scheduler_facts_ingress(sources,config)
+
+
+def test_scheduler_ingress_snapshot_detects_current_helper_selector_switch(fixed_facts_ingress,monkeypatch):
+    s,sources,config,rows,argv=fixed_facts_ingress
+    selected={'output':'/nix/store/current-helper/bin/facts'}
+    def origin(budget,path,**kw):
+        return dict(path=selected['output'] if str(path).endswith('/qcl-negf-resource-facts') else str(path),chain=[])
+    monkeypatch.setattr(s.engine,'public_binary_origin',origin)
+    before=s._scheduler_facts_ingress(sources,config)
+    selected['output']='/nix/store/replacement-helper/bin/facts'
+    after=s._scheduler_facts_ingress(sources,config)
+    assert before!=after
+
+
 def test_rpc_inherited_limit_before_snapshot_and_primary_failure(monkeypatch):
     import host_resource_facts as f
     import native_attempt as n
@@ -89,6 +203,51 @@ def test_rpc_inherited_limit_before_snapshot_and_primary_failure(monkeypatch):
         f.trusted_rpc(route, 'attempt-facts', {}, run=lambda *a, **kw: pytest.fail('RPC after failure'),
                       trust_snapshot_root='/protected/local/trust-snapshots', existing_budget=budget)
     assert captured.value is primary and budget.bytes > 0
+
+
+@pytest.mark.parametrize('case',['exact','request_short','decoder_short','large','cancel'])
+def test_inherited_rpc_prepays_new_request_and_decoder_not_another_transport(monkeypatch,case):
+    import host_resource_facts as f,native_attempt as n
+    route=dict(target='facts@worker',known_hosts='/protected/hosts',identity_file='/protected/key',helper='/fixed/rpc',role='facts')
+    class Trusted:
+        def __str__(self):return '/protected/key'
+        def stat(self):return type('Info',(),{'st_mode':0o600})()
+    monkeypatch.setattr(f,'trusted_root_path',lambda *a,**kw:Trusted())
+    events=[];budget=n.Operation(limits_for_rpc());primary=KeyboardInterrupt('original RPC cancellation')
+    monkeypatch.setattr(f.command_engine,'read_protected_file',lambda *a,**kw:events.append('trust-read') or b'key')
+    monkeypatch.setattr(f.command_engine,'freeze_ssh_trust',lambda *a,**kw:events.append('snapshot') or {'path':'snapshot'})
+    monkeypatch.setattr(f.command_engine,'ssh',lambda target,argv,**kw:kw['run'](['ssh','fixed']))
+    raw='{"ok":1}' if case!='large' else '{"large":"'+'x'*200000+'"}'
+    def run(*a,**kw):
+        events.append('command')
+        if case=='cancel':raise primary
+        if case=='decoder_short':budget.bytes=budget.limits['metadata_bytes']-1
+        return raw
+    if case=='request_short':budget.bytes=budget.limits['metadata_bytes']-1
+    parser=f.strict_json
+    def parse(value):events.append('parse');return parser(value)
+    monkeypatch.setattr(f,'strict_json',parse)
+    if case=='exact':
+        assert f.trusted_rpc(route,'attempt-facts',{'version':1},run=run,existing_budget=budget)=={'ok':1}
+        # No command charge in this explicit transport seam. Its real caller
+        # separately prepays four response caps before running the process.
+        assert budget.bytes<200000 and events[-1]=='parse'
+    else:
+        with pytest.raises(KeyboardInterrupt if case=='cancel' else n.Hold) as caught:
+            f.trusted_rpc(route,'attempt-facts',{'version':1},run=run,existing_budget=budget)
+        if case=='cancel':assert caught.value is primary
+        if case=='request_short':assert events==[]
+        if case in ('large','decoder_short'):assert 'command' in events and 'parse' not in events
+
+
+def test_scheduler_root_route_enters_single_operation_before_generic_config(monkeypatch):
+    import host_resource_service as s,native_attempt as n
+    monkeypatch.setattr(s.os,'geteuid',lambda:0)
+    monkeypatch.setattr(s.sys,'argv',['-c','scheduler-facts','e30='])
+    monkeypatch.setattr(s,'read_root_json',lambda *a:pytest.fail('configuration outside factory operation'))
+    packet=dict(schema='qcl.host-resource-scheduler-facts.v1',jobs={},outputs={})
+    monkeypatch.setattr(n,'capture_scheduler_output_facts',lambda:packet)
+    assert s.root_main('facts') is packet
 
 
 def service(tmp_path):
@@ -124,6 +283,33 @@ def test_request_reaches_host_full_grant_before_guest_fit_and_duplicate_no_mutat
     assert s.request_native(d)['phase']=='RUN' and len(b.calls)==1
     before=store.state_path.read_bytes();s.read_native_status(d.workload)
     assert store.state_path.read_bytes()==before
+
+
+@pytest.mark.parametrize('outcome',['success','recoverable','fatal','cancel'])
+def test_service_discards_native_output_pending_at_every_invocation_exit(tmp_path,monkeypatch,outcome):
+    """Typed SOURCE/L provider seam; seeded private maps carry no authority."""
+    from host_resource_facts import NativeFactsProvider
+    s,d,m,c,b,store,e,old=service(tmp_path);old.available=384
+    provider=NativeFactsProvider(c.policy,{},b,None,sources=object());s.provider=provider
+    error={'success':None,'recoverable':m.ResourceError('cleanup','synthetic incomplete output'),
+        'fatal':MemoryError('original fatal'),'cancel':KeyboardInterrupt('original cancellation')}[outcome]
+    def resolve(ref):
+        provider._output_epoch=provider._joined_epoch=object()
+        provider._pending_outputs={'synthetic':'pending'};provider._joined_outputs={'synthetic':'joined'}
+        provider.last=('old','guest');return old.resolve(ref)
+    def capture(*args,**kwargs):
+        if error is not None:raise error
+        return old.request_facts(*args,**kwargs)
+    monkeypatch.setattr(provider,'resolve',resolve);monkeypatch.setattr(provider,'request_facts',capture)
+    monkeypatch.setattr(provider,'guest_admission',old.guest_admission)
+    if outcome in ('fatal','cancel'):
+        with pytest.raises(type(error)) as caught:s.request_native(d)
+        assert caught.value is error
+    else:
+        view=s.request_native(d)
+        assert view['failure_code']==('cleanup' if outcome=='recoverable' else None)
+    assert provider._output_epoch is provider._joined_epoch is provider.last is None
+    assert provider._pending_outputs==provider._joined_outputs=={}
 
 
 def test_unknown_never_replays_and_missing_generation_does_not_mint_identity(tmp_path):
