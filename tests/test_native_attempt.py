@@ -275,7 +275,8 @@ def test_noarg_scheduler_factory_preserves_complete_jobs_without_optional_author
 
 
 @pytest.mark.parametrize('fault',[None,'no_close','legacy','technical','partial_pair','partial_original','forged_generation',
-    'duplicate','nine','cancel','late_source','raw_corruption'])
+    'duplicate','nine','cancel','late_source','raw_corruption','fixture_positive','fixture_ordinary_script',
+    'fixture_ordinary_r','fixture_wrong_held_plan','fixture_late_held_plan'])
 def test_scheduler_output_selection_is_finite_atomic_and_uses_original_owner(tmp_path,monkeypatch,fault):
     """Composition L: real private store/read/lock and original join; mocked OS,
     installed-source and held-reader operands remain explicit synthetic seams.
@@ -287,6 +288,23 @@ def test_scheduler_output_selection_is_finite_atomic_and_uses_original_owner(tmp
     source.policy.update(private_root=str(tmp_path),jobs_root='/srv/qcl-negf/jobs',native_result_prefix='native',
         slurm=dict(cluster='cluster'),limits=budget.limits,_policy_sha256='e'*64)
     store=m.AttemptStore(tmp_path);worker=p20_worker();runner=p20_runner()
+    publication=fault.startswith('fixture_') if isinstance(fault,str) else False
+    metadata=None;fixture_script=None
+    if publication:
+        launch,inputs,raws=publication_metadata_profile();runner=inputs['runner'];metadata=(launch,inputs,raws)
+        if fault=='fixture_ordinary_r':del runner['engineering_fixture']
+        fixture_script=NATIVE_ORIGIN_SCRIPT.replace(b"'run-plan'",b"'native-publication-fixture'").replace(b"'execution'",b"'execution-1'")
+        fixture_script=fixture_script.replace(b'unset QCL_NEGF_CAPTURE_SPEC',b'export QCL_NEGF_CAPTURE_SPEC=capture-spec.json QCL_NEGF_NATIVE_CAPTURE_INPUT=native-execution.json')
+        fixture_script=fixture_script.replace(b'fixture-release',launch['release_id'].encode()).replace(b'/nix/store/synthetic/bin/qcl-negf',runner['solver_executable'].encode())
+        fixture_script=fixture_script.replace(b'/srv/qcl-negf/jobs/native/new-domain',('/srv/qcl-negf/jobs/'+launch['relative_execution_root']).encode()).replace(NATIVE_ORIGIN_CALCJOB.encode(),calc.encode())
+        if fault=='fixture_ordinary_script':fixture_script=fixture_script.replace(b"'native-publication-fixture'",b"'run-plan'")
+        launch['files']['submit_script']=dict(bytes=len(fixture_script),sha256=hashlib.sha256(fixture_script).hexdigest())
+        records['claim.json']['launch']=launch
+        records['dispatch.json']['snapshot']['script_sha256']=launch['files']['submit_script']['sha256']
+        original=records['dispatch.json']['native'];original['script_sha256']=launch['files']['submit_script']['sha256']
+        original['argv']=source._argv(launch,records['dispatch.json']['snapshot'],records['claim.json']['dispatch_id'])
+        original['owner']['actor'].update(launch=copy.deepcopy(launch),execution_sha256=launch['files']['native_execution']['sha256'])
+        monkeypatch.setattr(source,'origin',lambda path:path)
     controller=dict(identity=dict(machine_id=records['claim.json']['context']['machine_id'],boot_id=records['claim.json']['context']['boot_id'],
         kernel='synthetic-kernel',dmi_uuid='33333333-3333-4333-8333-333333333333'),units=[p20_unit('qcl-negf-aiida.service'),p20_unit('qcl-negf-api.service')])
     generation=dict(controller=controller,workers=[worker]);gsha=hashlib.sha256(m.encoded(generation)).hexdigest()
@@ -297,7 +315,7 @@ def test_scheduler_output_selection_is_finite_atomic_and_uses_original_owner(tmp
     jobs={};allrecords={};fields_by_job={};closed_by_calc={};witnesses={}
     count=9 if fault=='nine' else 2 if fault=='duplicate' else 1
     for i in range(count):
-        current=copy.deepcopy(records);cid=str(uuid.UUID(int=i+1));jobid='42' if fault=='duplicate' else str(42+i)
+        current=copy.deepcopy(records);cid=calc if publication else str(uuid.UUID(int=i+1));jobid='42' if fault=='duplicate' else str(42+i)
         for name in ('ack.json','job.json','allocation.json'):current[name]['job_id']=jobid
         current['dispatch.json']['native']['owner']['actor']['calcjob_uuid']=cid
         f={**fields,'JobId':jobid};raw=' '.join(k+'='+v for k,v in f.items());jobs[jobid]=facts.parse_slurm_jobs(raw,cluster='cluster')[jobid]
@@ -326,11 +344,23 @@ def test_scheduler_output_selection_is_finite_atomic_and_uses_original_owner(tmp
     monkeypatch.setattr(m,'protected_read',lambda path,budget,limit=65536:m.encoded(dict(calcjob_uuid=next(iter(allrecords)),domain=records['claim.json']['launch']['relative_execution_root'])))
     def release(*args):
         source_calls.append(True)
+        if publication:
+            m._review_native_script(fixture_script,args[2]['launch'],runner['solver_executable'],'/bin/bash',source,
+                calcjob_uuid=args[1],engineering_fixture=runner.get('engineering_fixture'))
         if fault=='late_source' and len(source_calls)>1:raise m.Hold('release_binding_changed')
     monkeypatch.setattr(m,'_output_release_source',release)
     def close(owner,document,job,context,observed,controls,**kwargs):
         calls.append(document['calcjob_uuid']);assert kwargs['facts_guard'] is guard and kwargs['facts_inputs']['runner']==runner
         if fault=='cancel':raise primary
+        if publication:
+            launch,inputs,raws=metadata
+            assert document['launch']==launch and kwargs['facts_inputs']==inputs
+            changed=copy.deepcopy(raws)
+            if fault=='fixture_wrong_held_plan':
+                plan=json.loads(changed['plan.json']);plan['root_definition_id']='ordinary';changed['plan.json']=m.encoded(plan)
+            proof=m._completed_metadata(launch,inputs,changed,(11,12),budget=source.budget)
+            if fault=='fixture_late_held_plan':
+                changed['plan.json']+=b' ';m._completed_metadata(launch,inputs,changed,(11,12),budget=source.budget)
         cid=document['calcjob_uuid'];closed=closed_by_calc[cid];witness=witnesses[cid]
         return dict(original_close=(closed,m.encoded(closed)),original_observation=(witness,m.encoded(witness)),
             current_worker=observed,w1_before={'output_generation':generation},w1_after={'output_generation':generation},
@@ -338,8 +368,13 @@ def test_scheduler_output_selection_is_finite_atomic_and_uses_original_owner(tmp
     monkeypatch.setattr(m.OrdinaryAttemptOwner,'_close',close)
     def guard():guards.append(True)
     if fault=='raw_corruption':fields_by_job['42']['job']['raw']+=' JobId=42'
+    frozen={str(p.relative_to(store.root)):p.read_bytes() for p in store.root.rglob('*') if p.is_file()}
     selected=lambda:m._scheduler_output_entries(source,store,jobs,records['claim.json']['context'],runner,guard)
-    if fault in ('partial_pair','partial_original','forged_generation','duplicate','nine','cancel','late_source','raw_corruption'):
+    if fault in ('fixture_ordinary_script','fixture_ordinary_r','fixture_wrong_held_plan','fixture_late_held_plan'):
+        with pytest.raises(m.Hold):selected()
+        assert {str(p.relative_to(store.root)):p.read_bytes() for p in store.root.rglob('*') if p.is_file()}==frozen
+        assert calls==([] if fault in ('fixture_ordinary_script','fixture_ordinary_r') else [calc])
+    elif fault in ('partial_pair','partial_original','forged_generation','duplicate','nine','cancel','late_source','raw_corruption'):
         with pytest.raises(KeyboardInterrupt if fault=='cancel' else m.Hold) as caught:selected()
         if fault=='cancel':assert caught.value is primary
         if fault in ('partial_pair','partial_original','duplicate','nine','forged_generation','raw_corruption'):assert calls==[]
@@ -450,9 +485,11 @@ def test_completed_final_worker_unit_projection_is_closed_and_finite(fault):
         with pytest.raises(m.Hold):m._output_worker(worker)
 
 
+@pytest.mark.parametrize('engineering',[False,True])
 @pytest.mark.parametrize('fault',[None,'capture_selector','capture_selector_wrong','absent','null','extra','worker_omitted','corrupt','origin_drift','alias','read_failure','cancel'])
-def test_completed_runner_qualifies_all_exact_sources_before_return(monkeypatch,fault):
+def test_completed_runner_qualifies_all_exact_sources_before_return(monkeypatch,fault,engineering):
     m=module();runner=p20_runner();binding=dict(runner=runner,unit_generation_sha256='d'*64,worker_generations={'node-a':p20_worker()})
+    if engineering:runner['engineering_fixture']='native-publication-v1'
     if fault=='null':binding=None
     if fault=='extra':binding['pending']=True
     if fault=='worker_omitted':binding['worker_generations']={}
@@ -950,6 +987,7 @@ def test_owner_file_reader_reads_original_bytes_and_rejects_aliases(tmp_path):
     launch['remote_workdir'] = str(work)
     for name in m.FILES.values():
         (work / name).write_bytes(b'abc')
+    (work/'plan.json').write_bytes(b'{}');launch['files']['plan']=dict(bytes=2,sha256=hashlib.sha256(b'{}').hexdigest())
     policy = dict(jobs_root=str(tmp_path), client_uid=os.getuid(), limits=limits())
     assert m._owner_read(policy, launch, m.Operation(limits()))['script'] == base64_script(b'abc')
     (work / 'plan.json').unlink(); (work / 'plan.json').symlink_to('source-graph.json')
@@ -1311,7 +1349,7 @@ def test_native_origin_preflight_passes_actual_request_uuid(actor_bridge,monkeyp
     monkeypatch.setattr(m,'_review_native_script',review)
     assert sources.preflight(document['launch'],sources.budget,
         calcjob_uuid=document['calcjob_uuid'],action='submit')==state['host']
-    assert observed==[{'calcjob_uuid':document['calcjob_uuid']}]
+    assert observed==[{'calcjob_uuid':document['calcjob_uuid'],'engineering_fixture':None}]
     assert all(document['calcjob_uuid'] in row[0] for row in state['calls'])
     assert not any(document['launch'][key]==document['calcjob_uuid'] for key in
         ('request_id','native_execution_uuid','input_plan_uuid','source_graph_uuid','code_uuid'))
@@ -1826,6 +1864,7 @@ def test_protected_script_snapshot_positive_survives_original_upload_mutation(tm
     m = module(); work = tmp_path / 'upload'; work.mkdir(); spool = tmp_path / 'spool'; spool.mkdir()
     launch = request()['launch']; launch['remote_workdir'] = str(work)
     for name in m.FILES.values(): (work / name).write_bytes(b'abc')
+    (work/'plan.json').write_bytes(b'{}');launch['files']['plan']=dict(bytes=2,sha256=hashlib.sha256(b'{}').hexdigest())
     policy = dict(jobs_root=str(tmp_path), spool_root=str(spool), client_uid=3000, limits=limits())
     sources = m.NativeSources(policy, m.Operation(limits()))
     monkeypatch.setattr(m, '_read_submitted_files_as_owner', lambda p, l, b: m._owner_read({**p, 'client_uid': os.getuid()}, l, b))
@@ -2226,7 +2265,7 @@ def test_delivered_native_child_fatal_class_survives_owned_cleanup(q1_joined,mon
     s=q1_joined;m=s['m'];parent=os.getpid();close=m.os.close;failed={'metadata':False,'cleanup':False}
     cls={'memory':MemoryError,'invariant':RuntimeError,'assertion':AssertionError,'cancel':KeyboardInterrupt,'exit':SystemExit}[kind]
     primary=cls('original native metadata '+kind)
-    def metadata(*args):failed['metadata']=True;raise primary
+    def metadata(*args,**kwargs):failed['metadata']=True;raise primary
     def closing(fd):
         target=False
         if os.getpid()!=parent and failed['metadata'] and secondary_close and not failed['cleanup']:
@@ -2240,7 +2279,7 @@ def test_delivered_native_child_fatal_class_survives_owned_cleanup(q1_joined,mon
     assert type(caught.value) is cls and caught.value.__cause__.record['failure']==cls.__name__
 
 
-@pytest.mark.parametrize('fault',[None,'guard','late_metadata','cancel'])
+@pytest.mark.parametrize('fault',[None,'guard','late_metadata','late_plan','cancel'])
 def test_original_closed_bytes_requalify_through_actual_private_child_metadata(q1_joined,monkeypatch,fault):
     """Genuine Q1 close/read/fork/reclose code on declared synthetic metadata.
     OS/source authority is explicitly fixture-only, not native creator proof.
@@ -2293,6 +2332,7 @@ def test_original_closed_bytes_requalify_through_actual_private_child_metadata(q
         if len(calls)>1:
             if fault=='guard':raise m.Hold('facts_entry_changed')
             if fault=='late_metadata':(s['work']/'capture-source.json').write_bytes(b'late writer')
+            if fault=='late_plan':(s['work']/'plan.json').write_bytes(b'late original plan')
             if fault=='cancel':raise primary
     monkeypatch.setattr(s['store'],'put',lambda *a:pytest.fail('facts wrote journal'))
     def call():return s['owner']._close(document,s['job'],s['host'],packet,controls,facts_guard=guard,facts_inputs=inputs)
@@ -3270,3 +3310,595 @@ def test_q1t_external_client_typed_state_refusal_preserves_exact_wire(monkeypatc
     raw_request=m.encoded(document)
     assert connections[0].sent==struct.pack('!I',len(raw_request))+raw_request
     assert connections[0].raw==b''
+
+
+def publication_fixture_plan(*,original_bytes=False):
+    """Portable original input metadata, not source/creator/native evidence.
+
+    Source Runner original19cf3545; portable AiiDA original24136301.
+    Full v3 canonical profile376aedbb is independently matched by the owners.
+    No numerical payload or execution is embedded here.
+    """
+    import base64
+    import zlib
+    raw=zlib.decompress(base64.b85decode(
+        'c-'
+        'rlKTd(X!cHX;wMT36T?!#M?&6$@7W7+X&qD*W>Kp<!cHd*ZEY&O{<yZ1g@f&kCNuw(ck2;e6>FaqQu$eUtFV<nPjfFRFj&iM)QFU'
+        'hLny{bqSdv}xF`)mO-'
+        '(m7qM>#9}j@~ySLcxN_~{2*GRWS0cdUi#5YTB)vX_>0xTTF92SlnvQ&)s>|#Rm*f2ifJL_B5k31GEyvc<u6wn{M+<3RbLvar%LbQ'
+        'PSH!`9`->TrO@Xm@HeyB7v%rpw_Ot7p~#6`1iux33xA)+hr~r`<1e%3-'
+        'oeFv%{M`~Ldo8C<M6PpbzQc7;Ri4GhXlPy4pD@X7wDz4-GwN9;l`04tY0L^M+t(FZ&X>aZcO=h{@`pwsn*M<@74#85BuF=KTn-IW'
+        'beXwf5I`}9o9|c?1MXWvpcN9z;*C;+~i-'
+        '7?*3qn;45d3ydPzAzS+gl@S%NaX&m06WWJ9>_ztF*&Noi7PY@bmTl2BubNJU9e>sPdBX7QSUfKy-Cn!x}g(J))I&4t_8ye2>{;eP'
+        'EeR4?m_SQ+(!5HJG`-Ar|k9T`K2OD{7WS1v0!tk}r<!+FByNiJh*a%ML!3H`)$#}$2BSe@*n#Pg6b`EPa-'
+        'YtjCAe1+U^}{ZN@!Ix-aEuAuq9j5g@U<uf`peD(u0pUqY+)Ml?O|s}v4_&p2(o@NooIaso#fOrI2-'
+        '><;Xw=04OxiD#oxwTIBwW!*zs|%91vUJ9pK)(n?rOv#@L&OG+VQirnZNoG}u3kFm5Rh%$>tNo^OMQkoFdBV_-'
+        'C}4Jd&JcJ;6yk;Kc-Y&enA-'
+        't&n`o5xLZF0za7N8#xup@C2rdG;L&V|N@<bHa6;1pCc4g%jR8iHAHOFt}qokZwjKt{vJ3O#%4Y$%?wf_i=KY?i{#3Zj8r$X*)^cJ'
+        'f!vxC3Y@Mt>D;ir<5n}gUE~T#}gsKV7<Z8<4e1IRftG6qORhhy8sSljbH-%1fFu|4sM<uqG-'
+        'L}jC%pY_}&JQ?iQ{?NQiM%*_M?nUFVQG;W&J#k}u$r>;qsx)5=dy<b)4I%ee6ZXC1{U{NWsYrT0Jz!M2d{gFR+Lm&__VmIV6=gq5'
+        '+oafL_N%D{iHeSdE!_>ql$e?)^w<m}Q-JhrMxD{3$*$dXR@gsd{q3#<wr<hkR<2YgBG-'
+        '6oDsX$%?ba#R8X$f2+ar@SH8$Nh5J1<5c56Q&m=$lZhXGsZ)hF{w)7A=)3|xg(73#akzcY{zqUdndDOz(Y8E;G;LbCXfIbMk#Qt6'
+        'qWMXn95MF-5nAvjHNEvStGdQ_B~jZK~z|ctCfL7iV{DQ-IGi>gNJxD5s{V5Zc*qxq?<AKpk%Ke^5bNiZNV<y162g4d{Kma3s{A6k'
+        '^qZCCw4Okzonj&ZdNfU%wrintLNdDhcIyL{RZ@O?+S&$lB6mQJDNa9$<(R4axOujz8r0%#$?hRJh=&IVu6P*`Pk+tC-UIs0dn`CP'
+        'vHI2*hP+ee6NixYJzud@x9VF3^sQ|kd6XB@AVS5O3d^EUk0C_cnw1?8*roKFv>$x^4~C?O0uf$Jc1!T@2LCz$TQE4uIVQ5_g6)?j'
+        '1ztvT-U{GF})@M_UGRR-Y8Oai#+M3ccTh(E8w4}m*qqZCY4qL2C?-'
+        'f0;%@;gh`(B4*n}}_Y>g|N~N{H0gP$GubGg@3uCVw_ZA#GlRRk=I$-f}9Kn$zx>fAR{_H^JF$V|d8tp-'
+        '2dkJn%;%S;>XU0PkFn+ee5}m$PLhUe&Uk?%OVmQ3uZkz+GkO80rf$b$*llw4{kcPe0L43?h^+;iD8@wDx2jpp>0I|fZe02SwhY%C'
+        '=*#Ye09(jNW<HxXDP{+oB1u<+bUSVL8vkFHUzXc?fi^QWt#6X$aqwNke9O(ZFJZ!bu-'
+        'heqQ74o7M=FjsuGDo*Sdf+KcKm$Y|6pZ&Mi{0)q(HFH7#yBMq9KqTj?XT}-b9tu*&fdY4f|uj-'
+        'BP#fUz`U}(9TAmWc}X(N=39WSTOB+i;)9Sh)?-aJyT(qR&MxzWp-'
+        'qrtM?CP$-8kOQ8pI<EV;C4H8gQz~TkWl3!VWG2Hh1Q0UI=+a?!XXbpa?L)Ok+Naqu_H8z6*oT6{7K2#Ah6a!APNGr4R<Ol-q#lE-'
+        'nf~`wl;t=&J15JUieW$ZlSSk|^GyDPRg|u#Sj#F2W$Hb+At-3Q-%;W<oKI5F7o#5}F2?p&iU$p*Nab0BFQL&_Lm-86{?_#-'
+        '%_ly;eLVOGP7tciBg_j8b@7uPl#JM~lOtpZI2w+n92EMsEeqel&|?XLNU*x<MF@Wp`}&L{I4mo!YWrdYo5>wY~BD#c1pU#F@RbMw'
+        'tO1vz|X0zEJ^Wu`Jvac1DdE${zQleG?b*(y<%>#JFvM&thD`MaVvx>0o2dt0cD#xHEy!!2JQA<F_IYm)qg^mi+{Brtbuy4aA=*qV'
+        'RO20FZV^#D=FR^h+6Y0#{iXx>z7<@gF8aZ00tCbH>Z{&8MdPWg)d`B|7dgtxUotFC#O><-'
+        '`_IQF#~)epO}%F+QE4p=_)XZg=}}uR{qx0p@%cq=z$LY)?!x7b2)uxpgA!PapMl%_Y{e2&}`i8cmVZ>ZDehF&F{SG$svIIG<`!pj'
+        '6XwC7Rr(yE+78%G?~mp-8kgve-'
+        '}ueQX?v0NsO?{*+?n)rt)zZw9RcLGrs&j2I~puyULbqdJfZ(Cj$r_bRj#h!YsQ|5PDQ)sqm$5qM1w9?qL!Ux@wpGQ$Nc6?7W7IgU'
+        '!6G=?kKI&cjgP$fo6o>hCU>IQ(!33<{h`B)uf3fkzI(*%-r>5Ln1FKQ$LUF^q3ML}TK=7LSKk4S@=-'
+        '?it5K<Khf&zvD&#<;MS46JsB3>hORl;tA)05Xl(tH7BCHj-'
+        'a5oacF>aK6H3T2st+PLQM*^Nfv`3WipHHixYfWwz5vBH0MscQlv+k2ogD)7X`R{In+QVaTQ+niMOMdwn1r>fnxxmZ(T_Z0HQmzX9'
+        'Thn*_UYmrVSfzLQQ9K8sCZQ$=@20YO=hon@XS`xI>SQQcB_T^8#s$KDiKcJsiTYxMNhk=h4HL>J-kB9Jbl!$^T^86eUL-'
+        '2=9L+C?1>5C?WR1oi27A6g?GCv_4(KHxFMIVIi65Ht9}ik$5=5DIi~Qzkw;27hw4+;T%|biDQE2?||IGVG5Wj9Fk$$4p_%k|jS`K'
+        '#q|bEolIC9Q9y*8}!+Agz5HjLa-sfCwM;ZonU0#Ozr&{IiEot0ghhoa0D|H_qql7a%`t_5!^R=3Zp*U>!?{Sc(|DRG3$)A=p3a40'
+        'pX9hK;dcc?KI#yE{i13_-'
+        'OpG%zB<4u0l!@M77n_uh?}DyNre&=@fWe>clK$0L#NDz1ln%giZSgh?*q}c|vs^n9#e6@VA`}<rX>*C>d8r-'
+        '~(I62~cfG0DAHO9+7fG2pIk<i5-'
+        'vR!M&<Cj4w_95+syyH5^W%gfgY5y+PPMex6yB|NUkDUthjkmQ6k+fR96@Ml<xX!BT8_CKB>}P{xS-5&<PPt0+qpud&``egY-'
+        'mMjyj(H}YJo{fw!JuE@NGytcLv7ULxQM4l@P$|^!|gK(TXU@M?&kjSPK*hqtj>KzgLDIQ6g>sI5RWwYy|r|JuNE-NbaQIo35y%GN'
+        'gvVa4$4mb6kFhwo><;$0$v*r$9O2tubP=T;))Uu9xAJy@5P6+#BvbLP_E0R7-;6=nL-'
+        'Y#?^iJ_r8$ex4~Cj=fLBS681L4+zQ0x=Cskwjnwl077aBvYd$pl+HVatoN${+is}DL2e;S$UX-yGMHccdx&C{m-'
+        'v|3;+A}&0oF#=FP8O|DV_2zW(2{*S~xH75w3MuYddI&)@ud_U13(Z~v**=C`=b_wcW;Uw`xZyVu{&{@qW0_Tw2e`ReuW-uy@0B>T'
+        'hH(9M5&^XoUidh?%WFvwT%+h4u@=Qn@z`uiF5_A6-'
+        'k9dz(Dbo7s8Cf~xJzMo4paWqrJOVqPiKfdf~ptr26P@tjHIwUdJQeEK7$;*YIQ+%2!W?Xjog8T%gcL<E8KB^VgV(6a`T>&)%M-'
+        'u&G3yQcJHfz8ew&{UiP`@%2N+J*xYfZkSZdk5zuosw@O-'
+        ';%K&Zf}DuX3g|8`W#WvtzZDccC{<Y6SwQvc6=yWNjIo9yw7;><k+*<m}I!f>lyJc=nUTSuY8-'
+        '?^q)3SY9Y<*Uslo3hH9;lK^Yf;u;bedxz-qn36JI&bC{cGAl_=mub3erg@i?g*<!p{Z?wF%*Iw?G7b0X3(Os*PReQ7)Vk}sh5Q-'
+        '{74Cq`s7eu%;Z+@iwWPq)HH)^txKWz3?}nK-'
+        '4~gzmo*UdgDHT`c{8*h+^OiP19TFCD<QcrCO{Ja+C)K$<6jQX=4%)@6T#{<a<v?ocVzzDR1<olY_dAP(kd`vrl+KYxNg?dEa}U1C'
+        'uEU;um28KlEw(@*+lHT$pVJqe36Ikio1cs{;;xB<b)Xm5nb=-'
+        'IH!>yE@~}}@Zj)7t@Eeu3RZ8#^N~0yuRf@^TbLKD1MXUZ&1g%r3j)kI8Mv1(x0K-'
+        '&TU?IkWdto?OLO!KcW;6OQI;?0C?lY4~@6b!?uGEUHNIsr5u*?nA8*DZ!GYCjn0Cf`T7PW*LNSJR*JP1t@M3=L2?)~LT<P@d2&2@'
+        'ghqvXs6z+J)#eIf4`2%j|H$}(B9k6Tq~N@<cIp=T-wIFNkv6~+P?l^fG&ebkDC3G5`=E)F#mm1sfk5bQW*-'
+        'KE<El#nE~Zxdh>>*faW%RZLcP76uZ-je1^PyucvNZ`en`ZI-qBJ!5}wY2SlMIlNG%lm7Q2+a<J67<0SFJ>Qi7_@RE3`Q!m98aMRq'
+        '$qoruPPVKJC;=newy0ss}qaE6;9DUD43{1y?!KoSjsGy6h(9<w>7a$^Ffz+h)sdVeV=RgUiMzl2H;Pr3&CW!pc^n5Qt1XPYU0!St'
+        '>O}H<*{U_w*{Ol^Dak`CYl^EV;ZUD<K~KKg>#tJgqv}@or+ykWux9;Zs~015d_)@JW!s>>8J~XtC=_Vqq!oE+gB>myLNR}Dw}+pP'
+        '+=&g52;pZ88~VLvzItt!un)t2hQph+!R3UzS9Lfn_ECtglhhX4ZZB$=u9@gq{*CLDWR=dYpz|!a?)mgRvC*2KOv_^H*C)Z2sTt&<'
+        'SQpkeYJYX)gMJS^`&O$Oa8oB5DML}E6F&1AgJa%tdZW@C4THe^wM^c#CgcR$|pwp!Gxgpa-'
+        '$4Z%cv!lvX1pcp7@pNXbPjEwG_dI)fy&u22A;CdNRc`0~!!&kp;+|V{R%h!xc<f`~hLH988-'
+        'YTV1IG@U!VGnbu9L2(enTJvL%v`EA%-'
+        'Yph(686_xXpru(AG{hf|TPLffuX>#dEECIYi#8aQp)+k8iGs0KX)sN?%id^>=3ln(2o{{FGV;C%UQTW4pPPJ)ZcHLqcr=J@bf9nG'
+        '=Pf%%b<XZ8KQ~~@A+f1M6`9j#8A(91;@Z;c5jLP^cW$=;qDEtcu#7(t4uYHKz9HJe*pEe$+rKE+*{(J*X<!+*U4_YFc?~5iaqfjw'
+        '&$W&Tz2#ZTV;?zJfx}(slc$&qZ<s305}qXeeN_|(e{1r;wb#y}m?X2zJXnV}{|)G(P=2<h^G5kVUe7eI<E^e%R+q!+YJ8BtHJMF{'
+        'yR$uPPvQn>@OFV$W*fJ&nAtQrBQqkCeuCGi2!kev-Aepy8X}g&TN4^mk8;gK%QTc1ty5?((XMgZaXBvEtX9Ak7&(a#!eQ967q_^&'
+        'bEDk>vr3p!W2v;bTDSC2Q5cFkx7a7SGRl<SVVNx3$E9g5I7}a#smVH}_rgDR-'
+        'b*E>O~daX+A+{{{sw>)A9)3j0tr%;p*<}{X7k?!?rm<*mbAHQU`e#=@i@)4%jev6!|dGi<93|WY3qLX@3c9$tZ{bwnZRq?u3&%HG'
+        'l7pl;LEvw{7!RKyyuPPZnXML(j)EkVy<vr$5!*YU^aA6_?8yW^U-'
+        'vCNDE`Or9J(H=h{O)7P>RnWi7J}JTt6&pG{9FvF4|)^qx%XStU78f2|N~0O#*D(AucI{It*GUO`r|O^ls0Klx$d26>l@2&j}WNi*'
+        'gq2b+MkMf(ncu`fF>X`upV+rFT^mrPor4FAFSyRf~kQs1P7rkJza^^5H<G-'
+        'iqd3*lFIpxmStMgTyHh~PHB>I0~`12_qj;sNEuUj~0t9h@5{8PUV!DqE*DXHSkTqTO`1@aw@!`h0;DeFk$-'
+        'ss6gdscH5kHPR`uKEIYiXn1_ZSOO5*nlZ;$S!ipPTucoe*ys|sS^&YCkX3Mx2X`!vxrPg7QO*K5XK|$SQCR2W(9Xx<ox2gwLYQX('
+        ')N?=Xxy=udIQJcxWG*WCak%8`L?(-1lWDsI7oR)`q1=U07DOo@iBs-HD);+8jz=r^;gtmt%RB>f8){h`w=9TU?!_(-Krau$FN-'
+        '6Xg)z*%DCWU9=58eO5G=DGnpq6bEP!Yh#x!@MnuT!9Ed7dMn}yNMefZ{ngfq?V+EC6%;+%&eoyD=vJ!t1Xyt5eMxexO!gnI75Jr6'
+        ')W55hk8qMy6*&oo)IVxap_&|)}faU`@57Fq-iO|P&Y5j_|aEsl!r#YKxEqi0;hEQ5|_@X?f(ER2!vLP?9_q(za^^og~irCAIreT{'
+        '@*(S5+^LC|P1aP$Cpv;aU_7$V&TlJ15{3j(EkpwjF+*$S5y226KDrg@U(K-'
+        'ly^;Is&IdJxdRomX?P)q?11aeQ?L!dehx%|%(Wd}sjDS`ce3jJ6((x9&z<cVn*mP}f}CHM?D+*y|qfTtEI=0D&!l!R|$2Hx1!mwq'
+        '%duP`d~kTL6#UgUIf~WDB6Og>l)!$ZP>@wir5l06tp;p-'
+        'rD(8%nz$r#%FzJq)Yeht}@FYque`2V%B`QQJr0wg(`$2Vl2{qPLI7Zx29l55{ndp|~G|<L=^TTr_tNp1TjxEsE)8g0OpV-'
+        'L1%OW>GwJw;;Z||B>QiJX<NP7X^GQ4tO9ExC09;hz1^r2Np&IcVmJDQNfIGeH1cS92<NLI#@J5pw~h^G)6!yN<b`5U_hjRaI8Row'
+        '7{@<0g;G-VKD<jQ3C_x2AXV{)ed{n;obOf8i>n5k92~=Md0B=0C5qBcppf-'
+        '4<;@K6z_zJ_kqO);NoI{@m|PyA85P>HZB$~BM2QA2agND#{~i8EwK%qmqh?gJ_t`Pj40>C|A?W=#c}0~4$8-tx1-'
+        'BvyeEbWmgcZDVJPlE4Bb(1TroiIk&xWuK)Eymu}>`NJBk8LEq)a8xle+H9*Q6ukHRz#MKzv!_X|+<^F^5aA{40W=Zi4KMNkJ{gy-'
+        'Ea6}HE2eu2(@-uzRLey8)|SY-PEZ2Ph3c0qi5H^QBdai6t|d~G=Q7Nk47qr=hegYfP{5bxrccX8DF0NlGM@?8}B{s{E@QTX@c5b*'
+        'sN_~9t{;W+p{B>a(Bcp)@=8)O<TzXRwyqWarFm<emQk$w^<=tpVdzR0ZMFG|D-'
+        '@dkrxIR7OfP0d37Qgu~X)qGWzVNQy>v<!Cz|5HuRvt*>IXbBD6m1Zf(u#mUVk*4~pB3r7_MEIAZ=2*P6N{#*k>#_NuzN>pn-'
+        '86mG^L5QzIhN}zz+)n>RAu34nrp3KDCDWCYACv{X)DuPsS90!DVnaSv<#Xr6@}Q)fNypFANi=}!Zlr_D5ha(%Z0WwG{CRAzPU0T6'
+        ')>hqHH?+4`M#;^=F-%bj^iyg&65{P!_jqj(H!+pNh)|UZV<s;D={=hQuqd_y_f<*2JX-_bzjjIE7(D#tW3j!btBb+MJk@_D-LXn?'
+        '>goRX~>aH%SE!~s)}m$?KVE!Ee4Oh$PhclDLa<x89+9=t2>TvYAYXkj^d%EC;JO;fqW0?p6dF@@t2D3!MR!s!&i~IbbMoBxZNARf'
+        '7qd7BwvSb47|~*YkInA8J+=KYb`YoxxVjuE8kTYKs?CRW!W*n?xZc3hUOclhD>E8zQW39Y8OzUViHRo8IB3`38d_q3)o2AaTmI(I'
+        '6%jms~QU#PT2E3b*00eEMa!C0t60|cXZgOmSjKR>)v8Vv-Fu8-b85a-xP3}o5o>7=z-'
+        'Kov|l3LzTnwkZ0sutInFbZ@88Ct|21K@84fAPF8i09c$J(P;3*C!&wrI}9PqUN=&>aF2X>D7qE<&u_mCoPJ{fpjGShs8CTf95m5)'
+        '${gnP+=mg;R7{~;%C65j0Hp>#2UB#p2QwyV?HlWc#$_rM$gp@)0>fG2K(wegS}Z+pE^Fh9JL#Vbdo#jVyoD7=5#W5)%sDh!pDIIh'
+        'H5;et54z*Cr;>%h#??pf{9$Igl2@caQ?aBK&#O~sa_0k>Uq!&J`XYSUxFJh(F~)F2<b;_D(3D?U&$SPeRDYh5hADH67{Zuq)6zXy'
+        '>U9y}bh0XWiVjXIo#CE<I)7Vl~1;_W>y7`ddIf^<oYSO<}yk69_Qk4`$x>6PXK5h-'
+        '{Lgm)h@zbp2k3=X5}WY3(mXj!#1CRF7Uc8w>fH^b4Ws#z3pr+G_=)C5zSct;xHQYRe$-'
+        'QiuGpg>vwQacK<J+<|AMLSMFY3<QvlTM}{mo_au2v=ghoZG|+qnv_;QYGr>SivbD8YWzJ%E>VC$P-'
+        'M47w|j5H0mLkQ$4$VwVNloJk1E%DXFy?i9YQk(G35dieQ-7;wdJ=4g9{?m-'
+        'EPF6@d_wo%E@X_afy}P9B7dUh*aGqG)~Iad~$wg~`(<;zo{+NoBhd@jm4&xQTHlm{6H>=4nu0cNFx6IY4r=p{U<uKu)IatW3grnU'
+        '2oPB#@g)B=+Pn`I-'
+        '7NGzsNs;)naR=V=;}sYy6jlR&nnLHU}7Wo#OfvuQxqrX$ia38Z@J%iT0Ady{bfCZXI+oa{{9zNT(R6A9>8%8h?iA<t81>L(`o(_`'
+        'l-D+_j3{oYKGgjfTTP7O#q)t`7uB=yuO9ZVgGs|NX)%6{flf~m{aCVGXLYF&-'
+        'o5Z9}0GYg`!VvQ*&vYQ)3Ph@kM3?6TfUt`ENF}YBlw~4n+RC>Q@?r3*L!snA4uxV2sBbztzDezl5Z{<@HJD#tZ7=wJ?rz<m6RSJl'
+        'pwd&PB@e}J)5WXJ#9+e-SuPJ_L-'
+        '*Pp>5AEOoB{#p(hxX^3jIr>;`#H;h#FVYx>3;Tk|0vrYXroeT`~qOu5A78<P0#zeB!BdBabn@#(f^J8{v)Yi**nJ1vm{<z%h`waX'
+        'P>vw$NOx;Vw@7=@#kZ-pU#;q1YJ3d2bl;8RQ{ZaXB$%xDrdnBeVk+_g7KS^%&jk2Z<<MUNAyiHr{3_`NoLg^Fgew9nsEcy;v1~Z`'
+        'UW!Iq{k3zI@PZ8163!P3McS%Dng{gug9E6^`_42WdN>RX{{c3CU$y~LuNA%OhaqjyZ~<j=W9*nHOjVA84f18-'
+        'u(I;SANlJ>tm{lJR7LE9I-'
+        'p|!&Jn{R(p9WPf%N8jO(>^R{|wB&&tG#7$;B8L`2QjO?oOc&1Uy`0@U2daC1hIxhkW0&E_U(6(_XO3Mu-NKl;<w-'
+        '+uOQ+Y689SE;o@N13ownjpoBj193xa(bM%RNWerjq#>c77CksBHRK}Q%|b1wA|E_6RbTq_Oz&)c~eiPrDWdJ)9NU$_xwy{&s3i1O'
+        'Z1HzS_X1RAxMEzkmAK4XDvCAIRzm(B_VkPCR!G<yD+49X-M(nkf(g7yGlzAdY-'
+        'F}=54hi$7Bz+>2T{EjyadI`qvy+%$g6Ws5H@*QS~+_nnhWHWWvL0s|q&JmhkIvPP0GlwdN+;oQ{g3pNy+2Q$*BS#ciUEs#gUbd1q'
+        '>~psEB<#_F>AyVL7RwMi8<iswwp;c2cqT`2O(&2#mu&@4iIz1BG%NmFH^CwxXbOM*^)$*QW~7a<k0<vS<ZpsKX|^<Il=m#Jd56YX'
+        'iUO#OuP)?UMQ%1Lz>%AHzVdR(x|iMV^owlZ}bJo#uhI)<|4+*&I$PdK;M642AkiK*s&0mnvF-kxwqyqeS#ol{kp{W&n{N{rhzW2T'
+        '^eyApA5@lQ5OL|s#cssUih1*_c#s#tImO3)Wus!C2soFdw}Z3}W+M94{`uIjZ7E2@O^Oh_EtarP|Ol{Bkx%;{w_Mzh4#PSrLyOQE'
+        'Fa88$kGr(Y$bt-@)cazWXitO7*nM7%Nq4NIi7`+O&HY6{ndDpIo-'
+        'ga(lJB#w82V+@vV69+=tQu`Lt<OiIh+kCT|RMhj}O*>P;Y)S=_+grBzP1<R)CXTRiZ5_ri2|E?CYSDM-'
+        'rF5<!BnY8?c%)N-^ntVBqkV7&SL|6)xVT__h;FiN=to15l>+{0Ujp1upISq37Px2*F2#b&-%Vx>%chc7qj-zXeDpK}*(?Yz09OZe'
+        'a9Q!|=iU7JvM($k{oD($Qo|)NPI&h=9rb19uo;uTOp=W|n@BAz<*Dy^6*HG#uBU#toY2L!(2!lo4sgahkk_92!Xdlk<_facoRD>1'
+        'R+hB$t~<{+ke)5!z;r9VE^Iwnf}lyKMY7?=GqB3m<MPw=rY5Pe3wA!D)Yh4T_2b?Yto`{{Ir+icG{P*UE62*hzJI)WgHnrdqN!}3'
+        'oo`HQO5vK}fbFuVb(q~0j@hSAV(C1J54w-'
+        'SWb?s@90gBZJa0ao8u#aqMeB>7az<n%ZeAniZTXa2ppsV8J{>8oPR*YC$h10TM>H_vEeG?}Hl~(1eY)Z@7Y3@SZ4VG_;6YaPOK{p'
+        'fd+m=P=hK&fdd9>*Jv90=T=sh4vQG>-S7Tng4U|x@_mH09vXc)_66#-'
+        'V6Y%xGf3N{afO9KEUhMnR2?#}5oJ*=W_~^}k#xFhNmrjTMzocNQ%ZU?e=OJg%z$WI{*&PL$^APQy5_f!J@jA5=yBt>k9MW=yAuSg'
+        'Hp09J*0xEw|c<_sW@n3F2feEAIFFQK@assd~F4+0W#F;(^)Lm0R-CG>|bX5q4)=-'
+        'glm_v(0fsGenU5uLARi~I#wIIb#xi0&x2sF6NZ`)c>T9v}_VPkt@&p4S70s%Kk@rKB4p(KSiz^i=SG+nkNO>9qsBoZYwC{Ac-'
+        'q>xCg(BNnx;dr6p5kulJLxZA*2F48uMh*>%9Xd98=!p2CArVB!#1M%_5gi{##08SHx%6cYP>MXJx!zcKk}Xx$G*gu|W4X{xbFq|7'
+        '7DdH1!gCX|F+OzQ=sabOV@Fq7vg4+tB6^lWpIh<U%V9K%%q6e<_%JZZz9(6kZ6ET+CHZaReUz1LhYJSUTIM6otC#nl2S@po3VE(?'
+        'AIjqNXTsW)GQ%UGHdo?jzCgY1(y&37Xe)oR7S~I)bzZ22@gkJs=L9d$DNLSIm^?!Oo*@8NYzV64UO_uh?T|qghz?Hp*wiHL;$DmO'
+        '1gIVt&vZMDCw$pq$u)OyuXI<_R;I1D+Ywl9%Clv(N#Yu>ar=`i&lO&Fa;fJ%R2ALSmztq3+t<NLz`Vv?k`fLI;(WqmWO`@U{W_I^'
+        'R!U3Ktg21PSjzdTD2M2=Y0<MzY5~Ed#vNfF<JVilGnuM*CLVi?a=+JBGzgQJAgc!(Ao9Dzy>8c?mB{Cctf@;=UM@97gTOs>qxE0N'
+        'pZ&|P|J>f@^&S}BBE9;~{yF|}IhQT4IxQ8`GF5Y_vSkw9#~ndH8exabuRn!fyBGJ~3`(u5T?<roO;<D>?1HK}x3uNb>|Gt1)K7`^'
+        '+mKboGz?A0G{$ZCxL7+yXsdgQ&36q!4rrucI1k=@C>iT`&Tj9Vz);8Z_lVp-Pg+7`H(ro^tdsbDziB@Fi`KFyR8XfPa|3;g2wJGx'
+        '$BCaU`+B(p|3@B%%laPoSm3M+SD22CbG_<B7JlrjPC9AiMW_@T`!f*2p=QoJlS-$u-'
+        '{x~HJwXta0{$u}EI;`?B6PsciV5ndvd0D+5_veL6T3IDe`9<TnHVwcu_6Lud+-'
+        'uGZp4W;`8nn+0w)ESd@d7Jjn3v#cfL;&CMZTiS#kBd$+oF>TtL7n_WQ4$!&Jo6Nd1<p;l;E{)JZzc+-e2D?gQ{)-'
+        '=|e}I`UdhWX%_&vs)++`;cxfa&B3vHXGM!-R}02A2j<EW#@e{4`Y5Y0OoO+kl<L(agoG@5p4w`CM9-'
+        'UTsIzMN|a8%Z?1DlCzQDgRp8tlb_!=XyV;mWU(Cyq3nmx#ZlsXwDymQPs!{Qr`*uhY43x$A!XP?ag3tvH5AZHHs}QA^BXVIt-'
+        '9<gad?uc=tqWo1mn>mT{Lu8xE+$5_dncG)_$%JTvtEJgkJx9)zl6I6p!V-'
+        'Cg48Y|QT?a~SIab7+lZT846PqdbzLWavKpGl{petxZo#R<i$j_AB)&tZN5D=mM#W(mq?e$0){K19ThJdLU3<dW1X~B3F%IBYCP*Y'
+        'FD#4LQ_CmzB3o^u}*tl~D(PbLzroM7L^FtASnWlH_O_*^kpG=`2U5fXka_hyZ8-$^A8Agw6TJTl_s1iGwC-'
+        'x2ZkoRT1GNACDdluJ)9m{|Wg5Zx=|BIls0EEPad=znwT3d)Uu^wiIx<2SA9_!VAZ$WuA-'
+        'B`R1mEj4<`$b}Y3~aj%O65jpiWr8}j&ZogZ<QM_oZ+;&`Q;g~g34Q57P86VGyIhOWzS81smLvTmo{4-'
+        '5W2SHy5k7oMr^`+Zie>^R74<7c#|>07(Xkbhtibww0Aoxrd$b+LRhZYb}E%Dz>765p!%)8$0hfR1_u^B#Y(zlK~>xjSe#Nv?{%yL'
+        '{R#gI7P%riR&M4L9H%rq(#ux(BwX1RL<eZI9U3~feYZPM>n;B9C6`lI4p5d^SI;G%Q6}~u=3Aoh?vnlQb2>4(zy72R15AF+QC%I8'
+        '>WTe9XAf{79rOSVUVYd3ePN*K=;7yo_J^Gld@mos;{J*$tn>4l5Z>O1yp8Rv_<83EMV%+~)AoA~zvf=a_6Asy@0@xL^=j|o)o(h#'
+        'Pf6YjZmpbi)$AZ?83<WEs$xgp4a7de3EOuF;#tO5-'
+        '^*F#rGm~@mr8sl8^}=s@*7U&6S)tS_yx1t2Kz~j9Oc|V1Uw}8JxE=Ey^=$|cOZMw0aBkNlT9jum&4DZrIKvBfQZM4jA@^f1F4#bj'
+        'N>66OB`fMyLgYCD^57otit%B4i2VMs|R&Ob>M2Vz5$P8dJM6qQ|-'
+        'DJgA5EgpAblp(_nndsZ=q1lb9syga}2zqOu6sRP#t7Z5W(MMriJ2)5z2v*o{(1nC4VKtqXuQ-'
+        'Z~x;IuBXCt4X$<gwsyU7*ZUE<zANTvr8c5A(@Sf!qC3M!T0F8>(P{t5@gxSEg}=a89BlnXnyNWg!7|qNZPi^M7c1GAI>GaO?Bda0'
+        'EQrY6*%d${l7{XTWGd|9)J!$%{6GY*`IrYksATY+FUiTHHFjaORmZ6)i*zUL(C)U+~PLy;vHEYHx&tK@zQ=TBt`~a!VMBdU*rkNh'
+        'Qc*aA(te#?fXCc=D+rD1NyjcA7C;vj3K-'
+        'Ypn`!`Pp+@@Uiin(dnvz`?DmJ>eAifoh<*KRrwt+Z)?}wGiypRNp82TdqmEhdkPUOvBUa|t^L>6>?(=f4KVRo3eVx^FUFTLG=<@-'
+        'OdccdhVm#mB@sGGyxA~(&o$1K+^D)kMq;w|ySz3@+4vuQEke8~d_a}4u5c0?D{_j8j@by<cd4_s2E$Iun{tvUmoJ33g*{k{zDD@B'
+        'WnVt5ot8+)y0V{g-w;$U?-'
+        '+tVxjNXBKJ4fTNS4#Tqhp)f=;p^|mTz8LGfXmFfIacRY73G(LL$vCoCmu(^DIe>1gqNM`45MmFV^oztYA=I&^$(AsYEyuW?s{o<m'
+        'iAEXLe+&X>fitH^*2BK=D+>$_3s{$UCo*|SROe~tAFhO*`L$x7g{H)oi7w)3AU^L!9D_J&^^`%ou?+UnIB~g=iI}*`rA{SnL?czz'
+        '7C4O;NKA1<OxC2?|(&-A$BHV#1D7pnJzR%<ch3qe#SJI-@p8)f5`BeOLmH%KQ4`+$npHY|MC0379oV*CtYL2rxQYf-r@9;m4vF7-'
+        'vR%T3weHX+%Sd()x|ynM}-<G029qZ8@_1NDT&;;sQdJp8{R}{?ccZ#cxQ>tn<VnRxoa{pNQVkSG$~<}W$?qHQ=~-'
+        'DE`~(O*$iyvBVs<rUn%;^khPU7dkFa}%RxG12{w_cS;$pavgT>#QukDEsd?UF=`B>#*EMhHnb@KLuS2y(#RiqzgR!76dSjK6lein'
+        '$8hYtO4A>$t>qD`tynqvpN|fT=K8Ig13Ii!k1+dVF{7h?%7`^;U<Q5Q1@-_E3p|(_vOVY3>Qvh<=k#QX-a9-'
+        '#BPaY6kqEj&&rUGeGn@CRy|ClFK#`coM(y}ytVKsXq`veqk0|qpXvXsTkhM-kn&K`vTTHg;_&+6d&IN35T&6Z|`j5^LZbXJHcIDh'
+        'sZKK$rkzyHyn{A8ASif1)X@htbL%<hyQ&!QMAzPSPRDfxjrdohEA*a#ORD@hdgYlrqh0UIy>8kVw&JqXms;}tHETE#0UxJAmP;p>'
+        '|<YIj=K?-'
+        '3AIRT!>zkE#Y4(m0@MH)MYeQpG!z;3GjPx&Ui`fKf)yZF%mBrO8$ac9gO?mRZ_s;)z5epK1J{M6l@lxCYzp!nI4V4RG1O+l8~R=O'
+        'x_o6e9Hmn^KMdWbY(N00Z>|5im7yN0QP}us`w6USVYLrpZ(as68+@IKK#o(|2(P%rUV8%q}*oxz_Ajk@9FM3C%Bev8K03<hU6`ro'
+        '?;$8H%+fb>AT8_bs6HImu>$=XyBv4XWL0auX~%mv3I<jnt8Yblez}k5b^exCkTMuq_)3z|^VZG^sM`+j;#v*MWj(oR({hX|plO5@'
+        'ATwDfBqWmhB`}=!9KnSjUostn){<i$wd`&4`n(b*v9i$F9*Y-'
+        '4w4APO@IuP+2S%D!&;_d5;Yzq#fNA4o|EPrC63hVV@ht{YXhaLIDah9*F{j!^(>3)q7P9U8YAaE4(#^*J<RnlsNZL(Gn8Z1N0?7z'
+        'Lc{N*CA0A_0DuyO8YKDVL)y-'
+        '1*wupA44t)Y$#5g9Dl6f5_j}5=LP2OgFV3+l%?KGQ>EMDMErn^$hWf~2#Ux#yIWr1dk5wOBuc`$RaK`W9I_nz^^Jgc&uB+svmBNC'
+        '_+e{`i>GSiCw+s<PZVD@YlOnP;-vT?u@k%%{5DV*A<B5gCk;jeWl4iADu-xtM0N_z-'
+        '?QflA8oX!cxi1)6%(y#*1&jNlFPsbuAi0R07551Y{^e+tx3@dhD#FIfsJVfigDVNP`FqwJp^gp6~|S4U0Lats#pudMaIfqf{dt|D'
+        '+euBzPFH_CH##cy9)A5xY4?S0Ey6C3t*E=CQtB}#W1?HLaO8IfKxDhUv&%x84F)us@BS1$spGlGV&bPv^2vvk-'
+        '1!%s%tu~BU_d$TS$|*=S~EJqBNpZVMemZ84#Yxo*yDy(Q`!*YxRw)QeoSzLJ~B>m@GJ*qO>HRW{TRi4v=*Q-'
+        '>R25l`>5M_rgz;ZPg{Ycn>QmD|?V)w{64bZ(>(>G}*Rwg&!6YrXo3aAVc8&ka#PAB|bmF&rk646a4%H*I982H)iWJ%o&B$e^b0tO'
+        '@l^FbAkvBpg_#H+lR}v3jF`%X@m!r08@`uM#)4nt*+AazIdm}S8FwkT^!|EDl}{$mHjal)}E_;h2B`{i=cA5b(2v;6%y#UG%Z!Ht'
+        'EIb+y7Vm5bHSyj$_p?uJDR4d@VMe~$4f==p>~T353aH@7M>y-'
+        's<+ZC1ud7d;w>clO)c<;HrTvyc#))O8Uizr?5%u71<63s{FS4629!#%Oa=N^Tz`d32lE+A^(@CSprQ&wDokeKuhho7`x2P8v)hFM'
+        '$LBBM5$)mTF{uVcC-I^+YjLHB*7V!VY*2p$rCig6F+WmXz}<$cR6FxhdAB>1`54N4Ck;zR>%1ybE-'
+        'p$%3nEs9dKEJql327cje<#%OX)#ftZXCmKVgGUxfIVS%m`)G4JV_{vQ4d+R&M4i#ZJ4BH9=;^j0@)$KwfzfbEN4ktLydS87Zwk!{'
+        ')mgc|&JGI;&X_X0bopZ_uog<7T-DahBW4-'
+        'pS8WN@BRog*2S*4_;=#$^QNb(@<s8O(SOqA>Ei&a2XnIbkn#aWgjk}haHFtt&vr^sd*_q5XQ>w1SaE#hqRHpv1C9{I=vaz*Ru%5E'
+        'cIApoka1ma<X-5Kh_8bNDf4dZ1fGR-'
+        '!aMnSHEuW)PdL4JtDIQD^pH2*qY^sIjX)qkwQkMHoUrUl%P);@>0T{gPia{9B{(8Y0u1q_t9OcnS4?m3whoXk~{#mZjBNMxFDHEK'
+        'y6duwFb^=f+gOR-KF7x=H*!)l*ZB*3kw6gtrbAMW!d*Nv{01Q%F}dUyXtCbErv3xY$8EQa-ZZdcltDd1+D@QR?)H;n0uUL+Kybe^'
+        '<e`ztxDAgEG{lKP$rP54|a<L57pY1Kj4dyHiyj^MrvpA8(bnFBuwwHxzJ40UoBUvk7QT%T@Owc=}TWW;4NI5pnw|4@_k>i07DN}c'
+        '^BNLrmX9R2GDvZbIkDsoodJ%EdSozWzSvyOee5;dBzo~^w!*vB?7B08{_>s<mxEI)siVI?|k{r{|8m8F?j'
+    ))
+    assert len(raw)==127844 and hashlib.sha256(raw).hexdigest()=='24136301c403b0319759d054f3393a83843fcc70fbe7bfd24a7bedab6d6cb9b6'
+    return raw if original_bytes else json.loads(raw)
+
+
+def publication_owner_read(tmp_path,plan,*,budget=None):
+    m=module();launch=copy.deepcopy(request()['launch']);launch['execution_id']='execution-1'
+    work=tmp_path/'original';work.mkdir();launch['remote_workdir']=str(work)
+    for role,name in m.FILES.items():
+        raw=m.encoded(plan) if role=='plan' else b'{}'
+        (work/name).write_bytes(raw)
+        launch['files'][role]=dict(bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest())
+    policy=dict(jobs_root=str(tmp_path),client_uid=os.getuid(),limits={**limits(),'metadata_bytes':8*1024**2})
+    budget=budget or m.Operation(policy['limits'])
+    return m._owner_read(policy,launch,budget),budget
+
+
+@pytest.mark.parametrize('fault',[None,'ordinary','foreign_execution','extra','purpose','label','point','shape','telemetry',
+    'configuration','model_hash','scientific_fingerprint','history_order','history_append','fragment','unknown_source','rule_origin','relative_source'])
+def test_publication_original_reader_derives_only_complete_source_profile(tmp_path,fault):
+    m=module();plan=publication_fixture_plan();execution=plan['executions'][0]
+    if fault=='ordinary':plan={'schema':'ordinary-plan'}
+    if fault=='foreign_execution':execution['id']='other-execution'
+    if fault=='extra':plan['engineering_fixture']='native-publication-v1'
+    if fault=='purpose':execution['purpose']='production'
+    if fault=='label':execution['label']='ordinary'
+    if fault=='point':plan['points'][0]['initialization']='continuation'
+    if fault=='shape':execution['resolved_configuration']['numerical']['energy_nodes']=11
+    if fault=='telemetry':execution['output']['telemetry']['enabled']=True
+    if fault=='configuration':execution['resolved_configuration']['physical']['donor_sheet_density']='1e12 m^-2'
+    if fault=='model_hash':plan['points'][0]['effective_inputs']['model_sha256']='f'*64
+    if fault=='scientific_fingerprint':plan['scientific_fingerprint']='f'*64
+    sources=execution['provenance']['sources'];key=next(k for k,v in sources.items() if len(v)>1)
+    if fault=='history_order':sources[key].reverse()
+    if fault=='history_append':sources[key].append('invented-rule')
+    if fault=='fragment':sources[key][0]+='#changed-rule'
+    if fault=='unknown_source':sources[key][0]='/relocated/foreign.yaml#same'
+    if fault=='relative_source':sources[key][0]='relative/'+sources[key][0].rsplit('/',1)[-1]
+    if fault=='rule_origin':execution['resolved_snapshot']['default_rule_sources']['Core:src/domain/types.jl']='f'*64
+    if fault in (None,'ordinary'):
+        value,budget=publication_owner_read(tmp_path,plan)
+        assert value.get('engineering_fixture')==(None if fault=='ordinary' else 'native-publication-v1')
+        assert value['files']['plan']['sha256']==hashlib.sha256(m.encoded(plan)).hexdigest()
+    else:
+        with pytest.raises(m.Hold):publication_owner_read(tmp_path,plan)
+
+
+def test_publication_profile_allows_only_explicit_locator_prefix_and_capacity_normalization(tmp_path):
+    plan=publication_fixture_plan();execution=plan['executions'][0];plan['fingerprint']='e'*64
+    execution['resource_estimate']['worker_capacity']=7
+    histories=[execution['provenance']['sources']]+[s['input_assigning_histories'] for s in execution['resolved_snapshot']['sections'].values()]
+    for history in histories:
+        for key,values in history.items():
+            history[key]=['/independent/prefix/'+v.rsplit('/',1)[-1] if v.startswith('/') else v for v in values]
+    value,budget=publication_owner_read(tmp_path,plan)
+    assert value['engineering_fixture']=='native-publication-v1' and budget.bytes<8*1024**2
+
+
+@pytest.mark.parametrize('value',['native-publication-v1',None,'','unknown',True,{}])
+def test_publication_protected_runner_scope_is_finite(value):
+    m=module();runner=p20_runner();runner['engineering_fixture']=value
+    if value=='native-publication-v1':assert m._output_runner(runner)==runner
+    else:
+        with pytest.raises(m.Hold):m._output_runner(runner)
+
+
+def test_publication_engineering_qualification_cannot_review_ordinary_stock_script(monkeypatch):
+    m=module();sources=m.NativeSources({'jobs_root':'/srv/qcl-negf/jobs'},m.Operation(limits()))
+    monkeypatch.setattr(sources,'origin',lambda path:path)
+    runner=p20_runner();runner['engineering_fixture']='native-publication-v1'
+    sources.qualification=dict(completed_final=dict(runner=runner))
+    launch=request()['launch'];launch.update(release_id='fixture-release',execution_id='execution',relative_execution_root='native/new-domain')
+    with pytest.raises(m.Hold):m._review_native_script(NATIVE_ORIGIN_SCRIPT,launch,'/nix/store/synthetic/bin/qcl-negf',
+        '/bin/bash',sources,calcjob_uuid=NATIVE_ORIGIN_CALCJOB)
+
+
+def publication_metadata_profile():
+    """Full real plan plus explicit synthetic metadata, with honest failed science."""
+    m=module();launch,inputs,raws=p20_metadata_profile();docs={name:json.loads(raw) for name,raw in raws.items()}
+    plan=publication_fixture_plan();docs['plan.json']=plan;launch['execution_id']='execution-1'
+    inputs['runner']['engineering_fixture']='native-publication-v1'
+    plan_raw=m.encoded(plan);sha=hashlib.sha256(plan_raw).hexdigest()
+    native=docs['native-execution.json'];native['execution_id']='execution-1';native['input_plan'].update(bytes=str(len(plan_raw)),sha256=sha)
+    spec=docs['capture-spec.json'];spec['selection'].update(execution_id='execution-1',plan_fingerprint=plan['fingerprint']);spec['plan'].update(bytes=len(plan_raw),sha256=sha)
+    docs['capture-source.json'].update(execution_id='execution-1',plan_fingerprint=plan['fingerprint'])
+    result=docs['series_result.json'];result.update(status='failed',plan_fingerprint=plan['fingerprint'],plan_scientific_fingerprint=plan['scientific_fingerprint'],selected_execution_id='execution-1')
+    result['executions']=[dict(id='execution-1',point_ids=['point-1'])]
+    point=result['points'][0];point.update(id='point-1',execution_id='execution-1',status='failed',quality='invalid',converged=False,
+        warnings=[dict(code='SYNTHETIC_NATIVE_PUBLICATION_FIXTURE',scope='execution',message='synthetic; not_scientific; constructor-only; no SCBA/Poisson')],observables=dict(scientific_accepted=False))
+    point['data'].update(optical_attachment=None,phase_source=dict(status='disabled',session_id=None,current_path=None,reason='synthetic_fixture'))
+    state=point['data']['native_source']['selected_state'];state['identity'].update(execution_id='execution-1',point_id='point-1',plan_sha256=sha,
+        model_sha256=plan['points'][0]['effective_inputs']['model_sha256'])
+    row=docs['native-selection.json']['selected_inputs'][0];row['selected_state']=copy.deepcopy(state);row['plan'].update(bytes=str(len(plan_raw)),sha256=sha)
+    raws={name:m.encoded(value) for name,value in docs.items()}
+    for role,name in m.FILES.items():
+        raw=raws.get(name,b'fixed script fixture');launch['files'][role]=dict(bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest())
+    return launch,inputs,raws
+
+
+@pytest.mark.parametrize('fault',[None,'ordinary_r','ordinary_plan','completed_result','completed_point','quality','converged','accepted',
+    'warning_missing','warning_scope','warning_message','declaration','phase','optical'])
+def test_publication_metadata_requires_honest_failed_science_and_exact_original_scope(fault):
+    m=module();launch,inputs,raws=publication_metadata_profile();docs={name:json.loads(raw) for name,raw in raws.items()}
+    result=docs['series_result.json'];point=result['points'][0]
+    if fault=='ordinary_r':del inputs['runner']['engineering_fixture']
+    if fault=='ordinary_plan':docs['plan.json']['root_definition_id']='ordinary'
+    if fault=='completed_result':result['status']='completed'
+    if fault=='completed_point':point['status']='completed'
+    if fault=='quality':point['quality']='accepted'
+    if fault=='converged':point['converged']=True
+    if fault=='accepted':point['observables']['scientific_accepted']=True
+    if fault=='warning_missing':point['warnings']=[]
+    if fault=='warning_scope':point['warnings'][0]['scope']='point'
+    if fault=='warning_message':point['warnings'][0]['message']='scientific success'
+    if fault=='declaration':result['selected_execution_id']='foreign'
+    if fault=='phase':point['data']['phase_source']['status']='available'
+    if fault=='optical':point['data']['optical_attachment']={'present':True}
+    raws={name:m.encoded(value) for name,value in docs.items()}
+    if fault=='ordinary_plan':
+        # Rebind every raw claim too; a coherent ordinary input cannot borrow R scope.
+        sha=hashlib.sha256(raws['plan.json']).hexdigest();launch['files']['plan'].update(bytes=len(raws['plan.json']),sha256=sha)
+        native=docs['native-execution.json'];native['input_plan'].update(bytes=str(len(raws['plan.json'])),sha256=sha)
+        raws['native-execution.json']=m.encoded(native);launch['files']['native_execution'].update(bytes=len(raws['native-execution.json']),sha256=hashlib.sha256(raws['native-execution.json']).hexdigest())
+    budget=m.Operation({**limits(),'metadata_bytes':8*1024**2})
+    if fault is None:
+        proof=m._completed_metadata(launch,inputs,raws,(11,12),budget=budget)
+        assert proof['selected_points']==1 and json.loads(raws['series_result.json'])['points'][0]['observables']['scientific_accepted'] is False
+    else:
+        with pytest.raises(m.Hold):m._completed_metadata(launch,inputs,raws,(11,12),budget=budget)
+
+
+@pytest.mark.parametrize('fault',[None,'ordinary_r','ordinary_command','unset','legacy','extra','unquoted','wrong_uuid'])
+def test_publication_script_keeps_exact_eleven_native_arguments_and_protected_scope(monkeypatch,fault):
+    m=module();sources=m.NativeSources({'jobs_root':'/srv/qcl-negf/jobs'},m.Operation(limits()));monkeypatch.setattr(sources,'origin',lambda path:path)
+    runner=p20_runner();runner['engineering_fixture']='native-publication-v1'
+    if fault=='ordinary_r':del runner['engineering_fixture']
+    sources.qualification=dict(completed_final=dict(runner=runner))
+    launch=request()['launch'];launch.update(release_id='fixture-release',execution_id='execution-1',relative_execution_root='native/new-domain')
+    raw=NATIVE_ORIGIN_SCRIPT.replace(b"'run-plan'",b"'native-publication-fixture'").replace(b"'execution'",b"'execution-1'")
+    raw=raw.replace(b'unset QCL_NEGF_CAPTURE_SPEC',b'export QCL_NEGF_CAPTURE_SPEC=capture-spec.json QCL_NEGF_NATIVE_CAPTURE_INPUT=native-execution.json')
+    if fault=='ordinary_command':raw=raw.replace(b"'native-publication-fixture'",b"'run-plan'")
+    if fault=='unset':raw=raw.replace(b'export QCL_NEGF_CAPTURE_SPEC=capture-spec.json QCL_NEGF_NATIVE_CAPTURE_INPUT=native-execution.json',b'unset QCL_NEGF_CAPTURE_SPEC')
+    if fault=='legacy':raw=raw.replace((" '--native-execution' 'native-execution.json' '--native-calcjob-uuid' '"+NATIVE_ORIGIN_CALCJOB+"'").encode(),b'')
+    if fault=='extra':raw=raw.replace(b"  >",b" '--arbitrary'  >")
+    if fault=='unquoted':raw=raw.replace(b"'native-publication-fixture'",b'native-publication-fixture')
+    if fault=='wrong_uuid':raw=raw.replace(NATIVE_ORIGIN_CALCJOB.encode(),request()['calcjob_uuid'].encode())
+    def check():return m._review_native_script(raw,launch,'/nix/store/synthetic/bin/qcl-negf','/bin/bash',sources,
+        calcjob_uuid=NATIVE_ORIGIN_CALCJOB,engineering_fixture='native-publication-v1')
+    if fault is None:assert check() is None
+    else:
+        with pytest.raises(m.Hold):check()
+
+
+@pytest.mark.parametrize('fault',[None,'late_metadata','late_plan','cancel'])
+def test_publication_actual_held_fd_requalification_keeps_originals_and_late_guards(q1_joined,monkeypatch,fault):
+    # Exercise the real private fork, full original metadata, W1 handshake,
+    # original close pair and checked FD cleanup; no live-site source authority.
+    metadata=publication_metadata_profile()
+    monkeypatch.setattr(sys.modules[__name__],'p20_metadata_profile',lambda:copy.deepcopy(metadata))
+    test_original_closed_bytes_requalify_through_actual_private_child_metadata(q1_joined,monkeypatch,fault)
+
+
+@pytest.mark.parametrize('fault',['budget','duplicate','depth','cardinality'])
+def test_publication_original_parser_prepays_and_refuses_malformed_input(tmp_path,monkeypatch,fault):
+    m=module();raw=m.encoded(publication_fixture_plan());launch={'execution_id':'execution-1'}
+    budget=m.Operation({**limits(),'metadata_bytes':8*1024**2})
+    if fault=='budget':
+        budget.limits['metadata_bytes']=1
+        monkeypatch.setattr(m,'strict_json',lambda raw:pytest.fail('decoded before full prospective charge'))
+    if fault=='duplicate':raw=b'{"root_definition_id":"native-publication-fixture-v1","root_definition_id":"ordinary"}'
+    if fault=='depth':raw=b'{"root_definition_id":"native-publication-fixture-v1","nested":'+b'['*66+b'0'+b']'*66+b'}'
+    if fault=='cardinality':raw=b'{"root_definition_id":"native-publication-fixture-v1","nested":['+b'0,'*16385+b'0]}'
+    with pytest.raises(m.Hold):m._submitted_plan_mode(raw,launch,budget)
+    assert budget.bytes>0
+
+
+@pytest.mark.parametrize('fault',[None,'ordinary_r','ordinary_plan','ordinary_script'])
+def test_publication_original_preflight_derives_mode_before_fixed_script(actor_bridge,monkeypatch,fault):
+    s=actor_bridge;m=s['m'];source=s['sources'];launch=s['document']['launch'];files=s['files'];native=s['native']
+    files['plan']=m.encoded(publication_fixture_plan()) if fault!='ordinary_plan' else b'{"schema":"ordinary"}'
+    native['input_plan'].update(bytes=str(len(files['plan'])),sha256=hashlib.sha256(files['plan']).hexdigest())
+    files['native_execution']=m.encoded(native)
+    script=native_origin_bridge_script(s).replace(b'unset QCL_NEGF_CAPTURE_SPEC',b'export QCL_NEGF_CAPTURE_SPEC=capture-spec.json QCL_NEGF_NATIVE_CAPTURE_INPUT=native-execution.json')
+    if fault!='ordinary_script':script=script.replace(b"'run-plan'",b"'native-publication-fixture'")
+    files['submit_script']=script
+    launch['files']={key:dict(bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest()) for key,raw in files.items()}
+    s['actor_launch'].update(copy.deepcopy(launch))
+    runner=p20_runner()
+    if fault!='ordinary_r':runner['engineering_fixture']='native-publication-v1'
+    source.qualification['completed_final']=dict(runner=runner)
+    def originals(policy,actual,budget):
+        assert actual==launch and budget is source.budget
+        return dict(files=launch['files'],script=base64_script(script),
+            engineering_fixture=m._submitted_plan_mode(files['plan'],launch,budget))
+    monkeypatch.setattr(m,'_read_submitted_files_as_owner',originals)
+    def check():return source.preflight(launch,source.budget,calcjob_uuid=s['document']['calcjob_uuid'],action='submit')
+    if fault is None:assert check()==s['host'] and source.budget.bytes<source.budget.limits['metadata_bytes']
+    else:
+        with pytest.raises(m.Hold):check()
+        assert not hasattr(source,'_actor')
+
+
+def publication_fork_originals(tmp_path):
+    """Owned regular originals and actual reader/strict profile; no native authority."""
+    m=module();folder=tmp_path/'fork-originals';folder.mkdir()
+    launch={'execution_id':'execution-1','remote_workdir':str(folder),'files':{}}
+    for role,name in m.FILES.items():
+        raw=m.encoded(publication_fixture_plan()) if role=='plan' else b'{}'
+        (folder/name).write_bytes(raw)
+        launch['files'][role]=dict(bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest())
+    return launch,dict(client_uid=os.getuid(),jobs_root=str(tmp_path),limits={**m._bootstrap_operation().limits,'metadata_bytes':8*1024**2})
+
+
+def publication_real_fork_seam(monkeypatch):
+    """Only drop-credential authority is synthetic; retain real fork/pipe/FDs."""
+    m=module();uid=os.getuid;euid=os.geteuid;owner=m._owner_read;parent=os.getpid()
+    def actual_owner(*args,**kwargs):
+        assert os.getpid()!=parent
+        m.os.getuid=uid;m.os.geteuid=euid
+        return owner(*args,**kwargs)
+    monkeypatch.setattr(m,'_owner_read',actual_owner)
+    monkeypatch.setattr(m.os,'geteuid',lambda:0)
+    monkeypatch.setattr(m.os,'setgroups',lambda value:None)
+    monkeypatch.setattr(m.os,'setgid',lambda value:None)
+    monkeypatch.setattr(m.os,'setuid',lambda value:None)
+
+
+@pytest.mark.parametrize('next_action',['reserve','retry'])
+def test_publication_real_fork_preserves_full_debit_in_inherited_operation(tmp_path,monkeypatch,next_action):
+    m=module();launch,policy=publication_fork_originals(tmp_path)
+    direct=m.Operation(policy['limits']);expected=m._owner_read(policy,launch,direct)
+    assert direct.bytes>2*1024**2
+    parent=m.Operation(policy['limits']);parent.reserve(3*1024**2);before=parent.bytes
+    publication_real_fork_seam(monkeypatch)
+    observed=m._read_submitted_files_as_owner(policy,launch,parent)
+    assert observed==expected and parent.bytes-before>=direct.bytes
+    assert parent.actual_bytes>=sum(row['bytes'] for row in launch['files'].values())
+    assert not hasattr(parent,'_owner_read_credit')
+    charged=parent.bytes
+    with pytest.raises(m.Hold):
+        if next_action=='reserve':parent.reserve(policy['limits']['metadata_bytes']-charged+1)
+        else:m._read_submitted_files_as_owner(policy,launch,parent)
+    assert parent.bytes>=charged
+    if next_action=='retry':assert parent.bytes<=parent.limits['metadata_bytes']
+
+
+@pytest.mark.parametrize('failure',['profile','child_cancel','parent_cancel','parent_cancel_close'])
+def test_publication_real_fork_failure_or_cancel_never_returns_free_credit(tmp_path,monkeypatch,failure):
+    m=module();launch,policy=publication_fork_originals(tmp_path)
+    if failure=='profile':
+        path=Path(launch['remote_workdir'])/'plan.json';plan=json.loads(path.read_bytes());plan['name']='wrong profile'
+        raw=m.encoded(plan);path.write_bytes(raw);launch['files']['plan']=dict(bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest())
+    budget=m.Operation(policy['limits']);budget.reserve(3*1024**2);before=budget.bytes
+    primary=KeyboardInterrupt('original profile cancellation');parent=os.getpid();original=m._native_publication_fixture_mode
+    if failure=='child_cancel':
+        def cancel(*args,**kwargs):original(*args,**kwargs);raise primary
+        monkeypatch.setattr(m,'_native_publication_fixture_mode',cancel)
+    reserve=budget.reserve
+    cancelling={'active':False,'closed':False};close=os.close
+    if failure.startswith('parent_cancel'):
+        def debit(size):
+            reserve(size)
+            if os.getpid()==parent and size==655360:
+                cancelling['active']=True;raise primary
+        monkeypatch.setattr(budget,'reserve',debit)
+    if failure=='parent_cancel_close':
+        def closing(fd):
+            selected=os.getpid()==parent and cancelling['active'] and not cancelling['closed']
+            close(fd)
+            if selected:
+                cancelling['closed']=True;raise OSError('secondary original pipe close')
+        monkeypatch.setattr(m.os,'close',closing)
+    publication_real_fork_seam(monkeypatch)
+    with pytest.raises(KeyboardInterrupt if failure!='profile' else m.Hold) as caught:
+        m._read_submitted_files_as_owner(policy,launch,budget)
+    if failure.startswith('parent_cancel'):assert caught.value is primary
+    if failure=='parent_cancel_close':assert cancelling['closed'] and primary.__notes__
+    assert budget.bytes-before>2*1024**2 and not hasattr(budget,'_owner_read_credit')
+    paid=budget.bytes
+    monkeypatch.setattr(budget,'reserve',reserve)
+    monkeypatch.setattr(m,'_native_publication_fixture_mode',original)
+    with pytest.raises(m.Hold):m._read_submitted_files_as_owner(policy,launch,budget)
+    assert paid<=budget.bytes<=budget.limits['metadata_bytes']
+
+
+@pytest.mark.parametrize('kind',['ordinary','whitespace'])
+def test_original_real_fork_keeps_ordinary_json_and_parent_accounting(tmp_path,monkeypatch,kind):
+    m=module();launch,policy=publication_fork_originals(tmp_path);path=Path(launch['remote_workdir'])/'plan.json'
+    raw=b'{"ordinary":true}'
+    if kind=='whitespace':raw+=b' '*(1048576-len(raw))
+    path.write_bytes(raw);launch['files']['plan']=dict(bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest())
+    direct=m.Operation(policy['limits']);expected=m._owner_read(policy,launch,direct)
+    budget=m.Operation(policy['limits']);before=budget.bytes
+    publication_real_fork_seam(monkeypatch)
+    result=m._read_submitted_files_as_owner(policy,launch,budget)
+    assert result==expected and result['engineering_fixture'] is None
+    assert budget.bytes-before>=direct.bytes and budget.actual_bytes>=len(raw)+6
+    assert budget.bytes<=budget.limits['metadata_bytes'] and budget.files>=direct.files
+
+
+
+def publication_preflight_accounting_case(tmp_path,monkeypatch,*,cap,raw=None):
+    """Real bootstrap/load-policy/preflight/owner child on SOURCE/L operands.
+
+    Actual protected-root/caller/actor authorities are synthetic. The protected
+    JSON read_fd, actor reply/command/decoder prepay, original FD/strict JSON,
+    private fork/pipe/debit and inherited counters remain the production code.
+    """
+    m=module();real_reader=m._read_submitted_files_as_owner
+    state=actor_bridge.__wrapped__(monkeypatch);source=state['sources'];launch=state['document']['launch']
+    files=state['files'];native=state['native'];folder=tmp_path/'jobs';work=folder/'upload'/'one';work.mkdir(parents=True)
+    if raw is None:
+        raw=publication_fixture_plan(original_bytes=True);raw+=b' '*(131473-len(raw))
+    files['plan']=raw;launch['remote_workdir']=str(work)
+    native['input_plan'].update(bytes=str(len(raw)),sha256=hashlib.sha256(raw).hexdigest());files['native_execution']=m.encoded(native)
+    script=native_origin_bridge_script(state).replace(b'unset QCL_NEGF_CAPTURE_SPEC',b'export QCL_NEGF_CAPTURE_SPEC=capture-spec.json QCL_NEGF_NATIVE_CAPTURE_INPUT=native-execution.json')
+    script=script.replace(b"'run-plan'",b"'native-publication-fixture'").replace(b'/srv/qcl-negf/jobs',str(folder).encode())
+    files['submit_script']=script
+    launch['files']={key:dict(bytes=len(value),sha256=hashlib.sha256(value).hexdigest()) for key,value in files.items()}
+    state['actor_launch'].update(copy.deepcopy(launch))
+    for role,name in m.FILES.items():(work/name).write_bytes(files[role])
+    policy=dict(schema='qcl-negf.native-attempt-policy.v1',role='controller',private_root='/local/attempts',spool_root='/local/spool',
+        socket_path=m.SOCKET,jobs_root=str(folder),native_result_prefix='native',nfs_source='storage:/jobs',storage_identity_file='/protected/storage',
+        release_runtime='/protected/runtime',client_uid=3000,daemon_unit='qcl-negf-aiida.service',server_unit_prefix='qcl-negf-native-attempt@',
+        slurmd_unit='slurmd.service',tools={key:'/nix/store/'+key for key in ('systemctl','runuser','sbatch','scontrol','slurmd','slurmstepd','python')},
+        slurm=dict(cluster='cluster',version='slurm 1',config_file='/fixed/conf',cgroup_scope='/system.slice/slurmstepd.scope'),
+        facts_service_config='/protected/facts',worker_routes={'worker':dict(target='facts@worker',known_hosts='/protected/hosts',identity_file='/protected/key',helper='/fixed/rpc',role='facts')},
+        qualification_file='/protected/q',limits={**m._bootstrap_operation().limits,'metadata_bytes':cap})
+    budget=m._bootstrap_operation();source.budget=budget;trace=[];stage={'name':'bootstrap'};reserve=budget.reserve
+    def reserved(size):
+        before=budget.bytes;reserve(size);trace.append(dict(stage=stage['name'],bytes=size,before=before,after=budget.bytes))
+    monkeypatch.setattr(budget,'reserve',reserved)
+    protected=m.protected_read;counter={'value':0}
+    def local_read(data,limit):
+        counter['value']+=1;path=tmp_path/('protected-input-'+str(counter['value']));path.write_bytes(data)
+        fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
+        try:return m.read_fd(fd,limit,budget)[0]
+        finally:os.close(fd)
+    def root_json(path,actual,limit=65536):
+        assert actual is budget
+        stage['name']='policy' if Path(path)==m.POLICY else 'graph' if '/source-graph-' in str(path) else 'release'
+        return local_read(m.encoded(policy) if Path(path)==m.POLICY else protected(path,actual,limit),limit)
+    monkeypatch.setattr(m,'protected_read',root_json)
+    monkeypatch.setattr(m.os,'geteuid',lambda:0)
+    def gate(path,limit=65536):
+        stage['name']='admission';return local_read(m.encoded(dict(open=True,release_id=launch['release_id'])),limit)
+    monkeypatch.setattr(budget,'read',gate);monkeypatch.setattr(m.engine,'GATE',folder/'.release-admission.json')
+    actor=source._actor_read
+    def read_actor(kind,*args):stage['name']='actor:'+kind;return actor(kind,*args)
+    monkeypatch.setattr(source,'_actor_read',read_actor)
+    runner=p20_runner();runner['engineering_fixture']='native-publication-v1';source.qualification['completed_final']=dict(runner=runner)
+    reader=real_reader;owner=m._owner_read;uid=os.getuid
+    def owner_local(p,*args,**kwargs):
+        m.os.geteuid=lambda:uid()
+        return owner({**p,'client_uid':uid()},*args,**kwargs)
+    monkeypatch.setattr(m,'_owner_read',owner_local)
+    monkeypatch.setattr(m.os,'setgroups',lambda value:None);monkeypatch.setattr(m.os,'setgid',lambda value:None);monkeypatch.setattr(m.os,'setuid',lambda value:None)
+    def originals(*args,**kwargs):
+        stage['name']='originals';value=reader(*args,**kwargs);stage['name']='script';return value
+    monkeypatch.setattr(m,'_read_submitted_files_as_owner',originals)
+    def check():
+        source.policy=m._load_policy('controller',budget)
+        return source.preflight(launch,budget,calcjob_uuid=state['document']['calcjob_uuid'],action='submit')
+    state.update(check=check,trace=trace,cap=cap,protected_reads=counter,plan_raw=raw)
+    return state
+
+
+@pytest.mark.parametrize('cap',[8*1024**2,16*1024**2])
+def test_publication_whole_preflight_loads_policy_and_pays_real_fork(tmp_path,monkeypatch,cap):
+    state=publication_preflight_accounting_case(tmp_path,monkeypatch,cap=cap);m=state['m'];source=state['sources']
+    if cap==8*1024**2:
+        with pytest.raises(m.Hold,match='operation_bound'):state['check']()
+        assert not hasattr(source,'_actor')
+    else:
+        assert state['check']()==state['host'] and source.budget.bytes<=cap
+        assert source.policy['limits']['metadata_bytes']==cap
+        assert any(row['stage']=='originals' and row['bytes']==655360 for row in state['trace'])
+    assert len(state['plan_raw'])==131473 and source.budget.bytes>0
+
+
+@pytest.mark.parametrize('cap',[16*1024**2+1,32*1024**2])
+def test_uniform_bootstrap_never_admits_policy_above_metadata_ceiling(tmp_path,monkeypatch,cap):
+    m=module();state=publication_preflight_accounting_case(tmp_path,monkeypatch,cap=cap)
+    assert m._bootstrap_operation().limits['metadata_bytes']==16*1024**2
+    with pytest.raises(m.Hold,match='policy_limits'):state['check']()
+    assert state['calls']==[] and not hasattr(state['sources'],'_actor')
