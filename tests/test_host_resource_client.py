@@ -64,6 +64,59 @@ def test_installed_package_isolated_imports_shared_p11_engine_and_fixed_roles(tm
     assert [ast.unparse(arg) for arg in fixed[2:]]==['executable','action','token']
 
 
+@pytest.mark.parametrize('role,module,entry,service_role', [
+    ('authority','host_resource_service','main','authority'),
+    ('worker','host_resource_service','main','worker'),
+    ('facts','host_resource_service','main','facts'),
+    ('start-hook','host_resource_startup','hook_main',None),
+    ('admin','host_resource_startup','admin_main',None),
+    ('native-exec','host_resource_native_cleanup','native_exec_main',None),
+])
+def test_rendered_native_helpers_preserve_source_namespace(tmp_path,role,module,entry,service_role):
+    """Execute emitted helpers locally; imports must not add bytecode to fixed source.
+
+    Stub entry points record dispatch and argv without native/root/sudo actions.
+    Only the fixed source directory and Python interpreter are fixture inputs.
+    """
+    import json,os,shlex,subprocess
+    from jinja2 import Environment,StrictUndefined
+    root=Path(__file__).resolve().parents[1]
+    source=tmp_path/'source';source.mkdir()
+    poison=tmp_path/'poison';poison.mkdir()
+    stub='''import json,sys
+def emit(entry,role=None):
+    print(json.dumps({'module':__name__,'entry':entry,'role':role,
+        'argv':sys.argv[1:],'isolated':sys.flags.isolated}))
+    return 23
+def main(role):return emit('main',role)
+def hook_main():return emit('hook_main')
+def admin_main():return emit('admin_main')
+def native_exec_main():return emit('native_exec_main')
+'''
+    for name in ['host_resource_service','host_resource_startup','host_resource_native_cleanup']:
+        (source/(name+'.py')).write_text(stub)
+        (poison/(name+'.py')).write_text('raise RuntimeError("ambient import")\n')
+    def snapshot():
+        return {str(path.relative_to(source)):path.read_bytes() if path.is_file() else None
+            for path in source.rglob('*')}
+    before=snapshot()
+    environment=Environment(undefined=StrictUndefined)
+    environment.filters['quote']=shlex.quote
+    template=(root/'ansible/templates/host-resources/helper.j2').read_text()
+    assert template.count('/usr/local/lib/qcl-negf-host-resources')==1
+    template=template.replace('/usr/local/lib/qcl-negf-host-resources',str(source))
+    helper=tmp_path/'helper'
+    helper.write_text(environment.from_string(template).render(qcl_resource_python=sys.executable,item=role))
+    helper.chmod(0o700)
+    argv=['status','--json-stdin','literal argument']
+    result=subprocess.run([str(helper),*argv],cwd=poison,
+        env={**os.environ,'PYTHONPATH':str(poison)},capture_output=True,text=True,timeout=5)
+    assert result.returncode==23,result.stderr
+    assert json.loads(result.stdout)=={'module':module,'entry':entry,'role':service_role,
+        'argv':argv,'isolated':1}
+    assert snapshot()==before,'Helper imports changed the fixed source namespace or content'
+
+
 def test_generated_entries_select_only_nixos_privileged_sudo(tmp_path):
     """Catch store/ambient sudo selection without executing Python or sudo.
 

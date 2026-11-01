@@ -11,6 +11,9 @@ let
     } extra ];
   };
   off = (eval false {}).config;
+  offUserEnvironment = (eval false {
+    services.openssh.settings.PermitUserEnvironment = true;
+  }).config;
   on = (eval true {}).config;
   roles = (eval true {
     qclNegf.hostResources.authorityUser = "qcl-resource-authority";
@@ -25,6 +28,12 @@ let
 in assert builtins.isFunction outputs.nixosModules.hostResources;
 assert outputs.packages.x86_64-linux.hostResources.name == "qcl-negf-host-resources";
 assert off.environment.systemPackages != on.environment.systemPackages;
+assert !(builtins.hasAttr "PermitUserEnvironment" off.services.openssh.settings);
+assert offUserEnvironment.services.openssh.settings.PermitUserEnvironment;
+assert on.services.openssh.settings.PermitUserEnvironment == false;
+assert roles.services.openssh.settings.PermitUserEnvironment == false;
+assert !(pkgs.lib.hasInfix "PermitUserEnvironment" on.services.openssh.extraConfig);
+assert !(pkgs.lib.hasInfix "PermitUserEnvironment" roles.services.openssh.extraConfig);
 assert builtins.length rules == 1;
 assert (builtins.head rules).users == [ "qcl-negf" ];
 assert builtins.length (builtins.head rules).commands == 1;
