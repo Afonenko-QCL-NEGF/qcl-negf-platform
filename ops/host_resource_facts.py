@@ -676,6 +676,8 @@ def capture_scheduler(config,sources):
     require(clusters==[config['cluster']] and controllers and controllers==sorted(config['slurmctld_hosts']),
         'identity_mismatch','actual native cluster/controller identity differs')
     raw=sources.run([str(tool),'--oneliner','show','jobs'])
+    # Qualified C-locale response for the complete empty scheduler, not a job row.
+    if version=='slurm 25.11.8' and raw=='No jobs in the system\n':return {}
     # Unallocated jobs do not own a guest. Parse each allocated supported node;
     # relevant incomplete/multinode records refuse instead of disappearing.
     allocated=[]
