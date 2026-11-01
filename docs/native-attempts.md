@@ -32,6 +32,15 @@ false. Enabling it requires the existing API, the exact private runtime
 `resultPrefix` under the existing jobs mount (default `native`). The module does
 not copy policy contents or credentials into the Nix store. Root separately
 prepares the regular protected runtime file and the new result directory.
+
+Перед native приёмкой оператор подтверждает actual владельца NFS publisher и числовое
+сопоставление science UID/GID. Новый result leaf создаёт его owning publisher: каталог должен
+быть новым, exclusive, пустым и с проверенными permissions. При `root_squash` нельзя предполагать,
+что root сможет создать его через клиентский NFS mount. Existing данные не chmod/chown и export
+не ослабляют. После запуска API/AiiDA нужен readback текущих service mount namespaces:
+held native-leaf identity совпадает с publisher, mount read-only и effective owner W_OK=false.
+Один `ReadOnlyPaths` в unit или старый PID probe не заменяет эту проверку после restart.
+
 Worker hooks have their own default-disabled
 `qclNegf.cluster.nativeAttempts.enable` and the same fixed policy endpoint with
 worker-role contents. Foreign Prolog/Epilog settings conflict explicitly.
@@ -351,9 +360,11 @@ Before each fixed actor query, the same operation prepays its existing query
 workspace plus eight times each declared original length rounded through the
 4096-byte read/EOF request, bounded by that role limit plus one byte. The command
 response charge remains separate. Failure or cancellation cannot refund these
-charges. The aggregate workspace remains 8 MiB (or a tighter policy); a plan at
-the 1 MiB role ceiling can exceed that aggregate and must HOLD before the actor
-command. File bytes and charged workspace are not physical I/O or measured RSS.
+charges. The aggregate metadata workspace ceiling is 16 MiB (or a tighter policy);
+exhaustion must HOLD before the unpaid actor command. This does not change the separate
+8 MiB aggregate stdout/stderr bound for [delivery](delivery-operations.md).
+File bytes and charged workspace are not physical I/O or measured RSS; the root unit's
+128 MiB MemoryMax/16 tasks and native caller/C/G/R qualification remain separate gates.
 Hard-NFS/fsync can be uninterruptible: the helper does not claim safe remote
 cleanup merely because its local deadline expired.
 
