@@ -3,6 +3,32 @@
 For VM agent installation, runtime acceptance and a non-disruptive diagnosis, see
 [Guest agent: установка, диагностика и восстановление](guest-agent.md).
 
+## Русская карта native gates
+
+Начинайте с [QGA](guest-agent.md#приёмка-и-выбор-канала): declared channel и включённый service
+проверяются ordinary ping и короткой командой после install/first boot/reboot. При timeout
+используйте [раздел диагностики](guest-agent.md#если-агент-не-отвечает), сохраняя original
+failure; protocol resync, service recovery и VM reboot — разные решения, blanket restart не
+является диагнозом.
+
+Для первого дополнительного worker следуйте [Linux
+guide](linux-workers.md#первый-boot-enrollment-и-допуск): image build/content/transfer, stopped
+definition, boot, enrollment, admission и smoke — отдельные gates. [NM PORT-first
+guard](linux-workers.md#native-networkmanager-port-first-dhcp-и-ограниченный-guard) не заменяет
+actual host adapter/typed RPC и native IP-change, lease, reboot/NM restart, USB/carrier,
+unknown/CAS и L2/foreign checks. Новая epoch требует fresh binding/readback, а не silent reset.
+Source fixtures не устанавливают bridge и не разрешают запуск guest.
+
+[Restricted resource RPC
+checklist](host-resource-integration.md#source-installation-и-отдельная-n-приёмка) и [closed APP
+route](application-cd.md#закрытый-инженерный-маршрут) задают отдельные границы. [Native
+attempts](native-attempts.md#accounting-and-qualification) требуют собственной caller/unit/
+storage/C/G/R/RSS приёмки; [resource recovery](host-resource-recovery.md#открытые-gates) не
+превращает local-libvirt retirement в PVE lost-reply recovery. Technical publication, recovery и
+science принимаются раздельно; synthetic failed/nonconverged carrier с `scientific_accepted=false`
+не является научным результатом. Этот маршрут перечисляет требования, не утверждает их
+прохождение.
+
 ## Identity, networks and storage
 
 Use a private network between storage, controller and workers. Resolve their short hostnames
@@ -96,6 +122,36 @@ Each calculation uses one process on one node. Slurm assigns its CPUs and RAM; n
 stay within that allocation. Independent executions scale across workers through AiiDA. The solver
 owns convergence, and AiiDA parses scientific completion separately from the operating-system exit
 code. Use the parsed result status when accepting a calculation.
+
+## Документация в установленном API
+
+Strict docs build и offline browser check не подключают bundle к работающему API. Private site
+может использовать существующий NixOS service interface без нового module option:
+
+```nix
+# docsPackage — выбранная immutable derivation с public/bundle.json;
+# docsBundleSha256 — измеренный SHA256 именно этих bundle.json bytes.
+{
+  systemd.services.qcl-negf-api.environment = {
+    QCL_NEGF_DOCS_BUNDLE_DIR = "${docsPackage}/public";
+    QCL_NEGF_DOCS_BUNDLE_SHA256 = docsBundleSha256;
+  };
+}
+```
+
+Оба fields задаются парой. Сохраните Nix dependency context выбранного docs output, доставьте его
+closure на control и проверьте readable public contents от service UID. Directory должен быть
+прямым абсолютным canonical path без symlink parents; profile alias не подходит. Manifest source
+revision остаётся исходным: старый artifact нельзя retag как документацию нового source.
+
+`Documentation.load` выполняется при создании app; после штатной service reconfiguration проверьте
+current generation и `documentation` в защищённом `/api/v1/config` существующим authenticated
+клиентом, не публикуя credential. Для `available` нужны versioned GET/HEAD и asset readbacks через
+actual API по `documentation.url`; bare `/docs/` намеренно не является content route и при
+available даёт404. Ответ503 сообщает unavailable, но не различает not_configured/invalid
+configuration, missing или invalid bundle: сравните actual два docs fields и bounded loader
+category, не ослабляйте проверки. Existing root/health200 не доказывают docs availability. Старый
+browser/build receipt сохраняет свой scope и не заменяет installed readback.
 
 ## Source, CI and delivery
 

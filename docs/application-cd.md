@@ -6,6 +6,31 @@ credential or delivery runner. The controller-owned delivery systemd service reu
 maintenance engine; it adds no discovery or revision lock catalog. See the Russian
 [delivery operations manual](delivery-operations.md) for request identity and interruption handling. The initial deployment is CPU-only and selects one release for the active pool.
 
+## Закрытый инженерный маршрут
+
+Обычные `qcl-negf-release update`/`deliver` выполняют whole-cluster maintenance и при полном
+успехе доходят до admission opening. Для отдельно порученной проверки при постоянно закрытом
+admission нужен заранее reviewed scoped план: metadata staging → выбор NEW closed context → public
+local `qcl-negf-release activate` на controller и workers → отдельная final pair/readback. Staging
+означает доставку и проверку exact manifest/source/closure metadata; сам по себе он не меняет
+runtime/Code, не активирует release и не является readiness.
+
+У `qcl-negf-release` нет standalone действий `select` или `stage`. Выбор закрытого контекста
+выполняет владеющий lifecycle helper в reviewed плане; private adapter не становится public
+command или разрешением raw bypass. `activate` требует gate с тем же release ID, закрытый для
+этого маршрута, exact role/node/enrollment и обычные qualification/health guards. Он может
+изменить profiles, actual Code/runtime и перезапустить services; новый UUID читают фактически. Его
+owner journal и отсутствие pending intent проверяют независимо от unit exit0.
+
+Перед каждой мутацией нужны fresh paired witnesses с исходными timestamps, теми же immutable
+identities, PG/QGA generations, data namespaces и closed gate; допустимый age задаёт reviewed
+план. После каждой фазы сверяют exact phase/unit/InvocationID/own receipt и current runtime.
+ACK/queued не означает completion. При partial/unknown сначала установить исход той же операции,
+сохранить original failure и сверить owner journals; следующий этап и replay заблокированы.
+Успешная closed sequence не открывает admission и не доказывает native C/G/R/RSS, recovery или
+scientific acceptance. Правила ordinary request identity остаются в [delivery
+operations](delivery-operations.md#отправка-и-статус).
+
 ## One-time image preparation
 
 Pass the same `qclNegf.release.applicationPackage` and immutable `qclNegf.cluster.solverPackage` to

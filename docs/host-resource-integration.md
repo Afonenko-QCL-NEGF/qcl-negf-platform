@@ -360,6 +360,21 @@ attachment/service start. Private tool paths указывают на exact prote
 profile/symlink. Existing command engine и P12 store reader co-located read-only; их owning files не
 менялись.
 
+Краткая installed-RPC приёмка для оператора:
+
+- Проверить distinct enrolled role UID и exact root-owned public authorized-key file0644; все
+  parent directories должны позволять traverse выбранному account и оставаться защищёнными от его
+  записи. Private key/config сохраняют отдельные0700/0600 и не публикуются.
+- Для guest→controller client key проверить per-key `restrict` и forced marker; для
+  authority/facts — соответствующий Match/ForceCommand. Проверить actual effective `sshd -T -C`
+  для каждой роли, запрет shell/PTY/forwarding и exact canonical sudo wrapper. Match/source text
+  или копия ключа сами по себе не доказывают effective restrictions.
+- Выполнить разрешённый authenticated client/facts/authority RPC и отрицательные cases на actual
+  installed helpers; связать caller/UID, executable и process/cgroup generation с kernel readback,
+  а reply — с исходным request/receipt. Файл с ожидаемыми PID или скопированный PASS не является
+  kernel proof. Caller qualification, capacity/enrollment и backend native protocol принимаются
+  отдельно; этот checklist не присваивает им PASS.
+
 Требуют source follow-up: PVE lost-reply recovery, failed/cancelled/nonzero и другие unsupported
 output completion subsets, complete Nix daemon/build join и owning P07/P22/P12/P31 callsites.
 Successful completed-final source зависит от owning strong Runner publication и отдельной actual
