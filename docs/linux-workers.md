@@ -30,10 +30,10 @@ Publisher и оператор связывают один выбранный sou
 
 Числа из [provider input example](../tofu/arch-libvirt/site-base.json.example) (4 GiB RAM, 2 vCPU,
 32 GiB scratch и documentation IP) — synthetic fixture, а не defaults или измерение нового хоста.
-RAM/vCPU/root/scratch задаются явно; исторические потолки одного ноутбука больше не ограничивают
-adapter. Учитывайте существующие VM, QEMU overhead, физическую свободную память и место под image,
-root overlay, scratch и результаты. Sparse capacity не резервирует реальное место. Успешная
-validation не означает capacity admission.
+RAM, vCPU, корневой диск и scratch задаются явно; исторические потолки одного ноутбука больше не
+ограничивают adapter. Учитывайте существующие VM, QEMU overhead, физическую свободную память и место
+под image, root overlay, scratch и результаты. Sparse capacity не резервирует реальное место.
+Успешная validation не означает capacity admission.
 
 ## Профиль первого дополнительного production worker
 
