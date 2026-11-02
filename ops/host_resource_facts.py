@@ -731,7 +731,7 @@ def capture_guest_facts(config,sources,*,clock=time.time):
     main=next((p for p in processes if str(p['pid'])==unit['MainPID']),None)
     states=re.findall(r'(?:^|\s)State=([^\s]+)',node)
     registered=(unit['LoadState']=='loaded' and unit['ActiveState']=='active' and main is not None and
-        main['uids']==[0]*4 and main['cgroup']==unit['ControlGroup'] and
+        main['uids']==[0]*4 and command_engine.daemon_scope_bound(main['cgroup'],unit['ControlGroup']) and
         main['executable']==config['slurmd_executable'] and len(states)==1 and
         states[0].split('+')[0] in {'IDLE','ALLOCATED','MIXED'} and 'NOT_RESPONDING' not in states[0])
     output_after=_worker_output_generation(output_sources)

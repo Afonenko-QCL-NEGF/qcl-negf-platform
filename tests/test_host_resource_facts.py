@@ -707,3 +707,60 @@ def test_publication_host_join_keeps_protected_engineering_scope(monkeypatch,fau
     else:
         provider._join_scheduler_outputs(guests,observed_now=100)
         assert provider._joined_outputs==provider._pending_outputs
+
+
+@pytest.mark.parametrize('seam',['guest','attempt'])
+@pytest.mark.parametrize('service,scope,accepted,fault',[
+    ('/system.slice/slurmd.service','/system.slice/slurmd.service',True,None),
+    ('/system.slice/slurmd.service','/system.slice/slurmd.service/slurmd',True,None),
+    ('/system.slice/slurmd.service','/system.slice/slurmd.service-foreign/slurmd',False,None),
+    ('/system.slice/slurmd.service','/system.slice/slurmstepd.scope/system',False,None),
+    ('/system.slice/slurmd.service','/user.slice/manual/slurmd',False,None),
+    ('/system.slice/slurmd.service','/',False,None),
+    ('/','/slurmd',False,None),
+    ('/system.slice/slurmd.service','//system.slice/slurmd.service/slurmd',False,None),
+    ('/system.slice/slurmd.service','/system.slice/slurmd.service//slurmd',False,None),
+    ('/system.slice/slurmd.service','/system.slice/slurmd.service/./slurmd',False,None),
+    ('/system.slice/slurmd.service','/system.slice/slurmd.service/../foreign',False,None),
+    ('/system.slice/slurmd.service','/system.slice/slurmd.service/slurmd',False,'uid'),
+    ('/system.slice/slurmd.service','/system.slice/slurmd.service/slurmd',False,'executable'),
+    ('/system.slice/slurmd.service','/system.slice/slurmd.service/slurmd',False,'pid'),
+    ('/system.slice/slurmd.service','/system.slice/slurmd.service/slurmd',False,'inactive'),
+])
+def test_guest_and_writer_require_own_canonical_daemon_scope(monkeypatch,seam,service,scope,accepted,fault):
+    """A delegated daemon remains registered; a sibling/manual scope never does."""
+    import host_resource_facts as f
+    import native_attempt as m
+    from test_native_attempt import p20_worker,limits
+    worker=p20_worker();identity=worker['identity']
+    main={**worker['unit']['main'],'cgroup':scope}
+    unit={**worker['unit']['state'],'ControlGroup':service,'LoadState':'loaded'}
+    if fault=='uid':main['uids']=[995]*4
+    if fault=='executable':main['executable']='/nix/store/foreign/bin/slurmd'
+    if fault=='pid':unit['MainPID']='999'
+    if fault=='inactive':unit['ActiveState']='inactive'
+    class Local:
+        def host(self):return {**identity,'MemTotal':1024**3,'MemAvailable':512*1024**2}
+        def processes(self):return [dict(main)]
+        def run(self,argv):
+            assert argv==['/fixed/scontrol','--oneliner','show','node','node-a']
+            return 'RealMemory=512 State=IDLE'
+    config=dict(node='node-a',client_uid=3000,slurm_cgroup_root='/jobs',infrastructure_processes=[],
+        slurmd_executable=worker['unit']['main']['executable'],guest_protocol='synthetic',
+        scontrol='/fixed/scontrol',systemctl='/fixed/systemctl')
+    monkeypatch.setattr(m,'_worker_output_sources',lambda:None)
+    monkeypatch.setattr(f,'capture_scheduler',lambda *a:{})
+    monkeypatch.setattr(m.engine,'unit_state',lambda *a,**k:dict(unit))
+    monkeypatch.setattr(f.os.path,'realpath',lambda path:'/nix/store/synthetic-image')
+    monkeypatch.setattr(f,'trusted_root_path',lambda path,**kwargs:Path(path))
+    if seam=='guest':
+        packet=f.capture_guest_facts(config,Local(),clock=lambda:100)
+        assert packet['slurm_registered'] is accepted
+        assert packet['identity_before']==packet['identity_after']
+    elif accepted:
+        packet=m._capture_writer_snapshot(config,Local(),m.Operation(limits()))
+        assert packet['slurm_registered'] is True
+        assert packet['identity_before']==packet['identity_after']
+    else:
+        with pytest.raises(m.Hold,match='writer_domain_not_closed'):
+            m._capture_writer_snapshot(config,Local(),m.Operation(limits()))
