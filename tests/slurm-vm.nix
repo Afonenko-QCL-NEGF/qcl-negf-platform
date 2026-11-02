@@ -60,7 +60,7 @@ pkgs.testers.runNixOSTest {
     control.wait_for_unit("slurmctld.service")
     worker.wait_for_unit("slurmd.service")
     control.wait_until_succeeds("sinfo -h -o %T | grep -Fx idle")
-    control.succeed("su -s /bin/sh qcl-negf -c 'cd /srv/qcl-negf/jobs && sbatch --wait --output=smoke.txt --wrap=hostname'")
+    control.succeed("su -s /bin/sh qcl-negf -c 'cd /srv/qcl-negf/jobs && sbatch --wait --mem=128M --output=smoke.txt --wrap=hostname'")
     control.succeed("su -s /bin/sh qcl-negf -c 'grep -Fx worker /srv/qcl-negf/jobs/smoke.txt'")
     storage.succeed("test $(stat -c %u /srv/qcl-negf/jobs/smoke.txt) = 3000")
     # Interactive steps require worker->srun callbacks in addition to sbatch RPC.
