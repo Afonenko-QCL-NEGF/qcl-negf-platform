@@ -56,11 +56,17 @@ def test_failed_command_retains_diagnostics():
 
 def test_combined_output_and_deadline_are_bounded():
     m = load()
-    for source, cap in [("import sys; sys.stdout.write('x'*8192); sys.stderr.write('y'*8192)", 1024),
-                        ("import time; time.sleep(5)", 1024)]:
+    cap = 1024
+    for source, expected_failure in [
+            ("import sys; sys.stdout.write('x'*8192); sys.stderr.write('y'*8192)", "output limit"),
+            ("import time; time.sleep(5)", "deadline")]:
         with pytest.raises(m.CommandFailure) as error:
-            m.run([sys.executable, "-c", source], 0.15, cap)
-        assert error.value.record["failure"] in ("output limit", "deadline")
+            # Includes a fresh Python supervisor plus bounded ownership scans.
+            # The measured host needs ~0.19s even for this output fixture; use
+            # the existing 2s descendant-fixture allowance, not a 150ms SLA.
+            m.run([sys.executable, "-c", source], 2, cap)
+        assert error.value.record["failure"] == expected_failure
+        assert error.value.record["exit_code"] is not None
         assert len(error.value.record["stdout"].encode()) + len(error.value.record["stderr"].encode()) <= cap
 
 
@@ -328,3 +334,72 @@ time.sleep(30)
     assert error.value.record['exit_code'] == 0
     assert error.value.record['stdout'] == 'late-stdout\n'
     assert error.value.record['stderr'] == 'late-stderr\n'
+
+
+@pytest.mark.parametrize("completion_failure", ["deadline; cleanup uncertain", "output limit; cleanup uncertain"])
+def test_uncertain_cleanup_is_failure_even_with_zero_exit(monkeypatch, completion_failure):
+    """Exact outer supervisor protocol; no process, /proc scan or signal occurs."""
+    m = load()
+    copies = []
+    class FinishedSupervisor:
+        pid = 424242
+        returncode = 0
+        def __init__(self, gate): self.gate = gate; copies.append(self)
+        def poll(self): return 0
+        def wait(self, timeout):
+            if self.gate is not None: os.close(self.gate); self.gate = None
+            return 0
+    class Owner:
+        def __init__(self, deadline): pass
+        def row(self, pid): return (123, os.getpid(), b"S", os.getuid())
+    def spawn(argv, **kwargs):
+        status, gate = kwargs["pass_fds"]
+        child = FinishedSupervisor(os.dup(gate))
+        os.write(status, json.dumps(dict(exit_code=0, failure=completion_failure,
+                                         stdout="bounded diagnostic", stderr="")).encode())
+        return child
+    monkeypatch.setattr(m.subprocess, "Popen", spawn)
+    monkeypatch.setattr(m, "_CommandOwner", Owner)
+    monkeypatch.setattr(m.os, "pidfd_open", lambda pid, flags: os.open(os.devnull, os.O_RDONLY))
+    monkeypatch.setattr(m.signal, "pidfd_send_signal", lambda *args: pytest.fail("no signal permitted by fixture"))
+    try:
+        with pytest.raises(m.CommandFailure) as error:
+            m.run([str(Path(sys.executable).resolve()), "-c", "pass"], 2, 1024)
+        assert error.value.record["failure"] == completion_failure
+        assert error.value.record["exit_code"] == 0
+        assert error.value.record["stdout"] == "bounded diagnostic"
+    finally:
+        for child in copies:
+            if child.gate is not None: os.close(child.gate)
+
+
+def test_expired_command_budget_remains_failure_without_foreign_signal(monkeypatch):
+    """A deterministic clock expiration cannot become a successful completion."""
+    m = load()
+    clock = [0.0]
+    gates = []
+    class FinishedSupervisor:
+        pid = 424242
+        returncode = 0
+        def poll(self): return 0
+        def wait(self, timeout): return 0
+    class Owner:
+        def __init__(self, deadline): pass
+        def row(self, pid): return (123, os.getpid(), b"S", os.getuid())
+    def spawn(argv, **kwargs):
+        status, gate = kwargs["pass_fds"]
+        gates.append(os.dup(gate))
+        os.write(status, json.dumps(dict(exit_code=0, failure=None, stdout="", stderr="")).encode())
+        clock[0] = 3.0
+        return FinishedSupervisor()
+    monkeypatch.setattr(m.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(m.subprocess, "Popen", spawn)
+    monkeypatch.setattr(m, "_CommandOwner", Owner)
+    monkeypatch.setattr(m.os, "pidfd_open", lambda pid, flags: os.open(os.devnull, os.O_RDONLY))
+    monkeypatch.setattr(m.signal, "pidfd_send_signal", lambda *args: pytest.fail("no foreign signal"))
+    try:
+        with pytest.raises(m.CommandFailure) as error:
+            m.run([str(Path(sys.executable).resolve()), "-c", "pass"], 2, 1024)
+        assert error.value.record["failure"] == "deadline"
+    finally:
+        for fd in gates: os.close(fd)

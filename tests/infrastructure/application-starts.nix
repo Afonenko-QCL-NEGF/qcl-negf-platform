@@ -17,6 +17,7 @@ let
       coreutils = "/synthetic-coreutils";
     };
     config = {
+      qclNegf.monitoring.observation.portalCache.enable = false;
       qclNegf.cluster.solverPackage = "/nix/store/synthetic-solver";
       qclNegf.application = {
         enable = true;

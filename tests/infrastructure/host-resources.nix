@@ -19,6 +19,18 @@ let
     qclNegf.hostResources.authorityUser = "qcl-resource-authority";
     qclNegf.hostResources.factsUser = "qcl-resource-facts";
   }).config;
+  authorityOnly = (eval true {
+    qclNegf.hostResources.authorityUser = "qcl-resource-authority";
+  }).config;
+  factsOnly = (eval true {
+    qclNegf.hostResources.factsUser = "qcl-resource-facts";
+  }).config;
+  userRules = config: user: builtins.filter (rule: rule.users == [ user ]) config.security.sudo.extraRules;
+  onlyCommand = config: user:
+    let matches = userRules config user;
+    in assert builtins.length matches == 1;
+       assert builtins.length (builtins.head matches).commands == 1;
+       builtins.head (builtins.head matches).commands;
   package = import ../../nix/host-resources.nix { inherit pkgs; };
   outputs = (import ../../flake.nix).outputs {
     self = {}; nixpkgs = { lib = pkgs.lib; legacyPackages.x86_64-linux = pkgs; };
@@ -37,7 +49,21 @@ assert !(pkgs.lib.hasInfix "PermitUserEnvironment" roles.services.openssh.extraC
 assert builtins.length rules == 1;
 assert (builtins.head rules).users == [ "qcl-negf" ];
 assert builtins.length (builtins.head rules).commands == 1;
-assert pkgs.lib.hasSuffix "/bin/qcl-negf-resource-client-root" (builtins.head (builtins.head rules).commands).command;
+assert (onlyCommand on "qcl-negf").command == "/run/current-system/sw/bin/qcl-negf-resource-client-root";
+assert (onlyCommand on "qcl-negf").options == [ "NOPASSWD" ];
+assert (onlyCommand roles "qcl-negf").command == "/run/current-system/sw/bin/qcl-negf-resource-client-root";
+assert (onlyCommand roles "qcl-negf").options == [ "NOPASSWD" ];
+assert (onlyCommand roles "qcl-resource-authority").command == "/run/current-system/sw/bin/qcl-negf-resource-authority";
+assert (onlyCommand roles "qcl-resource-authority").options == [ "NOPASSWD" ];
+assert (onlyCommand roles "qcl-resource-facts").command == "/run/current-system/sw/bin/qcl-negf-resource-facts";
+assert (onlyCommand roles "qcl-resource-facts").options == [ "NOPASSWD" ];
+assert userRules off "qcl-negf" == [];
+assert userRules on "qcl-resource-authority" == [];
+assert userRules on "qcl-resource-facts" == [];
+assert (onlyCommand authorityOnly "qcl-resource-authority").command == "/run/current-system/sw/bin/qcl-negf-resource-authority";
+assert userRules authorityOnly "qcl-resource-facts" == [];
+assert (onlyCommand factsOnly "qcl-resource-facts").command == "/run/current-system/sw/bin/qcl-negf-resource-facts";
+assert userRules factsOnly "qcl-resource-authority" == [];
 assert !(builtins.hasAttr "qcl-resource" on.systemd.services);
 assert on.qclNegf.hostResources.authorityUser == null;
 assert on.qclNegf.hostResources.factsUser == null;

@@ -25,6 +25,7 @@ let
       util-linux = "/synthetic-util-linux";
     };
     config = {
+      qclNegf.monitoring.observation.portalCache.enable = false;
       qclNegf.cluster = {
         solverPackage = "/nix/store/synthetic-solver";
         jobDirectory = "/srv/qcl-negf/jobs";

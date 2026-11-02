@@ -32,6 +32,12 @@
         pkgs = nixpkgs.legacyPackages.${system};
         inherit workspaceRoot includeTests uv2nix pyproject-nix pyproject-build-systems;
       };
+    lib.mkPlatformCheck = { system, scope, applicationTestEnvironment ? null }:
+      import ./nix/operations-check.nix {
+        pkgs = nixpkgs.legacyPackages.${system};
+        platformSource = self.outPath;
+        inherit scope applicationTestEnvironment;
+      };
     lib.mkApplication = { system, workspaceRoot }:
       self.lib.mkPythonEnvironment { inherit system workspaceRoot; };
     lib.mkLocalLab = { site, system ? "x86_64-linux" }:
@@ -43,6 +49,8 @@
       testEnvironment = import ./nix/operations-test-environment.nix { inherit pkgs; };
     in {
       default = pkgs.mkShell (testEnvironment.environment // {
+        QCL_PLATFORM_OPERATIONS_PYTHON = testEnvironment.python.interpreter;
+        QCL_TEST_NIXPKGS = "${nixpkgs.outPath}";
         packages = with pkgs; [ deno git nix nixos-rebuild uv nodejs_24 opentofu testEnvironment.python ];
       });
     });
@@ -64,15 +72,8 @@
         checkedMonitoring = import ./tests/infrastructure/monitoring.nix { nixpkgs = nixpkgs.outPath; };
       in builtins.deepSeq [ checked checkedProduction checkedMunge checkedBuilder checkedRunner checkedRunnerRouting checkedRelease checkedNativeAttempt checkedMonitoring checkedLocalLab checkedSlurmNetwork ] (pkgs.runCommand "qcl-negf-infrastructure-check" {} "touch $out");
       slurm-vm = import ./tests/slurm-vm.nix { inherit pkgs; module = self.nixosModules.default; };
-      operations = pkgs.runCommand "qcl-negf-operations-check" (testEnvironment.environment // { nativeBuildInputs = [ pkgs.deno pkgs.nix testEnvironment.python ]; }) ''
-        cp -r ${./.} source
-        chmod -R u+w source
-        cd source
-        export DENO_DIR="$TMPDIR/deno"
-        export QCL_TEST_NIXPKGS=${nixpkgs.outPath}
-        deno task check
-        touch "$out"
-      '';
+      # Standalone component scope is intentionally Ops-only. Root composes full.
+      operations = (self.lib.mkPlatformCheck { inherit system; scope = "ops"; }).check;
     });
   };
 }

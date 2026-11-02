@@ -270,7 +270,7 @@
       \   reap();time.sleep(.01)\n  if members():\n   budget.tick()\n   try:os.killpg(p.pid,signal.SIGKILL);info['kill_sent']=True\n\
       \   except ProcessLookupError:pass\n  while time.monotonic()<end:\n   reap()\n   if not members():break\n\
       \   time.sleep(.01)\n  reap();info['reaped']=p.poll() is not None;info['group_absent']=not members()\n\
-      \ except (OSError,ValueError):pass\n return info\ndef boundary(r):\n result={'schema':SCHEMA,'slot_id':r.get('slot_id'),'identity':r.get('identity'),'clock':r.get('clock'),'status':'refused','returncode':None,'stdout':'','stderr':'','observed_bytes':{'stdout':0,'stderr':0,'metadata':0},'reserved_bytes':r.get('bounds'),'cleanup':{'pgid':None,'term_sent':False,'kill_sent':False,'reaped':True,'group_absent':True}}\n\
+      \ except (OSError,ValueError):pass\n return info\ndef transfer_owner_credit(owner,cleanup):\n need(owner is not cleanup and all(type(v) is int for v in (owner.used,owner.limit,cleanup.used,cleanup.limit)) and 0<=owner.used<=owner.limit and 0<=cleanup.used<=cleanup.limit,'invalid metadata credit')\n delta=owner.limit-owner.used;owner.limit=owner.used;cleanup.limit+=delta;return delta\ndef boundary(r):\n result={'schema':SCHEMA,'slot_id':r.get('slot_id'),'identity':r.get('identity'),'clock':r.get('clock'),'status':'refused','returncode':None,'stdout':'','stderr':'','observed_bytes':{'stdout':0,'stderr':0,'metadata':0},'reserved_bytes':r.get('bounds'),'cleanup':{'pgid':None,'term_sent':False,'kill_sent':False,'reaped':True,'group_absent':True}}\n\
       \ p=None;generation=None;sel=None;owner_budget=None;cleanup_budget=None;telemetry_read=None;telemetry_write=None;child_metadata=None\n\
       \ try:\n  need(type(r) is dict and set(r)=={'schema','identity','slot_id','clock','bounds','operation'},'exact\
       \ command request')\n  need(r['schema']==SCHEMA and type(r['slot_id']) is str and r['slot_id'],'command\
@@ -335,14 +335,14 @@
       \  if telemetry_read is not None:\n   try:child_metadata=json.loads(telemetry)['metadata'];need(integer(child_metadata,False)\
       \ and child_metadata<=child_r,'bounded child telemetry')\n   except (ValueError,KeyError,TypeError):\n\
       \    child_metadata=None\n    if status=='ok':status='metadata_unknown'\n  else:child_metadata=0\
-      \  # Native explicit stdout/stderr already charged by owner; opaque IO is not measured.\n  result['cleanup']=cleanup_group(p,generation,end,budget=cleanup_budget);result['returncode']=p.poll()\n\
+      \  # Native explicit stdout/stderr already charged by owner; opaque IO is not measured.\n  transfer_owner_credit(owner_budget,cleanup_budget);result['cleanup']=cleanup_group(p,generation,end,budget=cleanup_budget);result['returncode']=p.poll()\n\
       \  if not result['cleanup']['reaped'] or not result['cleanup']['group_absent']:status='cleanup_unknown'\n\
       \  elif status=='ok' and (result['returncode']!=0 or result['cleanup']['term_sent'] or result['cleanup']['kill_sent']):status='native_outcome_unknown'\
       \ if op['mutation'] else 'refused'\n  result['status']=status\n except Exception as exc:\n  result['stderr']=(result['stderr']+'\\\
       n'+str(exc))[:4096]\n  if p is not None:\n   result['status']='native_outcome_unknown' if r['operation']['mutation']\
       \ else 'refused'\n   if generation is None:\n    result['status']='cleanup_unknown';result['cleanup']={'pgid':p.pid,'term_sent':False,'kill_sent':False,'reaped':p.poll()\
       \ is not None,'group_absent':False}\n finally:\n  if p is not None:\n   if not result['cleanup']['pgid']\
-      \ and generation is not None:result['cleanup']=cleanup_group(p,generation,min(end,time.monotonic()+r['clock']['cleanup_seconds']),budget=cleanup_budget)\n\
+      \ and generation is not None:transfer_owner_credit(owner_budget,cleanup_budget);result['cleanup']=cleanup_group(p,generation,min(end,time.monotonic()+r['clock']['cleanup_seconds']),budget=cleanup_budget)\n\
       \   for stream in (p.stdin,p.stdout,p.stderr):\n    if stream and not stream.closed:stream.close()\n\
       \  if sel:sel.close()\n  for fd in (telemetry_read,telemetry_write):\n   if fd is not None:os.close(fd)\n\
       \  if owner_budget is not None:\n   result['observed_bytes']['metadata']=None if p is not None and\
