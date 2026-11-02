@@ -63,6 +63,8 @@
         - worker_distribution
         - image_stage
         - host_resource_facts
+        - native_attempt
+        - slurm_job_evidence
         - host_resource_client
         - host_resource_service
         - host_resource_startup
