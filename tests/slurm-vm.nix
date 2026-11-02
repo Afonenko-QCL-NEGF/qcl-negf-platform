@@ -2,7 +2,7 @@
 pkgs.testers.runNixOSTest {
   name = "qcl-negf-slurm-dedicated-storage";
   nodes = let
-    shared = { lib, ... }: {
+    shared = { config, lib, ... }: {
       imports = [ module ];
       qclNegf.privateInterface = "eth1";
       qclNegf.cluster = {
@@ -10,7 +10,15 @@ pkgs.testers.runNixOSTest {
         nodes = [ "worker CPUs=2 RealMemory=900 State=UNKNOWN" ];
         partitions = [ "compute Nodes=worker Default=YES MaxTime=00:10:00 State=UP" ];
       };
-      virtualisation = { cores = 2; memorySize = 1536; };
+      virtualisation = {
+        cores = 2; memorySize = 1536;
+        # qemu-vm overrides ordinary fileSystems; retain the real jobs mount.
+        fileSystems.${config.qclNegf.cluster.jobDirectory} = {
+          device = "${config.qclNegf.cluster.storageHost}:/srv/qcl-negf/jobs";
+          fsType = "nfs4";
+          options = [ "hard" "_netdev" "x-systemd.automount" ];
+        };
+      };
       # Isolated test VMs only: a public test key, never deployment credentials.
       systemd.tmpfiles.rules = [
         "d /run/secrets 0755 root root -"
@@ -18,20 +26,32 @@ pkgs.testers.runNixOSTest {
       ];
     };
   in {
-    storage = { ... }: {
+    storage = { config, ... }: {
       imports = [ module ];
       qclNegf.privateInterface = "eth1";
       qclNegf.storage = { enable = true; clients = [ "control" "worker" ]; initializeBlankDisk = true; };
       virtualisation = {
         memorySize = 1024;
         emptyDiskImages = [{ size = 256; driveConfig.deviceExtraOpts.serial = "qcl-data"; }];
+        fileSystems."/srv/qcl-negf" = {
+          device = config.qclNegf.storage.device;
+          fsType = "ext4";
+          autoFormat = config.qclNegf.storage.initializeBlankDisk;
+          options = [ "noatime" ];
+        };
       };
     };
     control = { ... }: { imports = [ shared ]; qclNegf.cluster = { controller = true; submit = true; }; };
-    worker = { ... }: {
+    worker = { config, ... }: {
       imports = [ shared ];
       qclNegf.cluster = { worker = true; scratchDevice = "/dev/disk/by-id/virtio-qcl-scratch"; initializeBlankScratch = true; };
       virtualisation.emptyDiskImages = [{ size = 256; driveConfig.deviceExtraOpts.serial = "qcl-scratch"; }];
+      virtualisation.fileSystems."/scratch" = {
+        device = config.qclNegf.cluster.scratchDevice;
+        fsType = "ext4";
+        autoFormat = config.qclNegf.cluster.initializeBlankScratch;
+        options = [ "noatime" ];
+      };
     };
   };
   testScript = ''
@@ -40,7 +60,7 @@ pkgs.testers.runNixOSTest {
     control.wait_for_unit("slurmctld.service")
     worker.wait_for_unit("slurmd.service")
     control.wait_until_succeeds("sinfo -h -o %T | grep -Fx idle")
-    control.succeed("su -s /bin/sh qcl-negf -c 'cd /srv/qcl-negf/jobs && sbatch --wait --output=smoke.txt --wrap=hostname'")
+    control.succeed("su -s /bin/sh qcl-negf -c 'cd /srv/qcl-negf/jobs && sbatch --wait --mem=128M --output=smoke.txt --wrap=hostname'")
     control.succeed("su -s /bin/sh qcl-negf -c 'grep -Fx worker /srv/qcl-negf/jobs/smoke.txt'")
     storage.succeed("test $(stat -c %u /srv/qcl-negf/jobs/smoke.txt) = 3000")
     # Interactive steps require worker->srun callbacks in addition to sbatch RPC.

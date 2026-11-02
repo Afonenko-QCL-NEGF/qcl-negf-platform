@@ -2998,7 +2998,7 @@ def _capture_writer_snapshot(config, local, budget, *, output_sources=None):
     need(all(first[k] == last[k] for k in ('machine_id', 'boot_id', 'kernel', 'dmi_uuid')), 'writer_domain_not_closed')
     unit = engine.unit_state(lambda argv: local.run([config['systemctl'], *argv[1:]]), 'slurmd.service')
     main = next((p for p in processes if str(p['pid']) == unit['MainPID']), None)
-    need(main is not None and main['uids'] == [0] * 4 and main['cgroup'] == unit['ControlGroup'] and
+    need(main is not None and main['uids'] == [0] * 4 and engine.daemon_scope_bound(main['cgroup'], unit['ControlGroup']) and
          main['executable'] == config['slurmd_executable'] and unit['ActiveState'] == 'active', 'writer_domain_not_closed')
     identity = {k: first[k] for k in ('machine_id', 'boot_id', 'kernel', 'dmi_uuid')}
     output_after=_worker_output_generation(output_sources)
