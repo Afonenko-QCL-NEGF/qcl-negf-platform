@@ -1,8 +1,8 @@
 # QCL-NEGF platform
 
 NixOS modules, VM definitions and typed deployment commands for a scientific Slurm cluster. The
-[qcl-negf superproject](https://github.com/Afonenko-QCL-NEGF/qcl-negf) selects eight component revisions
-with Git submodules and runs integration CI on one self-hosted GitHub Actions runner. This
+[qcl-negf superproject](https://github.com/Afonenko-QCL-NEGF/qcl-negf) selects eight component
+revisions with Git submodules and runs integration CI on one self-hosted GitHub Actions runner. This
 repository owns infrastructure and deployment; AiiDA owns workflow provenance and Slurm assigns
 compute resources.
 
@@ -26,17 +26,17 @@ For the first external Linux worker, use the [Arch/libvirt onboarding guide](doc
 artifact/trust inputs, initial DRAIN, protected enrollment and bounded native smoke. Other Linux
 host distributions require their own adapter acceptance.
 
-| Module                | Responsibility                                                                  |
-| --------------------- | ------------------------------------------------------------------------------- |
-| `qclNegf.cluster`     | Slurm controller/workers, cgroup CPU/RAM limits and shared job mounts           |
-| `qclNegf.storage`     | Dedicated NFS server and client allowlist                                       |
-| `qclNegf.stateDisk`   | Persistent controller application and scheduler state                           |
-| `qclNegf.application` | AiiDA, PostgreSQL and optional authenticated HTTP API                           |
-| `qclNegf.builder`     | Shared daemon/admin/jobs slice and standard/burst resource profiles             |
-| `qclNegf.runner`      | Isolated persistent root-repository runner with controller-issued registration |
-| `qclNegf.cache`       | Signed, read-only Nix binary cache endpoint                                     |
-| `qclNegf.stateArchive` | Manual coordinated controller archive, verification and empty-state restore |
-| `ops/`                | TypeScript commands for build, activation, clean installation and profile setup |
+| Module                 | Responsibility                                                                  |
+| ---------------------- | ------------------------------------------------------------------------------- |
+| `qclNegf.cluster`      | Slurm controller/workers, cgroup CPU/RAM limits and shared job mounts           |
+| `qclNegf.storage`      | Dedicated NFS server and client allowlist                                       |
+| `qclNegf.stateDisk`    | Persistent controller application and scheduler state                           |
+| `qclNegf.application`  | AiiDA, PostgreSQL and optional authenticated HTTP API                           |
+| `qclNegf.builder`      | Shared daemon/admin/jobs slice and standard/burst resource profiles             |
+| `qclNegf.runner`       | Isolated persistent root-repository runner with controller-issued registration  |
+| `qclNegf.cache`        | Signed, read-only Nix binary cache endpoint                                     |
+| `qclNegf.stateArchive` | Manual coordinated controller archive, verification and empty-state restore     |
+| `ops/`                 | TypeScript commands for build, activation, clean installation and profile setup |
 
 ## Development and validation
 
@@ -58,17 +58,38 @@ revisions; no separate source lock is maintained here. Nix inputs are pinned by 
 For platform-only checks, from this repository:
 
 ```sh
-nix develop --no-update-lock-file --command deno task check
+nix develop --no-update-lock-file --command deno task check:ops
 nix build --no-link --no-update-lock-file .#checks.x86_64-linux.slurm-vm
 ```
 
-The shared operations/devShell environment declares Python 3.14 and ansible-core 2.21.1,
-with community.general 13.4.0 and community.library_inventory_filtering_v1 1.1.5 from
-fixed upstream archives. Versions are checked against [Ansible requirements](ansible/requirements.yml).
-The storage, cutover and swap fixtures require this environment and verify the actual
-interpreter, engine files and collection resolver origins before running YAML; missing or
-foreign dependencies fail setup. Collection unpacking belongs to the Nix dependency derivation.
-These recording fixtures do not establish native host enforcement, boot or scientific acceptance.
+The standalone task and `checks.<system>.operations` are explicitly **Ops-only**. They exclude five
+whole application fixture files; they are not the full Root/release gate. Root's
+`packages.<system>.platformCheckRunner` and `checks.<system>.operations` compose both domains
+through `lib.mkPlatformCheck`: Root supplies its locked `includeTests` application environment,
+while Platform supplies the declared Ops environment. `deno task prepare` explicitly builds the full
+runner; `deno task test` selects that already prepared output and never builds or syncs it. The full
+`deno task check` / `test:state` task requires an explicit application Python operand; missing AiiDA
+or the installed Portal validator fails before collection, rather than becoming an import skip. Each
+Python domain runs in its own process with a source-relative `--rootdir`; their canonical parent
+sets must be disjoint and complete. No application/Ops site-packages are mixed. Both routes require
+a nonroot user and retain a report directory (the prepared Nix check uses its output).
+
+The one named source-package opt-in,
+`tests/test_host_resource_client.py::test_generated_entries_select_only_nixos_privileged_sudo`, may
+remain skipped with its exact opt-in reason. The report lists the separately required native gate:
+run that selector explicitly in the prepared Ops environment with
+`QCL_TEST_HOST_RESOURCE_ENTRY_BUILD=1`. This check builds the source package; it needs its own
+native admission. An Ops-only or full-domain test report does not claim that gate, live enforcement
+or scientific acceptance. Missing dependencies and other unexplained skips fail the check.
+
+The shared operations/devShell environment declares Python 3.14 and ansible-core 2.21.1, plus
+PyArrow for the required export fixtures, with community.general 13.4.0 and
+community.library_inventory_filtering_v1 1.1.5 from fixed upstream archives. Versions are checked
+against [Ansible requirements](ansible/requirements.yml). The storage, cutover and swap fixtures
+require this environment and verify the actual interpreter, engine files and collection resolver
+origins before running YAML; missing or foreign dependencies fail setup. Collection unpacking
+belongs to the Nix dependency derivation. These recording fixtures do not establish native host
+enforcement, boot or scientific acceptance.
 
 The Slurm test boots storage, controller and worker VMs, submits a batch job, checks shared output
 ownership and verifies result persistence across controller restart. It needs a Linux builder with
@@ -77,10 +98,10 @@ and image checks are described in [infrastructure](docs/infrastructure.md).
 
 ## Deployment
 
-For the first CI/build host, use the [platform-only bootstrap](docs/bootstrap.md)
-from official installation media. It has no application, solver or Julia-depot
-dependency. [The host policy](docs/host-network.md) declaratively creates the
-isolated guest bridges while retaining the existing management bridge.
+For the first CI/build host, use the [platform-only bootstrap](docs/bootstrap.md) from official
+installation media. It has no application, solver or Julia-depot dependency.
+[The host policy](docs/host-network.md) declaratively creates the isolated guest bridges while
+retaining the existing management bridge.
 
 Create a private site flake from `examples/private-site/`, set measured resources, hardware, network
 and runtime secrets, and attach the root application's and solver's immutable packages. Copy
@@ -115,8 +136,8 @@ or set a root password. Provision SSH access in the site configuration. See
 
 ## Repository boundaries
 
-Numerical algorithms belong to [QCLNEGF.jl](https://github.com/Afonenko-QCL-NEGF/QCLNEGF.jl); frozen-plan
-execution and scratch staging belong to
+Numerical algorithms belong to [QCLNEGF.jl](https://github.com/Afonenko-QCL-NEGF/QCLNEGF.jl);
+frozen-plan execution and scratch staging belong to
 [QCLNEGFRunner.jl](https://github.com/Afonenko-QCL-NEGF/QCLNEGFRunner.jl). Shared formats belong to
 [qcl-negf-contracts](https://github.com/Afonenko-QCL-NEGF/qcl-negf-contracts), result tools to
 [qcl-negf-results](https://github.com/Afonenko-QCL-NEGF/qcl-negf-results), workflows to

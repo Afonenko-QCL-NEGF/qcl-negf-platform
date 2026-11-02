@@ -2,7 +2,7 @@
 let
   basePython = pkgs.python314;
   engine = basePython.pkgs.ansible-core;
-  python = basePython.withPackages (ps: [ ps.pytest ps.ansible-core ]);
+  python = basePython.withPackages (ps: [ ps.pytest ps.ansible-core ps.pygobject3 ps.pyarrow ]);
   general = pkgs.fetchurl {
     url = "https://galaxy.ansible.com/download/community-general-13.4.0.tar.gz";
     hash = "sha256-79HAtdxviblmfkvXfyQmwwVFhhkQ26GIWThxCV7eGAQ=";
@@ -22,6 +22,7 @@ let
 in {
   inherit python collections;
   environment = {
+    GI_TYPELIB_PATH = pkgs.lib.makeSearchPath "lib/girepository-1.0" [ pkgs.glib.out pkgs.gobject-introspection pkgs.networkmanager.out ];
     QCL_TEST_ANSIBLE_COLLECTIONS = "${collections}";
     ANSIBLE_COLLECTIONS_PATH = "${collections}";
     ANSIBLE_COLLECTIONS_SCAN_SYS_PATH = "false";

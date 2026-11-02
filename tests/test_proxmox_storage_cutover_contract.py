@@ -1743,3 +1743,29 @@ def test_native_name_maximum_unknown_refuses_before_iterator(tmp_path,value):
     budget.raw=dict(budget.raw,pathconf=query,scandir=iterator)
     with pytest.raises(ValueError,match='filename'):budget.names(tmp_path)
     assert calls==['pathconf'] and budget.used<=budget.limit
+
+
+@pytest.mark.parametrize("owner_spent", [0, 1, 2097151, 2097152])
+def test_cleanup_credit_cannot_double_spend_owner_or_child(owner_spent):
+    """Finishing work can reassign its credit; total/child/time stay fixed."""
+    import time
+    api = review_body("cutover_command_boundary")
+    budget = api["MetadataBudget"]
+    deadline = time.monotonic() + 10
+    owner = budget(2097152, deadline)
+    cleanup = budget(2097152, deadline)
+    child = budget(4194304, deadline)
+    owner.charge(owner_spent)
+    child.charge(child.limit)
+    original_total = owner.limit + cleanup.limit + child.limit
+    api["transfer_owner_credit"](owner, cleanup)
+    with pytest.raises(ValueError, match="metadata shared cap"):
+        owner.charge(1)
+    assert child.used == child.limit == 4194304
+    assert owner.limit + cleanup.limit + child.limit == original_total
+    assert api["transfer_owner_credit"](owner, cleanup) == 0
+    cleanup.charge(cleanup.limit)
+    assert owner.used + cleanup.used + child.used == original_total
+    with pytest.raises(ValueError, match="metadata shared cap"):
+        cleanup.charge(1)
+    assert (owner.deadline, cleanup.deadline, child.deadline) == (deadline,) * 3

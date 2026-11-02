@@ -4,6 +4,7 @@ let
   cfg = config.qclNegf.hostResources;
   package = import ../nix/host-resources.nix { inherit pkgs; };
   command = role: "${package}/bin/qcl-negf-resource-${role}";
+  sudoCommand = role: "/run/current-system/sw/bin/qcl-negf-resource-${role}";
 in {
   options.qclNegf.hostResources = {
     enable = lib.mkEnableOption "native resource demand/facts helpers (private preparation required)";
@@ -22,13 +23,13 @@ in {
     ];
     security.sudo.extraRules = [ {
       users = [ cfg.clientUser ];
-      commands = [ { command = command "client-root"; options = [ "NOPASSWD" ]; } ];
+      commands = [ { command = sudoCommand "client-root"; options = [ "NOPASSWD" ]; } ];
     } ] ++ lib.optional (cfg.authorityUser != null) {
       users = [ cfg.authorityUser ];
-      commands = [ { command = command "authority"; options = [ "NOPASSWD" ]; } ];
+      commands = [ { command = sudoCommand "authority"; options = [ "NOPASSWD" ]; } ];
     } ++ lib.optional (cfg.factsUser != null) {
       users = [ cfg.factsUser ];
-      commands = [ { command = command "facts"; options = [ "NOPASSWD" ]; } ];
+      commands = [ { command = sudoCommand "facts"; options = [ "NOPASSWD" ]; } ];
     };
     services.openssh.settings.PermitUserEnvironment = false;
     services.openssh.extraConfig = lib.concatStringsSep "\n" (map (role:

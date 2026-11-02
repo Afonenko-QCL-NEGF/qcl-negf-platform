@@ -171,7 +171,7 @@ assert controller.systemd.services.qcl-negf-api.environment.TMPDIR == "/var/lib/
 assert lib.elem "d /var/lib/qcl-negf/exports 0700 qcl-negf qcl-negf -" controller.systemd.tmpfiles.rules;
 assert lib.elem "/var/lib/qcl-negf" controller.systemd.services.qcl-negf-api.serviceConfig.ReadWritePaths;
 {
-  controllerStart = controller.systemd.services.qcl-negf-aiida.serviceConfig.ExecStart;
+  controllerStart = toString controller.systemd.services.qcl-negf-aiida.serviceConfig.ExecStart;
   workerGate = worker.systemd.services.slurmd.serviceConfig.ExecStartPre;
   profileInit = controller.systemd.services.qcl-negf-application-profile.unitConfig.ConditionPathExists;
 }
