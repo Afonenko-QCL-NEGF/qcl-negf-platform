@@ -142,9 +142,74 @@ def _command_exception_record(error, record):
         pass
 
 
+# Optional diagnostics share the command's original absolute end. The Native
+# operation prepays this complete reader workspace; no raw argv is retained.
+COMMAND_OBSERVER_BYTES = 524288
+
+
+def command_argv_sha256(args):
+    if not isinstance(args, (list, tuple)) or not args or any(
+            not isinstance(arg, str) or '\0' in arg for arg in args):
+        raise ValueError('Observed command requires literal argv')
+    return hashlib.sha256(b'\0'.join(os.fsencode(arg) for arg in args) + b'\0').hexdigest()
+
+
+def _command_anchor(scan, pid):
+    path = Path('/proc') / str(pid)
+    row = process_record(scan, path)
+    fields = scan.read(path/'stat').decode().rsplit(')', 1)[1].split()
+    if int(fields[19]) != row['start_ticks'] or len(os.fsencode(row['cgroup'])) > 4096:
+        raise ValueError('Observed process birth/scope changed')
+    return dict(pid=pid, ppid=int(fields[1]), start_ticks=row['start_ticks'],
+        uids=row['uids'], cgroup=row['cgroup'], executable=row['executable'])
+
+
+def _command_frozen(value):
+    if isinstance(value, dict):
+        return MappingProxyType({key: _command_frozen(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_command_frozen(item) for item in value)
+    return value
+
+
+def _command_spawned(scan, process, args):
+    owned, _ = _command_child_status(process)
+    if not owned:
+        raise ValueError('Original unreaped direct command child required')
+    owner = _command_anchor(scan, os.getpid())
+    child = _command_anchor(scan, process.pid)
+    raw = scan.read(Path('/proc')/str(process.pid)/'cmdline', 16384)
+    expected = b'\0'.join(os.fsencode(arg) for arg in args) + b'\0'
+    if raw != expected or child['ppid'] != owner['pid'] or child['start_ticks'] < owner['start_ticks']:
+        raise ValueError('Original direct command argv/birth required')
+    if _command_anchor(scan, owner['pid']) != owner or _command_anchor(scan, child['pid']) != child:
+        raise ValueError('Observed command owner/child changed')
+    return dict(schema='qcl.command-owned-readonly-observation.v1', phase='spawned',
+        command_owner=owner, child=child, argv_sha256=command_argv_sha256(args))
+
+
+def _command_terminal(scan, spawned):
+    # child always denotes the retained ORIGINAL birth, never a claimed current
+    # process. Reap may make its PID absent or available for an unrelated birth.
+    if _command_anchor(scan, spawned['command_owner']['pid']) != spawned['command_owner']:
+        raise ValueError('Command owner changed before terminal observation')
+    pid = spawned['child']['pid']
+    try:
+        scan.stat(Path('/proc')/str(pid))
+    except FileNotFoundError:
+        current = dict(status='absent')
+    else:
+        current = dict(status='observed', process=_command_anchor(scan, pid))
+    return dict(spawned, phase='terminal', current_child=current)
+
+
 def command(args, *, timeout_seconds=360.0, output_bytes=1048576,
-            deadline=None, cleanup_seconds=2.0, env=None):
+            deadline=None, cleanup_seconds=2.0, env=None, process_observer=None):
     """Bound only our local process group; killing SSH does not establish remote completion."""
+    if process_observer is not None and not callable(process_observer):
+        raise ValueError('Process observer must be callable')
+    if process_observer is not None:
+        command_argv_sha256(args)
     duration(timeout_seconds, "Command timeout")
     duration(cleanup_seconds, "Cleanup timeout")
     output_bound(output_bytes)
@@ -160,6 +225,7 @@ def command(args, *, timeout_seconds=360.0, output_bytes=1048576,
     buffers = {"stdout": bytearray(), "stderr": bytearray()}
     process = None
     primary = cleanup_error = None
+    observed = scan = None
     selector = selectors.DefaultSelector()
     try:
         if start >= end - cleanup_seconds:
@@ -175,6 +241,11 @@ def command(args, *, timeout_seconds=360.0, output_bytes=1048576,
             except OSError:
                 record["failure"] = "spawn"
         if process is not None:
+            if process_observer is not None:
+                scan = UpdateScan(end)
+                scan.CAP = COMMAND_OBSERVER_BYTES
+                observed = _command_spawned(scan, process, args)
+                process_observer(_command_frozen(observed))
             for name in buffers:
                 pipe = getattr(process, name)
                 os.set_blocking(pipe.fileno(), False)
@@ -249,6 +320,15 @@ def command(args, *, timeout_seconds=360.0, output_bytes=1048576,
                         cleanup_error = error
                     if primary is None and not isinstance(error, Exception):
                         primary = error
+        if process_observer is not None and observed is not None:
+            try:
+                process_observer(_command_frozen(_command_terminal(scan, observed)))
+            except BaseException as error:
+                # A known command/cleanup failure or original exception retains
+                # precedence. The callback cannot acquire a second cleanup owner.
+                record['observer_failure'] = type(error).__name__
+                if primary is None and record['failure'] is None and record['cleanup_confirmed']:
+                    primary = error
         record["elapsed_seconds"] = time.monotonic() - start
         for name, data in buffers.items():
             record[name] = data.decode(errors="ignore")

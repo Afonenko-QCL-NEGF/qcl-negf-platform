@@ -21,7 +21,7 @@ let
     runtimeInputs = [ pkgs.nix pkgs.systemd pkgs.slurm pkgs.openssh pkgs.util-linux pkgs.coreutils pkgs.python314 ];
     text = ''
       export SLURM_CONF=${config.services.slurm.etcSlurm}/slurm.conf
-      exec python3 ${operations}/ops/application_release.py "$@"
+      exec ${pkgs.python314}/bin/python3 -I -c ${lib.escapeShellArg "import sys; sys.path.insert(0, '${operations}/ops'); import application_release as m; m.main()"} "$@"
     '';
   };
   deliveryCommand = pkgs.writeShellApplication {

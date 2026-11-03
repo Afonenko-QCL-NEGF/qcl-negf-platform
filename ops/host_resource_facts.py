@@ -260,6 +260,13 @@ def classify_guest_workloads(jobs,groups,known,*,gate_executables):
 class LocalSources:
     """Real readers; tests inject an explicit synthetic source, never a production flag."""
     def __init__(self,config,runner):self.config,self.runner=config,runner
+    def qualification_gate_sources(self):
+        from host_resource_qualification_sources import open_guest_gate_sources
+        return open_guest_gate_sources(self)
+    def qualification_subset(self):
+        from host_resource_qualification_sources import open_role_readonly_subset
+        require(self.config['role'] in ('guest','controller'), 'qualification_role', 'fixed local facts role required')
+        return open_role_readonly_subset('worker' if self.config['role']=='guest' else 'controller')
     def read(self,path,limit=65536):
         source=getattr(self,'_output_sources',None)
         if source is not None:return source.budget.read(path,limit).decode()
@@ -1256,5 +1263,14 @@ def capture_guest_facts(config,sources,*,clock=time.time,calibration=False):
             {key:identity[key] for key in ('machine_id','boot_id','kernel','dmi_uuid')},'qualification','local worker identity differs')
         packet['output_generation']=output_after
     if calibration:packet['calibration_accounting']=accounting
+    subset_reader=getattr(sources,'qualification_subset',None)
+    if callable(subset_reader):
+        subset=subset_reader()
+        if subset is not None:
+            require(type(subset)is dict and len(json.dumps(subset,sort_keys=True,allow_nan=False).encode())<=65536 and
+                subset['selector']['receiver']['machine_id']==identity['machine_id'] and
+                subset['selector']['receiver']['boot_id']==identity['boot_id'],
+                'qualification_observations_required','fixed bounded role subset identity differs')
+            packet['qualification']=subset
     require(len(json.dumps(packet,sort_keys=True,allow_nan=False).encode())<=MAX_OUTPUT_BYTES,'output_bound','whole bounded guest packet required')
     return packet
