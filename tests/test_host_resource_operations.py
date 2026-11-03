@@ -1,5 +1,5 @@
 """Synthetic behavioural host grant tests. No native executable is invoked."""
-from dataclasses import replace
+from dataclasses import asdict, replace
 import json
 import os
 from pathlib import Path
@@ -44,9 +44,30 @@ def setup(tmp_path, *, mechanism="qualified_dynamic", vm_ids=("vm-a", "vm-b")):
                                      "image-1", "guest-kernel-1", "host-kernel-1", "qemu-1",
                                      "backend-1", "readback-v1", "config-1")
                      for vm in vm_ids)
-    qualifications = tuple(m.BackendQualification(policy.host_id, policy.owner_id, binding,
-                          m.policy_digest(policy), "synthetic-qualification", True, True,
-                          True, True) for binding in bindings)
+    qualifications = []
+    for binding in bindings:
+        base = m.BackendQualification(policy.host_id, policy.owner_id, binding,
+                m.policy_digest(policy), "synthetic-qualification", mechanism == "qualified_dynamic", True, True, True)
+        if mechanism == "qualified_dynamic":
+            from host_resource_capacity import decode_capacity_qualification_v2
+            from host_resource_qualification_observations import MeasuredBackendQualification
+            digest = m.policy_digest(policy)
+            profile = dict(schema="qcl.host-resource-capacity-qualification.v2",
+                host_id=policy.host_id, owner_id=policy.owner_id, policy_sha256=digest,
+                binding=asdict(binding), source_graph_sha256="b" * 64, report_sha256="c" * 64,
+                measurement=dict(state="measured", scope="synthetic fixture only",
+                    evidence_sha256="d" * 64, mapping_evidence_sha256="e" * 64,
+                    observed_os_bytes=48, safety_allowance_bytes=16, os_reserve_bytes=64,
+                    native_gap_bound_bytes=32, maximum_guest_total_bytes=2016,
+                    native_maximum_bytes=2048))
+            capacity = decode_capacity_qualification_v2(profile, expected_host_id=policy.host_id,
+                expected_owner_id=policy.owner_id, expected_policy_sha256=digest,
+                expected_binding=asdict(binding), expected_source_graph_sha256="b" * 64,
+                expected_report_sha256="c" * 64, expected_native_maximum_bytes=2048)
+            base = MeasuredBackendQualification(**vars(base), capacity=capacity,
+                supported_targets=tuple(range(128, 2049, 64)))
+        qualifications.append(base)
+    qualifications = tuple(qualifications)
     evidence = m.HostEvidence(policy.host_id, policy.owner_id, "host-boot-1", m.policy_digest(policy),
                              100, 4096, 256, "synthetic-capacity", "synthetic-agreement",
                              True, True, True, "synthetic-authenticated-probe", bindings,
@@ -120,9 +141,22 @@ def request(m, request_id="request-1", workload="work-1", amount=321, vm="vm-a")
     return m.ResourceRequest(request_id, "synthetic-host", vm, "synthetic-owner", amount, workload)
 
 
-def guest(m, workload="work-1", live=(), *, total=512, available=400):
-    return m.GuestEvidence("vm-a", "guest-boot-1", workload, 100, total, available,
-                           128, 321, 384, True, tuple(live))
+def guest(m, controller, evidence, workload="work-1", live=(), *, vm="vm-a", total=512, available=400):
+    # Synthetic evidence only: requests and limits come from this explicit fixture's
+    # retained original receipts; no positive profile is inferred from missing data.
+    state = controller.store.load()
+    rows = controller._live(state, vm)
+    commitments = tuple((r["request"]["workload_id"], r["request"]["workload_bytes"],
+                         r["request"]["workload_bytes"]) for r in rows)
+    candidate = next(r for r in commitments if r[0] == workload)
+    if controller.policy.active_grant.mechanism == "conservative_reservation":
+        return m.GuestEvidence(vm, "guest-boot-1", workload, 100, total, available,
+                               128, candidate[2], 384, True, tuple(live))
+    from host_resource_qualification_observations import MeasuredGuestEvidence
+    capacity = next(q.capacity for q in evidence.qualifications if q.binding.vm_id == vm)
+    return MeasuredGuestEvidence(vm, "guest-boot-1", workload, 100, total, available,
+                                 capacity.os_reserve_bytes, candidate[2], 384, True, tuple(live),
+                                 capacity, commitments)
 
 
 def completion(m, workload="work-1", live=(), *, available=400):
@@ -144,7 +178,7 @@ def running(m, controller, evidence, *, req=None, live=()):
     req = req or request(m)
     controller.request(req, evidence)
     controller.grow(req.request_id, evidence)
-    g = guest(m, req.workload_id, live, total=1024, available=900)
+    g = guest(m, controller, evidence, req.workload_id, live, vm=req.vm_id, total=1024, available=900)
     g = replace(g, task_limit_bytes=req.workload_bytes, slurm_memory_bytes=896)
     # Slurm cannot advertise more than the full grant less OS reserve.
     grant = next(g for g in controller.snapshot() if g.vm_id == req.vm_id)
@@ -172,8 +206,8 @@ def test_request_rounds_full_charge_before_grow_and_guest_check(tmp_path):
     assert b.calls == []
     assert c.grow(receipt.request_id, e).phase == "GUEST_ADMIT"
     with pytest.raises(m.ResourceError, match="guest_capacity"):
-        c.admit(receipt.request_id, guest(m, available=1), e)
-    assert c.admit(receipt.request_id, guest(m), e).phase == "RUN"
+        c.admit(receipt.request_id, guest(m, c, e, available=1), e)
+    assert c.admit(receipt.request_id, guest(m,c,e), e).phase == "RUN"
 
 
 def test_timeout_after_grow_retains_charge_and_reconciles_without_repeat(tmp_path):
@@ -291,10 +325,10 @@ def test_cleanup_barrier_survives_native_error_then_journal_io_failure(tmp_path,
     with pytest.raises(m.ResourceError, match="reconciliation_required"):
         restored.reconcile("request-1", e)
     with pytest.raises(m.ResourceError):
-        restored.admit("request-1", guest(m), e)
+        restored.admit("request-1", guest(m,c,e), e)
     proof = native_cleanup(m, store, e)
     assert restored.reconcile("request-1", e, cleanup_evidence=proof).phase == "GUEST_ADMIT"
-    assert restored.admit("request-1", guest(m), e).phase == "RUN"
+    assert restored.admit("request-1", guest(m,c,e), e).phase == "RUN"
     assert b.calls == [("vm-a", 512)]
 
 
@@ -343,7 +377,7 @@ def test_cleanup_proof_binding_and_old_grow_proof_cannot_clear_new_shrink_intent
         c.reconcile("request-1", e, cleanup_evidence=replace(grow_proof,
             binding=replace(grow_proof.binding, process_id="different-process")))
     c.reconcile("request-1", e, cleanup_evidence=grow_proof)
-    c.admit("request-1", guest(m), e)
+    c.admit("request-1", guest(m,c,e), e)
     e.live_workloads["vm-a"] = ("work-1",)
     finish(c, "request-1", completion(m), e)
     assert c.shrink("request-1", e).phase == "SHRINK_UNKNOWN"
@@ -515,7 +549,7 @@ def test_administrative_cleanup_proof_cannot_clear_runtime_identity_block(tmp_pa
     proof = native_cleanup(m, store, e)
     changed_binding = replace(e.bindings[0], image_id="changed-image")
     changed = replace(e, bindings=(changed_binding, e.bindings[1]), qualifications=(
-        replace(e.qualifications[0], binding=changed_binding), e.qualifications[1]))
+        replace(e.qualifications[0], binding=changed_binding, capacity=replace(e.qualifications[0].capacity, binding=asdict(changed_binding))), e.qualifications[1]))
     with pytest.raises(m.ResourceError, match="identity_mismatch"):
         c.reconcile("request-1", changed, cleanup_evidence=proof)
     with pytest.raises(m.ResourceError, match="reconciliation_required"):
@@ -535,7 +569,7 @@ def test_cleanup_recovery_preserves_other_deferred_grants_and_metadata_slot_prog
     c.grow("request-b", e)
     proof = native_cleanup(m, store, e, "request-b")
     c.reconcile("request-b", e, cleanup_evidence=proof)
-    guest_b = replace(guest(m, "work-b"), vm_id="vm-b")
+    guest_b = replace(guest(m, c, e, "work-b", vm="vm-b"), vm_id="vm-b")
     assert c.admit("request-b", guest_b, e).phase == "RUN"
     e.live_workloads["vm-b"] = ("work-b",)
     assert c.reconcile("request-1", e).phase == "SHRINK_READY"
@@ -572,9 +606,9 @@ def test_multiple_workloads_aggregate_floor_and_finish_cannot_shrink_other_work(
     assert r.target_bytes == c.snapshot()[0].guest_bytes == 704
     c.grow("request-2", e)
     with pytest.raises(m.ResourceError, match="incomplete_workloads"):
-        c.admit("request-2", replace(guest(m, "work-2"), task_limit_bytes=200,
+        c.admit("request-2", replace(guest(m, c, e, "work-2"), task_limit_bytes=200,
                                     slurm_memory_bytes=576), e)
-    c.admit("request-2", replace(guest(m, "work-2", ("work-1",), total=704),
+    c.admit("request-2", replace(guest(m, c, e, "work-2", ("work-1",), total=704),
                                 task_limit_bytes=200, slurm_memory_bytes=576), e)
     e.live_workloads["vm-a"] = ("work-1", "work-2")
     with pytest.raises(m.ResourceError, match="incomplete_workloads"):
@@ -663,7 +697,7 @@ def test_conservative_mode_charges_maximum_and_never_uses_balloon_for_release(tm
     m, c, b, _, e = setup(tmp_path, mechanism="conservative_reservation")
     assert c.request(request(m), e).target_bytes == 1536
     c.grow("request-1", e)
-    c.admit("request-1", replace(guest(m), total_bytes=1536), e)
+    c.admit("request-1", replace(guest(m,c,e), total_bytes=1536), e)
     e.live_workloads["vm-a"] = ("work-1",)
     finish(c, "request-1", completion(m), e)
     c.shrink("request-1", e)
@@ -902,7 +936,7 @@ def test_cross_vm_completion_defers_shrink_until_other_host_grant_is_admitted(tm
     with pytest.raises(m.ResourceError, match="host_busy"):
         restored.shrink("request-1", e)
     assert restored.grow("request-b", e).phase == "GUEST_ADMIT"
-    guest_b = replace(guest(m, "work-b"), vm_id="vm-b", total_bytes=256, available_bytes=128,
+    guest_b = replace(guest(m, c, e, "work-b", vm="vm-b"), vm_id="vm-b", total_bytes=256, available_bytes=128,
                       task_limit_bytes=64, slurm_memory_bytes=128)
     assert restored.admit("request-b", guest_b, e).phase == "RUN"
     e.live_workloads["vm-b"] = ("work-b",)
@@ -931,7 +965,7 @@ def test_multiple_deferred_completions_serialize_durable_slot_release_and_reload
     restored = m.HostResourceController(c.policy, store, b, clock=lambda: 100)
     assert [g.guest_bytes for g in restored.snapshot()] == [512, 256, 512]
     restored.grow("request-b", e)
-    guest_b = replace(guest(m, "work-b"), vm_id="vm-b", total_bytes=256, available_bytes=128,
+    guest_b = replace(guest(m, c, e, "work-b", vm="vm-b"), vm_id="vm-b", total_bytes=256, available_bytes=128,
                       task_limit_bytes=64, slurm_memory_bytes=128)
     if interrupt_promotion:
         atomic, failed = store._atomic, []

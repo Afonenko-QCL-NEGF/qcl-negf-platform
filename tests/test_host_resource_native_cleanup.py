@@ -108,7 +108,7 @@ def test_healthy_terminal_witness_admits_and_lost_outer_reply_reconciles(tmp_pat
     assert len(r.calls)==len(b.calls)==1
     proof=p.cleanup('request-1',owner_state=state,evidence=e);assert proof.mutation_id==row['mutation_id']
     p.validate_state(state,evidence=e)
-    c.admit('request-1',guest(m),e);e.live_workloads['vm-a']=('work-1',)
+    c.admit('request-1',guest(m,c,e),e);e.live_workloads['vm-a']=('work-1',)
     p.validate_state(store.load(),evidence=e)
     # A new proof reader/owner invocation reuses durable proof, never native replay.
     reload=n.NativeMutationProofs(c.policy,store,b,p.config,r,sources=s)
@@ -322,7 +322,7 @@ def test_journal_io_prevents_dispatch_or_preserves_original_native_error(tmp_pat
 
 def test_claim_never_replays_and_older_grow_proof_cannot_clear_shrink(tmp_path):
     n,m,c,b,store,e,p,s,r,profiles=fixture(tmp_path);c.request(request(m),e);c.grow('request-1',e)
-    grow=store.load()['receipts'][0]['mutation_id'];c.admit('request-1',guest(m),e)
+    grow=store.load()['receipts'][0]['mutation_id'];c.admit('request-1',guest(m,c,e),e)
     c.finish('request-1',completion(m),e);r.fault='timeout';c.shrink('request-1',e)
     state=store.load();row=state['receipts'][0]
     assert row['mutation_id']!=grow and row['phase']=='SHRINK_UNKNOWN' and c.snapshot()[0].guest_bytes==512
@@ -486,7 +486,7 @@ def test_completed_sync_call_does_not_replace_actual_balloon_readback(tmp_path):
     assert p.read(row['mutation_id'])['phase']=='RETURNED_SUCCESS'
     p.validate_state(state,evidence=e)
     assert c.reconcile('request-1',e).phase=='GROW_UNKNOWN'
-    with pytest.raises(m.ResourceError):c.admit('request-1',guest(m),e)
+    with pytest.raises(m.ResourceError):c.admit('request-1',guest(m,c,e),e)
     b.rows['vm-a']=replace(b.rows['vm-a'],configured_bytes=512,assigned_bytes=512)
     assert c.reconcile('request-1',e).phase=='GUEST_ADMIT'
     assert len(r.calls)==1
@@ -494,11 +494,11 @@ def test_completed_sync_call_does_not_replace_actual_balloon_readback(tmp_path):
 
 def test_two_workloads_keep_aggregate_floor_and_latest_individual_proofs(tmp_path):
     n,m,c,b,store,e,p,s,r,profiles=fixture(tmp_path)
-    c.request(request(m),e);c.grow('request-1',e);c.admit('request-1',guest(m),e)
+    c.request(request(m),e);c.grow('request-1',e);c.admit('request-1',guest(m,c,e),e)
     e.live_workloads['vm-a']=('work-1',)
     second=request(m,'request-2',amount=129,workload='work-2')
     c.request(second,e);c.grow('request-2',e)
-    c.admit('request-2',replace(guest(m),workload_id='work-2',task_limit_bytes=129,total_bytes=640,live_workload_ids=('work-1',)),e)
+    c.admit('request-2',replace(guest(m,c,e,'work-2',live=('work-1',),total=640),slurm_memory_bytes=576),e)
     e.live_workloads['vm-a']=('work-1','work-2')
     state=store.load();p.validate_state(state,evidence=e)
     assert len({row['mutation_id'] for row in state['receipts']})==2 and len(r.calls)==2
@@ -640,3 +640,24 @@ def test_fixed_pve_native_lock_layout_uses_anchored_owned_inodes(tmp_path,change
     else:
         with pytest.raises((OSError,n.ResourceError)):n._pve_lock_released(101,native_os=SyntheticNativeOS(),lock=lock)
     assert not live
+
+
+def test_native_calibration_delegations_require_actual_runtime_and_exact_selectors():
+    import host_resource_native_cleanup as n
+    from types import SimpleNamespace
+    sources=n.NativeCleanupSources.__new__(n.NativeCleanupSources)
+    plan,state,before=object(),object(),object()
+    calls=[]
+    def dispatch(*args,**kwargs):calls.append((args,kwargs))
+    for invoke in (
+        lambda:sources.calibration_guard(plan,state,before,128,case_name='idle-shrink'),
+        lambda:sources.calibration_settlement_guard(plan,state,before,mutation_id='a'*32),
+        lambda:sources.calibration_assess_settled(plan,state,mutation_id='a'*32),
+    ):
+        with pytest.raises(n.ResourceError,match='qualification_observations_required'):invoke()
+    sources.idle_qualification_runtime=SimpleNamespace(calibration_guard=dispatch,settlement_guard=dispatch,assess_settled=dispatch)
+    sources.calibration_guard(plan,state,before,128,case_name='restore-full')
+    sources.calibration_settlement_guard(plan,state,before,mutation_id='b'*32)
+    sources.calibration_assess_settled(plan,state,mutation_id='b'*32)
+    assert calls==[((plan,state,before,128),{'case_name':'restore-full'}),
+                   ((plan,state,before),{'mutation_id':'b'*32}),((plan,state),{'mutation_id':'b'*32})]

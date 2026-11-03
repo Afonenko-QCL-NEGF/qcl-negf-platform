@@ -348,6 +348,8 @@ def test_provider_uses_actual_fixed_inventory_exact_qualification_and_whole_live
         qualified_protocols={vm.vm_id:dict(guest_protocol='synthetic-protocol',qemu_birth_ticks=9,gate_executables=['/gate']) for vm in c.policy.vms})
     agreement=dict(schema='qcl.host-resource-native-agreement.v1',policy_sha256=m.policy_digest(c.policy),agreement_ref='synthetic-agreement',foreign={'foreign':dict(maximum_bytes=224,overhead_bytes=foreign_overhead,config_fingerprint='f')})
     qualifications=dict(schema='qcl.host-resource-qualification.v1',qualifications=[asdict(q) for q in e.qualifications])
+    for q in qualifications['qualifications']:
+        for flag in ('qualified_dynamic','active_floor_protection','readback_verified','slurm_registration_verified'):q[flag]=False
     monkeypatch.setattr(f,'read_root_json',lambda path:agreement if path=='private-agreement' else qualifications)
     monkeypatch.setattr(f,'collect_native_runtime',lambda backend,read:__import__('host_resource_backends').NativeRuntimeFacts('host-boot-1','host-kernel-1','qemu-1','backend-1'))
     for vm,row in list(b.rows.items()):b.rows[vm]=replace(row,process_id='12' if vm=='vm-a' else '13')
@@ -764,3 +766,263 @@ def test_guest_and_writer_require_own_canonical_daemon_scope(monkeypatch,seam,se
     else:
         with pytest.raises(m.Hold,match='writer_domain_not_closed'):
             m._capture_writer_snapshot(config,Local(),m.Operation(limits()))
+
+
+def test_negative_v1_is_readable_but_legacy_positive_is_not_upgraded(tmp_path):
+    from dataclasses import asdict
+    import host_resource_facts as f
+    m,c,b,store,e=setup(tmp_path);binding=e.bindings[0]
+    row={key:getattr(e.qualifications[0],key)for key in f.BackendQualification.__dataclass_fields__};row['binding']=asdict(binding);flags=('qualified_dynamic','active_floor_protection','readback_verified','slurm_registration_verified')
+    for key in flags:row[key]=False
+    provider=f.NativeFactsProvider(c.policy,{},b,None,sources=object())
+    assert hasattr(provider,'_qualification'),'missing private measured qualification decoder'
+    bundle=dict(schema='qcl.host-resource-qualification.v1',qualifications=[row])
+    qualified=provider._qualification(bundle,binding,{})
+    assert not any(getattr(qualified,key)for key in flags)
+    for key in flags:
+        changed={**row,key:True}
+        with pytest.raises(f.ResourceError,match='qualification'):provider._qualification({**bundle,'qualifications':[changed]},binding,{})
+
+
+from test_host_resource_qualification_observations import witness as observation_witness
+
+@pytest.fixture
+def measured_provider(monkeypatch,observation_witness):
+    from types import SimpleNamespace
+    from dataclasses import asdict
+    import host_resource_facts as f
+    import host_resource_qualification_observations as o
+    from test_host_resource_qualification_observations import permit,all_cases,observations,job,MiB
+    from test_native_attempt import p20_worker,p20_runner
+    p=permit();ctx=p['context'];report=o.build_qualification_report(p,{k:observations(v)for k,v in all_cases(observation_witness).items()})
+    candidate=o.qualification_candidate(report);assert candidate is not None
+    policy=SimpleNamespace(host_id=ctx['host_id'],owner_id=ctx['owner_id'],vms=(SimpleNamespace(vm_id='vm',minimum_bytes=100*MiB,maximum_bytes=1000*MiB),),
+        active_grant=SimpleNamespace(mechanism='qualified_dynamic'),timeouts=SimpleNamespace(request_seconds=30))
+    monkeypatch.setattr(f,'policy_digest',lambda value:ctx['policy_sha256']if value is policy else pytest.fail('wrong actual policy'))
+    binding=f.RuntimeBinding(**ctx['binding']);worker=p20_worker('worker-a');runner=p20_runner();runner['source_graph_sha256']=ctx['source_graph_sha256']
+    worker['identity']={key:value for key,value in dict(machine_id=ctx['worker_machine_id'],boot_id=binding.guest_boot_id,kernel=binding.guest_kernel_id,dmi_uuid=binding.native_id).items()}
+    ident={**worker['identity'],'image_id':binding.image_id};j=job(42)
+    guest=dict(identity_before=ident,identity_after=dict(ident),output_generation=dict(worker=worker,runner=runner),
+        jobs={'42':j['native']},groups={'42':j['cgroup']},memory={'MemTotal':180*MiB,'MemAvailable':120*MiB},
+        observed_at=100,slurm_registered=True,slurm_memory_bytes=900*MiB)
+    config=dict(qualification='/protected/qualification',client_uid=3000,enrollment={'vm':dict(os_reserve_bytes=60*MiB)},
+        capacity_profiles={'vm':dict(source_graph_sha256=ctx['source_graph_sha256'],report_sha256=f.fingerprint(report),report_path='/protected/report')})
+    bundle=dict(schema='qcl.host-resource-qualification.v2',qualifications=[candidate])
+    data={'/protected/report':report,'/protected/qualification':bundle,str(f.SERVICE_CONFIG):dict(schema='qcl.host-resource-service.v1',role='native_host',client_uid=3000,facts=__import__('copy').deepcopy(config))}
+    monkeypatch.setattr(f,'read_root_json',lambda path:data[str(path)])
+    monkeypatch.setattr(f,'read_root_qualification_report',lambda path:data[str(path)],raising=False)
+    read=f.VMReadback if hasattr(f,'VMReadback')else __import__('host_resource_operations').VMReadback
+    backend=SimpleNamespace(quantum_bytes=MiB,readback=lambda vm:read(vm,binding.native_id,binding.process_id,binding.config_fingerprint,'native',200*MiB,200*MiB,True))
+    provider=f.NativeFactsProvider(policy,config,backend,None,sources=object(),clock=lambda:100)
+    return f,o,provider,bundle,binding,guest,report,data
+
+
+def test_measured_report_uses_only_the_dedicated_reader(measured_provider,monkeypatch):
+    f,o,p,bundle,binding,g,report,data=measured_provider
+    def ordinary_metadata(path):
+        assert str(path) != '/protected/report', 'report entered the generic 256 KiB metadata reader'
+        return data[str(path)]
+    monkeypatch.setattr(f,'read_root_json',ordinary_metadata)
+    assert type(p._qualification(bundle,binding,g,host_boot_id=report['permit']['context']['host_boot_id']))is o.MeasuredBackendQualification
+
+
+def test_v2_profile_is_actual_source_report_bound_and_typed_before_ready(measured_provider):
+    f,o,p,bundle,binding,g,report,data=measured_provider
+    assert hasattr(p,'_qualification'),'missing private measured qualification decoder'
+    q=p._qualification(bundle,binding,g,host_boot_id=report['permit']['context']['host_boot_id'])
+    assert type(q)is o.MeasuredBackendQualification and q.capacity.os_reserve_bytes==60*1024**2
+    assert q.capacity.maximum_guest_total_bytes==980*1024**2
+    # Existing exact-type consumers intentionally fail closed until Root integration.
+    assert type(q)is not f.BackendQualification
+
+
+@pytest.mark.parametrize('fault',['missing-pin','report-hash','report-bytes','source','reserve','binding','profile','positive-v1'])
+def test_v2_profile_never_uses_its_own_context_as_independent_authority(measured_provider,fault):
+    import copy
+    f,o,p,bundle,binding,g,report,data=measured_provider
+    assert hasattr(p,'_qualification'),'missing private measured qualification decoder'
+    if fault=='missing-pin':p.config.pop('capacity_profiles')
+    if fault=='report-hash':p.config['capacity_profiles']['vm']['report_sha256']='0'*64
+    if fault=='report-bytes':report['cases']['pressure']['status']='PASS-FORGED'
+    if fault=='source':g['output_generation']['runner']['source_graph_sha256']='0'*64
+    if fault=='reserve':p.config['enrollment']['vm']['os_reserve_bytes']=100*1024**2
+    if fault=='binding':binding=replace(binding,image_id='/nix/store/other')
+    if fault=='profile':bundle['qualifications'][0]['capacity']['measurement']['maximum_guest_total_bytes']=1000*1024**2
+    if fault=='positive-v1':bundle['schema']='qcl.host-resource-qualification.v1';bundle['qualifications'][0].pop('capacity')
+    with pytest.raises((f.ResourceError,ValueError)):p._qualification(bundle,binding,g,host_boot_id=report['permit']['context']['host_boot_id'])
+
+
+def test_measured_guest_capacity_uses_all_other_authorized_demands_and_actual_limits(measured_provider):
+    from types import SimpleNamespace
+    from test_host_resource_qualification_observations import job,MiB
+    f,o,p,bundle,binding,g,report,data=measured_provider
+    assert hasattr(p,'_qualification'),'missing private measured qualification decoder'
+    q=p._qualification(bundle,binding,g,host_boot_id=report['permit']['context']['host_boot_id']);native=g['jobs']['42'];work='slurm:'+native['generation']
+    p.last=(SimpleNamespace(qualifications=(q,),live_workloads={'vm':()}),{'vm':g})
+    state=dict(grants=[dict(vm_id='vm',guest_bytes=1000*MiB)],receipts=[dict(request=dict(request_id='first',vm_id='vm',workload_id=work,workload_bytes=100*MiB),finished=False)])
+    admitted=p.guest_admission('first',owner_state=state)
+    assert type(admitted)is o.MeasuredGuestEvidence and admitted.os_reserve_bytes==60*MiB and admitted.capacity is q.capacity
+    second=job(43);g['jobs']['43']=second['native'];g['groups']['43']=second['cgroup']
+    state['receipts'].append(dict(request=dict(request_id='second',vm_id='vm',workload_id='slurm:'+second['native']['generation'],workload_bytes=50*MiB),finished=False))
+    with pytest.raises(f.ResourceError,match='capacity'):p.guest_admission('first',owner_state=state)
+
+
+def accounting_sources():
+    """Literal Linux/cgroup reader fixtures; no live /proc or /sys reads."""
+    import host_resource_facts as f
+    from types import SimpleNamespace
+    identity=dict(machine_id='b'*32,boot_id='11111111-1111-4111-8111-111111111111',kernel='kernel',dmi_uuid='22222222-2222-4222-8222-222222222222',image_id='/nix/store/image')
+    native=f.parse_slurm_jobs('JobId=42 UserId=qcl-negf(3000) JobState=RUNNING NumNodes=1 NumTasks=1 NodeList=worker-a SubmitTime=2026-10-28T10:00:00 StartTime=2026-10-28T10:00:01 Restarts=0 MinMemoryNode=100M',cluster='cluster-one')['42']
+    group=dict(populated=True,processes=[dict(pid=42,start_ticks=5,executable='/guard',uids=[3000]*4)],memory_max_bytes=100*1024**2)
+    psi='some avg10=0.00 avg60=0.01 avg300=0.02 total=20\nfull avg10=0.00 avg60=0.00 avg300=0.01 total=10\n'
+    files={'/proc/meminfo':'MemTotal: 1024000 kB\nMemFree: 983040 kB\nMemAvailable: 1000000 kB\nBuffers: 1000 kB\nCached: 2000 kB\nSReclaimable: 1000 kB\nSUnreclaim: 500 kB\nKernelStack: 100 kB\nPageTables: 100 kB\nPercpu: 100 kB\n',
+        '/proc/vmstat':'nr_free_pages 10\nnr_anon_pages 20\nnr_file_pages 30\nballoon_inflate 11\nballoon_deflate 2\nballoon_migrate 1\n',
+        '/proc/pressure/memory':psi,'/proc/9/smaps_rollup':'0000-1000 ---p 0000 00:00 0 [rollup]\nRss: 1024 kB\nPss: 512 kB\n',
+        '/proc/42/smaps_rollup':'0000-1000 ---p 0000 00:00 0 [rollup]\nRss: 1024 kB\nPss: 512 kB\n',
+        '/sys/fs/cgroup/jobs/job_42/memory.current':str(20*1024**2),'/sys/fs/cgroup/jobs/job_42/memory.max':str(100*1024**2),
+        '/sys/fs/cgroup/jobs/job_42/memory.events':'low 0\nhigh 1\nmax 0\noom 0\noom_kill 0\n',
+        '/sys/fs/cgroup/jobs/job_42/memory.stat':'anon 10485760\nfile 1048576\nkernel 1024\n',
+        '/sys/fs/cgroup/jobs/job_42/memory.pressure':psi}
+    processes=[dict(pid=9,start_ticks=4,executable='/slurmd',uids=[0]*4,cgroup='/system.slice/slurmd.service'),dict(pid=42,start_ticks=5,executable='/guard',uids=[3000]*4,cgroup='/jobs/job_42/step_batch')]
+    class Sources:
+        def read(self,path,limit=65536):
+            value=files[str(path)];assert len(value.encode())<=limit;return value
+        def process(self,pid):return dict(next(p for p in processes if p['pid']==pid))
+    return f,Sources(),files,identity,{'42':native},{'42':group},processes
+
+
+def test_actual_guest_accounting_reads_linux_psi_cgroups_and_resident_upper_bound():
+    f,s,files,identity,jobs,groups,processes=accounting_sources()
+    assert hasattr(f,'capture_guest_accounting'),'missing actual bounded Linux accounting getter'
+    row=f.capture_guest_accounting(dict(slurm_cgroup_root='/jobs'),s,identity=identity,jobs=jobs,groups=groups,processes=processes,clock=lambda:100)
+    assert row['schema']=='qcl.host-resource-guest-accounting.v1' and row['identity']==identity
+    assert row['os_upper_bound_bytes']==40*1024**2 and row['meminfo_bytes']['MemAvailable']!=row['os_upper_bound_bytes']
+    assert row['pressure']['some']['total']==20 and row['jobs']['42']['memory_current_bytes']==20*1024**2
+    assert row['jobs']['42']['memory_events']['high']==1 and row['jobs']['42']['memory_max_bytes']==100*1024**2
+    assert row['processes'][0]['pss_bytes']==512*1024 and row['vmstat_counters']['balloon_inflate']==11
+    assert row['balloon_current_bytes'] is None  # cumulative counters never relabelled current capacity
+
+
+@pytest.mark.parametrize('fault',['missing-psi','duplicate','unlimited','raced-limit','oom','pid-birth','missing-resident','too-many','missing-balloon'])
+def test_actual_guest_accounting_refuses_missing_unsupported_raced_or_pressure_failures(fault):
+    f,s,files,identity,jobs,groups,processes=accounting_sources()
+    assert hasattr(f,'capture_guest_accounting'),'missing actual bounded Linux accounting getter'
+    if fault=='missing-psi':files.pop('/proc/pressure/memory')
+    if fault=='duplicate':files['/proc/vmstat']+='balloon_inflate 99\n'
+    if fault=='unlimited':files['/sys/fs/cgroup/jobs/job_42/memory.max']='max'
+    if fault=='raced-limit':files['/sys/fs/cgroup/jobs/job_42/memory.max']='1'
+    if fault=='oom':files['/sys/fs/cgroup/jobs/job_42/memory.events']+='oom_group_kill 1\n'
+    if fault=='pid-birth':s.process=lambda pid:{**next(p for p in processes if p['pid']==pid),'start_ticks':999}
+    if fault=='missing-resident':files.pop('/proc/9/smaps_rollup')
+    if fault=='too-many':processes*=513
+    if fault=='missing-balloon':files['/proc/vmstat']=files['/proc/vmstat'].replace('balloon_inflate 11\n','')
+    with pytest.raises(f.ResourceError):f.capture_guest_accounting(dict(slurm_cgroup_root='/jobs'),s,identity=identity,jobs=jobs,groups=groups,processes=processes,clock=lambda:100)
+
+
+@pytest.mark.parametrize('reader',['_calibration_pair','_calibration_binding_pair'])
+@pytest.mark.parametrize('fault',[None,'guest-source','boot','accounting-missing','accounting-not-measured','accounting-invalid','native-process','protocol','qemu-birth','guest-clock-skew','late-pair','pair-drift'])
+def test_actual_calibration_pair_preserves_full_host_inventory_source_and_binding(measured_provider,monkeypatch,fault,reader):
+    from types import SimpleNamespace
+    from dataclasses import asdict
+    from test_host_resource_qualification_observations import os_accounting
+    f,o,p,bundle,binding,g,report,data=measured_provider;ctx=report['permit']['context']
+    assert hasattr(p,'_calibration_pair'),'missing real readback/guest/accounting collector'
+    calls=[];host=dict(boot_id=ctx['host_boot_id'],MemTotal=4096,MemAvailable=1024)
+    p.policy.physical_ram_bytes=4096
+    monkeypatch.setattr(p,'_host_inventory',lambda:calls.append('whole-host')or(host,[dict(native_id=binding.native_id)],{}))
+    monkeypatch.setattr(f,'collect_native_runtime',lambda *args:SimpleNamespace(host_kernel_id=binding.host_kernel_id,qemu_version_id=binding.qemu_version_id,backend_version_id=binding.backend_version_id))
+    g.update(schema='qcl.host-resource-guest-facts.v1',protocol='synthetic-v2',calibration_accounting=os_accounting())
+    p.config.update(readback_version=binding.readback_version,qualified_protocols={'vm':dict(guest_protocol='synthetic-v2',qemu_birth_ticks=9)})
+    p.config['enrollment']['vm'].update(machine_id=g['identity_before']['machine_id'])
+    class Sources:
+        def guest(self,vm):assert vm=='vm';return g
+        def process(self,pid):assert str(pid)==binding.process_id;return dict(start_ticks=9)
+    p.sources=Sources()
+    if fault=='guest-source':g['output_generation']['runner']['source_graph_sha256']='0'*64
+    if fault=='boot':host['boot_id']='new-boot'
+    if fault=='accounting-missing':g.pop('calibration_accounting')
+    if fault=='accounting-not-measured':g['calibration_accounting']={'state':'NOT_MEASURED','reason':'original bounded capture unavailable'}
+    if fault=='accounting-invalid':g['calibration_accounting']['os_upper_bound_bytes']+=1
+    if fault=='native-process':p.backend.readback=lambda vm:__import__('host_resource_operations').VMReadback(vm,binding.native_id,'99',binding.config_fingerprint,'x',200*1024**2,200*1024**2,True)
+    if fault=='protocol':g['protocol']='other'
+    if fault=='qemu-birth':p.sources.process=lambda pid:dict(start_ticks=10)
+    if fault=='pair-drift':
+        original_read=p.backend.readback;reads=[]
+        def changed(vm):
+            reads.append(vm);r=original_read(vm)
+            return r if len(reads)==1 else replace(r,assigned_bytes=250*1024**2,configured_bytes=250*1024**2)
+        p.backend.readback=changed
+    if fault=='guest-clock-skew':g['observed_at']=101
+    if fault=='late-pair':
+        ticks=iter([1,31_000_000_002]);monkeypatch.setattr(f.time,'monotonic_ns',lambda:next(ticks))
+    binding_only_accounting=reader=='_calibration_binding_pair'and fault in {'accounting-missing','accounting-not-measured','accounting-invalid'}
+    if fault and fault!='guest-clock-skew'and not binding_only_accounting:
+        with pytest.raises(f.ResourceError):getattr(p,reader)(ctx)
+    else:
+        read,guest,original=getattr(p,reader)(ctx)
+        assert read.assigned_bytes==200*1024**2 and guest is g and original['inventory']==[dict(native_id=binding.native_id)]
+        assert original['capture_interval']['guest_observed_at']==g['observed_at']
+    assert calls==['whole-host']
+
+
+@pytest.mark.parametrize('native_outcome',['returned','timeout'])
+def test_actual_calibration_producer_reads_original_c_once_without_v3_or_replay(tmp_path,monkeypatch,native_outcome):
+    import host_resource_facts as f
+    from test_host_resource_qualification import calibration
+    q,n,m,c,b,store,e,proofs,s,runner,parent,raw,plan=calibration(tmp_path)
+    if native_outcome=='timeout':runner.fault='timeout'
+    try:result=parent.run_case('idle-shrink')
+    except m.ResourceError:result=None
+    mid=parent.repository.read(parent.repository.case_path(parent.operation,'idle-shrink'))['mutation_id'];binding=plan['bindings']['vm-a']
+    ctx=dict(host_id=plan['host_id'],owner_id=plan['owner_id'],host_boot_id=plan['host_boot_id'],policy_sha256=plan['policy_sha256'],
+        baseline_state_sha256=plan['baseline_state_sha256'],source_graph_sha256=plan['source_graph_sha256'],qualification_ref=c.policy.active_grant.qualification_ref,
+        worker_machine_id='b'*32,output_owner=next(iter(output_packet()['outputs'].values()))['owner'],binding=binding,
+        native_minimum_bytes=128,native_maximum_bytes=2048,quantum_bytes=64,paid_grant_bytes=2048)
+    permit=dict(schema='qcl.host-resource-calibration-evidence-permit.v1',context=ctx,authorized_demands={},capacity_measurement=None)
+    guest=dict(memory=dict(MemTotal=100,MemAvailable=80),slurm_memory_bytes=100,slurm_registered=True,calibration_accounting=None)
+    p=f.NativeFactsProvider(c.policy,{},b,None,sources=object())
+    monkeypatch.setattr(p,'_calibration_pair',lambda value:(b.readback('vm-a'),guest,dict(original_source='synthetic closed Source/L reader')))
+    observed=p.calibration_observation(parent,permit,1,case_name='idle-shrink')
+    assert observed.effect['mutation_id']==mid and observed.effect['dispatches']==1 and observed.effect['reply_status']is None
+    assert observed.effect['status']==('returned_success'if native_outcome=='returned'else'unknown')
+    assert len(runner.calls)==1 and store.state_path.read_bytes()==raw and observed.closure is None
+    assert observed.source_records['parent_plan']==plan and parent.repository.read(parent.repository.directory/'active.json')['operation_id']==parent.operation
+
+
+@pytest.mark.parametrize('fault',['total-missing','total-over-max','gap','scheduler-over-max','unmapped-target'])
+def test_positive_profile_is_checked_against_actual_capacity_before_ready(measured_provider,fault):
+    f,o,p,bundle,binding,g,report,data=measured_provider
+    if fault=='total-missing':g['memory'].pop('MemTotal')
+    if fault=='total-over-max':g['memory']['MemTotal']=981*1024**2
+    if fault=='gap':g['memory']['MemTotal']=179*1024**2
+    if fault=='scheduler-over-max':g['slurm_memory_bytes']=921*1024**2
+    if fault=='unmapped-target':p.backend.readback=lambda vm:__import__('host_resource_operations').VMReadback(vm,binding.native_id,binding.process_id,binding.config_fingerprint,'x',300*1024**2,300*1024**2,True)
+    with pytest.raises(f.ResourceError):p._qualification(bundle,binding,g,host_boot_id=report['permit']['context']['host_boot_id'])
+
+
+@pytest.mark.parametrize('drift',['protected-pins','report-after-read'])
+def test_measured_profile_rereads_current_protected_pins_and_report_at_positive_boundary(measured_provider,monkeypatch,drift):
+    import copy
+    f,o,p,bundle,binding,g,report,data=measured_provider
+    if drift=='protected-pins':data[str(f.SERVICE_CONFIG)]['facts']['capacity_profiles']['vm']['report_sha256']='0'*64
+    if drift=='report-after-read':
+        reads=[]
+        def current(path):
+            value=data[str(path)]
+            if str(path)=='/protected/report':
+                reads.append(path)
+                if len(reads)>1:return {**value,'native_recovery_limit':'forged'}
+            return value
+        monkeypatch.setattr(f,'read_root_qualification_report',current)
+    with pytest.raises(f.ResourceError):p._qualification(bundle,binding,g,host_boot_id=report['permit']['context']['host_boot_id'])
+
+
+@pytest.mark.parametrize('fault',['registration-false','registration-missing','registration-string','stale','future'])
+def test_positive_startup_qualification_requires_actual_fresh_registration_before_flags(measured_provider,fault):
+    f,o,p,bundle,binding,g,report,data=measured_provider
+    if fault=='registration-false':g['slurm_registered']=False
+    if fault=='registration-missing':g.pop('slurm_registered')
+    if fault=='registration-string':g['slurm_registered']='true'
+    if fault=='stale':g['observed_at']=69
+    if fault=='future':g['observed_at']=101
+    with pytest.raises(f.ResourceError):p._qualification(bundle,binding,g,host_boot_id=report['permit']['context']['host_boot_id'])

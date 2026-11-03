@@ -3718,6 +3718,51 @@ def test_publication_original_preflight_derives_mode_before_fixed_script(actor_b
         assert not hasattr(source,'_actor')
 
 
+@pytest.mark.parametrize('fault',[None,'ordinary','actor','permit','missing_owner'])
+def test_calibration_closed_preflight_adds_hold_only_after_original_fixture(actor_bridge,monkeypatch,fault):
+    s=actor_bridge;m=s['m'];source=s['sources'];launch=s['document']['launch'];files=s['files'];native=s['native']
+    files['plan']=m.encoded(publication_fixture_plan())
+    native['input_plan'].update(bytes=str(len(files['plan'])),sha256=hashlib.sha256(files['plan']).hexdigest())
+    files['native_execution']=m.encoded(native)
+    script=native_origin_bridge_script(s).replace(b'unset QCL_NEGF_CAPTURE_SPEC',
+        b'export QCL_NEGF_CAPTURE_SPEC=capture-spec.json QCL_NEGF_NATIVE_CAPTURE_INPUT=native-execution.json')
+    script=script.replace(b"'run-plan'",b"'native-publication-fixture'");files['submit_script']=script
+    launch['files']={key:dict(bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest()) for key,raw in files.items()}
+    s['actor_launch'].update(copy.deepcopy(launch));runner=p20_runner();runner['engineering_fixture']='native-publication-v1'
+    source.qualification['completed_final']=dict(runner=runner);s['ready']=s['gate']=False
+    source.policy['tools']['sbatch']='/nix/store/sbatch';source.policy['spool_root']='/protected/spool'
+    calls=[]
+    class Owner:
+        def submit_permit(self, actual, *, calcjob_uuid, actor=None, fixture=None):
+            calls.append((copy.deepcopy(actor),fixture))
+            assert actual==launch and calcjob_uuid==s['document']['calcjob_uuid']
+            if fault=='permit':raise m.Hold('private permit refused')
+            if actor is not None:
+                assert set(actor)=={'calcjob_uuid','action','launch','execution_sha256'}
+                if fixture!='native-publication-v1' or fault=='actor':raise m.Hold('private fixture refused')
+            return {'private':'synthetic root owner'}
+    if fault!='missing_owner':source._qualification_jobs=Owner()
+    monkeypatch.setattr(m,'_read_submitted_files_as_owner',lambda *args:dict(files=launch['files'],
+        script=base64_script(script),engineering_fixture=None if fault=='ordinary' else m._submitted_plan_mode(files['plan'],launch,source.budget)))
+    def preflight():return source.preflight(launch,source.budget,calcjob_uuid=s['document']['calcjob_uuid'],action='submit')
+    if fault is not None:
+        with pytest.raises(m.Hold):preflight()
+    else:
+        assert preflight()==s['host'] and calls[0]==(None,None)
+        assert calls[-1][1]=='native-publication-v1' and calls[-1][0]==source._actor
+        argv=source._argv(launch,dict(script_path='/protected/spool/'+NATIVE_ORIGIN_CALCJOB+'.sh',
+            script_sha256=launch['files']['submit_script']['sha256']),NATIVE_ORIGIN_CALCJOB)
+        assert argv.count('--hold')==1 and '--hold' in argv
+        assert set(source._actor)=={'calcjob_uuid','action','launch','execution_sha256'}
+
+
+def test_ordinary_native_submit_argv_stays_byte_for_byte_without_hold():
+    m=module();launch=request()['launch'];source=m.NativeSources(dict(tools={'runuser':'runuser','sbatch':'sbatch'}),None)
+    assert source._argv(launch,{'script_path':'/protected/original.sh'},NATIVE_ORIGIN_CALCJOB)==[
+        'runuser','-u','qcl-negf','--','sbatch','--parsable','--no-requeue','--chdir',launch['remote_workdir'],
+        '--comment',NATIVE_ORIGIN_CALCJOB,'/protected/original.sh']
+
+
 def publication_fork_originals(tmp_path):
     """Owned regular originals and actual reader/strict profile; no native authority."""
     m=module();folder=tmp_path/'fork-originals';folder.mkdir()

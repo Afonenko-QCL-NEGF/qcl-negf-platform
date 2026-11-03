@@ -17,12 +17,15 @@ import application_release as command_engine
 from host_resource_operations import (BackendQualification, CompletionEvidence, GuestEvidence,
     HostEvidence, ResourceError, RuntimeBinding, integer, policy_digest,
     require, strict_json, text)
-from host_resource_backends import (collect_native_runtime, fingerprint, pve_memory_mib, read_root_json,
+from host_resource_backends import (collect_native_runtime, fingerprint, pve_memory_mib, read_root_json, read_root_qualification_report,
     trusted_root_path, MAX_OUTPUT_BYTES)
 from host_resource_startup import ColdHostEvidence, ColdVMRecord
 
 TERMINAL={'CANCELLED','COMPLETED','FAILED','TIMEOUT','OUT_OF_MEMORY','NODE_FAIL','PREEMPTED','BOOT_FAIL','DEADLINE'}
 JOB_ID=re.compile(r'[1-9][0-9]{0,18}\Z')
+def _output_sha256(value):
+    require(type(value)is str and re.fullmatch(r'[0-9a-f]{64}',value)is not None,'qualification','actual protected SHA required')
+
 SERVICE_CONFIG=Path('/etc/qcl-negf/host-resources/service.json')
 
 
@@ -303,6 +306,25 @@ class LocalSources:
     def guest(self,vm_id):
         route=self.config['guests'][vm_id]
         return trusted_rpc(route,'guest-facts',{},run=command_engine.command)
+    def guest_calibration(self,vm_id):
+        # Same authenticated fixed read route; shared protected config must opt in.
+        packet=self.guest(vm_id)
+        require(type(packet.get('calibration_accounting'))is dict,'qualification_observations_required','actual accounting reader not enabled')
+        return packet
+    def calibration_attempt(self,vm_id,calcjob_uuid,creator):
+        # Existing read-only status phase validates original hook/dispatch/source;
+        # it does not create before/after evidence or change a worker journal.
+        return trusted_rpc(self.config['guests'][vm_id],'attempt-facts',dict(version=1,calcjob_uuid=calcjob_uuid,
+            dispatch_id=creator['dispatch_id'],job_id=creator['job_id'],generation=creator['generation'],phase='status'),run=command_engine.command)
+    def fixed_native(self,backend,vm_id):
+        """Original read-only native config; a fixed protocol label is not proof."""
+        from host_resource_backends import ProxmoxMemoryBackend,LibvirtMemoryBackend
+        require(type(backend)in (ProxmoxMemoryBackend,LibvirtMemoryBackend)and backend.dynamic is False,
+            'qualification','actual fixed native backend required')
+        if type(backend)is ProxmoxMemoryBackend:
+            return dict(backend='proxmox',configuration=strict_json(backend._run(
+                ['get',backend._path(vm_id)+'/config','--current','1'])))
+        return dict(backend='libvirt',configuration=backend._run(['dumpxml',backend._vm(vm_id).native_id]))
     def inventory(self,backend):
         rows=[]
         if self.config['backend_config']['backend']=='proxmox':
@@ -455,27 +477,375 @@ class NativeFactsProvider:
             return native,vm,identity,'native-'+hashlib.sha256(identity.encode()).hexdigest()
         except BaseException:
             self._end_invocation();raise
+    def _calibration_binding_pair(self,ctx):
+        """Actual paired native/guest identity and Source, without a physical verdict."""
+        from native_attempt import _output_worker,_output_runner,Hold
+        from host_resource_qualification_observations import context
+        try:
+            started_at=self.clock();started_ns=time.monotonic_ns()
+            context(ctx);host,inventory,agreement=self._host_inventory();vm=next(vm for vm in self.policy.vms if vm.vm_id==ctx['binding']['vm_id'])
+            require(ctx['host_id']==self.policy.host_id and ctx['owner_id']==self.policy.owner_id and
+                ctx['host_boot_id']==host['boot_id']and ctx['policy_sha256']==policy_digest(self.policy)and
+                vm.minimum_bytes==ctx['native_minimum_bytes']and vm.maximum_bytes==ctx['native_maximum_bytes']and
+                self.backend.quantum_bytes==ctx['quantum_bytes'],'identity_mismatch','actual host/policy/native bounds changed')
+            read=self.backend.readback(vm.vm_id);runtime=collect_native_runtime(self.backend,read)
+            guest=self.sources.guest(vm.vm_id)
+            require(guest['schema']=='qcl.host-resource-guest-facts.v1'and guest['identity_before']==guest['identity_after']and
+                type(guest['observed_at'])is int and guest['observed_at']>=0,
+                'stale_evidence','stable original actual calibration guest timestamp required')
+            ident=guest['identity_before'];binding=RuntimeBinding(vm.vm_id,read.native_id,read.process_id,ident['boot_id'],ident['image_id'],ident['kernel'],
+                runtime.host_kernel_id,runtime.qemu_version_id,runtime.backend_version_id,self.config['readback_version'],read.config_fingerprint)
+            profile=self.config['qualified_protocols'][vm.vm_id]
+            require(asdict(binding)==ctx['binding']and read.running is True and read.assigned_bytes==read.configured_bytes and
+                vm.minimum_bytes<=read.assigned_bytes<=ctx['paid_grant_bytes']==vm.maximum_bytes and
+                ident['machine_id']==self.config['enrollment'][vm.vm_id]['machine_id']==ctx['worker_machine_id']and ident['dmi_uuid']==read.native_id.lower()and
+                guest['protocol']==profile['guest_protocol']and self.sources.process(int(read.process_id))['start_ticks']==profile['qemu_birth_ticks'],
+                'qualification','actual native process/guest/protocol binding differs')
+            actual=guest['output_generation'];require(type(actual)is dict and set(actual)=={'worker','runner'},
+                'qualification','actual calibration Source generation required')
+            _output_worker(actual['worker']);_output_runner(actual['runner'])
+            require(actual['worker']['identity']=={key:ident[key]for key in ('machine_id','boot_id','kernel','dmi_uuid')}and
+                actual['runner']['source_graph_sha256']==ctx['source_graph_sha256'],'qualification','actual calibration Source/worker differs')
+            # Preserve the original packet; no installation/qualification is implied.
+            after_read=self.backend.readback(vm.vm_id)
+            require(after_read==read and collect_native_runtime(self.backend,after_read)==runtime,
+                'identity_mismatch','native allocation/runtime changed during paired guest capture')
+            ended_ns=time.monotonic_ns();ended_at=self.clock()
+            require(0<=ended_ns-started_ns<=self.policy.timeouts.request_seconds*10**9,
+                'stale_evidence','bounded actual caller capture interval required')
+            return read,guest,dict(host=host,inventory=inventory,agreement=agreement,guest=guest,native_before=asdict(read),native_after=asdict(after_read),
+                capture_interval=dict(caller_started_at=started_at,caller_ended_at=ended_at,
+                    caller_started_monotonic_ns=started_ns,caller_ended_monotonic_ns=ended_ns,
+                    guest_observed_at=guest['observed_at']))
+        except (OSError,KeyError,TypeError,ValueError,StopIteration,Hold)as error:
+            raise ResourceError('qualification_observations_required','actual calibration observations unavailable')from error
+
+    def _calibration_pair(self,ctx):
+        """Strict physical producer; binding-only settlement never qualifies it."""
+        from host_resource_qualification_observations import validate_accounting
+        read,guest,original=self._calibration_binding_pair(ctx)
+        try:
+            require(type(guest.get('calibration_accounting'))is dict,'qualification_observations_required','actual accounting required')
+            validate_accounting(guest['calibration_accounting'],ctx)
+        except (ResourceError,KeyError,TypeError,ValueError)as cause:
+            error=cause if isinstance(cause,ResourceError)else ResourceError('qualification_observations_required','actual accounting unavailable')
+            # Raw actual capture is secondary diagnostic evidence, never a
+            # successful return from this strict physical API.
+            error.calibration_pair=(read,guest,original)
+            if error is cause:raise
+            raise error from cause
+        return read,guest,original
+
+    def calibration_observation(self,parent,permit,sequence,*,jobs=None,case_name=None):
+        """Internal Root producer. Default installed ingress remains closed.
+
+        Parent and job owners are the existing protected readers, not submitted
+        JSON. Missing child/final/outer-response/closure evidence stays missing.
+        This method never executes C, Slurm, a body, or a fence close.
+        """
+        from host_resource_qualification import check_baseline,decode_case,_exists,readback_record
+        from host_resource_qualification_observations import CalibrationObservation,decode_permit,plain
+        decode_permit(permit);ctx=permit['context']
+        with parent.store.locked():
+            plan=parent.repository.plan(parent.operation);state=parent._state();check_baseline(self.policy,parent.store,plan,state)
+            pending=parent._catalog(plan,state)
+            require(parent.policy==self.policy and plan['host_id']==ctx['host_id']and plan['owner_id']==ctx['owner_id']and
+                plan['host_boot_id']==ctx['host_boot_id']and plan['policy_sha256']==ctx['policy_sha256']and
+                plan['baseline_state_sha256']==ctx['baseline_state_sha256']and plan['source_graph_sha256']==ctx['source_graph_sha256']and
+                plan['bindings'][ctx['binding']['vm_id']]==ctx['binding'],
+                'qualification','actual parent/paid baseline/source differs')
+            read,guest,original=self._calibration_pair(ctx);effect=None;job_rows=[]
+            original.update(parent_plan=plan,pending_mutation_ids=pending)
+            if case_name is not None:
+                require(case_name in plan['cases'],'shape','original frozen case required')
+                marker=decode_case(parent.repository.read(parent.repository.case_path(parent.operation,case_name)),parent.operation,case_name)
+                original['case']=marker;mid=marker['mutation_id']
+                if mid is not None:
+                    owner=parent.proofs.owner_for(mid);owned=owner.effect(state,mid);witness=parent.proofs.read(mid)
+                    dispatch=parent.proofs.dispatch(mid);original.update(effect=owner.record,dispatch=dispatch,witness=witness)
+                    returned=witness['phase']=='RETURNED_SUCCESS';readback_sha=None
+                    if returned:
+                        proof=parent._proof(owner,state,owned);path=parent.repository.readback_path(parent.operation,mid)
+                        if _exists(path):
+                            retained=parent.repository.read(path)
+                            require(retained==readback_record(owner,proof,__import__('host_resource_operations').VMReadback(**retained['readback'])),
+                                'cleanup_evidence','original confirmed readback differs')
+                            readback_sha=parent.repository.digest(path);original['confirmed_readback']=retained
+                    effect=dict(status='returned_success'if returned else'unknown',mutation_id=mid,old_bytes=owned.old_bytes,
+                        target_bytes=owned.target_bytes,before_revision=owned.before_revision,dispatches=1,witness=witness,
+                        readback_sha256=readback_sha,original_evidence_sha256=parent.repository.digest(parent.repository.effect_path(parent.operation,mid)),
+                        reply_status=None,failure_code=None)
+            if jobs is not None:
+                require(jobs.parent is parent,'qualification','child must belong to original parent')
+                child=jobs.evidence();original['child_jobs']=child
+                selected={calc:row for calc,row in child['permit']['jobs'].items()if row['vm_id']==ctx['binding']['vm_id']}
+                require({calc:row['demand_bytes']for calc,row in selected.items()}==permit['authorized_demands']and
+                    child['permit']['source_graph_sha256']==ctx['source_graph_sha256'],
+                    'qualification','all original authorized child commitments must match')
+                allowed=set();attempts={}
+                # The existing scheduler RPC is the original completed_final reader.
+                self._end_invocation();self._output_epoch=object();self._pending_epoch=self._output_epoch
+                try:
+                    self._output_config=self._current_output_config()
+                    packet=trusted_rpc(self.config['scheduler_route'],'scheduler-facts',{},run=command_engine.command)
+                    self._pending_outputs=_scheduler_output_observations(packet)
+                    self._pending_jobs={out['native_tuple']['job_id']:_output_native_tuple(packet['jobs'][out['native_tuple']['job_id']])for out in self._pending_outputs.values()}
+                    self._join_scheduler_outputs({ctx['binding']['vm_id']:guest},observed_now=self.clock())
+                    original['scheduler']=packet
+                    for calc,row in selected.items():
+                        refs=child['jobs'][calc];bound=refs['bound']
+                        if bound is None:continue
+                        creator=bound['record']['creator'];job_id=creator['job_id'];allowed.add(job_id)
+                        native=guest['jobs'].get(job_id)
+                        if native is None:continue  # held/unallocated is never given a fabricated StartTime
+                        status=self.sources.calibration_attempt(ctx['binding']['vm_id'],calc,creator);attempts[calc]=status
+                        from native_attempt import validate_worker_reply
+                        validate_worker_reply(status);fields=status['job']['fields']
+                        require(parse_slurm_jobs(status['job']['raw'],cluster=creator['cluster']).get(job_id)==native and
+                            fields['SubmitTime']==creator['submit_time']and fields.get('Comment')==creator['dispatch_id']and
+                            fields.get('Command')==child['permit']['submit']['spool_root']+'/'+creator['dispatch_id']+'.sh'and
+                            fields.get('WorkDir')==row['launch']['remote_workdir']and status['identity']['identity']==guest['identity_before'],
+                            'native_generation','original held creator/prolog/current allocation differs')
+                        if status['prolog_ref']is None:continue
+                        group=guest['groups'][job_id];final=self._joined_outputs.get(native['generation']);closed=refs['closed']
+                        phase='live'if native['state']=='RUNNING'and native['terminal']is False else'unknown'
+                        if closed is not None and refs['revoked']is not None and final is not None:
+                            require(closed['record']['completed_final_sha256']==fingerprint(final)and
+                                closed['record']['creator']==creator,'cleanup','original genuine final/creator closure differs')
+                            phase='closed'
+                        job_rows.append(dict(calcjob_uuid=calc,creator_generation=creator['generation'],native=native,demand_bytes=row['demand_bytes'],
+                            task_limit_bytes=group['memory_max_bytes'],state=phase,creator_sha256=bound['sha256'],
+                            prolog_sha256=fingerprint(dict(path=status['prolog_ref'],status=status)),cgroup=group,cgroup_sha256=fingerprint(group),
+                            completed_final=final if phase=='closed'else None,
+                            absence_sha256=fingerprint(dict(group=group,status=status,closed=closed))if phase=='closed'else None,
+                            revoked_sha256=refs['revoked']['sha256']if refs['revoked']is not None else None))
+                    require(set(guest['jobs'])<=allowed,'ownership','native allocation outside original finite child set')
+                    require(jobs.evidence()==child,'qualification','original child set changed while observing')
+                    original['attempts']=attempts
+                finally:self._end_invocation()
+            parent._catalog(plan,state);check_baseline(self.policy,parent.store,plan,parent._state())
+            return CalibrationObservation(context=ctx,sequence=sequence,readback=asdict(read),total_bytes=guest['memory']['MemTotal'],
+                available_bytes=guest['memory']['MemAvailable'],slurm_memory_bytes=guest.get('slurm_memory_bytes'),
+                slurm_registered=guest.get('slurm_registered'),jobs=tuple(job_rows),effect=effect,proposed_target_bytes=None,
+                pressure=None,closure=None,evidence_sha256=fingerprint(original),accounting=guest['calibration_accounting'],source_records=original)
+
+    def _current_capacity_pins(self,vm_id):
+        current=read_root_json(SERVICE_CONFIG)
+        require(current.get('schema')=='qcl.host-resource-service.v1'and current.get('role')=='native_host'and
+            current.get('client_uid')==self.config['client_uid']and current['facts'].get('capacity_profiles')==self.config.get('capacity_profiles'),
+            'qualification','current protected capacity pins changed')
+        return current['facts']['capacity_profiles'][vm_id]
+
+    def _fixed_qualification(self,protected,value,binding,guest,host_boot_id):
+        """Current fixed-full proof, distinct from measured dynamic capacity."""
+        from native_attempt import _output_worker,_output_runner
+        started_at=self.clock();started_ns=time.monotonic_ns()
+        vm=next(vm for vm in self.policy.vms if vm.vm_id==binding.vm_id)
+        require(value['evidence_ref']==self.policy.active_grant.qualification_ref and
+            self.config['readback_version']==binding.readback_version=='qcl.native-memory.fixed.v1',
+            'qualification','exact fixed qualification/reference required')
+        service=read_root_json(SERVICE_CONFIG)
+        expected_raw=self._current_output_config();expected=json.loads(expected_raw).get('output_owner')
+        require(type(expected)is dict and all(service['facts'].get(key)==self.config.get(key)for key in
+            ('readback_version','qualified_protocols','host_identity')) and
+            read_root_json(self.config['qualification'])==protected,
+            'qualification','current protected fixed Source/protocol required')
+        require(guest['identity_before']==guest['identity_after']and guest.get('slurm_registered')is True and
+            type(guest.get('observed_at'))is int and 0<=self.clock()-guest['observed_at']<=self.policy.timeouts.request_seconds,
+            'qualification','fresh stable registered fixed guest required')
+        identity=guest['identity_before'];enrolled=self.config['enrollment'][vm.vm_id]
+        require(identity['machine_id']==enrolled['machine_id']and identity['dmi_uuid']==binding.native_id==enrolled['native_id']and
+            enrolled['maximum_bytes']==vm.maximum_bytes and identity['boot_id']==binding.guest_boot_id and
+            identity['kernel']==binding.guest_kernel_id and identity['image_id']==binding.image_id,
+            'qualification','actual fixed enrollment/image/kernel/boot differs')
+        actual=guest['output_generation'];require(type(actual)is dict and set(actual)=={'worker','runner'},
+            'qualification','actual fixed worker/Runner Source required')
+        _output_worker(actual['worker']);_output_runner(actual['runner'])
+        nodes=[node for node,vm_id in self.config['nodes'].items()if vm_id==vm.vm_id]
+        require(len(nodes)==1 and actual['worker']==expected['worker_generations'].get(nodes[0])and
+            actual['worker']['identity']=={key:identity[key]for key in ('machine_id','boot_id','kernel','dmi_uuid')}and
+            actual['runner']==expected['runner'],'qualification','actual fixed Source/worker generation differs')
+        profile=self.config['qualified_protocols'][vm.vm_id]
+        require(guest['protocol']==profile['guest_protocol'],'qualification','actual fixed guest protocol differs')
+        read=self.backend.readback(vm.vm_id);runtime=collect_native_runtime(self.backend,read)
+        native_reader=getattr(self.sources,'fixed_native',None)
+        require(callable(native_reader),'qualification','actual fixed native configuration reader required')
+        native=native_reader(self.backend,vm.vm_id)
+        require(type(native)is dict and set(native)=={'backend','configuration'},'qualification','original fixed native config required')
+        if native['backend']=='proxmox':
+            from host_resource_backends import pve_config_fingerprint
+            cfg=native['configuration'];require(type(cfg)is dict,'qualification','actual PVE config required')
+            integer(cfg.get('balloon'),'fixed PVE balloon')
+            require(cfg['balloon']==0 and pve_memory_mib(cfg.get('memory'))*1024**2==vm.maximum_bytes and
+                pve_config_fingerprint(cfg)==binding.config_fingerprint and cfg.get('digest')==read.revision and
+                re.findall(r'(?:^|,)uuid=([^,]+)(?:,|$)',cfg.get('smbios1',''))==[binding.native_id],
+                'qualification','PVE full reservation requires actual disabled balloon/config')
+        else:
+            from host_resource_backends import LibvirtMemoryBackend,libvirt_config_fingerprint
+            raw=native['configuration'];require(native['backend']=='libvirt'and type(raw)is str and
+                '<!DOCTYPE'not in raw and '<!ENTITY'not in raw,'qualification','actual fixed libvirt XML required')
+            xml=ET.fromstring(raw)
+            require(xml.tag=='domain'and xml.findtext('uuid')==binding.native_id and
+                LibvirtMemoryBackend._memory(xml.find('currentMemory'))==LibvirtMemoryBackend._memory(xml.find('memory'))==vm.maximum_bytes and
+                libvirt_config_fingerprint(xml)==binding.config_fingerprint and hashlib.sha256(raw.encode()).hexdigest()==read.revision,
+                'qualification','libvirt current/configured maximum differs')
+        require(read.native_id==binding.native_id and read.process_id==binding.process_id and read.config_fingerprint==binding.config_fingerprint and
+            read.running is True and read.assigned_bytes==read.configured_bytes==vm.maximum_bytes and
+            runtime.host_boot_id==host_boot_id and runtime.host_kernel_id==binding.host_kernel_id and
+            runtime.qemu_version_id==binding.qemu_version_id and runtime.backend_version_id==binding.backend_version_id,
+            'qualification','current fixed full allocation/runtime differs')
+        integer(profile['qemu_birth_ticks'],'fixed QEMU birth',1)
+        birth=self.sources.process(int(read.process_id))['start_ticks']
+        require(type(birth)is int and birth==profile['qemu_birth_ticks'],'qualification','actual fixed QEMU birth differs')
+        total=guest['memory']['MemTotal'];available=guest['memory']['MemAvailable'];scheduler=guest['slurm_memory_bytes'];reserve=enrolled['os_reserve_bytes']
+        for amount in (total,available,scheduler,reserve):integer(amount,'actual fixed guest capacity')
+        require(0<reserve<=vm.minimum_bytes<=total<=vm.maximum_bytes and available<=total and
+            0<scheduler<=total-reserve,'qualification','fixed guest/Slurm/reserve capacity contradicts full reservation')
+        require(native_reader(self.backend,vm.vm_id)==native and self.backend.readback(vm.vm_id)==read and collect_native_runtime(self.backend,read)==runtime and
+            self.sources.process(int(read.process_id))['start_ticks']==birth and
+            self._current_output_config()==expected_raw and read_root_json(SERVICE_CONFIG)==service and
+            read_root_json(self.config['qualification'])==protected,
+            'qualification','fixed original Source/native proof changed during capture')
+        self._capture_timestamp(started_at,started_ns,{binding.vm_id:guest})
+        return BackendQualification(**value)
+
+    def _qualification(self,protected,binding,guest,*,host_boot_id=None):
+        # The report hash/source expectation comes from protected configuration,
+        # never from the row that is being authorized. No legacy positive upgrade.
+        from host_resource_qualification_observations import MeasuredBackendQualification,qualification_candidate
+        from host_resource_capacity import decode_capacity_qualification_v2,CapacityValidationError
+        from native_attempt import _output_worker,_output_runner,Hold
+        flags={'qualified_dynamic','active_floor_protection','readback_verified','slurm_registration_verified'}
+        try:
+            require(type(protected)is dict and set(protected)=={'schema','qualifications'} and
+                protected['schema']in {'qcl.host-resource-qualification.v1','qcl.host-resource-qualification.v2'} and
+                type(protected['qualifications'])is list and len(protected['qualifications'])<=64,
+                'qualification','closed bounded protected qualification required')
+            base=set(BackendQualification.__dataclass_fields__)
+            allowed=base if protected['schema'].endswith('.v1')else base|{'capacity'}
+            require(all(type(q)is dict and set(q)==allowed for q in protected['qualifications']),
+                'qualification','exact private qualification fields required')
+            matches=[q for q in protected['qualifications']if q['binding']==asdict(binding)]
+            require(len(matches)==1,'qualification','exact actual runtime qualification required');row=matches[0]
+            require(row['host_id']==self.policy.host_id and row['owner_id']==self.policy.owner_id and
+                row['policy_sha256']==policy_digest(self.policy) and type(row['evidence_ref'])is str and row['evidence_ref'] and
+                all(type(row[key])is bool for key in flags),'qualification','actual owner/policy/flags differ')
+            value={key:row[key]for key in base};value['binding']=binding
+            if not any(row[key]for key in flags):
+                require('capacity'not in row or row['capacity']is None,'qualification','negative qualification cannot carry positive capacity')
+                return BackendQualification(**value)
+            if self.policy.active_grant.mechanism=='conservative_reservation':
+                require(protected['schema']=='qcl.host-resource-qualification.v1'and row['qualified_dynamic']is False and
+                    all(row[key]is True for key in flags-{'qualified_dynamic'}),
+                    'qualification','fixed-only v1 qualification required; no legacy dynamic authority')
+                return self._fixed_qualification(protected,value,binding,guest,host_boot_id)
+            require(protected['schema'].endswith('.v2')and all(row[key]for key in flags),
+                'qualification','positive qualification requires full measured v2 evidence')
+            pins=self.config.get('capacity_profiles',{}).get(binding.vm_id)
+            require(type(pins)is dict and set(pins)=={'source_graph_sha256','report_sha256','report_path'},
+                'qualification','independent protected capacity pins required')
+            require(self._current_capacity_pins(binding.vm_id)==pins,'qualification','actual independent capacity pins differ')
+            for key in ('source_graph_sha256','report_sha256'):_output_sha256(pins[key])
+            report=read_root_qualification_report(pins['report_path'])
+            require(fingerprint(report)==pins['report_sha256']and qualification_candidate(report)==row,
+                'qualification','accepted actual report or deterministic predicates differ')
+            ctx=report['permit']['context'];vm=next(vm for vm in self.policy.vms if vm.vm_id==binding.vm_id)
+            require(ctx['host_id']==self.policy.host_id and ctx['owner_id']==self.policy.owner_id and
+                ctx['host_boot_id']==host_boot_id and ctx['policy_sha256']==policy_digest(self.policy)and
+                ctx['binding']==asdict(binding)and ctx['source_graph_sha256']==pins['source_graph_sha256']and
+                ctx['native_minimum_bytes']==vm.minimum_bytes and ctx['native_maximum_bytes']==vm.maximum_bytes and
+                ctx['quantum_bytes']==self.backend.quantum_bytes,'qualification','actual report context differs')
+            require(guest['identity_before']==guest['identity_after']and guest.get('slurm_registered')is True and
+                type(guest.get('observed_at'))is int and 0<=self.clock()-guest['observed_at']<=self.policy.timeouts.request_seconds,
+                'qualification','actual fresh stable guest registration required before positive qualification')
+            identity=guest['identity_before'];worker_identity={key:identity[key]for key in ('machine_id','boot_id','kernel','dmi_uuid')}
+            actual=guest['output_generation'];require(type(actual)is dict and set(actual)=={'worker','runner'},
+                'qualification','actual worker/source generation required')
+            _output_worker(actual['worker']);_output_runner(actual['runner'])
+            require(actual['worker']['identity']==worker_identity and identity['machine_id']==ctx['worker_machine_id']and
+                identity['boot_id']==binding.guest_boot_id and identity['kernel']==binding.guest_kernel_id and
+                identity['dmi_uuid']==binding.native_id and identity['image_id']==binding.image_id and
+                actual['runner']['source_graph_sha256']==pins['source_graph_sha256'],
+                'qualification','fresh actual Source/worker/runtime binding differs')
+            capacity=decode_capacity_qualification_v2(row['capacity'],expected_host_id=self.policy.host_id,
+                expected_owner_id=self.policy.owner_id,expected_policy_sha256=policy_digest(self.policy),
+                expected_binding=asdict(binding),expected_source_graph_sha256=pins['source_graph_sha256'],
+                expected_report_sha256=pins['report_sha256'],expected_native_maximum_bytes=vm.maximum_bytes)
+            require(capacity is not None and vm.minimum_bytes>=capacity.os_reserve_bytes+capacity.native_gap_bound_bytes and
+                self.config['enrollment'][vm.vm_id]['os_reserve_bytes']==capacity.os_reserve_bytes,
+                'qualification','measured R/K incompatible with actual enrollment/policy')
+            # This runs on every positive qualification path, including startup/
+            # binding facts, before the controller could treat it as ready.
+            read=self.backend.readback(vm.vm_id);memory=guest['memory'];total=memory['MemTotal'];available=memory['MemAvailable'];scheduler=guest['slurm_memory_bytes']
+            for amount in (total,available,scheduler):integer(amount,'actual guest capacity')
+            require(read.native_id==binding.native_id and read.process_id==binding.process_id and read.config_fingerprint==binding.config_fingerprint and
+                read.running is True and read.assigned_bytes==read.configured_bytes and
+                read.assigned_bytes in {sample['assigned_bytes']for sample in report['permit']['capacity_measurement']['mapping_samples']}and
+                0<total<=capacity.maximum_guest_total_bytes and available<=total and
+                max(0,read.assigned_bytes-total)<=capacity.native_gap_bound_bytes and
+                0<scheduler<=capacity.maximum_guest_total_bytes-capacity.os_reserve_bytes,
+                'qualification','current actual native/physical/scheduler capacity contradicts measured scope')
+            require(self._current_capacity_pins(binding.vm_id)==pins and read_root_qualification_report(pins['report_path'])==report,
+                'qualification','accepted original profile changed during actual observation')
+            return MeasuredBackendQualification(**value,capacity=capacity,supported_targets=tuple(sorted({sample['assigned_bytes']for sample in report['permit']['capacity_measurement']['mapping_samples']})))
+        except (KeyError,TypeError,ValueError,StopIteration,Hold,CapacityValidationError,ET.ParseError)as error:
+            raise ResourceError('qualification','missing or mismatched measured qualification')from error
+
+    def _capture_timestamp(self,started_at,started_ns,guests):
+        # Keep the oldest contributing observation; later work cannot renew it.
+        now=self.clock();timeout=self.policy.timeouts.request_seconds
+        require(0<=now-started_at<=timeout and 0<=time.monotonic_ns()-started_ns<=timeout*10**9,
+            'stale_evidence','bounded host/guest capture interval required')
+        stamps=[int(started_at)]
+        for guest in guests.values():
+            observed=guest.get('observed_at')
+            require(type(observed)is int and 0<=now-observed<=timeout,
+                'stale_evidence','every contributing guest observation must remain fresh')
+            stamps.append(observed)
+        return min(stamps)
+
+    def _live_guest_workloads(self,vm_id,guest,owner_state):
+        known={}
+        if owner_state:
+            for row in owner_state['receipts']:
+                if row['request']['vm_id']==vm_id and not row['finished'] and row['phase']=='RUN':
+                    identity=row['request']['workload_id'];native=self.native.get(identity)
+                    if native is None:
+                        native=next((j for j in guest['jobs'].values()if 'slurm:'+j['generation']==identity),None)
+                    require(native is not None,'native_generation','live owner native generation evicted')
+                    known[identity]=dict(native_id=native['native_id'],generation=native['generation'],phase='RUN')
+        return classify_guest_workloads(guest['jobs'],guest['groups'],known,
+            gate_executables=tuple(self.config['qualified_protocols'][vm_id]['gate_executables']))
+
     def binding_facts(self,native_vm_id,*,owner_state):
-        host,rows,_=self._host_inventory();bindings=[];qualifications=[]
+        started_at=self.clock();started_ns=time.monotonic_ns()
+        host,rows,_=self._host_inventory();bindings=[];qualifications=[];guests={};live={vm.vm_id:()for vm in self.policy.vms}
         protected=read_root_json(self.config['qualification'])
         for vm in self.policy.vms:
             enrolled=self.config['enrollment'][vm.vm_id]
             row=next(r for r in rows if r['native_id']==enrolled['native_id'])
             if not row['running']:continue
             read=self.backend.readback(vm.vm_id);runtime=collect_native_runtime(self.backend,read)
-            guest=self.sources.guest_identity(vm.vm_id);ident=guest['identity']
+            fixed_positive=(self.policy.active_grant.mechanism=='conservative_reservation'and any(
+                type(q)is dict and type(q.get('binding'))is dict and q['binding'].get('vm_id')==vm.vm_id and q.get('qualified_dynamic')is False and
+                all(q.get(key)is True for key in ('active_floor_protection','readback_verified','slurm_registration_verified'))
+                for q in protected.get('qualifications',[])))
+            full_guest=fixed_positive or protected.get('schema')=='qcl.host-resource-qualification.v2'
+            guest=(self.sources.guest(vm.vm_id)if full_guest else self.sources.guest_identity(vm.vm_id));ident=guest.get('identity_before',guest.get('identity'))
             require(ident['machine_id']==enrolled['machine_id'] and ident['dmi_uuid']==read.native_id.lower(),
                 'identity_mismatch','startup guest identity differs')
             binding=RuntimeBinding(vm.vm_id,read.native_id,read.process_id,ident['boot_id'],ident['image_id'],ident['kernel'],
                 runtime.host_kernel_id,runtime.qemu_version_id,runtime.backend_version_id,self.config['readback_version'],read.config_fingerprint)
-            matches=[q for q in protected['qualifications'] if q['binding']==asdict(binding)]
-            require(len(matches)==1,'qualification','exact startup qualification required')
-            q=dict(matches[0]);q['binding']=binding;bindings.append(binding);qualifications.append(BackendQualification(**q))
+            qualified=self._qualification(protected,binding,guest,host_boot_id=host['boot_id'])
+            if full_guest:
+                guests[vm.vm_id]=guest
+                live[vm.vm_id]=self._live_guest_workloads(vm.vm_id,guest,owner_state)
+            bindings.append(binding);qualifications.append(qualified)
         require(any(b.native_id==native_vm_id for b in bindings),'identity_mismatch','requested native VM is not observed running')
-        return HostEvidence(self.policy.host_id,self.policy.owner_id,host['boot_id'],policy_digest(self.policy),int(self.clock()),
+        observed_at=self._capture_timestamp(started_at,started_ns,guests)
+        return HostEvidence(self.policy.host_id,self.policy.owner_id,host['boot_id'],policy_digest(self.policy),observed_at,
             host['MemTotal'],self.policy.reserves.foreign_max_bytes,self.policy.capacity_evidence_ref,self.policy.owned_pool.agreement_ref,
-            True,True,host['MemAvailable']>=self.policy.reserves.safety_bytes,fingerprint([host,rows]),tuple(bindings),tuple(qualifications),
-            {vm.vm_id:() for vm in self.policy.vms})
+            True,True,host['MemAvailable']>=self.policy.reserves.safety_bytes,fingerprint([host,rows,guests]),tuple(bindings),tuple(qualifications),live)
     def request_facts(self,demand,*,owner_state):
         self.last=None
         try:return self._capture(demand,owner_state=owner_state)
@@ -491,7 +861,7 @@ class NativeFactsProvider:
         require(current.get('schema')=='qcl.host-resource-service.v1' and current.get('role')=='native_host' and
             current.get('client_uid')==self.config['client_uid'] and type(current.get('facts')) is dict,
             'qualification','current protected native-host facts configuration required')
-        facts=current['facts'];keys=('scheduler_route','guests','nodes','enrollment','output_owner')
+        facts=current['facts'];keys=('scheduler_route','guests','nodes','enrollment','output_owner','capacity_profiles')
         require(all(facts.get(key)==self.config.get(key) for key in keys),'qualification','facts binding/routes changed')
         expected=facts.get('output_owner')
         if 'output_owner' in facts:
@@ -555,9 +925,9 @@ class NativeFactsProvider:
         evidence=self._capture(None,owner_state=owner_state,retiring_vm_id=retiring_vm_id)
         return evidence,{vm.vm_id:self.backend.readback(vm.vm_id) for vm in self.policy.vms if vm.vm_id!=retiring_vm_id}
     def _capture(self,demand,*,owner_state,retiring_vm_id=None):
+        started_at=self.clock();started_ns=time.monotonic_ns()
         host,rows,agreement=self._host_inventory(retiring_vm_id=retiring_vm_id);bindings=[];qualifications=[];live={};guests={}
         protected=read_root_json(self.config['qualification'])
-        require(protected['schema']=='qcl.host-resource-qualification.v1','qualification','protected exact qualification required')
         for vm in self.policy.vms:
             if vm.vm_id==retiring_vm_id:continue
             read=self.backend.readback(vm.vm_id);runtime=collect_native_runtime(self.backend,read)
@@ -573,27 +943,17 @@ class NativeFactsProvider:
                     'identity_mismatch','guest not the enrolled VM')
             binding=RuntimeBinding(vm.vm_id,read.native_id,read.process_id,ident['boot_id'],ident['image_id'],ident['kernel'],
                 runtime.host_kernel_id,runtime.qemu_version_id,runtime.backend_version_id,self.config['readback_version'],read.config_fingerprint)
-            matching=[q for q in protected['qualifications'] if q['binding']==asdict(binding)]
-            require(len(matching)==1,'qualification','observed backend/image/kernel/readback has no exact qualification')
-            q=dict(matching[0]);q['binding']=binding;qualified=BackendQualification(**q)
+            qualified=self._qualification(protected,binding,guest,host_boot_id=host['boot_id'])
             qualified=replace(qualified,slurm_registration_verified=(qualified.slurm_registration_verified is True
                 and guest.get('slurm_registered') is True))
             profile=self.config['qualified_protocols'][vm.vm_id]
             require(guest['protocol']==profile['guest_protocol'] and
                 self.sources.process(int(read.process_id))['start_ticks']==profile['qemu_birth_ticks'],
                 'qualification','native process generation/protocol changed')
-            known={}
-            if owner_state:
-                for row in owner_state['receipts']:
-                    if row['request']['vm_id']==vm.vm_id and not row['finished'] and row['phase']=='RUN':
-                        identity=row['request']['workload_id'];native=self.native.get(identity)
-                        if native is None:
-                            native=next((j for j in guest['jobs'].values() if 'slurm:'+j['generation']==identity),None)
-                        require(native is not None,'native_generation','live owner native generation evicted')
-                        known[identity]=dict(native_id=native['native_id'],generation=native['generation'],phase='RUN')
-            live[vm.vm_id]=classify_guest_workloads(guest['jobs'],guest['groups'],known,gate_executables=tuple(profile['gate_executables']))
+            live[vm.vm_id]=self._live_guest_workloads(vm.vm_id,guest,owner_state)
             bindings.append(binding);qualifications.append(qualified)
-        evidence=HostEvidence(self.policy.host_id,self.policy.owner_id,host['boot_id'],policy_digest(self.policy),int(self.clock()),
+        observed_at=self._capture_timestamp(started_at,started_ns,guests)
+        evidence=HostEvidence(self.policy.host_id,self.policy.owner_id,host['boot_id'],policy_digest(self.policy),observed_at,
             host['MemTotal'],self.policy.reserves.foreign_max_bytes,self.policy.capacity_evidence_ref,self.policy.owned_pool.agreement_ref,
             True,True,host['MemAvailable']>=self.policy.reserves.safety_bytes,fingerprint([host,rows,guests]),tuple(bindings),tuple(qualifications),live)
         self._join_scheduler_outputs(guests,observed_now=self.clock())
@@ -601,13 +961,14 @@ class NativeFactsProvider:
         proofs=getattr(self,'native_proofs',None)
         if proofs is not None:proofs.validate_state(owner_state,evidence=evidence)
         if retiring_vm_id is None:self._persist(evidence,guests)
+        self._capture_timestamp(started_at,started_ns,guests)
         return evidence
     def _persist(self,evidence,guests):
         # One bounded probe cache for status/RootNativeBoundary, not another grant ledger.
         from host_resource_operations import FileReceiptStore
         directory=trusted_root_path(self.config['state_directory'],directory=True)
         store=FileReceiptStore.open_existing(directory)
-        host=asdict(evidence);host.pop('qualifications');host['schema']='qcl.host-resource-evidence.v1'
+        host=asdict(replace(evidence,qualifications=()));host.pop('qualifications');host['schema']='qcl.host-resource-evidence.v1'
         packet=dict(schema='qcl.host-resource-probe.v2',host=host,guests={},completions={},cleanups={})
         data=json.dumps(packet,sort_keys=True).encode();require(len(data)<=MAX_OUTPUT_BYTES,'output_bound','probe snapshot bound')
         target=trusted_root_path(self.config['evidence']) if Path(self.config['evidence']).exists() else Path(self.config['evidence'])
@@ -626,6 +987,43 @@ class NativeFactsProvider:
         require(not native['terminal'] and native['state']=='RUNNING' and g.get('slurm_registered') is True,'native_state','allocated running workload required')
         require(req['workload_bytes']>=native['limit_bytes'] and group['memory_max_bytes']==native['limit_bytes'],
                 'guest_capacity','native task cgroup/allocated memory mismatch')
+        from host_resource_qualification_observations import MeasuredBackendQualification,MeasuredGuestEvidence
+        measured=[q for q in self.last[0].qualifications if type(q)is MeasuredBackendQualification and q.binding.vm_id==req['vm_id']]
+        if measured:
+            require(len(measured)==1,'qualification','one exact measured profile required');qualified=measured[0];capacity=qualified.capacity
+            from host_resource_capacity import validate_guest_admission,CapacityValidationError
+            vm=next(vm for vm in self.policy.vms if vm.vm_id==req['vm_id'])
+            active=[r for r in owner_state['receipts']if r['request']['vm_id']==vm.vm_id and not r['finished']]
+            require(len(active)<=64 and len({r['request']['workload_id']for r in active})==len(active),
+                'capacity_evidence','complete unique authorized commitments required')
+            limits=[]
+            for receipt in active:
+                original=next((j for j in g['jobs'].values()if 'slurm:'+j['generation']==receipt['request']['workload_id']),None)
+                require(original is not None and original['state']=='RUNNING'and original['terminal']is False,
+                    'capacity_evidence','authorized pending/unknown body lacks actual allocation')
+                actual=g['groups'].get(original['native_id'])
+                require(actual is not None and actual['memory_max_bytes']==original['limit_bytes'],
+                    'capacity_evidence','every authorized original actual cgroup required')
+                limits.append(actual['memory_max_bytes'])
+            grants=[grant for grant in owner_state['grants']if grant['vm_id']==vm.vm_id]
+            require(len(grants)==1,'capacity_evidence','exact actual paid grant required');read=self.backend.readback(vm.vm_id)
+            require(read.native_id==qualified.binding.native_id and read.process_id==qualified.binding.process_id and
+                read.config_fingerprint==qualified.binding.config_fingerprint and read.running is True and read.assigned_bytes in qualified.supported_targets,
+                'qualification','actual native generation changed')
+            try:
+                validate_guest_admission(qualification=capacity,native_minimum_bytes=vm.minimum_bytes,
+                    paid_grant_bytes=grants[0]['guest_bytes'],assigned_bytes=read.assigned_bytes,configured_bytes=read.configured_bytes,
+                    total_bytes=g['memory']['MemTotal'],available_bytes=g['memory']['MemAvailable'],
+                    demands=[r['request']['workload_bytes']for r in active],task_limits=limits,candidate_index=active.index(row),
+                    slurm_memory_bytes=g['slurm_memory_bytes'],quantum_bytes=self.backend.quantum_bytes,limits_enforced=all(type(limit)is int and limit>0 for limit in limits),
+                    expected_host_id=self.policy.host_id,expected_owner_id=self.policy.owner_id,expected_policy_sha256=policy_digest(self.policy),
+                    expected_binding=asdict(qualified.binding),expected_source_graph_sha256=capacity.source_graph_sha256,
+                    expected_report_sha256=capacity.report_sha256,expected_native_maximum_bytes=vm.maximum_bytes)
+            except CapacityValidationError as error:raise ResourceError('guest_capacity',str(error))from error
+            return MeasuredGuestEvidence(req['vm_id'],g['identity_before']['boot_id'],req['workload_id'],g['observed_at'],
+                g['memory']['MemTotal'],g['memory']['MemAvailable'],capacity.os_reserve_bytes,group['memory_max_bytes'],
+                g['slurm_memory_bytes'],True,tuple(self.last[0].live_workloads[req['vm_id']]),capacity,
+                tuple((r['request']['workload_id'],r['request']['workload_bytes'],limit)for r,limit in zip(active,limits)))
         return GuestEvidence(req['vm_id'],g['identity_before']['boot_id'],req['workload_id'],g['observed_at'],
             g['memory']['MemTotal'],g['memory']['MemAvailable'],self.config['enrollment'][req['vm_id']]['os_reserve_bytes'],
             group['memory_max_bytes'],g['slurm_memory_bytes'],True,tuple(self.last[0].live_workloads[req['vm_id']]))
@@ -699,7 +1097,117 @@ def capture_guest_identity(config,sources):
         boot_id=before['boot_id'],kernel=before['kernel'],image_id=image))
 
 
-def capture_guest_facts(config,sources,*,clock=time.time):
+def _accounting_read(sources,path,limit=65536):
+    raw=sources.read(str(path),limit)
+    require(type(raw)is str and len(raw.encode())<=limit,'output_bound','bounded original Linux accounting read required')
+    return raw
+
+
+def _linux_counters(raw,*,kilobytes=False):
+    result={}
+    for line in raw.splitlines():
+        pattern=r'([A-Za-z_][A-Za-z0-9_()]*):[ \t]+([0-9]+) kB'if kilobytes else r'([A-Za-z_][A-Za-z0-9_]*)[ \t]+([0-9]+)'
+        match=re.fullmatch(pattern,line)
+        if kilobytes and match is None:
+            # HugePages counters are page counts, not bytes, and are not mixed in.
+            require(re.fullmatch(r'HugePages_[A-Za-z_]+:[ \t]+[0-9]+',line)is not None,
+                'unsupported','qualified literal meminfo protocol required');continue
+        require(match is not None and match[1]not in result,'unsupported','unique literal Linux counters required')
+        value=int(match[2])*(1024 if kilobytes else 1);integer(value,'Linux counter')
+        result[match[1]]=value
+    require(result,'incomplete_probe','explicit nonempty Linux counters required');return result
+
+
+def _memory_pressure(raw):
+    result={}
+    for line in raw.splitlines():
+        match=re.fullmatch(r'(some|full) avg10=([0-9]+\.[0-9]{2}) avg60=([0-9]+\.[0-9]{2}) avg300=([0-9]+\.[0-9]{2}) total=([0-9]+)',line)
+        require(match is not None and match[1]not in result,'unsupported','qualified PSI memory protocol required')
+        result[match[1]]=dict(avg10=match[2],avg60=match[3],avg300=match[4],total=int(match[5]))
+        integer(result[match[1]]['total'],'PSI total')
+    require(set(result)=={'some','full'},'incomplete_probe','some/full PSI observations required');return result
+
+
+def capture_guest_accounting(config,sources,*,identity,jobs,groups,processes,clock=time.time):
+    """Read real finite Linux accounting through the existing bounded Source.
+
+    The conservative OS upper observation includes all non-free guest memory,
+    including jobs/cache/balloon pages. It is deliberately not T-A, an exact OS
+    decomposition, an inferred balloon size, or a bound on future OS peaks.
+    Detailed kernel, process PSS, cgroup and pressure data remain in the packet.
+    """
+    try:
+        require(type(jobs)is dict and type(groups)is dict and set(jobs)==set(groups)and len(jobs)<=64 and
+            type(processes)is list and len(processes)<=1024,'output_bound','finite complete accounting inventory required')
+        root=config['slurm_cgroup_root'];require(type(root)is str and root.startswith('/')and root!='/'and
+            str(Path(root))==root and '..'not in Path(root).parts,'trust','canonical native job cgroup root required')
+        memory=_linux_counters(_accounting_read(sources,'/proc/meminfo'),kilobytes=True)
+        needed={'MemTotal','MemFree','MemAvailable','Buffers','Cached','SReclaimable','SUnreclaim','KernelStack','PageTables','Percpu'}
+        require(needed<=memory.keys()and memory['MemFree']<=memory['MemTotal']and memory['MemAvailable']<=memory['MemTotal'],
+            'incomplete_probe','complete actual OS/kernel accounting required')
+        vmstat=_linux_counters(_accounting_read(sources,'/proc/vmstat'))
+        require({'nr_free_pages','nr_anon_pages','nr_file_pages','balloon_inflate','balloon_deflate','balloon_migrate'}<=vmstat.keys(),
+            'unsupported','actual balloon counters unavailable; do not infer balloon capacity')
+        pressure=_memory_pressure(_accounting_read(sources,'/proc/pressure/memory'))
+        resident=[];seen=set()
+        for process in processes:
+            integer(process['pid'],'resident PID',1);integer(process['start_ticks'],'resident birth',1)
+            require(process['pid']not in seen,'incomplete_probe','complete unique resident process inventory required');seen.add(process['pid'])
+            projection={key:process[key]for key in ('pid','start_ticks','executable','uids','cgroup')}
+            if process['executable']in {'[kernel]','[nonexecuting]'}:
+                resident.append({**projection,'rss_bytes':None,'pss_bytes':None});continue
+            raw=_accounting_read(sources,f"/proc/{process['pid']}/smaps_rollup",16384)
+            lines=raw.splitlines();require(lines and re.fullmatch(r'[0-9a-f]+-[0-9a-f]+ .*',lines[0]),
+                'unsupported','actual smaps_rollup header required')
+            stats=_linux_counters('\n'.join(lines[1:]),kilobytes=True)
+            require({'Rss','Pss'}<=stats.keys()and stats['Pss']<=stats['Rss'],
+                'incomplete_probe','actual resident RSS/PSS accounting required')
+            actual=sources.process(process['pid'])
+            require(all(actual[key]==process[key]for key in projection),'identity_mismatch','resident PID birth/credentials/scope changed')
+            resident.append({**projection,'rss_bytes':stats['Rss'],'pss_bytes':stats['Pss']})
+        job_rows={}
+        for job,native in jobs.items():
+            require(JOB_ID.fullmatch(job)is not None,'unsupported','literal original job ID required')
+            group=groups[job];path='/sys/fs/cgroup'+root+'/job_'+job
+            try:
+                current=_accounting_read(sources,path+'/memory.current',128).strip()
+                maximum=_accounting_read(sources,path+'/memory.max',128).strip()
+                require(current.isdigit()and maximum.isdigit()and int(maximum)>0,
+                    'unsupported','actual finite cgroup current/max bytes required')
+                integer(int(current),'cgroup current');integer(int(maximum),'cgroup maximum',1)
+                require(int(maximum)==group['memory_max_bytes']==native['limit_bytes'],
+                    'guest_capacity','original allocation/cgroup limit changed')
+                events=_linux_counters(_accounting_read(sources,path+'/memory.events',4096))
+                require({'low','high','max','oom','oom_kill'}<=events.keys()and
+                    not any(value for key,value in events.items()if key.startswith('oom')),
+                    'guest_capacity','actual job experienced an OOM event')
+                stats=_linux_counters(_accounting_read(sources,path+'/memory.stat',16384))
+                require({'anon','file','kernel'}<=stats.keys(),'incomplete_probe','actual job resident/kernel counters required')
+                job_pressure=_memory_pressure(_accounting_read(sources,path+'/memory.pressure',4096))
+                require(_accounting_read(sources,path+'/memory.max',128).strip()==maximum,
+                    'identity_mismatch','actual cgroup limit raced during accounting')
+                job_rows[job]=dict(generation=native['generation'],cgroup=path,scope='present',memory_current_bytes=int(current),
+                    memory_max_bytes=int(maximum),memory_events=events,memory_stat=stats,pressure=job_pressure)
+            except FileNotFoundError:
+                require(native['terminal']is True and group['populated']is False and not group['processes'],
+                    'incomplete_probe','live original cgroup accounting missing')
+                job_rows[job]=dict(generation=native['generation'],cgroup=path,scope='absent',memory_current_bytes=None,
+                    memory_max_bytes=None,memory_events=None,memory_stat=None,pressure=None)
+        after=_linux_counters(_accounting_read(sources,'/proc/meminfo'),kilobytes=True)
+        require(needed<=after.keys()and memory['MemTotal']==after['MemTotal']and after['MemFree']<=after['MemTotal'],
+            'identity_mismatch','guest physical accounting changed during capture')
+        row=dict(schema='qcl.host-resource-guest-accounting.v1',identity=dict(identity),observed_at=int(clock()),
+            scope='finite all-nonfree upper including jobs/cache/balloon; explicit future safety allowance required',
+            meminfo_bytes=memory,meminfo_after_bytes=after,vmstat_counters=vmstat,pressure=pressure,processes=resident,jobs=job_rows,
+            os_upper_bound_bytes=max(memory['MemTotal']-memory['MemFree'],after['MemTotal']-after['MemFree']),
+            balloon_current_bytes=None)
+        require(len(json.dumps(row,sort_keys=True,allow_nan=False).encode())<=MAX_OUTPUT_BYTES,
+            'output_bound','bounded actual guest accounting packet required');return row
+    except (OSError,KeyError,TypeError,ValueError)as error:
+        raise ResourceError('incomplete_probe','actual Linux accounting unavailable or unsupported')from error
+
+
+def capture_guest_facts(config,sources,*,clock=time.time,calibration=False):
     """Installed root-only guest reader; machine-local protected config only."""
     from native_attempt import _worker_output_sources,_worker_output_generation
     output_sources=_worker_output_sources()
@@ -734,6 +1242,10 @@ def capture_guest_facts(config,sources,*,clock=time.time):
         main['uids']==[0]*4 and command_engine.daemon_scope_bound(main['cgroup'],unit['ControlGroup']) and
         main['executable']==config['slurmd_executable'] and len(states)==1 and
         states[0].split('+')[0] in {'IDLE','ALLOCATED','MIXED'} and 'NOT_RESPONDING' not in states[0])
+    accounting=None
+    if calibration:
+        try:accounting=capture_guest_accounting(config,sources,identity=identity,jobs=jobs,groups=groups,processes=processes,clock=clock)
+        except ResourceError as error:accounting=dict(schema='qcl.host-resource-guest-accounting.v1',state='NOT_MEASURED',reason=error.code)
     output_after=_worker_output_generation(output_sources)
     require(output_before==output_after,'qualification','worker output generation changed during guest snapshot')
     packet=dict(schema='qcl.host-resource-guest-facts.v1',protocol=config['guest_protocol'],observed_at=int(clock()),
@@ -743,4 +1255,6 @@ def capture_guest_facts(config,sources,*,clock=time.time):
         require(output_after['worker']['node']==config['node'] and output_after['worker']['identity']==
             {key:identity[key] for key in ('machine_id','boot_id','kernel','dmi_uuid')},'qualification','local worker identity differs')
         packet['output_generation']=output_after
+    if calibration:packet['calibration_accounting']=accounting
+    require(len(json.dumps(packet,sort_keys=True,allow_nan=False).encode())<=MAX_OUTPUT_BYTES,'output_bound','whole bounded guest packet required')
     return packet

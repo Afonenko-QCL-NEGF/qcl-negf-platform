@@ -201,7 +201,9 @@ def test_unsupported_backend_is_explicit_and_cannot_run_command():
 def test_positive_protected_probe_decoding_keeps_exact_workload_inventory(tmp_path):
     from test_host_resource_operations import setup
     m = api()
-    _, _, _, _, evidence = setup(tmp_path)
+    # The unchanged legacy probe DTO carries ordinary qualification only.
+    # Measured dynamic capacity is authenticated by the private report reader.
+    _, _, _, _, evidence = setup(tmp_path, mechanism='conservative_reservation')
     raw = asdict(evidence)
     qualifications = raw.pop('qualifications')
     raw['schema'] = 'qcl.host-resource-evidence.v1'
@@ -209,6 +211,17 @@ def test_positive_protected_probe_decoding_keeps_exact_workload_inventory(tmp_pa
     decoded = m.decode_host_evidence(json.loads(json.dumps(raw)),
                                     json.loads(json.dumps(qualifications)))
     assert decoded == evidence
+
+
+def test_legacy_probe_decoder_does_not_accept_a_measured_capacity_extension(tmp_path):
+    from test_host_resource_operations import setup
+    from host_resource_qualification_observations import plain
+    _, _, _, _, evidence = setup(tmp_path)
+    raw = plain(evidence)
+    qualifications = raw.pop('qualifications')
+    raw['schema'] = 'qcl.host-resource-evidence.v1'
+    with pytest.raises(api().ResourceError, match='shape'):
+        api().decode_host_evidence(raw, qualifications)
 
 
 @pytest.mark.parametrize('field', ['host_boot_id', 'host_kernel_id', 'qemu_version_id',

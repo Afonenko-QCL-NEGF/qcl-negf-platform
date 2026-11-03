@@ -1382,6 +1382,25 @@ class ApplicationReleaseTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "closed"):
                 self.ops.guard("release-a", "/nix/store/solver/bin/qcl-negf", runtime, gate)
 
+    def test_private_closed_calibration_result_never_returns_production_ready(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);runtime=root/'release.json';gate=root/'gate.json'
+            runtime.write_text(json.dumps({**release(),'ready':False}))
+            gate.write_text(json.dumps({'open':False,'release_id':'release-a'}))
+            decision=dict(schema='qcl.host-resource-calibration-gate.v1',purpose='calibration',allowed=True,
+                operation_id='11111111-1111-4111-8111-111111111111',
+                calcjob_uuid='22222222-2222-4222-8222-222222222222',generation='a'*64)
+            observed=[]
+            def owner(pin,solver):observed.append((pin,solver));return decision
+            self.assertEqual(self.ops.guard('release-a','/nix/store/solver/bin/qcl-negf',runtime,gate,
+                _qualification_gate=owner),decision)
+            self.assertNotIn('ready',decision);self.assertEqual(len(observed),1)
+            for field,value in [('purpose','production'),('allowed',False),('ready',True)]:
+                bad={**decision,field:value}
+                with self.assertRaises(ValueError):
+                    self.ops.guard('release-a','/nix/store/solver/bin/qcl-negf',runtime,gate,
+                        _qualification_gate=lambda *args:bad)
+
     def test_unverified_node_identity_cannot_open_admission(self):
         with tempfile.TemporaryDirectory() as temporary:
             gate = Path(temporary) / "admission.json"

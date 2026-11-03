@@ -29,6 +29,11 @@ def cold_setup(tmp_path):
     policy = m.validate_host_resource_policy(document)
     cold = replace(cold, policy_sha256=m.policy_digest(policy),
         vms=tuple(replace(vm, configured_max_bytes=1536, initial_peak_bytes=1536) for vm in cold.vms))
+    evidence = replace(evidence, policy_sha256=m.policy_digest(policy),
+        qualifications=tuple(replace(q, policy_sha256=m.policy_digest(policy),
+            capacity=replace(q.capacity, policy_sha256=m.policy_digest(policy),
+                maximum_guest_total_bytes=1504, native_maximum_bytes=1536),
+            supported_targets=tuple(range(128, 1537, 64))) for q in evidence.qualifications))
     return s, m, s.StartupManager(policy, store, backend, clock=lambda:100), store, cold, evidence
 
 

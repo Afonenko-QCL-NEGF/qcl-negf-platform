@@ -128,6 +128,8 @@ class StartupManager:
         require(set(config)=={'native_id','maximum_bytes','config_fingerprint'},'shape','actual static config required')
         with self.store.locked(read_only=True):
             state=self.controller._load()
+            from host_resource_qualification import require_no_active_calibration
+            require_no_active_calibration(self.store)
             from host_resource_recovery import check_start_fence
             check_start_fence(self.store,'libvirt',uuid=native_vm_id)
             check_start_fence(self.store,'proxmox',uuid=native_vm_id)
@@ -143,6 +145,8 @@ class StartupManager:
 
     def bind_running_startup(self,native_vm_id,evidence):
         with self.store.locked():
+            from host_resource_qualification import require_no_active_calibration
+            require_no_active_calibration(self.store)
             from host_resource_recovery import check_start_fence
             check_start_fence(self.store,'libvirt',uuid=native_vm_id)
             check_start_fence(self.store,'proxmox',uuid=native_vm_id)
@@ -305,6 +309,9 @@ def admin_main(argv=None):
     if args[0] in {'retire','recovery-status','reserve-replacement'}:
         from host_resource_recovery import admin_recovery
         print(json.dumps(admin_recovery(args)));return 0
+    if args[0]=='qualify':
+        from host_resource_qualification import admin_qualification_main
+        print(json.dumps(admin_qualification_main(args[1:])));return 0
     service=open_service()
     if args==['prepare']:
         with service.controller.store.operation():

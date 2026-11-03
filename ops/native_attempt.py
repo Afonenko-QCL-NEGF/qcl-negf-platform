@@ -2513,16 +2513,26 @@ class NativeSources:
         need(rows, 'mount_not_observed')
         return max(rows, key=lambda row: row[0])[1]
 
-    def _submit_admission(self, launch):
+    def _submit_admission(self, launch, *, calcjob_uuid=None, actor=None, fixture=None):
         current = strict_json(protected_read(Path(self.policy['release_runtime'])/'release.json',self.budget).decode())
-        need(current.get('ready') is True and current.get('release_id')==launch['release_id'] and
+        need(current.get('release_id')==launch['release_id'] and
              current.get('code_uuid')==launch['code_uuid'], 'native_admission_closed')
         gate = Path(self.policy['jobs_root'])/'.release-admission.json'
         # Existing G credential switch for its fixed NFS gate, no root-squash bypass.
         need(gate==engine.GATE, 'native_admission_namespace')
         with engine.admission_reader(gate):
             admission = strict_json(self.budget.read(gate,65536).decode())
-        need(admission.get('open') is True and admission.get('release_id')==launch['release_id'], 'native_admission_closed')
+        need(admission.get('release_id')==launch['release_id'], 'native_admission_closed')
+        if admission.get('open') is True:
+            need(current.get('ready') is True,'native_admission_closed')
+            return False
+        # Internal protected owner only. The installed constructor does not
+        # attach it; no job/env/public action can select calibration admission.
+        owner=getattr(self,'_qualification_jobs',None)
+        need(admission.get('open') is False and owner is not None and calcjob_uuid is not None,
+             'native_admission_closed')
+        owner.submit_permit(launch,calcjob_uuid=calcjob_uuid,actor=actor,fixture=fixture)
+        return True
 
     def _actor_read(self, kind, calcjob, launch, context):
         files = exact(launch['files'], FILES)
@@ -2561,7 +2571,7 @@ class NativeSources:
         need(hashlib.sha256(graph).hexdigest() == graph_hash == launch['files']['source_graph']['sha256'] and
              len(graph) == launch['files']['source_graph']['bytes'], 'release_graph_changed')
         need(retained['quantum_runtime_context'] == engine.quantum_context(envelope), 'release_binding_changed')
-        if action=='submit': self._submit_admission(launch)
+        if action=='submit': self._submit_admission(launch,calcjob_uuid=calcjob_uuid)
         actual = strict_json(self._actor_read('launch',calcjob_uuid,launch,context).decode())
         need(actual==launch, 'actor_launch_changed')
         raw = self._actor_read('execution',calcjob_uuid,launch,context)
@@ -2590,8 +2600,12 @@ class NativeSources:
         _review_native_script(script,launch,envelope['solver_executable'],context['configuration']['client']['bash_executable'],self,
                               calcjob_uuid=calcjob_uuid,engineering_fixture=submitted.get('engineering_fixture'))
         self._refresh_caller(action)
-        self._actor = {'calcjob_uuid':calcjob_uuid,'action':action,'launch':actual,
-                       'execution_sha256':hashlib.sha256(raw).hexdigest()}
+        actor = {'calcjob_uuid':calcjob_uuid,'action':action,'launch':actual,
+                 'execution_sha256':hashlib.sha256(raw).hexdigest()}
+        fixture=submitted.get('engineering_fixture')
+        if action=='submit':self._submit_admission(launch,calcjob_uuid=calcjob_uuid,actor=actor,fixture=fixture)
+        self._actor=actor
+        self._engineering_fixture=fixture  # separate context; original Q1 actor schema stays exact
         return host
 
     def snapshot(self, launch, dispatch, budget):
@@ -2625,7 +2639,18 @@ class NativeSources:
         return self.run(self._argv(launch, snapshot, dispatch), output_bytes=4096)
 
     def _argv(self, launch, snapshot, dispatch):
+        held=False;owner=getattr(self,'_qualification_jobs',None)
+        if owner is not None:
+            actor=getattr(self,'_actor',None)
+            if actor is not None and actor['action']=='submit' and actor['launch']==launch:
+                held=self._submit_admission(launch,calcjob_uuid=actor['calcjob_uuid'],actor=actor,
+                    fixture=getattr(self,'_engineering_fixture',None))
+            else:
+                # Historical Q1 compares the original argv, even after revoke.
+                # It never grants another dispatch or weakens original actor fields.
+                held=owner.held_argv(launch,snapshot,dispatch)
         return [self.policy['tools']['runuser'], '-u', 'qcl-negf', '--', self.policy['tools']['sbatch'],
+                *(['--hold'] if held else []),
                 '--parsable', '--no-requeue', '--chdir', launch['remote_workdir'], '--comment', dispatch,
                 snapshot['script_path']]
 
@@ -2633,7 +2658,8 @@ class NativeSources:
         _authenticate_server(self)
         need(hasattr(self,'_actor') and self._actor['launch']==launch, 'actor_input_binding_unavailable')
         caller = self._refresh_caller(self._actor['action'])
-        self._submit_admission(launch)
+        self._submit_admission(launch,calcjob_uuid=self._actor['calcjob_uuid'],actor=self._actor,
+            fixture=getattr(self,'_engineering_fixture',None))
         process = self.process(os.getpid()); unit = self.unit(process['cgroup'].rsplit('/', 1)[-1])
         packet = {'argv': self._argv(launch,snapshot,dispatch),'script_sha256':snapshot['script_sha256'],
                   'owner': {'process':process,'unit':unit,'host':self.host(),'caller':caller,'actor':self._actor}}
@@ -3042,6 +3068,12 @@ def handle_connection(connection):
             raise Hold('shape') from error
         validated = True
         sources._caller = authenticate_socket_peer(connection,policy,sources,action=action)
+        # Internal Source factory reads only the fixed protected controller
+        # permit mirror. No actor/job/environment selector supplies an owner.
+        factory=getattr(sources,'qualification_jobs_owner',None)
+        if callable(factory):
+            private_owner=factory()
+            if private_owner is not None:sources._qualification_jobs=private_owner
         owner = OrdinaryAttemptOwner(policy, AttemptStore(policy['private_root']), sources, budget)
         result = {'submit': owner.submit, 'reconcile': owner.reconcile, 'start': owner.observe_start,
                   'close': owner.qualify_close, 'status': owner.status}[action](document)

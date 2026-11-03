@@ -635,8 +635,11 @@ class HostResourceController:
         require(len({b.native_id for b in bindings.values()}) == len(bindings) and
                 len({b.process_id for b in bindings.values()}) == len(bindings),
                 "ownership", "resident VMs must have distinct native/process identities")
+        from host_resource_qualification_observations import MeasuredBackendQualification
+        dynamic = p.active_grant.mechanism == "qualified_dynamic"
         qualifications = {q.binding.vm_id: q for q in evidence.qualifications
-                          if type(q) is BackendQualification and type(q.binding) is RuntimeBinding}
+                          if type(q) is (MeasuredBackendQualification if dynamic else BackendQualification)
+                          and type(q.binding) is RuntimeBinding}
         require(len(qualifications) == len(evidence.qualifications) and
                 set(qualifications) == vm_ids, "qualification", "complete qualification required")
         for vm_id, binding in bindings.items():
@@ -649,6 +652,13 @@ class HostResourceController:
                     q.active_floor_protection is True and q.readback_verified is True,
                     "qualification", "exact backend/image/runtime qualification required")
             if p.active_grant.mechanism == "qualified_dynamic":
+                from host_resource_capacity import GuestCapacityQualification
+                require(type(q.capacity) is GuestCapacityQualification and
+                        q.capacity.host_id == p.host_id and q.capacity.owner_id == p.owner_id and
+                        q.capacity.policy_sha256 == policy_digest(p) and dict(q.capacity.binding) == asdict(binding) and
+                        q.capacity.native_maximum_bytes == self._vm(vm_id).maximum_bytes and
+                        self._vm(vm_id).minimum_bytes >= q.capacity.os_reserve_bytes + q.capacity.native_gap_bound_bytes,
+                        "qualification", "measured capacity must precede every positive qualification/READY path")
                 require(q.qualified_dynamic is True and q.slurm_registration_verified is True,
                         "qualification", "dynamic floor/readback/Slurm path is unsupported")
         return bindings
@@ -661,6 +671,8 @@ class HostResourceController:
 
     def _guard(self, state, evidence, *, pressure=True, completing=None):
         require(type(evidence) is HostEvidence, "shape", "HostEvidence required")
+        from host_resource_qualification import require_no_active_calibration
+        require_no_active_calibration(self.store)
         require(state["blocked"] is None, "reconciliation_required", str(state["blocked"]))
         require(all(value["phase"] == "binding_ready" for value in state["startups"].values()),
                 "startup_binding_required", "cold/quarantined reservation does not admit work")
@@ -706,6 +718,10 @@ class HostResourceController:
                 r["request"]["workload_id"] != completing)
             if min(row.assigned_bytes, row.configured_bytes) < live_floor:
                 self._block(state, "observed allocation is below the protected live RUN floor")
+            if self.policy.active_grant.mechanism == "qualified_dynamic":
+                q = next(q for q in evidence.qualifications if q.binding.vm_id == grant.vm_id)
+                require(row.assigned_bytes in q.supported_targets and row.configured_bytes == row.assigned_bytes,
+                        "qualification", "actual native target is outside measured mapping scope")
             readbacks[grant.vm_id] = row
         return readbacks
 
@@ -773,6 +789,13 @@ class HostResourceController:
         require(phases is None or row["phase"] in phases, "phase", "operation is invalid in this phase")
         return row
 
+    def _measured_target(self, vm_id, target, evidence):
+        if self.policy.active_grant.mechanism == "qualified_dynamic":
+            from host_resource_qualification_observations import MeasuredBackendQualification
+            matches = [q for q in evidence.qualifications if type(q) is MeasuredBackendQualification and q.binding.vm_id == vm_id]
+            require(len(matches) == 1 and target in matches[0].supported_targets,
+                    "qualification", "requested target has no measured native/guest mapping")
+
     def _rounded(self, value):
         quantum = self.backend.quantum_bytes
         return ((value + quantum - 1) // quantum) * quantum
@@ -801,6 +824,7 @@ class HostResourceController:
             target = max(grant.guest_bytes, self._rounded(floor))
             if self.policy.active_grant.mechanism == "conservative_reservation":
                 target = vm.maximum_bytes
+            self._measured_target(request.vm_id, target, evidence)
             validate_resize(self.policy, self._grants(state), request.vm_id, target)
             require(floor <= target, "maximum", "aggregate commitments exceed protected guest capacity")
             row = {"request": asdict(request), "phase": "HOST_GRANT", "target_bytes": target,
@@ -838,6 +862,7 @@ class HostResourceController:
                 validate_resize(self.policy, self._grants(state), vm_id, target)
                 row["old_bytes"], row["target_bytes"] = grant.guest_bytes, target
                 state["desired"][vm_id] = target
+            self._measured_target(vm_id, row["target_bytes"], evidence)
             row["phase"] = "SHRINK_UNKNOWN" if shrink else "GROW_UNKNOWN"
             needs_resize = (before.assigned_bytes != row["target_bytes"] or
                             before.configured_bytes != row["target_bytes"])
@@ -913,7 +938,9 @@ class HostResourceController:
                 "incomplete_workloads", "exact other-live-workload snapshot is required")
 
     def admit(self, request_id: str, guest_evidence: GuestEvidence, evidence: HostEvidence) -> Receipt:
-        require(type(guest_evidence) is GuestEvidence, "shape", "GuestEvidence required")
+        from host_resource_qualification_observations import MeasuredGuestEvidence
+        expected_type = MeasuredGuestEvidence if self.policy.active_grant.mechanism == "qualified_dynamic" else GuestEvidence
+        require(type(guest_evidence) is expected_type, "shape", "typed current GuestEvidence required")
         with self.store.locked():
             state = self._load()
             row = self._row(state, request_id, {"GUEST_ADMIT"})
@@ -924,12 +951,38 @@ class HostResourceController:
             for name in ("os_reserve_bytes", "task_limit_bytes", "slurm_memory_bytes"):
                 integer(getattr(g, name), name, 1)
             grant = self._grant(state, vm.vm_id)
-            require(g.limits_enforced is True and g.os_reserve_bytes <= vm.minimum_bytes and
-                    g.task_limit_bytes <= req["workload_bytes"] and
-                    g.slurm_memory_bytes <= grant.guest_bytes - g.os_reserve_bytes and
-                    g.total_bytes >= self._floor(state, vm.vm_id) and
-                    g.available_bytes >= req["workload_bytes"], "guest_capacity",
-                    "guest reserve/cgroup/Slurm/available memory does not fit the aggregate grant")
+            if self.policy.active_grant.mechanism == "qualified_dynamic":
+                from host_resource_capacity import validate_guest_admission, CapacityValidationError
+                q = next(q for q in evidence.qualifications if q.binding.vm_id == vm.vm_id)
+                require(g.capacity == q.capacity and g.os_reserve_bytes == q.capacity.os_reserve_bytes,
+                        "qualification", "guest and host must carry the same measured profile")
+                active = self._live(state, vm.vm_id)
+                expected = {r["request"]["workload_id"]: r["request"]["workload_bytes"] for r in active}
+                require(len(g.commitments) == len(expected) and {work: amount for work, amount, limit in g.commitments} == expected,
+                        "incomplete_workloads", "every authorized/live commitment needs its actual limit")
+                ids = [work for work, amount, limit in g.commitments]
+                require(g.task_limit_bytes == g.commitments[ids.index(req["workload_id"])][2],
+                        "guest_capacity", "current original task limit differs")
+                try:
+                    validate_guest_admission(qualification=q.capacity, native_minimum_bytes=vm.minimum_bytes,
+                        paid_grant_bytes=grant.guest_bytes, assigned_bytes=readback.assigned_bytes, configured_bytes=readback.configured_bytes,
+                        total_bytes=g.total_bytes, available_bytes=g.available_bytes,
+                        demands=[amount for work, amount, limit in g.commitments], task_limits=[limit for work, amount, limit in g.commitments],
+                        candidate_index=ids.index(req["workload_id"]), slurm_memory_bytes=g.slurm_memory_bytes,
+                        quantum_bytes=self.backend.quantum_bytes, limits_enforced=g.limits_enforced,
+                        expected_host_id=self.policy.host_id, expected_owner_id=self.policy.owner_id,
+                        expected_policy_sha256=policy_digest(self.policy), expected_binding=asdict(q.binding),
+                        expected_source_graph_sha256=q.capacity.source_graph_sha256,
+                        expected_report_sha256=q.capacity.report_sha256, expected_native_maximum_bytes=vm.maximum_bytes)
+                except CapacityValidationError as error:
+                    raise ResourceError("guest_capacity", str(error)) from error
+            else:
+                require(g.limits_enforced is True and g.os_reserve_bytes <= vm.minimum_bytes and
+                        g.task_limit_bytes <= req["workload_bytes"] and
+                        g.slurm_memory_bytes <= grant.guest_bytes - g.os_reserve_bytes and
+                        g.total_bytes >= self._floor(state, vm.vm_id) and
+                        g.available_bytes >= req["workload_bytes"], "guest_capacity",
+                        "guest reserve/cgroup/Slurm/available memory does not fit the aggregate grant")
             row["phase"], row["failure"] = "RUN", None
             self._save(state)
             return self._receipt(row)

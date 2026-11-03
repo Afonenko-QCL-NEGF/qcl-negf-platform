@@ -74,7 +74,10 @@ class NativeResourceService:
         admitted_now=False
         try:
             with c.store.operation():
-                state=c._load();native,vm,workload_id,request_id=self.provider.resolve(ref)
+                state=c._load()
+                from host_resource_qualification import require_no_active_calibration
+                require_no_active_calibration(c.store)
+                native,vm,workload_id,request_id=self.provider.resolve(ref)
                 mapping=dict(kind=ref.kind,native_id=ref.native_id,generation=native['generation'])
                 previous=self._active_row(state,ref)
                 require(previous is None or previous['native_workload']==mapping,'native_generation','native ID reused; retain original charge')
@@ -188,6 +191,10 @@ def open_service():
         service.recovery.sources.storage=service.storage
         proofs.sources.storage_collector=service.storage
         proofs.sources.recovery_sources=service.recovery.sources
+    if proofs is not None:
+        from host_resource_qualification_runtime import open_native_runtime
+        service.idle_qualification_runtime=open_native_runtime(service)
+        proofs.sources.idle_qualification_runtime=service.idle_qualification_runtime
     return service
 
 
@@ -266,6 +273,10 @@ def root_main(role,argv=None):
         from host_resource_recovery import NativeRecoveryRequest
         service=open_service();require(hasattr(service,'recovery'),'qualification','protected retirement owner missing')
         return service.recovery.retire(NativeRecoveryRequest(**decode_token(argv[1])))
+    if role=='worker' and len(argv)==2 and argv[0]=='qualification':
+        from host_resource_qualification import calibration_worker_main
+        require(config['role']=='native_host','trust','calibration worker is native-host root only')
+        return calibration_worker_main(decode_token(argv[1]))
     require(len(argv)==2,'shape','action and bounded token required');action,token=argv;document=decode_token(token)
     if role in {'client','authority'}:
         allowed_uid=config['client_uid'] if role=='client' else config['authority_uid']
@@ -273,6 +284,14 @@ def root_main(role,argv=None):
         for executable in config['sudo_executables']:trusted_root_path(executable,executable=True)
         caller=authenticate_sudo_caller(os.environ,parent_pid=os.getppid(),process=sources.process,
             sudo_executables=tuple(config['sudo_executables']),allowed_uid=allowed_uid)
+        if role=='client' and action=='qualification-gate':
+            # Private LOCAL route only, after original actual sudo authentication.
+            # No public ACTIONS/SSH/sudo rule changes. Source collector is mandatory.
+            from host_resource_qualification_gate import read_qualification_gate
+            factory=getattr(sources,'qualification_gate_sources',None)
+            require(config['role']=='guest' and callable(factory),
+                'qualification_observations_required','actual readonly guest gate Source is not installed')
+            return read_qualification_gate(document,caller,factory())
         if role=='client':return route_public(config,action,document,caller)
         require(config['role']=='native_host','trust','authority reaches native host only')
         decode_action(action,document)
@@ -416,7 +435,11 @@ def ssh_main(role,*,helper_prefix='/run/current-system/sw/bin'):
 def main(role):
     try:result=root_main(role)
     except ResourceError as error:
-        if role=='worker' and len(sys.argv)==3 and sys.argv[1]=='retirement':
+        if role=='worker' and len(sys.argv)==3 and sys.argv[1]=='qualification':
+            # Invalid identity/error-capture failure has no valid private reply.
+            # Never turn it into a generic production operation DTO.
+            raise
+        elif role=='worker' and len(sys.argv)==3 and sys.argv[1]=='retirement':
             from host_resource_recovery import NativeRecoveryRequest,read_recovery_status
             try:
                 request=NativeRecoveryRequest(**decode_token(sys.argv[2]))

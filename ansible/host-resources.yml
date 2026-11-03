@@ -55,6 +55,11 @@
         - release_health
         - runtime_bindings
         - host_resource_policy
+        - host_resource_capacity
+        - host_resource_qualification
+        - host_resource_qualification_gate
+        - host_resource_qualification_observations
+        - host_resource_qualification_runtime
         - host_resource_operations
         - host_resource_backends
         - host_resource_native_cleanup
