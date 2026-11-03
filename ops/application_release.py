@@ -2016,11 +2016,41 @@ def _activate_owned(manifest_value, *, owner, profile=PROFILE, runtime=RUNTIME,
     return identity
 
 
-def guard(release_id, solver_executable, runtime=RUNTIME / "release.json", gate=GATE):
+def _closed_qualification_gate(release_id, solver_executable):
+    """Fixed existing local sudo ingress; the private root route is opt-in Source.
+
+    No operation UUID/environment selector is sent. Root must select the actual
+    original job from the authenticated returned sudo caller and protected mirror.
+    """
+    packet={'schema':'qcl.host-resource-calibration-guard-request.v1',
+        'release_id':release_id,'solver_executable':solver_executable}
+    token=base64.urlsafe_b64encode(json.dumps(packet,separators=(',',':')).encode()).decode()
+    try:
+        raw=command(['/run/wrappers/bin/sudo','-n',
+            '/run/current-system/sw/bin/qcl-negf-resource-client-root','qualification-gate',token],
+            timeout_seconds=15,output_bytes=4096,env={'PATH':'/empty','LANG':'C','LC_ALL':'C'})
+        return unique_json(raw)
+    except (OSError,RuntimeError,ValueError) as error:
+        raise ValueError('Application admission is closed; private calibration guard refused') from error
+
+
+def _calibration_decision(value):
+    keys={'schema','purpose','allowed','operation_id','calcjob_uuid','generation'}
+    if (type(value) is not dict or set(value)!=keys or value['schema']!='qcl.host-resource-calibration-gate.v1' or
+        value['purpose']!='calibration' or value['allowed'] is not True or
+        not isinstance(value['generation'],str) or re.fullmatch(r'[0-9a-f]{64}',value['generation']) is None):
+        raise ValueError('Application admission is closed; invalid private calibration decision')
+    for key in ('operation_id','calcjob_uuid'):normalized_uuid(value[key])
+    return value
+
+
+def guard(release_id, solver_executable, runtime=RUNTIME / "release.json", gate=GATE, *, _qualification_gate=None):
     current, admission = load(runtime), load_admission(gate)
-    if admission.get("open") is not True:
-        raise ValueError("Application admission is closed")
-    if current.get("ready") is not True:
+    closed=admission.get('open') is not True
+    if closed and (admission.get('open') is not False or
+        (_qualification_gate is None and (Path(runtime)!=RUNTIME/'release.json' or Path(gate)!=GATE))):
+        raise ValueError('Application admission is closed')
+    if not closed and current.get("ready") is not True:
         raise ValueError("Worker application release is not ready")
     if release_id != admission.get("release_id") or release_id != current.get("release_id"):
         raise ValueError("Job or worker release differs from the selected release")
@@ -2036,6 +2066,10 @@ def guard(release_id, solver_executable, runtime=RUNTIME / "release.json", gate=
             raise ValueError('Job admission requires current activation boot generation')
         require_activation_health(current.get('activation_health'), node)
         _require_artifact_qualifications(expected, current, node, runtime=Path(runtime).parent)
+    if closed:
+        decision=(_qualification_gate or _closed_qualification_gate)(release_id,solver_executable)
+        # A private result is never the ordinary ready release record.
+        return _calibration_decision(decision)
     return current
 
 

@@ -241,6 +241,19 @@ class NativeCleanupSources:
     def __init__(self,config,runner):
         from host_resource_facts import LocalSources
         self.local=LocalSources(config,runner);self.config,self.runner=config,runner
+    def calibration_guard(self,plan,state,before,target,*,case_name):
+        runtime=getattr(self,'idle_qualification_runtime',None)
+        require(runtime is not None,'qualification_observations_required','actual idle runtime is not installed')
+        return runtime.calibration_guard(plan,state,before,target,case_name=case_name)
+    def calibration_settlement_guard(self,plan,state,current,*,mutation_id):
+        runtime=getattr(self,'idle_qualification_runtime',None)
+        require(runtime is not None,'qualification_observations_required','actual idle runtime is not installed')
+        return runtime.settlement_guard(plan,state,current,mutation_id=mutation_id)
+    def calibration_assess_settled(self,plan,state,*,mutation_id):
+        runtime=getattr(self,'idle_qualification_runtime',None)
+        require(runtime is not None,'qualification_observations_required','actual idle runtime is not installed')
+        return runtime.assess_settled(plan,state,mutation_id=mutation_id)
+
     def clock(self):return int(time.time())
     def root_json(self,path):return read_root_json(path)
     def trusted(self,path,*,executable=False):return trusted_root_path(path,executable=executable)
@@ -368,6 +381,39 @@ class NativeCleanupSources:
         return _pve_lock_released(backend.vms[vm].vmid)
 
 
+@dataclass(frozen=True)
+class MutationEffect:
+    """Internal native effect; not a guest ResourceRequest or paid ledger row."""
+    request_id: str
+    vm_id: str
+    mutation_id: str
+    operation: str
+    old_bytes: int
+    target_bytes: int
+    mutation_started_at: int
+    native_context: dict
+    before_revision: str | None = None
+    cleanup_pending: bool = True
+    binding: RuntimeBinding | None = None
+    owner_sha256: str | None = None
+
+
+class ProductionEffectOwner:
+    """Adapter preserving the existing production receipt semantics."""
+    def __init__(self,proofs):self.proofs=proofs
+    @staticmethod
+    def from_row(row):
+        return MutationEffect(row['request']['request_id'],row['request']['vm_id'],row['mutation_id'],
+            'shrink' if row['phase']=='SHRINK_UNKNOWN' else 'grow',row['old_bytes'],row['target_bytes'],
+            row['mutation_started_at'],row['native_context'],cleanup_pending=not row['native_cleanup_confirmed'])
+    def effect(self,state,mutation_id):return self.from_row(self.proofs.row(state,mutation_id))
+    def proof_effect(self,state,mutation_id):
+        rows=[r for r in state['receipts'] if r['mutation_id']==mutation_id]
+        require(len(rows)==1,'effect_owner','one original production effect required')
+        return self.from_row(rows[0])
+    def check(self,state,effect,before):return None
+
+
 class NativeMutationProofs:
     def __init__(self,policy,store,native_backend,protected_config,runner,*,sources=None):
         if sources is None:
@@ -402,15 +448,29 @@ class NativeMutationProofs:
     def path(self,mutation_id):
         require(type(mutation_id) is str and UUID.fullmatch(mutation_id),'shape','exact mutation UUID required')
         return self.directory/(mutation_id+'.json')
+    def owner_path(self,mutation_id):return self.path(mutation_id).with_suffix('.owner.json')
+    def owner_for(self,mutation_id):
+        path=self.owner_path(mutation_id)
+        try:self.directory.lstat()
+        except FileNotFoundError:return ProductionEffectOwner(self)
+        self.store._check_path(self.directory,directory=True)
+        try:path.lstat()
+        except FileNotFoundError:return ProductionEffectOwner(self)
+        from host_resource_qualification import CalibrationEffectOwner, _raw
+        return CalibrationEffectOwner(self,strict_json(_raw(self.store,path).decode()),mutation_id=mutation_id)
+    def effect(self,state,mutation_id):return self.owner_for(mutation_id).effect(state,mutation_id)
     def state(self):return HostResourceController(self.policy,self.store,self.backend)._load()
     def row(self,state,mutation_id):
         rows=[r for r in state['receipts'] if r['mutation_id']==mutation_id]
         require(len(rows)==1 and rows[0]['phase'] in UNKNOWN,'cleanup_evidence','latest durable UNKNOWN intent required')
         return rows[0]
     def intent(self,row,state,before):
-        vm=row['request']['vm_id'];binding=RuntimeBinding(**state['bindings'][vm]);p=self.profile(binding,state['host_boot_id'])
+        effect=row if type(row) is MutationEffect else ProductionEffectOwner.from_row(row)
+        vm=effect.vm_id;binding=RuntimeBinding(**state['bindings'][vm]);p=self.profile(binding,state['host_boot_id'])
+        if effect.binding is not None:require(effect.binding==binding,'identity_mismatch','original effect binding changed')
         require(before.vm_id==vm and before.native_id==binding.native_id and before.process_id==binding.process_id and before.config_fingerprint==binding.config_fingerprint and before.running,'identity_mismatch','actual before runtime/configuration changed')
-        doc=dict(request_id=row['request']['request_id'],mutation_id=row['mutation_id'],operation='shrink' if row['phase']=='SHRINK_UNKNOWN' else 'grow',host_id=self.policy.host_id,owner_id=self.policy.owner_id,host_boot_id=state['host_boot_id'],policy_sha256=state['policy_sha256'],binding=asdict(binding),native_context=row['native_context'],old_bytes=row['old_bytes'],target_bytes=row['target_bytes'],before_revision=before.revision,protocol_id=p['protocol_id'],qualification_sha256=fingerprint(p))
+        if effect.before_revision is not None:require(before.revision==effect.before_revision,'identity_mismatch','original calibration before revision changed')
+        doc=dict(request_id=effect.request_id,mutation_id=effect.mutation_id,operation=effect.operation,host_id=self.policy.host_id,owner_id=self.policy.owner_id,host_boot_id=state['host_boot_id'],policy_sha256=state['policy_sha256'],binding=asdict(binding),native_context=effect.native_context,old_bytes=effect.old_bytes,target_bytes=effect.target_bytes,before_revision=before.revision,protocol_id=p['protocol_id'],qualification_sha256=fingerprint(p))
         return decode_intent(doc)
     def read(self,mutation_id):
         self.store._check_path(self.directory,directory=True)
@@ -432,8 +492,9 @@ class NativeMutationProofs:
         require(doc['schema']=='qcl.host-resource-native-dispatch.v1','shape','dispatch version')
         decode_intent(doc['intent']);decode_birth(doc['worker_birth']);return doc
     def claim(self,mutation_id):
-        state=self.state();row=self.row(state,mutation_id);before=self.backend.readback(row['request']['vm_id'])
-        require(row['native_cleanup_confirmed'] is False,'cleanup_evidence','intent already settled')
+        state=self.state();row=self.effect(state,mutation_id);before=self.backend.readback(row.vm_id)
+        self.owner_for(mutation_id).check(state,row,before)
+        require(row.cleanup_pending is True,'cleanup_evidence','intent already settled')
         intent=self.intent(row,state,before);p=self.profile(intent.binding,intent.host_boot_id)
         dispatch=self.dispatch(mutation_id)
         require(dispatch['intent']==asdict(intent),'identity_mismatch','native before/revision changed after durable dispatch preparation')
@@ -453,13 +514,16 @@ class NativeMutationProofs:
             decode_witness(doc);self.exclusive(self.path(mutation_id),doc)
             validate=getattr(self.sources,'validate_target_use',None)
             if validate is not None:validate(mutation_id)
+            require(self.owner_for(mutation_id).effect(self.state(),mutation_id)==row,
+                'effect_owner','original effect owner changed during pre-exec claim')
             return self.backend.mutation_argv(intent.binding.vm_id,intent.target_bytes,before)
         except BaseException:
             storage=getattr(self.sources,'storage_collector',None)
             if storage is not None and mutation_id in storage.handles:storage.handles[mutation_id].close()
             raise
     def execute(self,intent,*,timeout_seconds):
-        state=self.state();row=self.row(state,intent.mutation_id)
+        state=self.state();row=self.effect(state,intent.mutation_id)
+        self.owner_for(intent.mutation_id).check(state,row,self.backend.readback(intent.binding.vm_id))
         require(self.intent(row,state,self.backend.readback(intent.binding.vm_id))==intent,'identity_mismatch','durable intent changed before dispatch')
         require(not self.path(intent.mutation_id).exists() and not self.dispatch_path(intent.mutation_id).exists(),'cleanup_evidence','native intent already dispatched/prepared; no replay')
         worker=self.sources.worker(intent.native_context)
@@ -467,7 +531,7 @@ class NativeMutationProofs:
         output=self.runner.run([self.config['helper'],intent.mutation_id],timeout_seconds=timeout_seconds,max_output_bytes=MAX_OUTPUT_BYTES)
         try:
             doc=self.read(intent.mutation_id)
-            require(doc['phase']=='CLAIMED' and doc['intent']==asdict(intent) and doc['worker_birth']==worker and doc['claimed_at']>=row['mutation_started_at'],'cleanup_evidence','exact fresh pre-exec claim required')
+            require(doc['phase']=='CLAIMED' and doc['intent']==asdict(intent) and doc['worker_birth']==worker and doc['claimed_at']>=row.mutation_started_at,'cleanup_evidence','exact fresh pre-exec claim required')
             p=self.profile(intent.binding,intent.host_boot_id)
             require(doc['source_ids']==p['source_ids'] and doc['native_peer']==p['native_peer_identity'] and self.sources.absent(doc) and self.sources.lock_released(self.backend,intent.binding.vm_id),'cleanup_evidence','owned command/lock cleanup not confirmed')
             doc.update(phase='RETURNED_SUCCESS',terminal_at=self.sources.clock(),local_cleanup_confirmed=True,result_sha256=hashlib.sha256(str(output).encode()).hexdigest())
@@ -480,14 +544,18 @@ class NativeMutationProofs:
             error.native_output_truncated=False
             raise
     def _proof(self,row,state,evidence):
-        require(row['native_context'] is not None,'cleanup_evidence','no exact production native owner')
-        doc=self.read(row['mutation_id']);intent=decode_witness(doc)
-        dispatch=self.dispatch(row['mutation_id'])
+        row=row if type(row) is MutationEffect else ProductionEffectOwner.from_row(row)
+        require(self.owner_for(row.mutation_id).proof_effect(state,row.mutation_id)==row,
+            'effect_owner','terminal proof differs from selected original effect owner')
+        require(row.native_context is not None,'cleanup_evidence','no exact production native owner')
+        doc=self.read(row.mutation_id);intent=decode_witness(doc)
+        dispatch=self.dispatch(row.mutation_id)
         require(dispatch['intent']==doc['intent'] and dispatch['worker_birth']==doc['worker_birth'],'cleanup_evidence','immutable dispatch and terminal witness differ')
         p=self.profile(intent.binding,state['host_boot_id'])
-        binding=next((b for b in evidence.bindings if b.vm_id==row['request']['vm_id']),None)
-        require(intent.operation==('shrink' if row['target_bytes']<row['old_bytes'] else 'grow') and intent.host_id==self.policy.host_id and intent.owner_id==self.policy.owner_id and intent.protocol_id==p['protocol_id'] and doc['phase']=='RETURNED_SUCCESS' and intent.request_id==row['request']['request_id'] and intent.mutation_id==row['mutation_id'] and intent.target_bytes==row['target_bytes'] and intent.old_bytes==row['old_bytes'] and intent.native_context==row['native_context'] and intent.binding==binding and asdict(intent.binding)==state['bindings'][intent.binding.vm_id] and intent.host_boot_id==evidence.host_boot_id==state['host_boot_id'] and intent.policy_sha256==evidence.policy_sha256==state['policy_sha256']==policy_digest(self.policy) and intent.qualification_sha256==fingerprint(p) and doc['source_ids']==p['source_ids'] and doc['native_peer']==p['native_peer_identity'],'cleanup_evidence','latest witness/runtime/policy mismatch')
-        require(doc['claimed_at']>=row['mutation_started_at'] and doc['terminal_at']<=self.sources.clock() and self.sources.absent(doc) and self.sources.lock_released(self.backend,intent.binding.vm_id),'cleanup_evidence','fresh exact owned absence required')
+        binding=next((b for b in evidence.bindings if b.vm_id==row.vm_id),None)
+        require(intent.operation==('shrink' if row.target_bytes<row.old_bytes else 'grow') and intent.host_id==self.policy.host_id and intent.owner_id==self.policy.owner_id and intent.protocol_id==p['protocol_id'] and doc['phase']=='RETURNED_SUCCESS' and intent.request_id==row.request_id and intent.mutation_id==row.mutation_id and intent.target_bytes==row.target_bytes and intent.old_bytes==row.old_bytes and intent.native_context==row.native_context and intent.binding==binding and asdict(intent.binding)==state['bindings'][intent.binding.vm_id] and intent.host_boot_id==evidence.host_boot_id==state['host_boot_id'] and intent.policy_sha256==evidence.policy_sha256==state['policy_sha256']==policy_digest(self.policy) and intent.qualification_sha256==fingerprint(p) and doc['source_ids']==p['source_ids'] and doc['native_peer']==p['native_peer_identity'],'cleanup_evidence','latest witness/runtime/policy mismatch')
+        if row.before_revision is not None:require(intent.before_revision==row.before_revision,'cleanup_evidence','original calibration before revision changed')
+        require(doc['claimed_at']>=row.mutation_started_at and doc['terminal_at']<=self.sources.clock() and self.sources.absent(doc) and self.sources.lock_released(self.backend,intent.binding.vm_id),'cleanup_evidence','fresh exact owned absence required')
         return doc
     def cleanup(self,request_id,*,owner_state,evidence):
         row=next((r for r in owner_state['receipts'] if r['request']['request_id']==request_id),None)

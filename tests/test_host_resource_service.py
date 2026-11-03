@@ -264,7 +264,7 @@ def service(tmp_path):
             self.events.append('host');return e
         def guest_admission(self,request_id,*,owner_state):
             self.events.append('guest');assert store.load()['grants'][0]['guest_bytes']==512
-            return replace(guest(m,'slurm:g42',total=512,available=self.available),slurm_memory_bytes=384)
+            return replace(guest(m,c,e,'slurm:g42',total=512,available=self.available),slurm_memory_bytes=384)
         def completion(self,request_id,*,owner_state):return completion(m,'slurm:g42')
         def cleanup(self,*a,**kw):return None
     p=Provider();s=NativeResourceService(c,p,clock=lambda:100)
@@ -343,7 +343,7 @@ def test_two_live_allocations_same_vm_finish_one_preserves_other_floor(tmp_path)
         def guest_admission(self,request_id,*,owner_state):
             row=next(r for r in owner_state['receipts'] if r['request']['request_id']==request_id)
             grant=owner_state['grants'][0]
-            return replace(guest(m,row['request']['workload_id'],live=e.live_workloads['vm-a'],
+            return replace(guest(m,c,e,row['request']['workload_id'],live=e.live_workloads['vm-a'],
                 total=grant['guest_bytes'],available=grant['guest_bytes']-128),task_limit_bytes=100,slurm_memory_bytes=grant['guest_bytes']-128)
         def completion(self,request_id,*,owner_state):
             return replace(completion(m,'slurm:g'+request_id.split('-')[1],live=e.live_workloads['vm-a']),total_bytes=b.rows['vm-a'].assigned_bytes,available_bytes=b.rows['vm-a'].assigned_bytes-128)
@@ -431,7 +431,7 @@ def test_every_existing_run_authorization_rechecks_full_owner_guard(tmp_path,mon
         def resolve(self,ref):return dict(generation='g42',limit_bytes=321),'vm-a','slurm:g42','native-fixed-42'
         def request_facts(self,*a,**kw):return self.facts
         def guest_admission(self,*a,**kw):
-            return replace(guest(m,'slurm:g42',total=1536,available=1408),slurm_memory_bytes=1408)
+            return replace(guest(m,c,e,'slurm:g42',total=1536,available=1408),slurm_memory_bytes=1408)
         def completion(self,*a,**kw):return completion(m,'slurm:g42')
         def cleanup(self,*a,**kw):return None
     p=Provider();s=NativeResourceService(c,p)

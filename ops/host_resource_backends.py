@@ -75,6 +75,50 @@ def read_root_json(path):
         os.close(fd)
 
 
+def read_root_qualification_report(path):
+    """Read the finite retained calibration report, independently of RPC limits.
+
+    The producer bounds a whole report at eight MiB. This dedicated reader does
+    not change the limits of policy/configuration, native commands or RPCs.
+    Parsing a report supplies no qualification; its consumer must recompute and
+    join the pinned report, current source, policy and runtime separately.
+    """
+    limit = 8 * 1024**2
+    # Reports are retained private runtime evidence, not immutable package
+    # Source. The generic store ancestry exception reads a Source payload with
+    # its own larger bound; refuse that namespace before invoking it.
+    path = Path(path)
+    require(str(path) != '/nix/store' and not str(path).startswith('/nix/store/'),
+            'trust', 'qualification report must be retained outside the Nix store')
+    path = trusted_root_path(path)
+    fields = ('st_dev', 'st_ino', 'st_uid', 'st_gid', 'st_mode', 'st_nlink',
+              'st_size', 'st_mtime_ns', 'st_ctime_ns')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(fd)
+        require(stat.S_ISREG(before.st_mode) and before.st_uid == 0 and
+                not before.st_mode & 0o022 and before.st_nlink == 1 and
+                before.st_size <= limit, 'trust', 'unsafe protected qualification report')
+        data = bytearray()
+        while len(data) <= limit:
+            block = os.read(fd, min(65536, limit + 1 - len(data)))
+            if not block:
+                break
+            data.extend(block)
+        require(len(data) <= limit, 'output_bound', 'qualification report exceeds producer bound')
+        after = os.fstat(fd)
+        trusted_root_path(path)
+        named = os.lstat(path)
+        require(all(getattr(before, key) == getattr(after, key) == getattr(named, key)
+                    for key in fields), 'trust', 'protected qualification report changed during read')
+        result = strict_json(data.decode())
+        require(type(result) is dict and result.get('schema') == 'qcl.host-resource-calibration-report.v1',
+                'shape', 'retained calibration report required')
+        return result
+    finally:
+        os.close(fd)
+
+
 class NativeCommandRunner:
     """Bounded local argv execution. Only root-enrolled absolute tools are allowed."""
     def __init__(self, tools, *, slurm_conf=None):

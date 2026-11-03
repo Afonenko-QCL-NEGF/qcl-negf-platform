@@ -26,7 +26,7 @@ def fixture(tmp_path,protocol='libvirt-local-setmem-v1'):
         state['startups'][new.vm_id]['native_id']=new.native_id
         b.rows[new.vm_id]=replace(b.rows[new.vm_id],native_id=new.native_id,process_id=new.process_id)
         profiles[i-1]['binding']=asdict(new)
-    e=replace(e,bindings=tuple(bindings),qualifications=tuple(replace(q,binding=bindings[i]) for i,q in enumerate(e.qualifications)))
+    e=replace(e,bindings=tuple(bindings),qualifications=tuple(replace(q,binding=bindings[i],capacity=replace(q.capacity,binding=asdict(bindings[i]))) for i,q in enumerate(e.qualifications)))
     store.save(state)
     class Sources:
         """Synthetic facts only. Production has no synthetic/qualified boolean."""
