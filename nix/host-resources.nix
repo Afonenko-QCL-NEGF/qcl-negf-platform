@@ -13,6 +13,7 @@ let
     cp ${../ops/host_resource_capacity.py} "$out/ops/host_resource_capacity.py"
     cp ${../ops/host_resource_qualification.py} "$out/ops/host_resource_qualification.py"
     cp ${../ops/host_resource_qualification_gate.py} "$out/ops/host_resource_qualification_gate.py"
+    cp ${../ops/host_resource_qualification_sources.py} "$out/ops/host_resource_qualification_sources.py"
     cp ${../ops/host_resource_qualification_observations.py} "$out/ops/host_resource_qualification_observations.py"
     cp ${../ops/host_resource_qualification_runtime.py} "$out/ops/host_resource_qualification_runtime.py"
     cp ${../ops/host_resource_operations.py} "$out/ops/host_resource_operations.py"
@@ -37,7 +38,7 @@ let
     runtimeInputs = [ "/run/wrappers" pkgs.python314 pkgs.openssh pkgs.systemd ];
     inheritPath = false;
     text = ''
-      exec python3 -I -c ${pkgs.lib.escapeShellArg "import sys; sys.path.insert(0, '${source}/ops'); ${expression}"} "$@"
+      exec ${pkgs.python314}/bin/python3 -I -c ${pkgs.lib.escapeShellArg "import sys; sys.path.insert(0, '${source}/ops'); ${expression}"} "$@"
     '';
   };
   client = entry "qcl-negf-resource" "import host_resource_client as m; sys.exit(m.main())";

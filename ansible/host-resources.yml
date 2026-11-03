@@ -58,6 +58,7 @@
         - host_resource_capacity
         - host_resource_qualification
         - host_resource_qualification_gate
+        - host_resource_qualification_sources
         - host_resource_qualification_observations
         - host_resource_qualification_runtime
         - host_resource_operations

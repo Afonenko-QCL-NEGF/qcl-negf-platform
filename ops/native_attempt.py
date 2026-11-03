@@ -464,13 +464,17 @@ class Operation:
         self.before(); self.files += 1
         need(self.files <= self.limits['maximum_files'], 'operation_file_bound')
 
-    def command(self, argv, *, env=None, run=engine.command, output_bytes=None):
+    def command(self, argv, *, env=None, run=engine.command, output_bytes=None, process_observer=None):
         self.before(); self.calls += 1
         need(self.calls <= self.limits['maximum_calls'], 'operation_call_bound')
         cap = min(output_bytes or 65536, self.limits['response_bytes'])
         self.reserve(cap * 4)
+        observed = {}
+        if process_observer is not None:
+            self.reserve(engine.COMMAND_OBSERVER_BYTES)
+            observed['process_observer'] = process_observer
         result = run(argv, timeout_seconds=self.limits['command_seconds'], output_bytes=cap,
-                     deadline=self.deadline, cleanup_seconds=self.limits['cleanup_seconds'], env=env)
+                     deadline=self.deadline, cleanup_seconds=self.limits['cleanup_seconds'], env=env, **observed)
         self.before()
         return result
 
@@ -2260,8 +2264,13 @@ class NativeSources:
         self.policy, self.budget = policy, budget
         self.qualification = None
 
-    def run(self, argv, *, output_bytes=None):
-        return self.budget.command(argv, run=engine.command, output_bytes=output_bytes,
+    def qualification_jobs_owner(self):
+        from host_resource_qualification_sources import open_controller_jobs
+        return open_controller_jobs(self)
+
+    def run(self, argv, *, output_bytes=None, process_observer=None):
+        observed = {} if process_observer is None else dict(process_observer=process_observer)
+        return self.budget.command(argv, run=engine.command, output_bytes=output_bytes, **observed,
                                    env={'PATH': '/empty', 'LANG': 'C', 'LC_ALL': 'C',
                                         'SLURM_CONF': self.policy['slurm']['config_file']})
 
@@ -2526,8 +2535,8 @@ class NativeSources:
         if admission.get('open') is True:
             need(current.get('ready') is True,'native_admission_closed')
             return False
-        # Internal protected owner only. The installed constructor does not
-        # attach it; no job/env/public action can select calibration admission.
+        # Only the fixed protected role view selected after socket auth.
+        # No job/env/public action can select calibration admission.
         owner=getattr(self,'_qualification_jobs',None)
         need(admission.get('open') is False and owner is not None and calcjob_uuid is not None,
              'native_admission_closed')
